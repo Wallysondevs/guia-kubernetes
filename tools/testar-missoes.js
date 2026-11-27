@@ -266,6 +266,7 @@ async function testarPagina(arq, avaliador, nomeArq) {
   dados.forEach((d, k) => {
     const nome = "caixa " + (k + 1), L = d.linha;
     if (d.htmls.length !== 1) fal(L, nome + ": " + d.htmls.length + " pre.yaml (é um só, o editor com o componente)");
+    if (d.outs.length === 0) fal(L, nome + ": falta pre.out (é a resposta que o motor devolve; rode verificar-saidas --fix)");
     if (d.outs.length > 1) fal(L, nome + ": " + d.outs.length + " pre.out (a caixa mostra uma saída só)");
     if (d.solucoes.length !== 1) fal(L, nome + ": " + d.solucoes.length + " pre.solucao (é uma só, escondida, com o HTML que cumpre a meta)");
     const modo = d.cx.at["data-modo"];
