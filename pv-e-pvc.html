@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PV e PVC | Guia Kubernetes</title>
+<meta name="description" content="PersistentVolume e PersistentVolumeClaim na prática: a oferta e o pedido de disco, como os dois se encontram, os modos de acesso e o pod que monta o claim.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>PV e <span class="hl">PVC</span></h1>
+<p class="intro">O caderno de encomendas da padaria da Ana vive dentro de um pod, num arquivo de texto. Toda
+vez que o pod é recriado — e ele é recriado o tempo todo — o arquivo volta vazio, porque o disco do
+container morre junto com ele. A Ana precisa de um lugar que sobreviva ao pod, e o Kubernetes tem duas peças
+para isso: o <strong>PersistentVolume</strong>, que é a oferta de espaço no cluster, e o
+<strong>PersistentVolumeClaim</strong>, que é o pedido formal desse espaço. Nesta aula ela cria os dois,
+descobre por que eles não se encontram sozinhos e aprende a ligar o pod no pedido — não na oferta.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que o disco do container não serve para guardar dado que importa.</li>
+  <li>O que é um PersistentVolume e por que ele não tem namespace.</li>
+  <li>O que é um PersistentVolumeClaim e o que ele pede, exatamente.</li>
+  <li>As regras que fazem um PVC encontrar (ou não) um PV.</li>
+  <li>Como o pod monta o claim, e por que ele nunca cita o PV.</li>
+  <li>O que cada modo de acesso promete — e o que ele não promete.</li>
+  <li>Como reservar um PV para um claim específico.</li>
+  <li>O que acontece com o disco quando o PVC é apagado.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o caderno que sumia</h2>
+
+<p>O programa da Ana é simples: ele guarda as encomendas num arquivo, <code>/dados/encomendas.txt</code>,
+dentro do container. Funcionou no primeiro dia. No segundo, o pod foi recriado por causa de uma atualização
+e o arquivo voltou vazio. No terceiro, ela escalou o Deployment para dois pods e descobriu algo pior: cada
+pod tinha o seu próprio arquivo, com metade das encomendas em cada um.</p>
+
+<p>Isso não é bug do Kubernetes, é a definição de container: o sistema de arquivos dele é descartável e
+nasce igual à imagem sempre que o container começa. Guardar dado importante ali é como anotar o pedido num
+guardanapo e jogar o guardanapo fora a cada troca de turno. O que a Ana precisa é de um volume que exista
+<em>fora</em> do ciclo de vida do pod.</p>
+
+<p>Existe uma solução mais simples para alguns casos: o <code>emptyDir</code>, que é um espaço temporário
+compartilhado pelos containers do mesmo pod. Ele resolve dois containers que precisam trocar arquivos e não
+resolve nada do que a Ana quer, porque o <code>emptyDir</code> também morre quando o pod morre. Para dado
+que precisa sobreviver, o caminho é outro, e ele tem duas peças com nomes compridos.</p>
+
+<h2>2. Duas peças, dois papéis</h2>
+
+<p>Pense numa locadora de espaço. De um lado está quem oferece o espaço — o disco de um servidor, uma pasta
+na rede, um volume na nuvem. Do outro está quem precisa do espaço — a aplicação, que quer um pedaço de
+alguns gigabytes com certas garantias. O Kubernetes separa os dois papéis justamente para que quem escreve
+a aplicação não precise saber em qual servidor o disco está.</p>
+
+<p>O <strong>PersistentVolume</strong> é a oferta: um pedaço de armazenamento que já existe no cluster, com
+tamanho, modos de acesso e uma política de reciclagem. O <strong>PersistentVolumeClaim</strong> é o pedido:
+uma declaração de intenção, "quero um gigabyte, com acesso de um nó só". O cluster então procura uma oferta
+que satisfaça o pedido e amarra as duas. Essa amarração se chama <em>binding</em>, e é o coração da aula.</p>
+
+<dl class="anatomy">
+<dt>PersistentVolume (PV)</dt>
+<dd>A oferta de armazenamento, criada pelo administrador do cluster ou por uma StorageClass. Não tem
+namespace: é do cluster inteiro, como um nó.</dd>
+<dt>PersistentVolumeClaim (PVC)</dt>
+<dd>O pedido de armazenamento, dentro de um namespace. Quem escreve é quem escreve a aplicação.</dd>
+<dt>binding</dt>
+<dd>O casamento entre um PVC e um PV. É um para um: um PV atende um claim por vez.</dd>
+<dt>capacity</dt>
+<dd>O tamanho oferecido pelo PV, em <code>spec.capacity.storage</code> — <code>1Gi</code>,
+<code>500Mi</code>. E o tamanho pedido no PVC, em <code>spec.resources.requests.storage</code>.</dd>
+<dt>accessModes</dt>
+<dd>Como o volume pode ser montado: um nó por vez (<code>ReadWriteOnce</code>), muitos nós só leitura
+(<code>ReadOnlyMany</code>), muitos nós com escrita (<code>ReadWriteMany</code>).</dd>
+<dt>reclaimPolicy</dt>
+<dd>O que o cluster faz com o PV quando o claim é apagado: <code>Retain</code> guarda, <code>Delete</code>
+apaga o armazenamento de trás.</dd>
+</dl>
+
+<p>Uma confusão comum vale desfazer agora: PV e PVC não são “o volume do pod” que você viu na aula de
+ConfigMap. O <code>spec.volumes</code> do pod continua existindo, e é lá que o pod aponta para o claim. A
+diferença é que, em vez de um <code>emptyDir</code> que nasce e morre com o pod, a origem do conteúdo é um
+objeto do cluster que tem vida própria.</p>
+
+<h2>3. A oferta: o PV</h2>
+
+<p>Vamos escrever a oferta. Um PV precisa de quatro informações: quanto espaço ele oferece, quais modos de
+acesso aceita, como o dado é guardado de verdade (o <em>driver</em>: uma pasta do nó, um servidor NFS, um
+disco da nuvem) e o que fazer quando ninguém mais o estiver usando. A caixa começa com o PV incompleto e o
+pedido incompleto — a missão é completar os dois com um gibibyte.</p>
+
+<div class="tryk8s" data-get="pvc" data-goal="objeto:PersistentVolume/dados-padaria;;objeto:PersistentVolumeClaim/dados-padaria;;campo:PersistentVolume/dados-padaria|spec.capacity.storage=1Gi;;campo:PersistentVolumeClaim/dados-padaria|spec.resources.requests.storage=1Gi">
+  <p class="try-task">O PV está sem <code>capacity</code> e o PVC está sem o pedido de espaço. Acrescente
+  <code>storage: 1Gi</code> nos dois (em <code>spec.capacity</code> no PV e em
+  <code>spec.resources.requests</code> no PVC) e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: dados-padaria
+spec:
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /mnt/dados-padaria
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-padaria
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Mi</pre>
+<pre class="out">
+persistentvolume/dados-padaria created
+persistentvolumeclaim/dados-padaria created
+
+NAME            STATUS    VOLUME         CAPACITY   ACCESS MODES   STORAGECLASS   AGE   VOLUMEMODE
+dados-padaria   Pending   pvc-549tjl7v              RWO                           1m    Filesystem
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: dados-padaria
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /mnt/dados-padaria
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-padaria
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi</pre>
+</div>
+
+<p>O painel mostra os dois objetos criados e a tabela do <code>kubectl get pvc</code>. Repare no
+<code>STATUS</code>: <code>Pending</code>. O pedido foi aceito — o objeto existe, o cluster guardou a
+intenção — mas ainda não está atendido. Num cluster com provisionamento dinâmico isso dura um ou dois
+segundos; num cluster sem StorageClass, como o do painel, dura para sempre. Voltamos a isso na quinta
+seção.</p>
+
+<p>O campo <code>hostPath</code> é o driver mais simples que existe: o volume é uma pasta do próprio nó. É
+ótimo para estudar e ruim para produção, porque amarra o dado a uma máquina específica — se o pod for
+agendado em outro nó, a pasta não está lá. Num cluster de verdade, o PV de um disco de nuvem tem outro
+driver, com nome comprido tipo <code>csi.aws.amazon.com</code> e parâmetros próprios. O que não muda é a
+forma: capacidade, modos, driver e política.</p>
+
+<h2>4. O pedido: o PVC</h2>
+
+<p>O PVC é onde a aplicação fala. Ele pede três coisas: tamanho, modo de acesso e — opcionalmente — a classe
+de armazenamento. Quem escreve o Deployment da Ana não precisa saber se o disco está num servidor com SSD ou
+numa pasta de rede; escreve <code>1Gi</code> e <code>ReadWriteOnce</code> e segue. É a mesma lógica de pedir
+um quarto de hotel: você escolhe o tamanho e a categoria, não o andar.</p>
+
+<p>O pedido fica no namespace da aplicação, e isso tem consequência prática: dois times podem ter um PVC
+chamado <code>dados</code> em namespaces diferentes sem conflito. Já o PV é do cluster, então dois PVs com o
+mesmo nome não podem existir, mesmo em namespaces distintos. Se você algum dia vir um erro de “nome já em
+uso” num PV que jurou não ter criado, procure em outro namespace — o PVC é de lá, o PV não.</p>
+
+<p>O <code>accessModes</code> do PVC não é um pedido de luxo, é um filtro: o cluster só casa o claim com um
+PV que aceite aquele modo. Pedir <code>ReadWriteMany</code> quando o PV só oferece
+<code>ReadWriteOnce</code> é o caminho mais curto para um <code>Pending</code> eterno. E os modos são
+promessas diferentes, não sinônimos — a sétima seção é sobre isso.</p>
+
+<h2>5. O encontro dos dois: como o binding acontece</h2>
+
+<p>O cluster tenta casar cada PVC com um PV que satisfaça quatro condições. Primeira: o PV tem capacidade
+maior ou igual ao pedido. Segunda: os modos de acesso do PV incluem os modos pedidos. Terceira: a classe de
+armazenamento combina — o PVC sem classe procura um PV sem classe. Quarta: o PV não está reservado para
+outro claim nem já está amarrado. Quem casa primeiro leva; se dois claims disputam um PV, um fica esperando.</p>
+
+<p>Quando o casamento dá certo, o <code>STATUS</code> do PVC vira <code>Bound</code> e o campo
+<code>VOLUME</code> passa a mostrar o nome do PV. Quando não dá, ele fica <code>Pending</code> — e o motivo
+está nos eventos, como em tudo no Kubernetes. Esta é uma transcrição de um cluster de prova, com um pedido
+de 2Gi que nenhum PV atende:</p>
+
+<pre class="term">$ kubectl get pvc
+NAME            STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+dados-padaria   Pending                                       manual         12s
+
+$ kubectl describe pvc dados-padaria
+Events:
+  Type     Reason              Age   From                         Message
+  ----     ------              ----  ----                         -------
+  Warning  ProvisioningFailed  8s    persistentvolume-controller  no persistent volumes available for this claim and no storage class is set</pre>
+
+<p>A mensagem diz exatamente o que falta: nenhum volume disponível para este pedido e nenhuma classe
+configurada. Traduzindo para o dia a dia: ninguém ofereceu espaço com esse tamanho e esse modo, e também não
+existe um provisionador para fabricar um sob demanda. As duas saídas são aumentar a oferta (criar ou ajustar
+um PV) ou configurar uma StorageClass, que é a aula seguinte.</p>
+
+<p>No painel desta página o casamento não acontece, e é importante ser honesto sobre isso: o motor valida,
+guarda e mostra os objetos, mas não tem o controlador que amarra PVC a PV. Por isso a tabela do
+<code>get pvc</code> fica em <code>Pending</code> mesmo com o PV sobrando. O que você aprende aqui é a
+anatomia das duas peças e as regras do encontro; o encontro em si você vai ver acontecendo de verdade na
+aula de StatefulSet, onde cada pod ganha o seu claim já amarrado.</p>
+
+<h2>6. O pod aponta para o claim</h2>
+
+<p>Agora a parte que resolve o problema da Ana. O pod não cita o PV em lugar nenhum: ele declara um volume do
+tipo <code>persistentVolumeClaim</code> e monta esse volume numa pasta do container. Quem sabe em qual disco
+isso vai parar é o cluster. A caixa começa com o pod usando <code>emptyDir</code> — o caderno que some — e a
+missão é trocar a origem do volume pelo claim.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/estoque|spec.volumes.0.persistentVolumeClaim.claimName=dados-padaria;;campo:Pod/estoque|spec.containers.0.volumeMounts.0.mountPath=/dados;;texto:Running">
+  <p class="try-task">Troque o <code>emptyDir</code> do pod por um volume que aponta para o PVC
+  <code>dados-padaria</code>, mantendo a montagem em <code>/dados</code>. Rode e confira o pod em
+  <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: estoque
+spec:
+  containers:
+    - name: estoque
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      emptyDir: {}</pre>
+<pre class="out">
+pod/estoque created
+
+NAME      READY   STATUS    RESTARTS   AGE
+estoque   1/1     Running   0          3m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: estoque
+spec:
+  containers:
+    - name: estoque
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      persistentVolumeClaim:
+        claimName: dados-padaria</pre>
+</div>
+
+<p>O <code>kubectl describe</code> desse pod mostra a ligação no bloco <code>Volumes</code>. Esta é a saída
+do motor para o manifesto da solução:</p>
+
+<pre class="term">Volumes:
+  dados:
+    Type:       PersistentVolumeClaim (a reference to a PersistentVolumeClaim in the same namespace)
+    ClaimName:  dados-padaria</pre>
+
+<p>Repare que o <code>ClaimName</code> não traz namespace: o claim é procurado no mesmo namespace do pod.
+Essa é a razão de o PVC e o pod precisarem morar juntos — e o motivo de um pod em <code>default</code> não
+achar um claim criado em <code>padaria</code>. Se o pod não subir e o evento falar de
+<code>FailedMount</code> ou de claim não encontrado, comece conferindo o namespace antes de qualquer outra
+coisa.</p>
+
+<p>Vale também notar o que <em>não</em> está no manifesto: nenhuma menção a tamanho, a nó ou a tipo de disco.
+O pod pede “o volume chamado dados”, o claim pede “um gibibyte com escrita de um nó”, o PV oferece “um
+gibibyte numa pasta do nó”. Três camadas, cada uma sabendo só o que precisa. Quando a Ana mudar de um disco
+local para um disco de nuvem, o manifesto do pod não muda uma vírgula — só o PV (ou a classe) muda.</p>
+
+<p>A montagem funciona igual à do <a href="configmap-como-volume.html">ConfigMap como volume</a> — duas
+declarações que combinam pelo nome — mas os sintomas quando erra são outros, porque agora existe um objeto no
+meio. Esta tabela é o mapa de onde olhar:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que você vê</th><th>O que significa</th><th>Onde olhar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Pending</code> no <code>get pvc</code></td><td>ninguém atendeu o pedido</td><td>eventos do
+próprio PVC: capacidade, modo ou classe</td></tr>
+<tr><td>pod parado em <code>ContainerCreating</code></td><td>o volume não montou</td><td><code>describe
+pod</code>, seção <code>Events</code>: <code>FailedMount</code></td></tr>
+<tr><td>pod <code>Running</code> e arquivo vazio</td><td>montou outro volume</td><td><code>spec.volumes</code>
+do pod: ainda é <code>emptyDir</code>?</td></tr>
+<tr><td>claim “não encontrado” no evento</td><td>namespace diferente</td><td><code>metadata.namespace</code>
+do PVC e do pod</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>7. Os modos de acesso, sem decoreba</h2>
+
+<p>Os quatro modos são fáceis de confundir porque os nomes falam de <em>nós</em>, não de pods. Um volume
+<code>ReadWriteOnce</code> pode ser montado com escrita por um nó — e vários pods naquele mesmo nó podem
+usá-lo ao mesmo tempo. Já <code>ReadWriteMany</code> permite que nós diferentes montem o mesmo volume com
+escrita, o que exige um sistema de arquivos de rede por trás. Não é uma opção que se liga: é uma propriedade
+do driver.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Modo</th><th>Quem pode montar</th><th>Serve para</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ReadWriteOnce</code> (RWO)</td><td>um nó, com leitura e escrita</td><td>banco de dados, fila
+local, o caderno de encomendas de um único consumidor</td></tr>
+<tr><td><code>ReadOnlyMany</code> (ROX)</td><td>vários nós, só leitura</td><td>arquivos estáticos, imagens
+de cardápio, biblioteca compartilhada</td></tr>
+<tr><td><code>ReadWriteMany</code> (RWX)</td><td>vários nós, com escrita</td><td>NFS, CephFS, volumes
+compartilhados entre réplicas</td></tr>
+<tr><td><code>ReadWriteOncePod</code> (RWOP)</td><td>um único pod</td><td>garantia forte de que ninguém
+mais escreve no mesmo volume</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A pegadinha clássica é escalar um Deployment que usa um volume RWO. Duas réplicas, dois nós, o mesmo
+claim: o primeiro pod monta, o segundo fica preso em <code>ContainerCreating</code> com um evento de
+<code>FailedMount</code> dizendo que o volume está sendo usado por outro nó. O manifesto é aceito, o
+Deployment mostra <code>1/2</code> pronto, e a causa não está no Deployment — está no modo de acesso. Quem
+precisa de várias réplicas escrevendo no mesmo lugar precisa de RWX, ou de um volume por réplica, que é o que
+o StatefulSet faz.</p>
+
+<h2>8. Quando algo é apagado</h2>
+
+<p>O ciclo de vida do dado depende de duas coisas: o que você apaga e qual é a política de reciclagem do PV.
+Apagar o <strong>pod</strong> não toca no PVC nem no PV — o dado continua lá, e o próximo pod monta o mesmo
+conteúdo. É esse detalhe que faz o caderno da Ana sobreviver a uma atualização de imagem.</p>
+
+<p>Apagar o <strong>PVC</strong> é o momento em que a política decide o destino do disco. Com
+<code>Retain</code>, o PV fica lá com o status <code>Released</code>, ainda com os dados, esperando alguém
+decidir o que fazer — é o padrão seguro e o que o nosso PV usa. Com <code>Delete</code>, o cluster manda o
+driver apagar o armazenamento de verdade: o disco da nuvem vai embora, e não há <em>undo</em>. Em cluster de
+teste isso é conveniente; em produção, é o tipo de configuração que se confere duas vezes.</p>
+
+<p>Existe ainda uma situação intermediária que assusta: o PVC foi apagado, o PV está <code>Released</code>, e
+um novo PVC com o mesmo nome não consegue usar aquele PV, porque ele ainda guarda a referência ao claim
+antigo. A saída é editar o PV e limpar <code>spec.claimRef</code>, ou criar o PV de novo. Nada disso apaga
+dado — mas exige que alguém saiba o que está fazendo, e é por isso que o time da Ana mantém um runbook com
+esse procedimento.</p>
+
+<p>Quando você precisa garantir que <em>aquele</em> claim use <em>aquele</em> disco, existe a reserva feita à
+mão: o PV aponta para o claim em <code>spec.claimRef</code> e o claim aponta para o PV em
+<code>spec.volumeName</code>. Os dois lados precisam combinar, senão o pedido continua esperando. A caixa
+começa com a reserva apontando para um claim antigo que ninguém mais tem.</p>
+
+<div class="tryk8s" data-get="pvc" data-goal="campo:PersistentVolume/dados-padaria|spec.claimRef.name=dados-padaria;;campo:PersistentVolumeClaim/dados-padaria|spec.volumeName=dados-padaria">
+  <p class="try-task">O PV está reservado para o claim <code>dados-antigo</code>, que não existe mais. Reserve-o
+  para <code>dados-padaria</code> (em <code>spec.claimRef.name</code>) e aponte o claim para o PV (em
+  <code>spec.volumeName</code>).</p>
+<pre class="yaml">apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: dados-padaria
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  claimRef:
+    name: dados-antigo
+    namespace: default
+  hostPath:
+    path: /mnt/dados-padaria
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-padaria
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi</pre>
+<pre class="out">
+persistentvolume/dados-padaria created
+persistentvolumeclaim/dados-padaria created
+
+NAME            STATUS    VOLUME         CAPACITY   ACCESS MODES   STORAGECLASS   AGE   VOLUMEMODE
+dados-padaria   Pending   pvc-549tjl7v              RWO                           1m    Filesystem
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: dados-padaria
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  claimRef:
+    name: dados-padaria
+    namespace: default
+  hostPath:
+    path: /mnt/dados-padaria
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-padaria
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeName: dados-padaria
+  resources:
+    requests:
+      storage: 1Gi</pre>
+</div>
+
+<p>Com a reserva dos dois lados, o resultado é determinístico: aquele claim usa aquele PV, e nenhum outro
+claim entra ali, mesmo que sobre espaço. É a receita para recuperar um disco antigo depois de um acidente e
+para separar discos rápidos dos lentos sem depender de sorte no casamento. O preço é que você passa a
+administrar o encaixe à mão — cada claim novo precisa da sua linha no PV certo.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o banco de dados pequeno</h3>
+<p>O banco de teste da padaria pede <code>5Gi</code> com <code>ReadWriteOnce</code>. O PVC é criado no
+namespace da aplicação e o pod do banco monta em <code>/var/lib/postgresql/data</code>. O Deployment do site
+continua sem volume: só o banco precisa de disco durável. Essa separação é normal — volume persistente é
+para estado, e a maior parte dos pods não tem estado nenhum.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o relatório que dois pods leem</h3>
+<p>O relatório mensal é gerado por um Job e lido por um pod de exportação. Os dois precisam do mesmo arquivo,
+então o claim é <code>ReadOnlyMany</code> e o PV é um NFS da rede da padaria. Se fosse RWO, o segundo pod
+ficaria esperando o primeiro soltar — e como Jobs terminam e soltam, funcionaria por acidente. Não conte com
+acidentes: escolha o modo pelo uso, não pelo que passou no teste.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o disco que virou órfão</h3>
+<p>Alguém apagou o PVC do banco “para limpar” e o PV ficou <code>Released</code>. Na semana seguinte, o time
+tentou recriar o PVC com o mesmo nome e ele ficou <code>Pending</code>. O conserto foi editar o PV, limpar o
+<code>claimRef</code> e apontar o novo claim para ele com <code>volumeName</code>. O dado estava intacto o
+tempo todo — mas ninguém sabia onde estava, e é por isso que o <code>Retain</code> vem com a
+responsabilidade de anotar qual PV pertence a quê.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Quem pede espaço ao cluster?</p>
+<label><input type="radio" name="q1"> o PersistentVolume, que é a oferta</label>
+<label><input type="radio" name="q1"> o PersistentVolumeClaim, que é o pedido</label>
+<label><input type="radio" name="q1"> o pod, direto no <code>spec.volumes</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o pod declara no manifesto para usar o disco?</p>
+<label><input type="radio" name="q2"> o nome do PersistentVolume, em <code>claimName</code></label>
+<label><input type="radio" name="q2"> o caminho do disco do nó, em <code>hostPath</code></label>
+<label><input type="radio" name="q2"> o nome do PersistentVolumeClaim, no volume do tipo
+<code>persistentVolumeClaim</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que <code>ReadWriteOnce</code> significa?</p>
+<label><input type="radio" name="q3"> um nó pode montar o volume com escrita; vários pods naquele nó
+podem usá-lo</label>
+<label><input type="radio" name="q3"> um único pod no cluster inteiro pode montar o volume</label>
+<label><input type="radio" name="q3"> o volume pode ser lido por vários nós e escrito por um</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o pedido do caderno</h2>
+<p>Complete o PVC para pedir dois gibibytes com escrita de um nó, no namespace da padaria:</p>
+<div class="ex-code">apiVersion: v1<br>
+kind: PersistentVolumeClaim<br>
+metadata:<br>
+&nbsp;&nbsp;name: dados-padaria<br>
+spec:<br>
+&nbsp;&nbsp;accessModes:<br>
+&nbsp;&nbsp;&nbsp;&nbsp;- ReadWriteOnce<br>
+&nbsp;&nbsp;resources:<br>
+&nbsp;&nbsp;&nbsp;&nbsp;requests:<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;storage: <input aria-label="resposta 1" data-answer="2Gi" placeholder="..."></div>
+<p class="ex-dica">Dica: a unidade é <code>Gi</code> (gibibyte), não <code>GB</code>. E o campo é
+<code>requests</code>, não <code>limits</code> — volume não tem teto elástico como CPU.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>PersistentVolume é a oferta de disco, do cluster e sem namespace. PersistentVolumeClaim é o pedido, no
+namespace da aplicação. O cluster casa os dois quando a capacidade cabe, os modos de acesso são compatíveis,
+a classe combina e o PV está livre — e esse casamento é um para um. Enquanto não casa, o PVC fica
+<code>Pending</code>, e o motivo está nos eventos.</p>
+
+<p>O pod nunca cita o PV: ele declara um volume do tipo <code>persistentVolumeClaim</code> com o nome do
+claim e monta numa pasta do container. É essa indireção que permite trocar o disco por baixo sem tocar no
+manifesto da aplicação. E é por isso que o tamanho aparece no PVC, não no pod: quem sabe quanto precisa é
+quem pede, não quem usa.</p>
+
+<p>Os três detalhes que mais causam problema na vida real são o modo de acesso errado (RWO com várias
+réplicas), o namespace diferente entre pod e claim, e a política de reciclagem. Cada um tem um sintoma
+próprio: pod preso em <code>ContainerCreating</code>, claim não encontrado, e dado que ninguém sabe se ainda
+existe. Saber onde olhar em cada caso vale mais do que decorar os quatro nomes de modo de acesso. Na próxima
+aula a Ana conhece a peça que cria PVs sob demanda e faz o <code>Pending</code> durar um segundo: a
+StorageClass.</p>
+
+<div class="note">
+<h3>Para lembrar</h3>
+<ul>
+<li>PV é oferta (cluster, sem namespace); PVC é pedido (namespace da aplicação).</li>
+<li>O pod monta o PVC, nunca o PV.</li>
+<li>O casamento exige capacidade suficiente, modo compatível, classe igual e PV livre.</li>
+<li><code>Pending</code> = pedido aceito, ainda não atendido; o motivo está nos eventos.</li>
+<li><code>ReadWriteOnce</code> fala de nós, não de pods.</li>
+<li><code>Retain</code> guarda o disco depois do PVC; <code>Delete</code> apaga de verdade.</li>
+<li>Claim e pod precisam estar no mesmo namespace; o PV não tem namespace.</li>
+<li>Pod sem claim não acha volume: o nome do claim é obrigatório no manifesto.</li>
+<li>Dado que importa não mora no disco do container nem no <code>emptyDir</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

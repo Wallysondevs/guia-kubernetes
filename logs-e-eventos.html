@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logs e eventos | Guia Kubernetes</title>
+<meta name="description" content="Logs e eventos no Kubernetes: o que o programa conta no kubectl logs, o que o cluster conta nos eventos do describe, e como cruzar as duas fontes para achar a causa.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Logs e <span class="hl">eventos</span></h1>
+<p class="intro">O cliente ligou dizendo que a encomenda sumiu. A Ana abriu o site, viu o cardápio, não viu
+erro nenhum, e ficou sem saber onde procurar. É o momento em que o cluster oferece duas testemunhas: o
+<strong>log</strong>, em que o programa conta o que aconteceu com ele, e o <strong>evento</strong>, em que o
+Kubernetes conta o que tentou fazer com o pod. Uma sem a outra conta meia história; juntas, quase sempre
+apontam o culpado.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é log e o que é evento, e por que os dois existem.</li>
+  <li>Como ler o <code>kubectl logs</code> e o que fazer quando ele vem vazio.</li>
+  <li>Como ler a seção <code>Events</code> do <code>describe</code>, coluna por coluna.</li>
+  <li>Quando um pod pendente não tem log nenhum — e o que isso significa.</li>
+  <li>Como filtrar log por container, por tempo e ao vivo.</li>
+  <li>Como cruzar as duas fontes: o que o programa reclamou e o que o cluster respondeu.</li>
+</ul>
+</div>
+
+<h2>1. A cena: duas testemunhas, uma história</h2>
+
+<p>O pedido 1042 foi gravado no banco, mas o site devolveu erro ao cliente. A Ana tem duas perguntas
+diferentes para responder. A primeira: “o que o meu programa fez quando recebeu esse pedido?”. A segunda:
+“o que o cluster fez com o meu pod naquele momento?”. São perguntas de naturezas diferentes, e cada uma tem
+uma fonte própria.</p>
+
+<p>O <strong>log</strong> é a saída do seu programa. Tudo o que ele escreveria no terminal com
+<code>console.log</code>, <code>print</code> ou <code>logger.error</code> vai para um arquivo que o kubelet
+guarda e que você lê com <code>kubectl logs</code>. É texto do seu código, no formato que você escolheu, com
+as palavras que você escolheu — inclusive “erro” que não é erro e sucesso que passou em silêncio.</p>
+
+<p>O <strong>evento</strong> é a saída do cluster. Quem escreve é o agendador, o kubelet, o controlador de
+Deployment: “tentei agendar e não coube”, “baixei a imagem”, “o container morreu e vou reiniciar”. É um
+registro curto, com tipo (<code>Normal</code> ou <code>Warning</code>), motivo e mensagem, e ele aparece no
+fim do <code>kubectl describe</code> de qualquer objeto.</p>
+
+<p>A confusão mais comum é procurar erro de configuração no log. Se o pod nunca subiu, não existe log: o
+programa não rodou, então não teve o que escrever. Quem fala nesse caso é o evento. E o contrário também
+vale: se o pod está rodando e devolvendo erro 500, os eventos vão estar limpos e a explicação está no log.</p>
+
+<h2>2. Quem escreve o quê</h2>
+
+<p>Vale fixar as duas fontes com nomes e limites, porque elas se confundem com facilidade. O log pertence ao
+container e morre com ele; o evento pertence ao objeto e tem prazo de validade no cluster (uma hora, por
+padrão). Um é escrito pelo seu código; o outro, pelos componentes do Kubernetes.</p>
+
+<dl class="anatomy">
+<dt>log</dt>
+<dd>A saída do processo (stdout e stderr) do container. Lida com <code>kubectl logs</code>; é texto do seu
+programa.</dd>
+<dt>evento</dt>
+<dd>Registro do cluster sobre um objeto: agendamento, pull de imagem, reinício, criação. Aparece no
+<code>describe</code>.</dd>
+<dt>stdout e stderr</dt>
+<dd>As duas saídas padrão do processo. O kubelet junta as duas no mesmo log — por isso erro e aviso
+aparecem misturados com o resto.</dd>
+<dt>Warning</dt>
+<dd>Tipo de evento que indica problema: <code>FailedScheduling</code>, <code>BackOff</code>,
+<code>Failed</code>. <code>Normal</code> é o evento de rotina.</dd>
+<dt>Reason</dt>
+<dd>O motivo curto do evento: <code>Scheduled</code>, <code>Pulling</code>, <code>Created</code>,
+<code>FailedScheduling</code>.</dd>
+<dt>rotação</dt>
+<dd>O kubelet guarda só uma quantidade limitada de log por container. Container que reinicia muito perde as
+primeiras linhas.</dd>
+<dt>--previous</dt>
+<dd>Lê o log do container anterior quando o atual ainda não escreveu nada.</dd>
+</dl>
+
+<p>Repare numa consequência prática: apagar o pod apaga o log com ele. Se você suspeita de um problema e vai
+recriar o pod, leia o log antes. Já os eventos sobrevivem um pouco depois da morte do objeto — mas também
+somem, e é por isso que a investigação tem hora: quanto antes você olhar, mais história existe para ler.</p>
+
+<h2>3. A caixa: o log do programa</h2>
+
+<p>A caixa cria um pod com a imagem do cardápio e lê o log. É o caminho mais comum de todos: você tem um pod
+rodando, quer saber o que ele está dizendo, e o comando é <code>kubectl logs</code> seguido do nome do
+pod.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Servindo o cardapio na porta 8080">
+  <p class="try-task">A caixa só lista os pods, e não há nenhum. Crie o pod com
+  <code>kubectl run cardapio --image=cardapio:1.0</code> e, na linha seguinte, leia o log com
+  <code>kubectl logs cardapio</code>.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+No resources found in default namespace.
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl logs cardapio</pre>
+</div>
+
+<p>O painel mostra seis linhas do programa: o servidor dizendo em que porta subiu, que carregou os preços,
+que a conexão com o banco está de pé, e duas requisições atendidas. É exatamente o que você veria no
+terminal do notebook se tivesse rodado o programa à mão — a diferença é que agora ele está num nó do
+cluster.</p>
+
+<p>Duas coisas para observar. A primeira: o log não tem data nem nível por padrão; quem formata é o seu
+programa, e é uma boa ideia incluir hora e nível (<code>INFO</code>, <code>WARN</code>,
+<code>ERROR</code>). A segunda: o log é do container, não do pod. Num pod com dois containers, o comando
+sem <code>-c</code> pega o primeiro, e você pode estar lendo o log errado sem perceber.</p>
+
+<p>Se o programa não escreve nada — muitos servidores só logam requisição —, o <code>kubectl logs</code>
+volta vazio e isso não é erro. Um log vazio pode significar “está tudo bem e ninguém chamou” ou “o programa
+ainda não chegou a iniciar”. Quem separa os dois casos é o status do pod, na tabela do
+<code>get pods</code>.</p>
+
+<h2>4. A caixa: o log que vem vazio</h2>
+
+<p>Agora o caso que mais confunde: o pod está pendente e o log não mostra nada. Isso não é bug do
+<code>kubectl logs</code>: o container nunca rodou, então não há saída para ler. A explicação está do outro
+lado, nos eventos. A caixa começa com o forno pendente no cluster.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="pod-pendente" data-goal="texto:FailedScheduling">
+  <p class="try-task">Rode como está: o <code>get pods</code> mostra o <code>Pending</code> e o
+  <code>logs</code> vem vazio. Acrescente <code>kubectl describe pod forno</code> na terceira linha e rode
+  de novo, para ler o evento que explica o problema.</p>
+<pre class="yaml">kubectl get pods
+kubectl logs forno</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+
+ana@notebook:~$ kubectl logs forno
+</pre>
+<pre class="solucao">kubectl get pods
+kubectl logs forno
+kubectl describe pod forno</pre>
+</div>
+
+<p>No painel, depois de <code>kubectl logs forno</code>, aparece só o convite para o próximo comando — nenhuma
+linha de saída. Em seguida, o <code>describe</code> entrega a seção <code>Events</code> com
+<code>Warning  FailedScheduling</code> e a mensagem <code>0/3 nodes are available: 3 Insufficient cpu</code>.
+O contraste é a lição: o programa não tem nada a dizer porque não começou; o cluster tem muito a dizer
+porque tentou.</p>
+
+<p>Essa é a regra que resolve a maioria dos casos. Pod em <code>Pending</code>, <code>ImagePullBackOff</code>
+ou <code>CreateContainerConfigError</code>: o log está vazio ou não existe, e a resposta está nos eventos.
+Pod em <code>Running</code>, <code>CrashLoopBackOff</code> ou <code>Error</code>: o log tem conteúdo, e os
+eventos complementam com horários e reinícios.</p>
+
+<p>Há um detalhe de tempo que engana: quando o pod reinicia muito, o log atual pode ser curto ou vazio porque
+o container acabou de subir. É aí que entra o <code>--previous</code>, que você viu na aula de
+<code>CrashLoopBackOff</code>. A ordem prática é sempre a mesma: <strong>status → log atual → log anterior →
+eventos</strong>.</p>
+
+<h2>5. Como ler um evento</h2>
+
+<p>A seção <code>Events</code> tem cinco colunas, e cada uma responde a uma pergunta. <code>Type</code> diz
+se é rotina (<code>Normal</code>) ou problema (<code>Warning</code>). <code>Reason</code> é o motivo curto.
+<code>Age</code> é quando aconteceu, relativo a agora. <code>From</code> é quem escreveu — agendador, kubelet,
+controlador. <code>Message</code> é a frase completa, e é onde está o diagnóstico.</p>
+
+<p>Num cluster com problemas, o comando <code>kubectl get events</code> mostra os eventos do namespace numa
+tabela parecida. Esta é uma transcrição de um cluster real, com três pods em situações diferentes:</p>
+
+<pre class="term">LAST SEEN   TYPE      REASON             OBJECT          MESSAGE
+2m          Warning   FailedScheduling   pod/forno       0/3 nodes are available: 3 Insufficient cpu.
+96s         Normal    Scheduled          pod/relatorio   Successfully assigned default/relatorio to guia-worker
+40s         Warning   BackOff            pod/relatorio   Back-off restarting failed container</pre>
+
+<p>A leitura é de baixo para cima se você quiser a história: o relatório foi agendado, começou a reiniciar e
+entrou em backoff; o forno, mais antigo, nunca foi agendado. Repare que o mesmo comando mistura eventos de
+pods diferentes e de idades diferentes — e é por isso que ele é bom para ver o quadro geral, mas ruim para
+investigar um caso só. Para um caso só, o <code>describe</code> do objeto é mais direto.</p>
+
+<p>Outra coisa que a tabela ensina: evento <code>Normal</code> é tão importante quanto
+<code>Warning</code>. Um <code>Normal Scheduled</code> diz “o agendamento deu certo”; se ele aparece e o
+problema continua, você já eliminou uma família inteira de causas e pode ir direto para a próxima etapa.
+Diagnóstico é isso: usar os eventos para riscar suspeitas, não para acumular texto.</p>
+
+<h2>6. A caixa: eventos de outros objetos</h2>
+
+<p>Eventos não são exclusividade de pod. Deployment, Service, Job e nó também têm — e são eles que contam o
+que o controlador fez. A caixa começa com o cluster da padaria já montado, com dois pods do cardápio
+rodando, e pede o <code>describe</code> do Deployment.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:ScalingReplicaSet">
+  <p class="try-task">A caixa só lista os pods. Acrescente <code>kubectl describe deployment cardapio</code>
+  e rode: procure a seção <code>Events</code> e o evento <code>ScalingReplicaSet</code>, que conta quantas
+  réplicas o controlador criou.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl get pods
+kubectl describe deployment cardapio</pre>
+</div>
+
+<p>A saída do Deployment tem <code>Selector</code>, <code>Pod Template</code>, <code>Conditions</code>,
+<code>OldReplicaSets</code>, <code>NewReplicaSet</code> e, no fim, os eventos. O
+<code>Normal ScalingReplicaSet</code> com a mensagem <code>Scaled up replica set cardapio-... to 2</code> é
+o controlador contando o que fez: “criei o ReplicaSet e subi para duas réplicas”. Se o número de pods na
+tela não bate com o que você pediu, esse evento é a primeira coisa a ler.</p>
+
+<p>O mesmo vale para o Service: o <code>describe service</code> mostra <code>Selector</code> e
+<code>Endpoints</code>, e os eventos contam se o controlador conseguiu achar pods. E vale para o nó: eventos
+de nó falam de pressão de memória, disco cheio, rede. Em cluster grande, é comum o problema estar no nó e
+não no pod — e o evento é o único lugar onde isso aparece.</p>
+
+<p>Uma dica de leitura: o campo <code>From</code> diz quem escreveu. <code>default-scheduler</code> é o
+agendador; <code>kubelet</code> é o agente do nó; <code>deployment-controller</code> é o controlador. Se o
+evento vem do kubelet, o problema é no nó ou na imagem; se vem do agendador, é de lugar; se vem de um
+controlador, é de reconciliação. Saber a origem encurta o caminho.</p>
+
+<h2>7. O log por dentro</h2>
+
+<p>O <code>kubectl logs</code> parece simples, mas tem opções que fazem diferença no meio de um incidente.
+Esta tabela é a cola que a Ana deixou no caderno.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Comando</th><th>O que faz</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kubectl logs pod</code></td><td>log do primeiro container</td><td>pod de um container só</td></tr>
+<tr><td><code>kubectl logs pod -c web</code></td><td>log de um container específico</td><td>pod com sidecar</td></tr>
+<tr><td><code>kubectl logs pod --previous</code></td><td>log da execução anterior</td><td>container reiniciando</td></tr>
+<tr><td><code>kubectl logs pod --tail=50</code></td><td>só as últimas 50 linhas</td><td>log gigante</td></tr>
+<tr><td><code>kubectl logs pod -f</code></td><td>acompanha ao vivo</td><td>ver o erro acontecer</td></tr>
+<tr><td><code>kubectl logs -l app=cardapio</code></td><td>log de todos os pods do seletor</td><td>várias
+réplicas</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>-f</code> merece um parágrafo. Ele transforma o comando num acompanhamento contínuo, como
+<code>tail -f</code>: você deixa aberto, reproduz o problema no site, e vê a linha aparecer na hora. É a
+forma mais rápida de ligar “o cliente clicou” a “o programa reclamou”. Com várias réplicas, o
+<code>-l</code> junta os logs de todos os pods que casam com a etiqueta, com o nome do pod na frente de cada
+linha — útil quando você não sabe qual réplica atendeu.</p>
+
+<p>Um log de aplicação de verdade costuma ser mais verboso que o da caixa. Esta é uma transcrição de um
+servidor parecido com o da padaria, com hora, nível e mensagem:</p>
+
+<pre class="term">2026-11-27T06:12:04Z INFO  servidor iniciado na porta 8080
+2026-11-27T06:12:04Z INFO  cardapio carregado: 12 paes
+2026-11-27T06:12:09Z WARN  estoque baixo: pao de queijo
+2026-11-27T06:12:12Z ERROR falha ao gravar pedido 1042: timeout no banco</pre>
+
+<p>Com formato assim, o log vira ferramenta de busca. Você procura <code>ERROR</code>, encontra a hora exata
+e cruza com o evento do cluster naquele minuto: se o evento mostra um reinício às 06:12:12, o “timeout no
+banco” pode ser consequência do reinício, e não a causa. Sem hora nos dois lados, essa correlação é
+impossível — e é a razão pela qual vale a pena investir em log com data.</p>
+
+<h2>8. O que cada fonte não vê</h2>
+
+<p>Nenhuma das duas é completa, e saber os limites evita procurar no lugar errado. A tabela abaixo é a
+comparação que a Ana usa quando está em dúvida sobre onde olhar primeiro.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Log</th><th>Evento</th></tr>
+</thead>
+<tbody>
+<tr><td>quem escreve?</td><td>o seu programa</td><td>o cluster</td></tr>
+<tr><td>o que responde?</td><td>o que o programa fez ou reclamou</td><td>o que o cluster tentou fazer com o
+objeto</td></tr>
+<tr><td>quando não existe?</td><td>se o container nunca rodou</td><td>se o objeto nunca foi criado</td></tr>
+<tr><td>quanto tempo dura?</td><td>até o pod ser apagado (com rotação)</td><td>cerca de uma hora no
+cluster</td></tr>
+<tr><td>formato</td><td>livre, definido pelo programa</td><td>fixo: tipo, motivo, origem, mensagem</td></tr>
+<tr><td>nível de detalhe</td><td>alto, mas só do seu código</td><td>baixo, mas do cluster inteiro</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um exemplo de como as duas se completam. O log diz “timeout ao conectar no banco às 06:12”. O evento diz
+“BackOff reiniciando o container às 06:12”. Juntos: o container foi reiniciado, e o programa estava no meio
+de uma conexão — o timeout pode ser sintoma do reinício. O log sozinho faria você culpar o banco; o evento
+sozinho não diria qual operação estava em curso.</p>
+
+<p>E há o que nenhuma das duas vê: o que aconteceu fora do cluster. O cliente que clicou duas vezes, o
+celular sem sinal, o banco que estava em manutenção. Para isso existem as métricas e os logs do próprio
+banco — outro assunto. Aqui basta saber que log e evento cobrem o que está dentro do Kubernetes; o resto
+exige outra fonte.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o log certo, o container errado</h3>
+<p>O pod do cardápio tinha dois containers: <code>web</code> e <code>metrics</code>. A Ana rodou
+<code>kubectl logs cardapio</code>, viu três linhas de métricas e concluiu que o site não logava nada. O
+código estava certo; ela estava lendo o sidecar. Com <code>-c web</code>, a história apareceu inteira. Em pod
+com mais de um container, o <code>-c</code> não é opcional.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o evento que já tinha expirado</h3>
+<p>A Ana chegou de manhã com o pod em <code>CrashLoopBackOff</code>, reiniciando desde as três da madrugada.
+O <code>describe</code> mostrava só os últimos eventos, e o primeiro erro — o que explicava tudo — já tinha
+saído da janela de uma hora. O log, com rotação, também tinha perdido as primeiras linhas. A lição foi
+configurar alerta: quem olha na hora vê a história completa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o pedido que sumiu sem erro</h3>
+<p>O cliente reclamou, o log não tinha erro nenhum e os eventos estavam limpos. A Ana achou que era mentira
+do cliente até perceber que o pedido chegou ao pod errado: o Service mandava para as duas réplicas, e uma
+delas estava com a versão antiga do código. O evento de rollout, dias antes, mostrava que a atualização não
+tinha terminado. A causa estava num evento velho, não num log novo.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="1"><p class="mc-q">1. De quem é o texto que aparece no
+<code>kubectl logs</code>?</p>
+<label><input type="radio" name="q1"> do seu programa, na saída padrão do container</label>
+<label><input type="radio" name="q1"> do agendador, contando em que nó o pod caiu</label>
+<label><input type="radio" name="q1"> do kubelet, listando os eventos do pod</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O pod está em <code>Pending</code> e o
+<code>kubectl logs</code> veio vazio. O que fazer?</p>
+<label><input type="radio" name="q2"> apagar o pod e criar de novo, porque o log corrompeu</label>
+<label><input type="radio" name="q2"> aumentar o <code>requests.memory</code></label>
+<label><input type="radio" name="q2"> ler os eventos do <code>describe</code>: o container nunca
+rodou</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. O que o tipo <code>Warning</code> num evento
+indica?</p>
+<label><input type="radio" name="q3"> que o evento é antigo e pode ser ignorado</label>
+<label><input type="radio" name="q3"> que o cluster registrou um problema, como falha ao agendar ou ao
+baixar imagem</label>
+<label><input type="radio" name="q3"> que o programa escreveu um erro no log</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: peça os eventos do pod</h2>
+<p>O log do forno veio vazio. Complete o comando que abre o objeto e mostra a seção <code>Events</code> no
+fim.</p>
+<div class="ex-code">kubectl <input aria-label="resposta 1" data-answer="describe" placeholder="..."> pod forno</div>
+<p class="ex-dica">Dica: é o verbo do kubectl que abre o objeto inteiro — identidade, containers, condições e
+eventos.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Log e evento são fontes diferentes com papéis diferentes. O log é do programa: você lê com
+<code>kubectl logs</code>, escolhe o container com <code>-c</code>, volta no tempo com
+<code>--previous</code> e acompanha ao vivo com <code>-f</code>. O evento é do cluster: aparece no fim do
+<code>describe</code> com tipo, motivo, origem e mensagem, e é onde o Kubernetes conta o que tentou fazer.</p>
+
+<p>A regra de ouro é pelo status. Se o pod nunca rodou (<code>Pending</code>,
+<code>ImagePullBackOff</code>), o log não existe e a resposta está nos eventos. Se o pod rodou e caiu
+(<code>CrashLoopBackOff</code>, <code>Error</code>), o log tem a mensagem do programa e os eventos
+complementam com horários e reinícios. Ler na ordem — status, log atual, log anterior, eventos — evita
+meia hora de procura no lugar errado.</p>
+
+<p>Na próxima aula a lente fecha no comando que já apareceu aqui várias vezes: o <code>kubectl
+describe</code>. Vamos ver a anatomia da saída inteira, bloco por bloco, e como transformar aquelas seções
+num roteiro de diagnóstico.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Log = saída do programa. Evento = registro do cluster. São fontes diferentes.</li>
+  <li>Pod que nunca rodou não tem log: procure nos eventos.</li>
+  <li>Eventos aparecem no fim do <code>kubectl describe</code> de qualquer objeto.</li>
+  <li><code>Warning</code> indica problema; <code>Normal</code> é rotina — e ambos informam.</li>
+  <li><code>-c</code> escolhe o container, <code>--previous</code> o ciclo anterior, <code>-f</code>
+  acompanha.</li>
+  <li>Apagar o pod apaga o log; os eventos expiram em cerca de uma hora.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

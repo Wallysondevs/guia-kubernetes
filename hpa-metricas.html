@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HPA e métricas | Guia Kubernetes</title>
+<meta name="description" content="De onde vem o número do HPA: metrics-server, kubectl top, requests como denominador, várias métricas e adaptadores — com o cardápio da padaria da Ana.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>HPA e <span class="hl">métricas</span></h1>
+<p class="intro">O HPA da Ana está escrito, apontando para o Deployment certo, com piso e teto razoáveis — e
+não faz nada. A tabela mostra <code>TARGETS &lt;unknown&gt;/70%</code> e o número de réplicas não sai do
+lugar. O problema não está no HPA: está no número que ele precisa ler. Nesta aula a Ana descobre de onde
+vem esse número, por que ele depende de um servidor de métricas que ninguém instalou por padrão, o que os
+<code>requests</code> têm a ver com a porcentagem e como pedir ao HPA que olhe mais de uma métrica ao
+mesmo tempo.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O caminho da métrica: kubelet, <code>metrics-server</code>, API e HPA.</li>
+  <li>O que <code>kubectl top</code> faz e o que significa <code>Metrics API not available</code>.</li>
+  <li>Por que <code>requests</code> é o denominador da porcentagem.</li>
+  <li>A lista <code>metrics</code>: CPU, memória e o critério de “a maior vence”.</li>
+  <li><code>averageUtilization</code> e <code>averageValue</code>: quando usar cada um.</li>
+  <li>Métricas customizadas, adaptadores e o que investigar quando o número não bate.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o TARGETS que não sai do lugar</h2>
+
+<p>O <a href="hpa.html">HPA</a> do cardápio foi copiado de um tutorial, com <code>averageUtilization: 70</code> e
+<code>maxReplicas: 6</code>. No cluster de teste da Ana ele funciona; no cluster novo, não. O
+<code>kubectl get hpa</code> mostra <code>TARGETS &lt;unknown&gt;/70%</code> e
+<code>REPLICAS 2</code> congelado. O <code>kubectl describe hpa</code> diz, nos eventos,
+<code>FailedGetResourceMetric</code> e uma frase sobre não conseguir ler a métrica de CPU dos pods.</p>
+
+<p>O instinto é mexer no HPA: aumentar o <code>maxReplicas</code>, trocar o alvo para 50%, recriar o
+objeto. Nada disso resolve, porque o HPA não está quebrado: ele está pedindo um dado que ninguém está
+publicando. É como reclamar que a balança não marca o peso quando ninguém subiu nela. Antes de ajustar a
+conta, é preciso garantir que os dois números da conta existam.</p>
+
+<p>Esta aula é sobre esses dois números. O de baixo, o <code>request</code>, é você quem escreve no
+manifesto. O de cima, o consumo, vem de um componente do cluster que precisa estar instalado e saudável.
+Quando os dois existem, o HPA funciona; quando um falta, o <code>TARGETS</code> vira
+<code>&lt;unknown&gt;</code> e o autoscaler, com razão, não chuta.</p>
+
+<h2>2. O caminho da métrica: do kubelet ao HPA</h2>
+
+<p>O consumo de CPU e memória de um container não é medido pelo HPA nem pelo API server. Quem mede é o
+<strong>kubelet</strong>, o agente que roda em cada nó e conversa com o runtime de containers. Ele lê os
+números do cgroup — o mecanismo do Linux que agrupa processos e contabiliza recursos — e os expõe num
+endpoint local do próprio nó. Nenhum outro componente do cluster enxerga esse endpoint diretamente.</p>
+
+<p>No meio do caminho existe um componente chamado <strong>metrics-server</strong>. Ele roda como um
+Deployment no namespace <code>kube-system</code>, descobre os nós, vai até o kubelet de cada um, coleta os
+números de todos os pods e os publica numa API do próprio Kubernetes: <code>metrics.k8s.io</code>. É essa
+API que o <code>kubectl top</code> consulta, e é ela que o HPA consulta. Sem o metrics-server, a API não
+existe, e tanto o <code>top</code> quanto o HPA ficam sem resposta.</p>
+
+<p>O fluxo completo, em ordem: kubelet mede → metrics-server coleta (a cada 15 segundos, por padrão) →
+API <code>metrics.k8s.io</code> serve → HPA lê a média dos pods do alvo → HPA calcula → HPA escreve
+<code>spec.replicas</code>. Se qualquer elo dessa corrente faltar, o resultado é o mesmo
+<code>&lt;unknown&gt;</code>. Por isso o diagnóstico começa pelo elo mais fácil de testar, que é o
+<code>kubectl top</code>.</p>
+
+<p>Vale saber que o metrics-server não guarda histórico. Ele serve o retrato do momento, e o HPA é quem
+decide como usar esse retrato (para subir, usa o valor mais recente; para descer, olha a janela de
+estabilização). Quem quer histórico de verdade — gráficos, consultas, alertas — usa Prometheus, que é
+outro produto, com outro custo e outro assunto.</p>
+
+<h2>3. <code>kubectl top</code>: o teste de dez segundos</h2>
+
+<p><code>kubectl top pods</code> mostra CPU e memória de cada pod agora; <code>kubectl top nodes</code> faz
+o mesmo por nó. É o comando mais rápido para responder “existe métrica neste cluster?”. Num cluster com
+metrics-server funcionando, a saída é uma tabela curta:</p>
+
+<pre class="term">$ kubectl top pods
+NAME                        CPU(cores)   MEMORY(bytes)
+cardapio-6d9c8f7b5b-4xj2q    24m          38Mi
+cardapio-6d9c8f7b5b-9p7wl    19m          35Mi
+
+$ kubectl top nodes
+NAME                 CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+guia-control-plane   182m         9%     1104Mi          26%
+guia-worker          241m         12%    1650Mi          40%
+guia-worker2         96m          4%     890Mi           21%</pre>
+
+<p>Num cluster sem metrics-server, os dois comandos respondem a mesma frase:
+<code>error: Metrics API not available</code>. Essa mensagem é ouro, porque separa dois mundos: se ela
+aparece, o problema é de infraestrutura (falta instalar ou o servidor está quebrado); se o
+<code>top</code> funciona mas o HPA mostra <code>&lt;unknown&gt;</code>, o problema é de configuração do
+alvo — quase sempre falta de <code>requests</code> ou métrica customizada sem adaptador.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="erro:Metrics API not available;;texto:cardapio-">
+  <p class="try-task">Suba o cardápio e complete o diagnóstico: rode o <code>top</code> dos pods e o dos
+  nós. O painel se comporta como um cluster sem metrics-server — a mensagem de erro é a resposta que você
+  procura.</p>
+<pre class="yaml">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create deployment cardapio --image=cardapio:1.0
+deployment.apps/cardapio created
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-pvx6crj8rr-w5m2v   1/1     Running   0          1m
+</pre>
+<pre class="solucao">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl get pods
+kubectl top pods
+kubectl top nodes</pre>
+</div>
+
+<p>O painel desta aula não roda um cluster com métricas: ele responde exatamente o que um cluster sem
+metrics-server responde. Isso é proposital — o erro é a lição. Num <code>kind</code> recém-criado, o
+metrics-server não vem instalado; num cluster gerenciado de nuvem, costuma vir. A instalação é um
+<code>apply</code> de um manifesto pronto, e no <code>kind</code> ela precisa de um ajuste por causa do
+certificado do kubelet:</p>
+
+<pre class="term">$ kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+serviceaccount/metrics-server created
+deployment.apps/metrics-server created
+...
+
+$ kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+deployment.apps/metrics-server patched
+
+$ kubectl top nodes
+NAME                 CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+guia-control-plane   180m         9%     1098Mi          26%</pre>
+
+<p>Esse <code>--kubelet-insecure-tls</code> é um remédio para laboratório: os certificados que o
+<code>kind</code> gera para os kubelets não são assinados por uma autoridade que o metrics-server confie.
+Em produção, o caminho é configurar os certificados, não desligar a verificação. É um dos raros casos em
+que o tutorial da internet está certo para o seu laboratório e errado para o seu trabalho.</p>
+
+<h2>4. <code>requests</code> é o denominador</h2>
+
+<p>Aqui está a parte que quase ninguém entende na primeira leitura. Quando o HPA diz que a CPU está em
+<code>142%</code>, isso não significa “142% de um núcleo”. Significa 142% do <code>request</code> de CPU
+daquele container. Se o pod pede <code>200m</code> e está usando <code>284m</code>, a conta é 284 ÷ 200 =
+1,42, ou 142%. Sem <code>requests</code>, não há denominador — e sem denominador, não há porcentagem.</p>
+
+<p>É por isso que o HPA de CPU exige <code>requests</code> em todos os containers do alvo. Um pod sem
+request aparece como <code>&lt;unknown&gt;</code> na média, e se todos estiverem sem, o HPA não tem o que
+calcular. O erro é silencioso: o manifesto é aceito, o pod roda, o site funciona — só o autoscaler fica
+parado. Num Deployment de várias réplicas, basta um container sem request para contaminar a média.</p>
+
+<p>Há uma consequência prática que muda a escolha dos números: o <code>request</code> não é só a reserva
+que o agendador usa; é também a régua do autoscaler. Se a Ana pedir <code>200m</code> e o programa
+normalmente usar <code>50m</code>, o HPA vai ler 25% e nunca vai escalar, mesmo com o site cheio — porque
+25% está muito abaixo de 70%. Se ela pedir <code>40m</code> e o programa usar <code>50m</code>, ele lê
+125% e escala sem necessidade. Ajustar request é ajustar o humor do HPA.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.resources.requests.cpu=200m;;campo:HorizontalPodAutoscaler/cardapio|spec.metrics.0.resource.target.averageUtilization=60;;texto:60%/60%" data-get="hpa">
+  <p class="try-task">O cardápio não tem <code>requests</code> de CPU — sem isso o HPA não calcula
+  porcentagem. Coloque <code>requests.cpu: 200m</code> no container e mude o alvo para <code>60</code>.
+  Rode e leia o <code>TARGETS</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80</pre>
+<pre class="out">
+deployment.apps/cardapio created
+horizontalpodautoscaler.autoscaling/cardapio created
+
+NAME       REFERENCE             TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+cardapio   Deployment/cardapio   80%/80%   2         6         2          2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 200m
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60</pre>
+</div>
+
+<p>Uma ressalva honesta sobre o painel: a métrica dele é semeada, então o <code>TARGETS</code> aparece
+igual ao alvo e não há como simular um consumo alto ou baixo. O que a caixa prova é o que costuma estar
+errado na vida real — o request ausente e o alvo trocado. Num cluster de verdade, com métrica de verdade,
+o <code>TARGETS</code> mostraria o consumo real contra os 60%.</p>
+
+<h2>5. Várias métricas: a lista e o “maior vence”</h2>
+
+<p>O campo <code>metrics</code> é uma lista, e quase todo manifesto de tutorial mostra um item só. Mas o
+HPA aceita vários, e o critério é simples: ele calcula a recomendação de réplicas para <em>cada</em>
+métrica e escolhe a <strong>maior</strong>. A lógica é de segurança: se a CPU pede 4 réplicas e a memória
+pede 6, seis é o número que satisfaz as duas; quatro deixaria a memória estourada.</p>
+
+<p>Combinar CPU e memória é o caso mais comum, e ele resolve um problema real: um programa pode ter CPU
+tranquila e memória crescendo, ou o contrário. Com uma métrica só, o HPA fica cego para o outro recurso.
+Com duas, ele escala pelo que estiver pior. O preço é que o comportamento fica mais difícil de explicar —
+“por que subiu?” passa a ter duas respostas possíveis.</p>
+
+<dl class="anatomy">
+<dt>metrics[].type</dt>
+<dd>A família da métrica: <code>Resource</code> (CPU e memória do pod), <code>Pods</code> (métrica
+customizada por pod), <code>Object</code> (métrica de outro objeto) ou <code>External</code> (fora do
+cluster).</dd>
+<dt>resource.name</dt>
+<dd><code>cpu</code> ou <code>memory</code>. Só vale quando o tipo é <code>Resource</code>.</dd>
+<dt>target.type</dt>
+<dd><code>Utilization</code> (porcentagem do request) ou <code>AverageValue</code> (valor absoluto por
+pod). Obrigatório: sem ele, a API de verdade recusa o objeto.</dd>
+<dt>target.averageUtilization</dt>
+<dd>A porcentagem alvo, como <code>60</code> para 60%. É o campo que o <code>TARGETS</code> mostra depois
+da barra.</dd>
+<dt>target.averageValue</dt>
+<dd>O alvo em valor absoluto, como <code>500Mi</code> de memória por pod. Não depende de
+<code>request</code>.</dd>
+<dt>metric.selector</dt>
+<dd>Para <code>Pods</code> e <code>Object</code>: quais objetos entram na média, por etiqueta. Sem
+seletor, a métrica pode agregar pods que não interessam.</dd>
+</dl>
+
+<div class="tryk8s" data-goal="campo:HorizontalPodAutoscaler/cardapio|spec.metrics.1.resource.name=memory;;campo:HorizontalPodAutoscaler/cardapio|spec.metrics.1.resource.target.averageUtilization=80;;campo:HorizontalPodAutoscaler/cardapio|spec.metrics.0.resource.target.averageUtilization=70" data-get="hpa">
+  <p class="try-task">O HPA olha só CPU, com alvo 80. Deixe a CPU em <code>70</code> e acrescente uma
+  segunda métrica de memória com alvo <code>80</code>: a lista <code>metrics</code> aceita mais de um item,
+  e o HPA escala pelo que pedir mais.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80</pre>
+<pre class="out">
+deployment.apps/cardapio created
+horizontalpodautoscaler.autoscaling/cardapio created
+
+NAME       REFERENCE             TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+cardapio   Deployment/cardapio   80%/80%   2         6         2          2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80</pre>
+</div>
+
+<p>O <code>TARGETS</code> do painel mostra só a primeira métrica, porque é assim que o
+<code>kubectl get hpa</code> funciona: uma coluna, a métrica principal. Com duas, use
+<code>kubectl get hpa -o yaml</code> ou o <code>describe</code> para ver as duas linhas de
+<code>Metrics</code>. E lembre que a memória também precisa de <code>request</code>: a porcentagem dela é
+calculada contra o request de memória, do mesmo jeito que a CPU.</p>
+
+<h2>6. <code>averageUtilization</code> ou <code>averageValue</code>?</h2>
+
+<p>As duas formas de alvo respondem perguntas diferentes. <code>averageUtilization</code> pergunta “quanto
+do que eu pedi você está usando?” e depende do request. <code>averageValue</code> pergunta “quanto você
+está usando, em número absoluto?” e não depende de nada. Para CPU, a porcentagem é o padrão da indústria
+porque o custo de CPU é relativo ao que você reservou. Para memória, o valor absoluto costuma fazer mais
+sentido, porque memória de programa não escala com o request: um processo que usa 300 MB usa 300 MB,
+tenha ele pedido 256 MB ou 1 GB.</p>
+
+<p>Há um efeito colateral de escolher porcentagem para memória: se o request está superdimensionado, a
+porcentagem fica baixa e o HPA não escala, mesmo com o pod perto do limite. Se está subdimensionado, a
+porcentagem fica alta e o HPA escala por um consumo que é normal para o programa. Com
+<code>averageValue</code>, o alvo é o número que você quer ver de verdade, e o request deixa de
+interferir.</p>
+
+<p>Não existe escolha “certa” universal: existe a métrica que representa o que dói no seu serviço. Um site
+que fica lento quando a CPU aperta escala por CPU. Um serviço que estoura memória e morre com
+<code>OOMKilled</code> escala por memória. Um que processa fila escala pelo tamanho da fila — e aí
+estamos no território das métricas customizadas.</p>
+
+<h2>7. Métricas customizadas e adaptadores</h2>
+
+<p>CPU e memória são as únicas métricas que o Kubernetes serve sem ajuda. Todo o resto — tamanho de fila,
+latência, requisições por segundo, conexões abertas — precisa de um <strong>adaptador</strong>: um
+componente que lê a fonte (Prometheus, por exemplo) e publica o número numa API que o HPA entende. São
+três APIs diferentes, e o tipo da métrica no manifesto diz qual delas usar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tipo no manifesto</th><th>API que serve</th><th>O que mede</th><th>Exemplo da padaria</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Resource</code></td><td><code>metrics.k8s.io</code></td><td>CPU e memória do próprio
+pod</td><td>uso de CPU do cardápio</td></tr>
+<tr><td><code>Pods</code></td><td><code>custom.metrics.k8s.io</code></td><td>métrica por pod, agregada
+pela média</td><td>pedidos por segundo atendidos por pod</td></tr>
+<tr><td><code>Object</code></td><td><code>custom.metrics.k8s.io</code></td><td>métrica de outro objeto do
+cluster</td><td>profundidade da fila de um Service</td></tr>
+<tr><td><code>External</code></td><td><code>external.metrics.k8s.io</code></td><td>métrica de fora do
+cluster</td><td>tamanho da fila no serviço de mensagens</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Montar esse caminho é trabalho de algumas horas: instalar o Prometheus, instalar o
+<code>prometheus-adapter</code>, escrever as regras que traduzem a consulta em métrica e declarar o
+<code>spec.metrics</code> com o seletor certo. Quando o adaptador não está no lugar, o sintoma é o mesmo de
+sempre — <code>TARGETS &lt;unknown&gt;</code> —, mas a mensagem do <code>describe hpa</code> muda: em vez
+de reclamar da métrica de recurso, ela diz que não encontrou a métrica customizada.</p>
+
+<p>Para casos em que a decisão de escalar é por evento (uma mensagem na fila, um job pendente), existe uma
+alternativa que embala tudo isso: KEDA. Ele cria HPAs por baixo dos panos a partir de gatilhos declarados,
+e é o caminho comum quando o time não quer escrever adaptador nem consulta. Não é objeto nativo do
+Kubernetes, então fica como ponte para o Nível 3 — mas vale saber que existe antes de sofrer montando um
+adaptador do zero.</p>
+
+<h2>8. Quando o número não bate: o roteiro</h2>
+
+<p>Com métrica no lugar, ainda aparece o clássico “o HPA não escala como eu esperava”. A ordem de
+investigação é sempre a mesma: primeiro o <code>get hpa</code>, depois o <code>describe hpa</code>, depois
+o <code>top</code>, depois os <code>requests</code>. Cada passo elimina uma camada, e o evento quase sempre
+entrega o motivo antes do último passo.</p>
+
+<pre class="term">$ kubectl get hpa
+NAME       REFERENCE             TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+cardapio   Deployment/cardapio   &lt;unknown&gt;/70%   2         6         2          14m
+
+$ kubectl describe hpa cardapio | tail -n 8
+Conditions:
+  Type           Status  Reason                   Message
+  -------------- ------  ------------------------ ---------------------------------------
+  AbleToScale    True    SucceededGetScale        the HPA controller was able to get the target's current scale
+  ScalingActive  False   FailedGetResourceMetric  the HPA was unable to compute the replica count:
+                 failed to get cpu utilization: unable to get metrics for resource cpu
+Events:
+  Type     Reason                        Age   From                       Message
+  Warning  FailedGetResourceMetric       30s   horizontal-pod-autoscaler  failed to get cpu
+           utilization: no metrics returned from resource metrics API
+
+$ kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes
+Error from server (NotFound): the server could not find the requested resource</pre>
+
+<p>Essa sequência conta uma história completa: o HPA conseguiu ler a escala do alvo
+(<code>AbleToScale True</code>), mas não conseguiu calcular (<code>ScalingActive False</code>), e o motivo
+é a API de métricas ausente — confirmado pelo <code>get --raw</code> respondendo <code>NotFound</code>. O
+conserto é instalar o metrics-server, não mexer no HPA. Quando o <code>get --raw</code> funciona e o
+<code>top</code> mostra números, o problema muda de lado: ou falta <code>requests</code>, ou o alvo está
+errado, ou o teto já foi atingido.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Onde confirmar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>TARGETS &lt;unknown&gt;</code></td><td>sem metrics-server ou sem <code>requests</code></td><td><code>kubectl top pods</code> e
+<code>describe hpa</code></td></tr>
+<tr><td><code>REPLICAS</code> no teto e alvo estourado</td><td><code>maxReplicas</code> pequeno ou cluster
+cheio</td><td><code>get pods</code> com <code>Pending</code></td></tr>
+<tr><td>escala e volta toda hora</td><td>tolerância pequena ou janela de descida curta</td><td>eventos
+<code>SuccessfulRescale</code></td></tr>
+<tr><td>nunca escala, mesmo com carga</td><td><code>request</code> grande demais para a régua</td><td>o
+<code>%</code> no <code>TARGETS</code></td></tr>
+<tr><td><code>TARGETS</code> de métrica customizada desconhecido</td><td>adaptador ausente ou seletor
+errado</td><td><code>get --raw /apis/custom.metrics.k8s.io/…</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o cluster de nuvem que veio sem nada</h3>
+<p>A Ana subiu um cluster num provedor e o <code>kubectl top</code> funcionava no primeiro dia. Duas
+semanas depois, o HPA parou de reagir. O metrics-server tinha sido instalado por um colega, com duas
+réplicas, e as duas caíram em <code>CrashLoopBackOff</code> por falta de memória no nó do
+<code>kube-system</code>. O sintoma apareceu longe da causa: o site não escalava, e o time procurava o
+problema no HPA. O primeiro comando do diagnóstico deveria ter sido <code>kubectl -n kube-system get
+pods</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a memória que nunca chega a 80%</h3>
+<p>Ela configurou duas métricas, CPU a 70% e memória a 80%, e o HPA só escala pela CPU. O gráfico de
+memória mostra o pod usando 200 MB, mas o request é <code>1Gi</code> — 20% de utilização, longe dos 80%.
+A régua está errada, não o alvo: com <code>averageValue: 400Mi</code>, o HPA passaria a olhar o consumo
+real em vez da fração de uma reserva que ela nunca usou. Ajustar o request para perto do real resolve
+tanto a conta do HPA quanto o desperdício de reserva no nó.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a fila que cresce e o HPA não vê</h3>
+<p>A padaria passou a receber pedidos por uma fila, e o tempo de espera cresceu. A CPU do cardápio
+continuava baixa — o programa passa a maior parte do tempo esperando — então o HPA de CPU não tinha por
+que escalar. O conserto foi uma métrica customizada de profundidade da fila, com adaptador no meio. É o
+exemplo perfeito de que o HPA só é tão bom quanto a métrica que você escolhe: CPU mede trabalho, não mede
+espera.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<p>Três perguntas sobre a origem e a régua do número.</p>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O <code>TARGETS</code> mostra <code>&lt;unknown&gt;/70%</code>
+e o <code>kubectl top pods</code> responde <code>Metrics API not available</code>. Qual é o
+problema?</p>
+<label><input type="radio" name="q1"> o <code>maxReplicas</code> está baixo demais</label>
+<label><input type="radio" name="q1"> o alvo do HPA aponta para o Deployment errado</label>
+<label><input type="radio" name="q1"> não há API de métricas no cluster: falta o metrics-server</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Se o <code>request</code> de CPU de um pod é
+<code>200m</code> e o consumo é <code>284m</code>, o que o HPA lê?</p>
+<label><input type="radio" name="q2"> 142% do request</label>
+<label><input type="radio" name="q2"> 284%, porque a base é o núcleo inteiro</label>
+<label><input type="radio" name="q2"> 42%, porque desconta o request</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. O HPA tem duas métricas: uma recomenda 4 réplicas e a
+outra recomenda 6. Quantas ele tenta deixar?</p>
+<label><input type="radio" name="q3"> 4, a menor, para economizar</label>
+<label><input type="radio" name="q3"> 6, a maior, porque precisa satisfazer as duas</label>
+<label><input type="radio" name="q3"> 10, a soma das duas recomendações</label>
+</div>
+
+<h2>Exercício: a régua do cardápio</h2>
+
+<p>O cardápio pede <code>250m</code> de CPU e <code>256Mi</code> de memória. Escreva no HPA uma métrica de
+memória com alvo absoluto de <code>200Mi</code> por pod. Depois responda: qual campo do alvo diz que o
+número é porcentagem em vez de valor absoluto?</p>
+
+<div class="exercise">
+<div class="ex-code">target.<input aria-label="resposta 1" data-answer="type" placeholder="...">: Utilization</div>
+<p class="ex-dica">Dica: <code>averageUtilization</code> anda junto com <code>Utilization</code>;
+<code>averageValue</code> anda com <code>AverageValue</code>. O <code>target.type</code> é obrigatório na
+API de verdade.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O número que o HPA lê não nasce no HPA: o kubelet mede, o metrics-server coleta e publica em
+<code>metrics.k8s.io</code>, e o autoscaler consulta essa API. Sem metrics-server,
+<code>kubectl top</code> responde <code>Metrics API not available</code> e o <code>TARGETS</code> vira
+<code>&lt;unknown&gt;/70%</code>. A instalação é um <code>apply</code> de manifesto pronto; no
+<code>kind</code>, com o ajuste de certificado do kubelet.</p>
+
+<p>A porcentagem é sempre relativa ao <code>request</code>: 142% significa 142% do que o container pediu,
+não 142% de um núcleo. Sem request, não há denominador — e é por isso que o HPA de CPU exige
+<code>requests</code> em todos os containers do alvo. O request, portanto, não é só reserva para o
+agendador: é a régua do autoscaler.</p>
+
+<p>O campo <code>metrics</code> é uma lista: com várias métricas, o HPA calcula cada uma e escolhe a maior
+recomendação. Cada item tem um <code>type</code> (<code>Resource</code>, <code>Pods</code>,
+<code>Object</code>, <code>External</code>) e um <code>target</code> com
+<code>averageUtilization</code> ou <code>averageValue</code>. Métricas fora de CPU e memória exigem
+adaptador — Prometheus Adapter ou KEDA — e o diagnóstico segue sempre a mesma ordem:
+<code>get hpa</code>, <code>describe hpa</code>, <code>top</code>, requests.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>kubelet mede, metrics-server publica, HPA lê. Faltou um elo, faltou número.</li>
+  <li><code>Metrics API not available</code> = infraestrutura; <code>&lt;unknown&gt;</code> com
+  <code>top</code> funcionando = configuração.</li>
+  <li>A porcentagem é sobre o <code>request</code>: 284m ÷ 200m = 142%.</li>
+  <li>Várias métricas: o HPA escolhe a recomendação <em>maior</em>.</li>
+  <li>Memória costuma pedir <code>averageValue</code>; CPU, <code>averageUtilization</code>.</li>
+  <li><code>target.type</code> é obrigatório; sem ele, a API de verdade recusa o objeto.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

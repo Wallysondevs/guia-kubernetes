@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Réplicas e escala | Guia Kubernetes</title>
+<meta name="description" content="Réplicas na prática: o campo replicas, o kubectl scale, escalar para zero, o que acontece quando o cluster não tem lugar e como ler os números de um Deployment.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Réplicas</span> e escala</h1>
+<p class="intro">Domingo de manhã é o pior horário da padaria da Ana: a fila dobra a esquina, o site
+recebe pedido de todo lado e o servidor — uma cópia só — começa a responder devagar. Na segunda-feira ela
+descobre que a solução não é um computador maior, é <em>mais cópias</em>. No Kubernetes isso tem nome:
+réplicas. Nesta aula a Ana aprende a escrever o número no manifesto, a mudá-lo com um comando, a levar o
+número a zero para pausar o site e a descobrir o limite: pedir cópias que o cluster não tem onde
+colocar.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é uma réplica e o que o campo <code>replicas</code> realmente promete.</li>
+  <li>Escalar pelo manifesto e pelo <code>kubectl scale</code>, sem editar arquivo.</li>
+  <li>Ler <code>READY</code>, <code>DESIRED</code> e <code>CURRENT</code> sem confundir os números.</li>
+  <li>Levar um Deployment a zero réplicas para pausar sem apagar.</li>
+  <li>Reconhecer o limite do cluster: pod em <code>Pending</code> por falta de CPU.</li>
+  <li>Saber quando a escala deve ser automática, e por que isso é assunto de outra aula.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a fila de domingo</h2>
+
+<p>O site da Ana rodava com uma réplica. Uma. Isso quer dizer que existia um pod, num nó, atendendo todo
+mundo. Enquanto o movimento era de dez pedidos por hora, ninguém notava. No domingo, com oitenta pessoas
+na fila, cada requisição esperava a anterior terminar, e o tempo de resposta passou de meio segundo para
+seis. A Ana pensou em trocar de servidor; o problema não era o tamanho do servidor, era a fila única.</p>
+
+<p>Duas cópias do mesmo programa atendem duas requisições ao mesmo tempo. Quatro atendem quatro. É a
+diferença entre um caixa na padaria e três caixas: o tempo de cada cliente não muda muito, mas a fila
+anda. Em computação isso se chama escalar horizontalmente — crescer em número de cópias, não em tamanho
+de uma cópia. E é justamente o que o Deployment faz de graça, porque ele já sabe manter um número de
+pods.</p>
+
+<p>Tem um detalhe que separa quem já sofreu de quem ainda vai sofrer: as cópias precisam ser
+<em>substituíveis</em>. Se cada pod guardasse o carrinho de compras de um cliente na memória, a segunda
+cópia não saberia do carrinho da primeira e o site ficaria esquizofrênico. O site da Ana guarda o
+carrinho num banco de dados; os pods só buscam e mostram. Sem isso, escalar não resolve — só multiplica
+o problema. É a primeira pergunta a fazer antes de subir o número.</p>
+
+<h2>2. O que é uma réplica, na prática</h2>
+
+<p>Réplica é uma cópia do pod: mesmo modelo, mesma imagem, mesmas etiquetas, um nome diferente no fim.
+Nenhuma réplica é “a principal”; o Service manda requisição para qualquer uma que esteja pronta. Se uma
+cai, as outras continuam, e o ReplicaSet repõe a que faltou. O número que você escreve no manifesto é o
+<em>desejado</em>, e o controlador trabalha sem parar para que o real seja igual a ele.</p>
+
+<dl class="anatomy">
+<dt>réplica</dt>
+<dd>Uma cópia do pod descrito no <code>template</code>. Duas réplicas, dois pods; cinco réplicas, cinco
+pods.</dd>
+<dt>replicas desejadas</dt>
+<dd>O número em <code>spec.replicas</code>. É uma promessa, não um botão: o controlador cria ou apaga
+pods até chegar lá.</dd>
+<dt>escalar</dt>
+<dd>Mudar o número desejado. Para cima (scale up) cria pods; para baixo (scale down) apaga, sempre
+escolhendo quais sair.</dd>
+<dt>ReplicaSet</dt>
+<dd>Quem conta os pods. Quando você escala, é ele que recebe o novo número e age.</dd>
+<dt>agendador</dt>
+<dd>O componente que escolhe em qual nó cada pod novo vai caber. Sem nó com espaço, o pod fica em
+<code>Pending</code>.</dd>
+</dl>
+
+<p>Uma confusão comum: “réplica” não é “container”. Um pod pode ter dois containers (o site e um
+exportador de métricas, por exemplo) e continua sendo <em>uma</em> réplica. O número conta pods, não
+processos. Se você escrever <code>replicas: 3</code> num Deployment com dois containers no modelo, terá
+três pods e seis containers.</p>
+
+<h2>3. O campo replicas: o número que o controlador persegue</h2>
+
+<p>No manifesto, <code>replicas</code> fica dentro de <code>spec</code>, ao lado de
+<code>selector</code> e <code>template</code>. É um número inteiro e, se você não escrever, o padrão é
+<code>1</code>. A caixa abaixo começa com uma réplica só e a tarefa é subir para quatro — exatamente o
+que a Ana precisava no domingo.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|spec.replicas=4;;conta:pods=4;;campo:Deployment/cardapio|status.readyReplicas=4">
+  <p class="try-task">Mude <code>replicas</code> para <code>4</code>, rode e confira os quatro pods na
+  tabela do painel.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>O painel mostra a linha do <code>apply</code> e, logo abaixo, a tabela do <code>get pods</code> com
+quatro linhas. Os nomes terminam em sufixos diferentes, mas o começo é igual: mesmo Deployment, mesmo
+ReplicaSet, mesma imagem. Se você olhar com atenção, vai ver que os quatro têm a mesma idade — o
+controlador criou todos no mesmo instante, porque a mudança de número é um evento só.</p>
+
+<p>O <code>apply</code> é declarativo: você diz “quero quatro” e ele ajusta o que existe. Se já houvesse
+duas réplicas, ele criaria mais duas; se houvesse seis, apagaria duas. Não existe “adicionar uma réplica”
+no manifesto — existe o número final. Isso é diferente de pensar em comandos e é a cabeça que o
+Kubernetes pede emprestada: descreva o destino, não o caminho.</p>
+
+<h2>4. kubectl scale: mudar o número sem editar o arquivo</h2>
+
+<p>Nem toda mudança de número merece um commit. Se a fila cresceu agora e vai diminuir à noite, você quer
+um comando, não um arquivo. O <code>kubectl scale</code> faz isso: recebe o recurso, o nome e o novo
+número, e responde com uma linha só. A caixa abaixo começa com o cluster da padaria em duas réplicas. A
+tarefa é escalar para cinco, olhar as tabelas e depois levar a zero.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Como mudar o número</th><th>Quando usar</th><th>O que fica registrado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>replicas</code> no manifesto + <code>apply</code></td><td>o número é parte da configuração
+do serviço</td><td>o arquivo versionado, que é a fonte da verdade</td></tr>
+<tr><td><code>kubectl scale</code></td><td>ajuste pontual, pico de movimento, pausa</td><td>só o estado do
+cluster; o arquivo continua dizendo o número antigo</td></tr>
+<tr><td>HorizontalPodAutoscaler</td><td>o número deve acompanhar a carga sozinho</td><td>o objeto do
+autoscaler, com mínimo, máximo e métrica</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A terceira linha explica o primeiro susto de quem usa <code>scale</code>: o número não “volta sozinho”
+por magia, mas volta no próximo <code>apply</code> do arquivo. Se o manifesto diz duas réplicas e você
+escalou para cinco, o próximo deploy devolve para duas. Não é bug — é o arquivo mandando no cluster, que
+é exatamente o que se quer de um manifesto versionado.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:scaled;;campo:Deployment/cardapio|spec.replicas=0;;conta:pods=0">
+  <p class="try-task">Escale para <code>5</code>, rode os <code>get</code> e depois escale para
+  <code>0</code>. O painel tem de terminar com <code>0/0</code> e nenhum pod.</p>
+<pre class="yaml">kubectl get deployments
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl scale deployment/cardapio --replicas=5
+kubectl get pods
+kubectl get deployments
+kubectl scale deployment/cardapio --replicas=0
+kubectl get pods
+kubectl get deployments</pre>
+</div>
+
+<p>Duas coisas acontecem ao escalar para cinco. A primeira é imediata: o Deployment muda o número
+desejado e o ReplicaSet começa a criar pods. A segunda é a conta do agendador: cada pod novo precisa de
+um nó com espaço. No painel, todos os cinco cabem e aparecem em <code>Running</code>. Esta é a saída que
+ele devolve:</p>
+
+<pre class="term">$ kubectl scale deployment/cardapio --replicas=5
+deployment.apps/cardapio scaled
+
+$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-2h4sk   1/1     Running   0          3m
+cardapio-wj4jsx2tcw-dzkjz   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-llsrh   1/1     Running   0          5m
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+
+$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   5/5     5            5           2m
+
+$ kubectl get replicasets
+NAME                  DESIRED   CURRENT   READY   AGE
+cardapio-wj4jsx2tcw   5         5         5       6m</pre>
+
+<p>Repare que o ReplicaSet também mudou: <code>DESIRED 5</code>, <code>CURRENT 5</code>,
+<code>READY 5</code>. Essa é a cadeia inteira concordando — Deployment quer cinco, ReplicaSet tem cinco,
+cinco estão prontos. Quando os três números não concordam, o que está acontecendo é uma escala em
+andamento ou um pod que não sobe. É a leitura mais rápida que existe para saber se o cluster está em paz.</p>
+
+<h2>5. Desejado, atual e pronto: quem conta o quê</h2>
+
+<p>Existem três números parecidos e é fácil trocá-los. O <strong>desejado</strong> é o que está no
+manifesto ou no último <code>scale</code>. O <strong>atual</strong> é quantos pods existem de fato. O
+<strong>pronto</strong> é quantos desses pods passaram na verificação de prontidão e podem receber
+tráfego. O Deployment mostra pronto/desejado (<code>READY</code>), o ReplicaSet mostra desejado, atual e
+pronto (<code>DESIRED</code>, <code>CURRENT</code>, <code>READY</code>).</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Situação</th><th>O que você vê</th><th>O que está acontecendo</th></tr>
+</thead>
+<tbody>
+<tr><td>escala concluída</td><td><code>5/5</code>, <code>DESIRED 5</code>, <code>CURRENT 5</code></td>
+<td>nada a fazer; o controlador está satisfeito</td></tr>
+<tr><td>escala em andamento</td><td><code>3/5</code> e <code>CURRENT 3</code></td><td>os pods ainda estão
+subindo; espere alguns segundos antes de investigar</td></tr>
+<tr><td>pods não agendam</td><td><code>3/5</code> com <code>Pending</code> na lista de pods</td><td>falta
+lugar no nó: CPU, memória ou restrição de agendamento</td></tr>
+<tr><td>pods não ficam prontos</td><td><code>0/5</code> com pods em <code>Running</code></td><td>o
+programa subiu, mas a verificação de prontidão não passa</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O erro clássico é olhar <code>READY 0/5</code> e concluir “a escala falhou”. Pode ser o contrário: os
+cinco pods existem, o Deployment pediu cinco, e nenhum está pronto — o problema está no pod, não no
+número. Outro erro é achar que <code>3/5</code> significa “três réplicas configuradas”. Significa três
+prontas de cinco desejadas, e o número desejado continua sendo cinco. Ler <code>3/5</code> como “cinco
+menos três” é o caminho mais curto para mexer no lugar errado.</p>
+
+<h2>6. Escalar para zero: pausar sem apagar</h2>
+
+<p>Levar as réplicas a zero é uma jogada mais útil do que parece. O Deployment continua existindo, com
+seletor, modelo e histórico; só não há pods. Nenhum pod, nenhum consumo de CPU, nenhuma porta ocupada. É
+o jeito limpo de dizer “este serviço está fora do ar de propósito, mas não foi esquecido”. Quando a Ana
+volta a escalar para dois, os pods nascem do mesmo modelo, com o mesmo nome de ReplicaSet.</p>
+
+<p>A diferença para <code>kubectl delete deployment</code> é grande. Apagar remove o objeto e o histórico;
+escalar para zero mantém tudo e só zera a contagem. Em ambiente de teste, é comum ver Deployments
+dormentes em zero por meses, esperando alguém lembrar que existem. Em produção, zero réplicas é uma
+decisão explícita: o Service daquele Deployment fica sem endpoints, e quem tentar acessar recebe erro de
+conexão.</p>
+
+<p>O painel mostra os dois lados dessa moeda. Depois de <code>--replicas=0</code>, o
+<code>get pods</code> responde <code>No resources found in default namespace.</code> e o
+<code>get deployments</code> mostra <code>0/0</code>. Não é erro: é um Deployment saudável com zero
+réplicas desejadas. O <code>UP-TO-DATE</code> em <code>0</code> também está certo, porque não há pod
+nenhum para estar atualizado.</p>
+
+<h2>7. Quando o cluster não tem lugar</h2>
+
+<p>Escalar tem um limite físico. Cada nó oferece uma quantidade de CPU e memória, e cada pod que pede
+recursos reserva uma parte. Se você pedir cinco pods de 1500m de CPU num cluster de três nós de 2000m,
+cabem três: cada nó recebe um, e os outros dois não encontram lugar. Eles existem, aparecem na lista, e
+ficam em <code>Pending</code> para sempre. A caixa abaixo reproduz exatamente isso.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:pods=5;;campo:Deployment/cardapio|status.readyReplicas=5">
+  <p class="try-task">Rode e veja dois pods sem lugar. Depois baixe o pedido de CPU para
+  <code>100m</code> e rode de novo: os cinco ficam prontos.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: "1500m"</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-mbqx6npxsm-bgklj   1/1     Running   0          5m
+cardapio-mbqx6npxsm-bx4h7   0/1     Pending   0          4m
+cardapio-mbqx6npxsm-g7bbr   0/1     Pending   0          2m
+cardapio-mbqx6npxsm-jl4ps   1/1     Running   0          8m
+cardapio-mbqx6npxsm-tjnlv   1/1     Running   0          1m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: "100m"</pre>
+</div>
+
+<p>A tabela do painel é o retrato do problema: cinco pods, três em <code>Running</code>, dois em
+<code>Pending</code> com <code>READY 0/1</code>. O <code>get deployments</code> mostraria
+<code>3/5</code>, e o <code>describe</code> do pod que não subiu traria um evento
+<code>FailedScheduling</code> dizendo que nenhum dos três nós tem CPU suficiente. Não há nada de errado
+com o manifesto: não há lugar.</p>
+
+<p>As saídas têm sempre a mesma forma, mudando só o motivo:</p>
+
+<pre class="term">NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-mbqx6npxsm-bgklj   1/1     Running   0          5m
+cardapio-mbqx6npxsm-bx4h7   0/1     Pending   0          4m
+cardapio-mbqx6npxsm-g7bbr   0/1     Pending   0          2m
+cardapio-mbqx6npxsm-jl4ps   1/1     Running   0          8m
+cardapio-mbqx6npxsm-tjnlv   1/1     Running   0          1m</pre>
+
+<p>Esse bloco é a lista de pods que a caixa devolve para o caso acima, copiada do painel. Repare que os
+três primeiros caracteres do sufixo são iguais: são todos do mesmo ReplicaSet, do mesmo modelo. A
+diferença entre eles é só o nó onde couberam — e dois não couberam em nenhum. Baixar o pedido para
+<code>100m</code> resolve porque cada nó passa a acomodar vários pods, e é o que a solução da caixa faz.</p>
+
+<h2>8. Escala automática: quando o número muda sozinho</h2>
+
+<p>Trocar o número à mão funciona até o dia em que ninguém está olhando. O Kubernetes tem um objeto para
+isso: o HorizontalPodAutoscaler, que observa uma métrica (por exemplo, CPU média) e ajusta
+<code>replicas</code> entre um mínimo e um máximo. Você declara <code>minReplicas: 2</code>,
+<code>maxReplicas: 10</code> e uma meta de 70% de CPU; o controlador sobe e desce o número sozinho.</p>
+
+<p>É uma ferramenta poderosa e uma fonte de confusão se usada cedo demais. Sem métricas confiáveis, o
+autoscaler toma decisões ruins; sem limites de recurso nos pods, ele escala em cima de um número que não
+significa nada. A ordem saudável é: primeiro você entende escala manual, depois define recursos, depois
+liga o autoscaler. O guia tem uma aula inteira sobre HPA no nível de escala e disponibilidade; aqui o
+que importa é saber que <code>replicas</code> pode passar a ser escrito por outro programa — e que um
+<code>apply</code> seu pode brigar com ele.</p>
+
+<p>Essa briga é o assunto mais chato e mais real de todos: se o HPA mudou o número para sete e você
+aplica um manifesto que diz dois, o número volta para dois e o HPA sobe de novo. Nada está quebrado; são
+dois donos do mesmo campo. Em times grandes, a regra é ter um dono só por campo — ou o manifesto, ou o
+autoscaler, nunca os dois ao mesmo tempo.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a escala que não adiantou</h3>
+<p>A Ana subiu de duas para seis réplicas e o site continuou lento. O motivo estava no banco de dados: uma
+consulta pesada por requisição, e o banco, um só, virou o gargalo. Escalar o site não escala o banco. Antes
+de aumentar o número, vale perguntar qual peça está saturada — se todas as cópias dependem de um recurso
+único, mais cópias só aumentam a fila do recurso único.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod que foi apagado no meio da noite</h3>
+<p>Um nó fica sem memória e o Kubernetes começa a despejar pods (eviction). Três dos cinco pods morrem.
+O ReplicaSet vê a contagem cair e cria três novos, que o agendador coloca nos nós que sobraram. Se a
+capacidade total não bastar, os novos ficam em <code>Pending</code> e a Ana vê <code>3/5</code> pela
+manhã. A escala não é mágica: ela move pods, não cria hardware.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a réplica que recebia todo o tráfego</h3>
+<p>Com cinco réplicas, um cliente reclamou que o carrinho sumia. A causa não era a escala: era a sessão
+guardada na memória de cada pod. Quem caía na réplica A via o carrinho; na réplica B, via vazio. A
+solução foi mover a sessão para um armazenamento compartilhado. Escalar exige que as cópias sejam
+intercambiáveis — e é isso que a Ana aprendeu do jeito difícil.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o campo <code>spec.replicas</code> promete?</p>
+<label><input type="radio" name="q1"> que o cluster tem espaço para aquele número de pods</label>
+<label><input type="radio" name="q1"> que o controlador vai manter aquele número de pods, criando ou
+apagando conforme a diferença</label>
+<label><input type="radio" name="q1"> que aquele número de pods já está rodando</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que <code>kubectl scale deployment/cardapio
+--replicas=0</code> faz?</p>
+<label><input type="radio" name="q2"> apaga o Deployment e o ReplicaSet</label>
+<label><input type="radio" name="q2"> deixa o Deployment em erro</label>
+<label><input type="radio" name="q2"> zera os pods e mantém o Deployment, o modelo e o histórico</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Você pediu cinco réplicas e o <code>get pods</code>
+mostra cinco pods, dois em <code>Pending</code>. Qual é o problema?</p>
+<label><input type="radio" name="q3"> nenhum nó tem recursos para agendar os dois pods</label>
+<label><input type="radio" name="q3"> o manifesto está inválido e o cluster recusou os pods</label>
+<label><input type="radio" name="q3"> o <code>scale</code> não funciona com número ímpar</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a escala do domingo</h2>
+<p>O site da Ana precisa de seis cópias no domingo e duas durante a semana. Escreva o trecho do manifesto
+que declara as seis réplicas e depois responda: qual comando muda o número sem tocar no arquivo?</p>
+<div class="ex-code">kubectl <input aria-label="resposta 1" data-answer="scale" placeholder="...">
+deployment/cardapio --replicas=6</div>
+<p class="ex-dica">Dica: é o verbo que recebe o recurso, o nome e <code>--replicas</code>. Ele muda o
+número desejado e deixa o ReplicaSet fazer a conta.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Réplica é cópia do pod, e <code>spec.replicas</code> é o número desejado — não o número atual. O
+controlador compara os dois sem parar: faltou, cria; sobrou, apaga. Você muda o número pelo manifesto
+(<code>replicas: 4</code>) ou por um comando (<code>kubectl scale deployment/cardapio --replicas=5</code>),
+e o ReplicaSet executa a conta.</p>
+
+<p>Os números que aparecem nas tabelas têm significados diferentes: <code>READY</code> é prontas sobre
+desejadas, <code>DESIRED</code> é o pedido, <code>CURRENT</code> é o que existe. Escalar para zero é uma
+pausa limpa, sem apagar o objeto. E escalar tem limite físico: sem nó com CPU e memória, os pods ficam em
+<code>Pending</code> e o Deployment mostra <code>3/5</code> para sempre.</p>
+
+<p>Por último, a lição que o dinheiro não compra: mais cópias só ajudam se as cópias forem
+intercambiáveis. Sessão na memória do pod, arquivo local, cache por processo — tudo isso vira problema
+quando o número passa de um. Na próxima aula a Ana publica a versão 2.0 do site sem derrubar a versão
+1.0: o rolling update.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>replicas</code> é o número desejado; o controlador persegue até o real empatar.</li>
+  <li><code>kubectl scale deployment/nome --replicas=N</code> muda sem editar arquivo.</li>
+  <li><code>0</code> réplicas é pausa, não exclusão: o Deployment e o histórico continuam.</li>
+  <li><code>Pending</code> depois de escalar é falta de lugar, não manifesto inválido.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

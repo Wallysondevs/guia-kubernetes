@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kubectl get | Guia Kubernetes</title>
+<meta name="description" content="O kubectl get na prática: listar pods, deployments e serviços, escolher a saída com -o wide, filtrar por etiqueta com -l e enxergar outro namespace com -n.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>kubectl <span class="hl">get</span></h1>
+<p class="intro">A Ana deixou o site da padaria rodando no cluster na sexta e voltou na segunda com uma
+pergunta simples: “o que está rodando aí?”. Ela não quer editar nada, não quer entender o YAML de novo, quer
+<em>ver</em>. É exatamente para isso que existe o <code>kubectl get</code>: ele é o <code>ls</code> do
+cluster. Nesta aula a Ana aprende a pedir a lista certa, a olhar as colunas certas, a filtrar por etiqueta e
+a encontrar o que está no namespace errado — sem apagar nem mudar nada.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>A gramática do <code>get</code>: verbo, tipo, nome e opções.</li>
+  <li>Os tipos do dia a dia e seus apelidos (<code>po</code>, <code>deploy</code>, <code>svc</code>).</li>
+  <li>Pedir um objeto pelo nome e reconhecer o erro de “não achei”.</li>
+  <li>Ver mais colunas com <code>-o wide</code> e outras formas de saída.</li>
+  <li>Filtrar por etiqueta com <code>-l</code>.</li>
+  <li>Enxergar o que está em outro namespace com <code>-n</code>.</li>
+  <li>Os quatro tropeços de quem lê a tabela do <code>get</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o cardápio sumiu?</h2>
+
+<p>O site da padaria é um programa pequeno que responde na porta 8080 com o cardápio e os preços. Ele roda
+dentro do cluster, empacotado numa imagem chamada <code>cardapio:1.0</code>. Na sexta-feira a Ana aplicou o
+manifesto, viu a linha <code>pod/cardapio created</code> e foi dormir tranquila. Na segunda, o primeiro
+cliente reclamou que o site estava fora do ar.</p>
+
+<p>Antes de mexer em qualquer coisa, ela precisa de uma resposta factual: o pod existe? está rodando? quantas
+cópias? em que nó? O <code>kubectl get</code> responde isso em uma linha. Ele não conserta, não explica e
+não muda nada no cluster — é leitura pura. Essa é a primeira qualidade dele: você pode rodar
+<code>get</code> à vontade, em produção, sem medo de estragar.</p>
+
+<p>Vale a analogia que fica: se o cluster fosse uma pasta cheia de arquivos, o <code>get</code> seria o
+<code>ls</code>. Você diz <em>de que tipo</em> é o objeto e ele lista o que existe. Com uma diferença
+importante em relação ao <code>ls</code>: aqui você escolhe quais colunas quer ver, e a lista pode vir de
+outro “diretório” (o namespace) com uma opção só.</p>
+
+<p>O roteiro dela tem três perguntas, sempre na mesma ordem. <em>Existe?</em> — a lista mostra o objeto ou
+uma tabela vazia. <em>Está pronto?</em> — a coluna <code>READY</code> diz quantos containers prontos sobre o
+total. <em>Quantas cópias?</em> — o número de linhas, e depois o <code>get deployments</code> para ver o
+pedido. Só depois dessas três respostas vale a pena abrir o <code>describe</code> e procurar motivo; ir
+direto para o detalhe é como abrir o capô antes de conferir se o carro está ligado.</p>
+
+<h2>2. Verbo + tipo: a gramática do get</h2>
+
+<p>Todo comando do kubectl segue a mesma ordem: <strong>verbo</strong>, <strong>tipo</strong>,
+<strong>nome</strong> (opcional) e <strong>opções</strong>. No caso do <code>get</code>, o verbo é
+“listar”. O tipo é o recurso — <code>pods</code>, <code>deployments</code>, <code>services</code>. O nome é
+para quando você quer um objeto só. As opções mudam a forma da resposta, não o conteúdo do cluster.</p>
+
+<pre class="file" data-file="terminal">kubectl  get  pods  cardapio  -o wide
+   |      |     |        |        |
+ verbo  tipo  nome   opções</pre>
+
+<p>Esse desenho explica por que quase todo erro de kubectl parece igual: o programa lê as palavras na ordem
+e reclama da primeira que não entende. Se você trocar o tipo por algo que não existe, ele diz que o servidor
+não tem aquele tipo de recurso. Se você puser o nome de um objeto que não existe, ele diz “não achei”. A
+mensagem sempre aponta a peça errada — o difícil é saber qual peça estava errada.</p>
+
+<p>Uma coisa que confunde no começo: o tipo pode ser escrito no plural, no singular ou pela abreviação.
+<code>pods</code>, <code>pod</code> e <code>po</code> são a mesma coisa. O kubectl normaliza antes de
+perguntar ao servidor. Isso é comodidade, não regra de negócio: escolha uma forma e mantenha, para os
+comandos do time ficarem parecidos.</p>
+
+<h2>3. Os tipos do dia a dia</h2>
+
+<p>O cluster guarda dezenas de tipos de objeto, mas a rotina da padaria usa oito. A tabela traz o plural, o
+singular, a abreviação e o que cada um lista — vale consultar antes de decorar:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tipo</th><th>Também aceita</th><th>O que lista</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pods</code></td><td><code>pod</code>, <code>po</code></td><td>os containers em execução, com estado e reinícios</td></tr>
+<tr><td><code>deployments</code></td><td><code>deployment</code>, <code>deploy</code></td><td>quem cuida das réplicas dos pods</td></tr>
+<tr><td><code>replicasets</code></td><td><code>replicaset</code>, <code>rs</code></td><td>o nível do meio entre Deployment e pod</td></tr>
+<tr><td><code>services</code></td><td><code>service</code>, <code>svc</code></td><td>os pontos de acesso estáveis para os pods</td></tr>
+<tr><td><code>namespaces</code></td><td><code>namespace</code>, <code>ns</code></td><td>as divisões lógicas do cluster</td></tr>
+<tr><td><code>nodes</code></td><td><code>node</code>, <code>no</code></td><td>as máquinas que rodam os pods</td></tr>
+<tr><td><code>events</code></td><td><code>event</code>, <code>ev</code></td><td>o que o cluster tentou fazer e por quê</td></tr>
+<tr><td><code>configmaps</code></td><td><code>configmap</code>, <code>cm</code></td><td>configuração que os pods consomem</td></tr>
+</tbody>
+</table>
+</div>
+
+<dl class="anatomy">
+<dt>recurso</dt>
+<dd>O tipo de objeto no cluster: pod, deployment, service, namespace. É o “o que” da pergunta do
+<code>get</code>.</dd>
+<dt>nome</dt>
+<dd>O identificador de um objeto dentro do namespace. Com nome, o <code>get</code> devolve uma linha; sem
+nome, devolve a lista.</dd>
+<dt>opção</dt>
+<dd>O que muda a forma da resposta, e não o cluster: <code>-o</code>, <code>-l</code>, <code>-n</code>,
+<code>--show-labels</code>.</dd>
+<dt>etiqueta</dt>
+<dd>Par chave-valor colado no objeto (<code>app=cardapio</code>). Serve para agrupar e é o que os Services
+usam para achar pods.</dd>
+<dt>namespace</dt>
+<dd>A divisão lógica onde o objeto mora. Sem <code>-n</code>, o kubectl olha o
+<code>default</code>.</dd>
+</dl>
+
+<p>Duas dessas linhas merecem atenção agora. <code>nodes</code> não é do namespace de ninguém: nós são a
+infraestrutura, e a lista mostra três no cluster de teste — <code>guia-control-plane</code>,
+<code>guia-worker</code> e <code>guia-worker2</code>. <code>events</code> é a lista mais subestimada do
+kubectl: cada linha é uma frase do cluster contando o que ele tentou. Quando algo não sobe, os eventos
+costumam dizer o motivo antes de qualquer outra coisa.</p>
+
+<p>Se você esquecer quais tipos existem, o próprio kubectl responde com <code>kubectl api-resources</code>:
+uma tabela com todos os tipos, o grupo da API e se são ou não por namespace. No painel deste guia esse
+comando também funciona, e é uma boa forma de descobrir o plural exato de um recurso com nome esquisito.</p>
+
+<h2>4. Um objeto só, e o erro de “não achei”</h2>
+
+<p>A lista é útil quando você não sabe o nome. Quando sabe, pedir um objeto só rende uma tabela de uma linha
+— e, se o nome estiver errado, o erro mais comum do kubectl inteiro:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pod cardapio
+Error from server (NotFound): pods "cardapio" not found</pre>
+
+<p>Leia essa frase por partes, porque ela aparece em quase toda aula deste guia. “Error from server” quer
+dizer que a pergunta chegou ao cluster e o cluster respondeu — ou seja, o kubectl está funcionando, a
+conexão está de pé. “NotFound” é o tipo do erro. E <code>pods "cardapio" not found</code> é o que faltou
+encontrar. O plural na mensagem é do servidor, não seu.</p>
+
+<p>Três causas possíveis, nesta ordem de frequência: o nome está errado (um hífen a mais, uma letra
+trocada), o objeto está em outro namespace, ou o objeto realmente não existe. As duas primeiras somam a
+maioria absoluta. E repare no detalhe que salva tempo: a mensagem fala do <em>tipo</em> que você pediu. Se
+você pediu <code>pod</code> e o objeto é um <code>deployment</code>, o erro é o mesmo “not found”, e a pista
+é o tipo que a mensagem repete.</p>
+
+<p>Uma leitura que economiza tempo: a tabela vem ordenada por idade, do mais novo para o mais antigo — não
+por nome. Quando um pod aparece no topo com <code>AGE</code> de dois segundos, ele acabou de nascer (ou de
+renascer), e isso costuma ser o sintoma e não o acidente. Combinada com a coluna
+<code>RESTARTS</code>, a idade conta a história: pod antigo com muitos reinícios é programa morrendo em
+loop; pod novinho em folha no lugar de um que existia antes é alguém apagando ou o Deployment trocando
+réplicas.</p>
+
+<h2>5. Ver mais colunas: <code>-o wide</code></h2>
+
+<p>A tabela padrão é econômica de propósito: nome, prontidão, estado, reinícios e idade. Quando a Ana precisa
+saber <em>onde</em> o pod caiu e <em>qual IP</em> ele ganhou, existe a saída larga. A caixa abaixo é um
+terminal: cada linha é um comando, e o painel mostra o que o kubectl responderia.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:NODE;;texto:IP">
+  <p class="try-task">Crie o pod do cardápio e liste os pods. A tabela padrão não mostra o nó nem o IP:
+  use a opção de saída larga (<code>-o wide</code>) na última linha para aparecerem as colunas
+  <code>IP</code> e <code>NODE</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods -o wide</pre>
+</div>
+
+<p>A saída larga acrescenta quatro colunas: <code>IP</code> (o endereço interno do pod),
+<code>NODE</code> (a máquina onde ele caiu), <code>NOMINATED NODE</code> (raramente usado, aparece como
+<code>&lt;none&gt;</code>) e <code>READINESS GATES</code> (também <code>&lt;none&gt;</code> na maioria dos
+casos). O IP é interno ao cluster: ninguém na internet chega nele. Quem abre a porta para fora é o Service,
+numa aula mais adiante.</p>
+
+<p>O <code>-o</code> significa “output”, saída. Ele aceita vários valores, e cada um serve a um momento
+diferente do trabalho:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Saída</th><th>Como fica</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-o wide</code></td><td>tabela com IP e nó</td><td>descobrir onde o pod está e se dois pods caíram no mesmo nó</td></tr>
+<tr><td><code>--show-labels</code></td><td>tabela com uma coluna de etiquetas</td><td>conferir a etiqueta antes de filtrar ou de criar um Service</td></tr>
+<tr><td><code>-o name</code></td><td>uma linha por objeto, no formato <code>pod/nome</code></td><td>alimentar outro comando ou copiar o nome sem espaços</td></tr>
+<tr><td><code>-o json</code></td><td>o objeto inteiro em JSON</td><td>ver tudo o que o servidor sabe; usar com <code>| jq</code> no terminal</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>-o name</code> é o mais subestimado da lista. Ele imprime <code>pod/cardapio</code>, exatamente o
+formato que o <code>delete</code>, o <code>describe</code> e o <code>logs</code> aceitam. Copiar dali evita o
+erro de digitação que gera o “not found” da seção anterior. E o <code>-o json</code> é o que se usa quando a
+pergunta é “o que esse objeto tem por dentro?” — a mesma resposta que o <code>describe</code> dá, mas em
+formato que um programa consegue ler.</p>
+
+<h2>6. Etiquetas na tabela: <code>--show-labels</code></h2>
+
+<p>Etiqueta (<em>label</em>) é o par chave-valor que o cluster usa para agrupar objetos. O
+<code>kubectl run</code> coloca uma automaticamente: <code>run=&lt;nome do pod&gt;</code>. Um manifesto de
+Deployment costuma usar <code>app=cardapio</code>. Elas não aparecem na tabela padrão, e é por isso que a
+Ana às vezes não entende por que um Service não acha o pod — a resposta costuma estar numa etiqueta que
+ninguém está vendo.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:LABELS;;texto:run=vitrine">
+  <p class="try-task">Crie os dois pods e liste. A tabela não mostra as etiquetas: use
+  <code>--show-labels</code> na última linha para aparecer a coluna <code>LABELS</code> com
+  <code>run=cardapio</code> e <code>run=vitrine</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl run vitrine --image=cardapio:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl run vitrine --image=cardapio:1.0
+pod/vitrine created
+
+ana@notebook:~$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+vitrine    1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl run vitrine --image=cardapio:1.0
+kubectl get pods --show-labels</pre>
+</div>
+
+<p>Com a coluna na tela, a conversa muda. Dá para ver que os dois pods vêm da mesma imagem mas têm etiquetas
+diferentes — e é a etiqueta, não o nome, que decide quem recebe tráfego de um Service. Nomes de pod criados
+por Deployment são compridos e mudam toda hora; etiquetas são estáveis. É por isso que o time da Ana nunca
+escreve “o pod tal”: escreve “os pods com <code>app=cardapio</code>”.</p>
+
+<h2>7. Filtrar por etiqueta: <code>-l</code></h2>
+
+<p>A opção <code>-l</code> (de <em>label</em>) filtra a lista antes de imprimir. Ela recebe
+<code>chave=valor</code> e devolve só os objetos que têm aquela etiqueta. É o que transforma uma tabela de
+vinte linhas na pergunta que você realmente fez: “quais pods servem o cardápio?”.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods -l run=vitrine
+NAME      READY   STATUS    RESTARTS   AGE
+vitrine   1/1     Running   0          10m
+
+ana@notebook:~$ kubectl get pods -l run=brioche
+No resources found in default namespace.</pre>
+
+<p>Duas leituras. A primeira: o filtro funcionou, e o pod que não tem a etiqueta sumiu da tabela. A segunda é
+mais importante: quando nada casa com o filtro, o kubectl responde <code>No resources found in default
+namespace.</code> — não é erro, é uma lista vazia. Essa frase aparece também quando o namespace está vazio,
+quando você digitou a etiqueta errada e quando o objeto existe em outro lugar. Ela nunca diz “você errou”,
+só diz “não achei”, e por isso engana tanto.</p>
+
+<p>Um detalhe que só aparece quando você começa a usar Service: o seletor do Service e a etiqueta do pod
+têm de ser <em>exatamente</em> iguais, com a mesma chave e o mesmo valor. O <code>get -l</code> é o jeito
+mais rápido de testar isso antes de acusar o Service de estar quebrado — se o filtro que você colou do
+seletor não devolve nenhum pod, o problema está ali, na etiqueta, e não no roteamento.</p>
+
+<p>Combinar filtros é permitido: <code>-l app=cardapio,tier=web</code> exige as duas etiquetas. E o
+<code>-l</code> também conversa com o <code>delete</code> e o <code>logs</code>, em aulas próprias. O hábito
+que vale desde já: antes de filtrar, rode <code>--show-labels</code> uma vez para ver as etiquetas que
+existem de verdade — é mais rápido do que adivinhar.</p>
+
+<h2>8. Ver em outro namespace: <code>-n</code></h2>
+
+<p>Namespace é a divisão lógica do cluster — uma pasta, para continuar na analogia. Quando você não diz nada,
+o kubectl olha o namespace <code>default</code>. Se o objeto estiver em outro, o <code>get</code> responde
+“não achei” com a maior naturalidade do mundo, mesmo que o pod esteja rodando a dois passos de distância.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:READY;;texto:Running">
+  <p class="try-task">Crie o namespace <code>padaria</code> e um pod dentro dele. A última linha lista o
+  namespace <code>default</code> e não encontra nada: acrescente <code>-n padaria</code> para ver o pod em
+  <code>Running</code>.</p>
+<pre class="yaml">kubectl create namespace padaria
+kubectl run cardapio --image=cardapio:1.0 -n padaria
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create namespace padaria
+namespace/padaria created
+
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0 -n padaria
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pods
+No resources found in default namespace.
+</pre>
+<pre class="solucao">kubectl create namespace padaria
+kubectl run cardapio --image=cardapio:1.0 -n padaria
+kubectl get pods -n padaria</pre>
+</div>
+
+<p>Repare que o <code>-n</code> aparece na criação <em>e</em> na listagem. Isso é a vida real: se você cria
+no <code>padaria</code> e lista no <code>default</code>, a resposta é
+<code>No resources found in default namespace.</code> — e a tentação é achar que o pod não foi criado. Ele
+foi; está do outro lado. Uma dica de leitura: a frase do “não achei” sempre diz em qual namespace ela olhou.
+Se o nome ali não é o que você esperava, o problema é o <code>-n</code>.</p>
+
+<p>Existe um terceiro jeito, que é o que o time dela usa no dia a dia: trocar o namespace padrão do
+contexto com <code>kubectl config set-context --current --namespace=padaria</code>. Depois disso, todo
+comando sem <code>-n</code> passa a olhar o <code>padaria</code>. É cômodo e é perigoso na mesma medida: um
+comando sem <code>-n</code> deixa de significar “default” e passa a significar “aquele que eu configurei
+ontem e esqueci”. Para quem está aprendendo, os comandos explícitos com <code>-n</code> ensinam mais e
+enganam menos.</p>
+
+<p>Existe também <code>--namespace=padaria</code>, com o nome por extenso. As duas formas fazem o mesmo, e
+esta é a hora de escolher uma e ficar com ela: em comando digitado à mão, <code>-n</code> é mais rápido; em
+script que outra pessoa vai ler, <code>--namespace</code> não deixa dúvida. O que não vale é descobrir o
+problema depois de meia hora procurando no namespace errado.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o pod que não estava em lugar nenhum</h3>
+<p>A Ana passou vinte minutos procurando o pod do cardápio no <code>default</code>, com a tabela vazia e a
+suspeita de que o manifesto não tinha funcionado. O pod estava no namespace <code>padaria</code>, criado
+semanas antes por outro manifesto. O conserto foi uma letra: <code>-n padaria</code>. Desde então ela lê o
+fim da mensagem “No resources found in <em>tal</em> namespace” antes de duvidar do cluster.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: dois pods do mesmo Deployment</h3>
+<p>Com duas réplicas, o <code>get pods</code> mostra dois nomes compridos e diferentes — e nenhum deles é o
+nome do Deployment. Isso confunde na primeira vez: o Deployment se chama <code>cardapio</code> e os pods se
+chamam <code>cardapio-7d9f8-abcde</code>. A leitura certa é pelo prefixo e pela etiqueta: são dois pods do
+mesmo dono, provavelmente em nós diferentes. O <code>get deployments</code> mostra
+<code>READY 2/2</code> e resolve a dúvida em uma linha.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a etiqueta que ninguém via</h3>
+<p>Um Service não mandava tráfego para lugar nenhum, e a Ana comparou o seletor do Service com a etiqueta do
+pod: <code>app=cardapio</code> de um lado, <code>run=cardapio</code> do outro. O
+<code>--show-labels</code> mostrou a diferença em dois segundos. O conserto foi acrescentar a etiqueta
+<code>app</code> no pod (ou no manifesto do Deployment), não mexer no Service.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o <code>kubectl get pods</code> faz com o
+cluster?</p>
+<label><input type="radio" name="q1"> cria um pod novo e devolve o nome dele</label>
+<label><input type="radio" name="q1"> lista os pods e não muda nada no cluster</label>
+<label><input type="radio" name="q1"> reinicia os pods que estão com problema</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. A resposta foi
+<code>No resources found in default namespace.</code> O que isso quer dizer?</p>
+<label><input type="radio" name="q2"> o cluster está fora do ar</label>
+<label><input type="radio" name="q2"> o kubectl não está instalado</label>
+<label><input type="radio" name="q2"> não há objeto que case com o pedido naquele namespace</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual opção mostra o nó e o IP de cada pod?</p>
+<label><input type="radio" name="q3"> <code>-o wide</code></label>
+<label><input type="radio" name="q3"> <code>--show-labels</code></label>
+<label><input type="radio" name="q3"> <code>-l</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: só os pods do cardápio</h2>
+
+<p>Você quer listar apenas os pods que têm a etiqueta <code>app=cardapio</code>. Complete o comando com a
+opção que filtra por etiqueta:</p>
+
+<div class="ex-code">kubectl get pods <input aria-label="resposta 1" data-answer="-l" placeholder="..."> app=cardapio</div>
+
+<p class="ex-dica">Dica: a letra vem de <em>label</em>. Sem ela, o kubectl interpreta
+<code>app=cardapio</code> como nome de um pod e responde
+<code>Error from server (NotFound): pods "app=cardapio" not found</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O <code>kubectl get</code> é o <code>ls</code> do cluster: verbo, tipo, nome opcional e opções. O tipo
+aceita plural, singular e abreviação (<code>pods</code>, <code>pod</code>, <code>po</code>). Sem nome, você
+recebe a lista; com nome, uma linha só; com nome errado, o <code>Error from server (NotFound)</code>.</p>
+
+<p>A tabela padrão é econômica. <code>-o wide</code> acrescenta IP e nó, <code>--show-labels</code>
+acrescenta as etiquetas, <code>-o name</code> imprime no formato que os outros comandos aceitam e
+<code>-o json</code> abre o objeto inteiro. O <code>-l</code> filtra por etiqueta e o <code>-n</code> escolhe
+o namespace — e a frase “No resources found in <em>tal</em> namespace” é a pista mais rápida de que o
+problema está num desses dois.</p>
+
+<p>Duas coisas para levar: o <code>get</code> não explica, ele mostra — quem explica é o
+<code>describe</code>, a próxima aula; e nenhuma leitura substitui a outra, então o hábito bom é
+<code>get</code> para saber o que existe e só depois aprofundar no objeto que interessa. Na próxima parada, a
+Ana aprende a abrir esse objeto por dentro.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl get pods</code> lista; <code>kubectl get pod cardapio</code> mostra um só.</li>
+  <li><code>po</code>, <code>deploy</code>, <code>svc</code>, <code>ns</code>, <code>no</code>: as
+  abreviações que economizam dedo.</li>
+  <li><code>-o wide</code> traz IP e nó; <code>--show-labels</code> traz as etiquetas.</li>
+  <li><code>-l app=cardapio</code> filtra; lista vazia responde <code>No resources found</code>.</li>
+  <li><code>-n padaria</code> olha outro namespace; sem ela, é sempre <code>default</code>.</li>
+  <li><code>NotFound</code> quer dizer “não achei”: confira nome e namespace antes de duvidar do cluster.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

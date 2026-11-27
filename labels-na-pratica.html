@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Labels na prática | Guia Kubernetes</title>
+<meta name="description" content="Labels na prática: criar, trocar e remover etiquetas, filtrar com -l, ver com --show-labels e descobrir como a etiqueta do template chega aos pods.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Labels na <span class="hl">prática</span></h1>
+<p class="intro">A Ana já sabe que label é uma etiqueta de chave e valor presa no objeto, e que o
+<em>selector</em> é o que usa essa etiqueta para escolher quem entra no grupo. O que ela ainda não sabe é
+o dia a dia: como colocar uma etiqueta que faltou, como trocar uma que está errada, como tirar uma que
+não serve mais, e por que o filtro do <code>-l</code> às vezes devolve “nada encontrado” quando ela
+<em>jura</em> que etiquetou o pod. Nesta aula a Ana etiqueta a padaria inteira e aprende a conferir cada
+passo com o cluster respondendo de verdade.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Onde a label mora no manifesto e o que ela tem de diferente do nome.</li>
+  <li>As regras de formato de uma chave e de um valor de label.</li>
+  <li>Acrescentar etiqueta no manifesto e por comando, sem recriar o objeto.</li>
+  <li>Ler as etiquetas com <code>--show-labels</code> e filtrar com <code>-l</code>.</li>
+  <li>Trocar uma etiqueta (<code>--overwrite</code>) e remover uma (<code>chave-</code>).</li>
+  <li>Por que a etiqueta do <code>template</code> do Deployment aparece nos pods.</li>
+  <li>Os três enganos clássicos: chave com typo, valor com maiúscula e etiqueta no lugar errado.</li>
+</ul>
+</div>
+
+<h2>1. A cena: as caixas sem etiqueta</h2>
+
+<p>No depósito da padaria, a Ana tem prateleiras e caixas. Durante anos, ela achou tudo porque era ela
+quem guardava. No dia em que contratou a primeira ajudante, o sistema desabou: ninguém sabia qual caixa
+tinha farinha, qual tinha fermento e qual tinha aquele pó branco que ninguém lembrava o nome. A solução
+foi analógica e óbvia — uma etiqueta em cada caixa, com <code>tipo=fermento</code> e
+<code>fornecedor=central</code>.</p>
+
+<p>Cluster é igual. Um pod sozinho tem nome e pronto. Mas quando existem quarenta pods, você não quer
+“o pod cardapio-6d8f89b786-88dn9”; você quer “os pods do cardápio, do ambiente de teste”. A label é a
+etiqueta que responde a essa pergunta, e o Kubernetes a usa em três lugares que você vai ver toda semana:
+para <em>filtrar</em> no <code>kubectl get</code>, para <em>selecionar</em> quem um Service atende e para
+<em>casar</em> o Deployment com os pods que ele criou.</p>
+
+<p>A diferença em relação ao nome é a intenção. Nome é identidade: um por objeto, único no namespace, e
+não muda. Label é classificação: um objeto pode ter quantas quiser, o valor pode mudar amanhã, e dois
+objetos diferentes podem (e devem) ter a mesma etiqueta. É justamente por poder repetir que a etiqueta
+serve para juntar.</p>
+
+<h2>2. O que é uma label, na prática</h2>
+
+<p>No manifesto, labels ficam em <code>metadata.labels</code>, ao lado do nome. É um mapa de chave e
+valor, os dois sempre texto — mesmo quando o valor parece número. <code>versao: "2"</code> com aspas é
+texto; <code>versao: 2</code> sem aspas o YAML entrega como número, e o API server recusa com
+<code>must be a string</code>. Esse é um erro que aparece uma vez e nunca mais esquece.</p>
+
+<dl class="anatomy">
+<dt>chave</dt>
+<dd>O nome da etiqueta, até 63 caracteres: letras minúsculas, números, <code>-</code>, <code>_</code> e
+<code>.</code>, começando e terminando por letra ou número. Exemplos: <code>app</code>,
+<code>tier</code>, <code>ambiente</code>.</dd>
+<dt>prefixo</dt>
+<dd>Opcional, antes da barra: um domínio DNS que diz de quem é a chave, como
+<code>cardapio.loja.test/versao</code>. Serve para não colidir com etiquetas de outra pessoa.</dd>
+<dt>valor</dt>
+<dd>Até 63 caracteres, com as mesmas regras de caractere. Pode ser vazio
+(<code>tier: ""</code>), e valor vazio casa com <code>-l tier=</code>.</dd>
+<dt>selector</dt>
+<dd>O filtro por etiqueta: <code>-l app=cardapio</code> no <code>kubectl</code>,
+<code>selector.matchLabels</code> no Service e no Deployment.</dd>
+<dt>template</dt>
+<dd>O modelo de pod dentro do Deployment. As labels escritas em
+<code>spec.template.metadata.labels</code> são copiadas para cada pod criado.</dd>
+</dl>
+
+<p>Duas consequências das regras que confundem no começo. A primeira: comparação é sempre texto exato,
+sem diferenciar maiúscula de minúscula <em>na chave</em> (que só aceita minúscula) e diferenciando tudo no
+<em>valor</em> — <code>web</code> não casa com <code>Web</code>, e o cluster aceita os dois como valores
+diferentes. A segunda: valor vazio é permitido e tem significado próprio. <code>tier: ""</code> quer dizer
+“esta chave existe e não tem valor”; filtrar por <code>-l tier</code> acha o objeto, filtrar por
+<code>-l tier=</code> também, e as duas coisas são diferentes de não ter a chave.</p>
+
+<p>Repare que não existe “editar label de um pod” como operação especial: o que existe é o objeto com
+<code>metadata.labels</code> diferente. Você pode chegar a esse estado de dois jeitos — reaplicando o
+manifesto inteiro ou usando <code>kubectl label</code>, que mexe só nesse mapa. As duas rotas chegam ao
+mesmo lugar, e é isso que a próxima caixa mostra.</p>
+
+<h2>3. Onde as labels aparecem</h2>
+
+<p>Vale conhecer os quatro lugares em que você vai digitar ou ler uma etiqueta. No <strong>manifesto</strong>,
+em <code>metadata.labels</code>. No <strong>get</strong>, com <code>--show-labels</code> para ver e
+<code>-l</code> para filtrar. No <strong>selector</strong> de um Service ou de um Deployment, que é
+quem liga a etiqueta ao trabalho de verdade. E no <strong>template</strong>, de onde ela desce para os
+pods.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Comando</th><th>O que faz</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kubectl get pods --show-labels</code></td><td>acrescenta a coluna
+<code>LABELS</code></td><td>conferir o que está preso em cada pod</td></tr>
+<tr><td><code>kubectl get pods -l app=cardapio</code></td><td>mostra só quem tem
+<code>app=cardapio</code></td><td>achar o grupo antes de mexer nele</td></tr>
+<tr><td><code>kubectl label pod/x tier=web</code></td><td>cria ou troca a chave no
+objeto</td><td>consertar uma etiqueta sem reaplicar o manifesto</td></tr>
+<tr><td><code>kubectl label pod/x tier=api --overwrite</code></td><td>troca o valor de uma chave
+existente</td><td>o valor antigo está errado</td></tr>
+<tr><td><code>kubectl label pod/x tier-</code></td><td>remove a chave</td><td>a etiqueta não faz mais
+sentido</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Vale distinguir as duas formas de ver etiqueta. <code>--show-labels</code> junta tudo numa coluna só,
+em ordem alfabética e sem espaço depois da vírgula — ótimo para conferir. <code>-L chave</code> abre uma
+coluna por chave, o que é melhor para comparar muitos objetos e descobrir quem está fora da convenção,
+porque quem não tem a chave fica com a célula vazia. No dia a dia, a Ana usa a primeira quando está
+consertando um pod e a segunda quando está auditando o namespace inteiro.</p>
+
+<p>Uma observação sobre o painel deste guia: ele entende a forma <code>kubectl label pod/cardapio</code>
+(a barra) e não a forma com dois argumentos soltos. No cluster de verdade as duas funcionam — o kubectl
+aceita <code>pod cardapio</code> ou <code>pod/cardapio</code> —, então não estranhe se você vir as duas
+por aí.</p>
+
+<h2>4. A etiqueta que faltava no manifesto</h2>
+
+<p>A primeira caixa é o caso mais simples e mais comum: o manifesto já existe, o pod já roda, mas falta
+uma etiqueta que o time combinou de usar. Sem ela, o <code>-l tier=web</code> do painel de plantão não
+acha o pod, e alguém conclui que o site está fora do ar.</p>
+
+<p>A missão é acrescentar <code>tier: web</code> embaixo de <code>labels</code>, sem mexer no resto, e
+rodar. O painel mostra a tabela do <code>get pods --show-labels</code>, que é o jeito mais rápido de
+conferir o resultado.</p>
+
+<div class="tryk8s" data-get="pods --show-labels" data-goal="campo:Pod/cardapio|metadata.labels.tier=web;;texto:app=cardapio,tier=web">
+  <p class="try-task">O pod está sem a etiqueta combinada. Acrescente <code>tier: web</code> embaixo de
+  <code>labels</code> e rode: a coluna <code>LABELS</code> tem de mostrar
+  <code>app=cardapio,tier=web</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE   LABELS
+cardapio   1/1     Running   0          2m    app=cardapio
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    tier: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+</div>
+
+<p>A resposta traz <code>pod/cardapio created</code> e a tabela com a coluna extra. As etiquetas aparecem
+em ordem alfabética (<code>app</code> antes de <code>tier</code>), separadas por vírgula e sem espaço —
+detalhe que importa quando você for copiar o texto para um <code>-l</code>.</p>
+
+<p>Se você já tivesse esse pod rodando e só quisesse acrescentar a etiqueta, não precisaria reaplicar o
+manifesto: <code>kubectl label pod/cardapio tier=web</code> resolveria. Aplicar de novo também funciona,
+porque o <code>apply</code> compara o que você mandou com o que está lá e responde
+<code>unchanged</code> ou <code>configured</code> conforme o caso.</p>
+
+<h2>5. Etiquetar um pod que já está rodando</h2>
+
+<p>A segunda caixa é um terminal, e o cenário é o plantão da madrugada: o pod subiu com <code>kubectl
+run</code> (que só põe <code>run=cardapio</code>), e o painel de monitoramento filtra por
+<code>tier=web</code>. Resultado: o pod existe, roda, atende — e não aparece em lugar nenhum.</p>
+
+<p>A missão é etiquetar o pod com <code>tier=web</code> e conferir com o filtro. Repare na ordem dos
+comandos: primeiro o pod precisa existir, senão o <code>label</code> responde que não achou.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="conta:pods[tier=web]=1;;texto:Running">
+  <p class="try-task">O pod foi criado mas ficou com a etiqueta errada (<code>camada=web</code>), e o
+  filtro do plantão usa <code>tier=web</code>. Etiquete o pod com <code>tier=web</code> e rode o filtro
+  de novo.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl label pod/cardapio camada=web
+kubectl get pods -l tier=web</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl label pod/cardapio camada=web
+pod/cardapio labeled
+
+ana@notebook:~$ kubectl get pods -l tier=web
+No resources found in default namespace.
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl label pod/cardapio tier=web
+kubectl get pods -l tier=web</pre>
+</div>
+
+<p>No código inicial, o filtro responde <code>No resources found in default namespace.</code> — e é
+literalmente verdade: nenhum pod tem <code>tier=web</code>, porque a etiqueta foi para a chave errada.
+Trocar <code>camada</code> por <code>tier</code> faz a linha do pod aparecer.</p>
+
+<p>Se você rodar <code>kubectl get pods -l tier=web --show-labels</code>, vai ver a coluna
+<code>LABELS</code> com <code>run=cardapio,tier=web</code>: a etiqueta do <code>kubectl run</code> continua
+lá, e a nova entrou ao lado. É o normal — <code>kubectl label</code> soma chaves, não substitui o mapa
+inteiro. Quem substitui o mapa é o <code>apply</code>, e é por isso que os dois caminhos podem dar
+resultados diferentes quando o manifesto não lista todas as etiquetas que o objeto já tinha.</p>
+
+<p>Vale reparar que o objeto <em>não</em> é recriado: o pod continua com o mesmo nome, o mesmo IP e a
+mesma idade. O <code>kubectl label</code> manda um <code>patch</code> no objeto e o cluster só atualiza
+<code>metadata.labels</code>. É uma mudança barata e imediata — e é por isso que ela aparece tanto em
+runbook de plantão.</p>
+
+<h2>6. A etiqueta do template desce para os pods</h2>
+
+<p>Quase todo pod em produção nasce de um Deployment, e a label dele não é digitada no pod: ela está no
+<code>spec.template.metadata.labels</code> — o “molde” que o Deployment usa para fabricar pods. Quem
+escreve a etiqueta no molde está etiquetando todos os pods que nascerem dali, inclusive os que forem
+recriados depois.</p>
+
+<p>A terceira caixa tem um Deployment de duas réplicas com o seletor em <code>app=cardapio</code> e o
+molde com a mesma etiqueta. Falta o <code>tier: web</code> no molde. A missão é acrescentar e conferir
+que os dois pods nasceram com as duas etiquetas.</p>
+
+<div class="tryk8s" data-get="pods --show-labels" data-goal="conta:pods[tier=web]=2;;texto:app=cardapio,tier=web">
+  <p class="try-task">Acrescente <code>tier: web</code> nas labels do <code>template</code> (não nas do
+  Deployment) e rode. As duas réplicas precisam ficar com <code>tier=web</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE   LABELS
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m    app=cardapio
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m   app=cardapio
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        tier: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Duas coisas para observar. A primeira: as labels do <code>metadata</code> do Deployment (no topo) são
+do Deployment, não dos pods; mexer nelas não muda pod nenhum. A segunda: o seletor continua em
+<code>app=cardapio</code>, e o molde tem <code>app</code> <em>e</em> <code>tier</code>. Isso é permitido e
+é o normal — o seletor precisa casar com um subconjunto das labels do molde, não com todas.</p>
+
+<p>Se você pusesse no molde uma etiqueta que o seletor não conhece, tudo certo; se pusesse no molde um
+pod <em>sem</em> a etiqueta que o seletor exige, o cluster recusaria com
+<code>selector does not match template labels</code>. Essa é uma das validações mais úteis do
+Deployment: ela impede que o Deployment crie pods que ele mesmo não reconheceria como seus.</p>
+
+<h2>7. Trocar, remover e o --overwrite</h2>
+
+<p>Etiqueta errada é rotina. O valor certo muda quando o serviço sobe de versão, quando o pod muda de
+time, quando a padaria abre uma loja nova. Para trocar o valor de uma chave que já existe, o kubectl
+exige que você diga isso explicitamente, com <code>--overwrite</code>. Sem a flag, ele se recusa:</p>
+
+<pre class="term">$ kubectl label pod cardapio tier=front
+error: 'tier' already has a value (web), and --overwrite is false</pre>
+
+<p>A mensagem é curta e específica: a chave já tem valor, e o comando não pediu permissão para
+sobrescrever. A correção é acrescentar <code>--overwrite</code>. O motivo de existir essa trava é
+proteção: um script antigo que etiqueta <code>tier=web</code> não pode, sem querer, desfazer a mudança
+que o time fez ontem.</p>
+
+<p>Para remover, o sinal é o hífen no fim, sem valor: <code>kubectl label pod/cardapio tier-</code>. O
+kubectl responde <code>pod/cardapio labeled</code> e a chave some. É o mesmo comando, com uma sintaxe
+estranha que vale memorizar — quem tenta <code>tier=""</code> não remove nada, só deixa o valor vazio,
+que é diferente de não ter a etiqueta.</p>
+
+<p>Remover uma chave que não existe não é erro: o kubectl responde <code>labeled</code> e nada muda.
+Isso é conveniente em script (rodar duas vezes não quebra), mas também é uma armadilha de diagnóstico —
+“eu rodei o comando e ele disse que fez” não prova que a etiqueta estava lá antes. Confira com
+<code>--show-labels</code> antes e depois.</p>
+
+<p>E existe o caminho declarativo, que é o que você quer em produção: tirar a linha do manifesto e
+reaplicar. O <code>apply</code> substitui o mapa de labels pelo que está no arquivo, então a etiqueta que
+saiu do YAML sai do objeto. A diferença é de registro: no arquivo, a mudança fica versionada e revisável;
+no comando, ela existe só no histórico do seu terminal.</p>
+
+<h2>8. Seletores na prática</h2>
+
+<p>O <code>-l</code> aceita mais de um par, separado por vírgula, e a leitura é “E”: todos precisam casar.
+<code>-l app=cardapio,tier=web</code> devolve só o que tem as duas etiquetas. Não existe “ou” no mesmo
+filtro — para isso você roda duas vezes, ou usa a sintaxe de conjunto
+(<code>-l 'tier in (web,api)'</code>), que o painel deste guia não implementa mas o cluster de verdade
+aceita.</p>
+
+<p>Uma coluna por etiqueta é o jeito mais confortável de ler muita coisa de uma vez. O `-L` pede uma
+coluna por chave, e é o que a Ana usa quando quer comparar o ambiente de cada pod sem abrir um por um
+(transcrição de um cluster local de três nós):</p>
+
+<pre class="term">$ kubectl get pods -Lapp -Ltier
+NAME       READY   STATUS    RESTARTS   AGE   APP        TIER
+cardapio   1/1     Running   0          5m    cardapio   web
+forno      1/1     Running   0          3m    forno</pre>
+
+<p>O pod sem a etiqueta fica com a célula vazia — e é assim que você descobre, olhando, quem escapou da
+convenção. Vale mais do que uma auditoria: a etiqueta que falta aparece na tela.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Chave</th><th>Para que serve</th><th>Exemplo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>app</code></td><td>qual aplicação é</td><td><code>app: cardapio</code></td></tr>
+<tr><td><code>tier</code></td><td>que papel ela tem na arquitetura</td><td><code>tier: web</code></td></tr>
+<tr><td><code>ambiente</code></td><td>onde roda</td><td><code>ambiente: producao</code></td></tr>
+<tr><td><code>versao</code></td><td>qual versão está no ar</td><td><code>versao: "1.4.0"</code></td></tr>
+<tr><td><code>app.kubernetes.io/name</code></td><td>a convenção oficial do Kubernetes para o nome da
+aplicação</td><td><code>app.kubernetes.io/name: cardapio</code></td></tr>
+<tr><td><code>app.kubernetes.io/managed-by</code></td><td>quem cuida do objeto</td><td><code>helm</code>,
+<code>kustomize</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>As chaves com prefixo <code>app.kubernetes.io/</code> são as <em>recommended labels</em> da
+documentação. Você não é obrigado a usá-las, mas ganha compatibilidade com ferramentas que as conhecem.
+O importante é escolher uma convenção e mantê-la: metade do time com <code>env</code> e metade com
+<code>ambiente</code> é pior do que qualquer nome feio escolhido em conjunto.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o pod que não aparecia no monitoramento</h3>
+<p>O painel filtrava por <code>app=cardapio</code>, e o pod tinha <code>app=cardapio-web</code>. Nenhum
+erro, nenhum alerta, nenhum pod na tela. A Ana perdeu uma hora procurando problema no cluster até rodar
+<code>kubectl get pods --show-labels</code> e ver a diferença de uma letra. A lição: antes de investigar
+o cluster, confira se o filtro e a etiqueta falam a mesma língua.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a etiqueta trocada que tirou o pod do Service</h3>
+<p>Alguém trocou <code>app: cardapio</code> por <code>app: cardápio</code> (com acento) no manifesto. O
+pod subiu normalmente, mas o Service, que seleciona por <code>app=cardapio</code>, deixou de vê-lo: os
+endpoints ficaram vazios e o site começou a dar erro 503. Label é texto exato — acento, maiúscula e
+espaço contam. Se o Service está sem endpoint, o primeiro lugar para olhar é a etiqueta do pod.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o Deployment que recriou tudo ao mudar a etiqueta</h3>
+<p>A Ana mudou <code>tier: web</code> para <code>tier: api</code> no molde do Deployment. O cluster
+entendeu que o molde era outro, criou um ReplicaSet novo e foi trocando os pods um a um — o tal do
+rolling update, que é o assunto do Nível 2. Nada quebrou, mas o <code>AGE</code> de todos os pods voltou
+a zero e o IP mudou. Etiqueta em molde é mudança de verdade: o cluster trata como versão nova.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Onde a etiqueta de um pod fica no manifesto?</p>
+<label><input type="radio" name="q1"> em <code>spec.containers.labels</code></label>
+<label><input type="radio" name="q1"> em <code>metadata.labels</code></label>
+<label><input type="radio" name="q1"> em <code>status.labels</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que <code>kubectl label pod/cardapio tier-</code>
+faz?</p>
+<label><input type="radio" name="q2"> cria a chave <code>tier</code> com valor vazio</label>
+<label><input type="radio" name="q2"> troca o valor de <code>tier</code> para <code>web</code></label>
+<label><input type="radio" name="q2"> remove a chave <code>tier</code> do objeto</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que <code>kubectl label pod/x tier=front</code>
+pode falhar com <code>--overwrite is false</code>?</p>
+<label><input type="radio" name="q3"> porque a chave já tem outro valor e o comando não pediu para
+sobrescrever</label>
+<label><input type="radio" name="q3"> porque <code>front</code> não é um valor permitido</label>
+<label><input type="radio" name="q3"> porque o pod não tem etiqueta nenhuma</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a etiqueta certa no lugar certo</h2>
+<p>Um pod criado por Deployment precisa nascer com <code>app=cardapio</code> e <code>tier=web</code>, e o
+Deployment precisa continuar selecionando pelo <code>app</code>. Complete o caminho do campo no manifesto
+onde essas etiquetas são escritas:</p>
+<div class="ex-code">spec.<input aria-label="resposta 1" data-answer="template" placeholder="...">.metadata.labels
+  app: cardapio
+  tier: web</div>
+<p class="ex-dica">Dica: as labels do topo do Deployment são do próprio Deployment. As que descem para os
+pods ficam dentro do molde de pod, que é o <code>spec.template</code>. O seletor
+(<code>spec.selector.matchLabels</code>) precisa casar com um subconjunto dessas etiquetas.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Label é classificação, não identidade: fica em <code>metadata.labels</code>, é texto dos dois lados e
+pode repetir entre objetos — é isso que permite juntar. As regras de formato são as de sempre: até 63
+caracteres, minúsculas, números, <code>-</code>, <code>_</code> e <code>.</code>, começando e terminando
+por letra ou número, com prefixo de domínio opcional.</p>
+
+<p>No dia a dia, quatro comandos resolvem quase tudo: <code>--show-labels</code> para ver,
+<code>-l</code> para filtrar (com vírgula significando “e”), <code>kubectl label</code> para criar ou
+trocar (com <code>--overwrite</code> quando a chave já existe) e <code>chave-</code> para remover. O
+caminho declarativo — editar o YAML e reaplicar — é o que deixa rastro.</p>
+
+<p>No Deployment, a etiqueta que vale é a do <code>spec.template</code>, porque é ela que desce para cada
+pod. O seletor precisa casar com um subconjunto dessas etiquetas; se o molde não tiver a etiqueta que o
+seletor pede, o cluster recusa o manifesto. E, quando um Service fica sem endpoint, a primeira suspeita é
+sempre a etiqueta do pod: uma letra errada derruba a ligação sem produzir erro nenhum.</p>
+
+<p>Na próxima aula a Ana conhece o vizinho da label: a <em>annotation</em>, que também é chave e valor em
+<code>metadata</code>, mas serve para informação — e não para selecionar nada.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+<li><code>metadata.labels</code>: chave e valor de texto, até 63 caracteres cada, com prefixo
+opcional.</li>
+<li><code>kubectl get pods --show-labels</code> mostra; <code>-l app=cardapio,tier=web</code> filtra com
+“e” entre os pares.</li>
+<li><code>kubectl label pod/x chave=valor</code>; <code>--overwrite</code> para trocar; <code>chave-</code>
+para remover.</li>
+<li>No Deployment, <code>spec.template.metadata.labels</code> é o que chega aos pods.</li>
+<li>O seletor casa com um subconjunto das labels do molde — nunca com todas.</li>
+<li>Service sem endpoint quase sempre é etiqueta errada no pod.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

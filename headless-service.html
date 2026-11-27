@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Headless Service | Guia Kubernetes</title>
+<meta name="description" content="Headless Service na prática: clusterIP None, o DNS que devolve os IPs dos pods, o nome por pod com StatefulSet e quando trocar o balanceamento por uma lista de destinos.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Headless <span class="hl">Service</span></h1>
+<p class="intro">Todos os Services que a Ana viu até aqui têm uma coisa em comum: um ClusterIP, um endereço
+virtual único que esconde os pods e divide o tráfego por baixo. Mas há um tipo de cliente que <em>não</em> quer
+isso. Um banco replicado, um cache distribuído, um sistema que precisa falar com cada réplica sabendo qual é
+qual — todos precisam da lista de pods, não de um endereço só. Para eles existe o
+<strong>headless Service</strong>: um Service sem ClusterIP, cujo nome DNS devolve os IPs dos pods.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que muda quando um Service declara <code>clusterIP: None</code>.</li>
+  <li>O que o DNS responde num Service normal e o que responde num headless.</li>
+  <li>Como cada pod ganha um nome próprio, e o que o StatefulSet tem a ver com isso.</li>
+  <li>Por que o cliente passa a fazer o balanceamento (e quando isso é bom).</li>
+  <li>Quando usar headless e quando ele só cria problema.</li>
+  <li>Os tropeços: endpoints vazios, cache de DNS e aplicação que espera um IP só.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o cliente que precisa de todos</h2>
+
+<p>O cardápio da padaria cresceu e a Ana colocou um cache na frente do banco: três réplicas guardando os
+preços em memória. O site precisa consultar as três — não uma qualquer. Se cada consulta cair numa réplica
+diferente, metade das respostas vem de uma cópia desatualizada, e o preço muda conforme o cliente recarrega a
+página. O problema não é o Service: é que o Service foi feito para esconder os pods, e aqui a Ana precisa
+justamente do contrário.</p>
+
+<p>Com um Service comum, o nome <code>cache</code> resolve para um ClusterIP, e o ClusterIP distribui as
+conexões entre as três réplicas. É ótimo para um site sem estado, que não se importa com qual réplica
+responde. É péssimo para um cliente que quer escolher: falar com a réplica 2 para escrever e com todas para
+ler, ou manter uma conexão fixa com cada uma delas.</p>
+
+<p>O <strong>headless Service</strong> resolve exatamente isso: ele existe como Service — tem nome, seletor e
+portas, e o DNS do cluster responde por ele — mas não tem ClusterIP. Sem o endereço virtual, o nome resolve
+direto para os IPs dos pods. O cliente recebe a lista e decide o que fazer com ela, e o balanceamento passa a
+ser problema de quem chama.</p>
+
+<h2>2. O que é um headless Service</h2>
+
+<p>“Headless” quer dizer “sem cabeça” — sem o ClusterIP, que é a cabeça do Service tradicional. Não é um tipo
+novo no campo <code>type</code>; é o mesmo Service do tipo ClusterIP com um valor especial no campo
+<code>clusterIP</code>: a palavra <code>None</code>. A partir daí, o comportamento do DNS muda.</p>
+
+<dl class="anatomy">
+<dt><code>clusterIP: None</code></dt>
+<dd>O que faz um Service ser headless. O cluster não cria endereço virtual para ele.</dd>
+<dt>registros A</dt>
+<dd>As respostas de DNS que apontam um nome para IPs. Num Service normal é um IP; num headless, um por
+pod.</dd>
+<dt>nome por pod</dt>
+<dd>Com StatefulSet, cada pod ganha <code>pod-0.nome</code>, <code>pod-1.nome</code> — endereços estáveis
+para réplicas que têm identidade.</dd>
+<dt><code>serviceName</code></dt>
+<dd>O campo do StatefulSet que liga os pods ao headless Service e habilita o nome por pod.</dd>
+<dt>Endpoints</dt>
+<dd>A lista de destinos, que existe igual nos dois casos — mas no headless é <em>entregue</em> ao cliente, e
+não escondida atrás de um IP.</dd>
+</dl>
+
+<p>Repare no que não muda: o seletor, as portas, o <code>targetPort</code> e os Endpoints são iguais. Se você
+trocar <code>clusterIP: None</code> por um Service normal, a lista de destinos continua a mesma — o que muda é
+quem a vê. No Service normal, o kube-proxy lê a lista e encaminha; no headless, o cliente lê a lista pelo DNS e
+conecta direto no pod.</p>
+
+<p>Essa diferença tem uma consequência de rede importante: no headless, o cliente fala com o IP do pod, e
+não com um IP virtual. Se o pod morre, aquela conexão morre com ele — não há reencaminhamento mágico. É por
+isso que headless combina com clientes que sabem lidar com falha por conta própria, como drivers de banco e
+bibliotecas de cache distribuído.</p>
+
+<h2>3. O manifesto do headless</h2>
+
+<p>A mudança é de uma linha. A caixa abaixo tem o Service do cardápio do jeito tradicional e pede a
+transformação; repare que o resto do manifesto não muda nada.</p>
+
+<div class="tryk8s" data-get="services" data-goal="campo:Service/cardapio|spec.clusterIP=None;;texto:None">
+  <p class="try-task">Transforme o Service em headless: declarar <code>clusterIP: None</code> e rodar. A
+  coluna <code>CLUSTER-IP</code> tem de mostrar <code>None</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+pod/web created
+service/cardapio created
+
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        80/TCP    2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  clusterIP: None
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>O painel do código inicial mostra um ClusterIP normal, <code>10.96.147.79</code>. Depois da missão, a
+coluna passa a mostrar <code>None</code> — e é a única diferença visível na tabela. O tipo continua
+<code>ClusterIP</code>, porque headless não é um tipo: é um ClusterIP sem endereço.</p>
+
+<pre class="term">$ kubectl get services
+NAME       TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   None         &lt;none&gt;        80/TCP    2m</pre>
+
+<p>A transcrição acima é a resposta do painel para o Service headless do cardápio. Comparada com a de um
+Service comum, a única diferença é a coluna do meio — e é justamente ela que muda o comportamento do DNS. Vale
+guardar essa imagem: o dia a dia é cheio de Services iguais, e o <code>None</code> é o sinal de que aquele
+nome devolve uma lista.</p>
+
+<p>Repare que a coluna <code>TYPE</code> mentiria para quem só olha ela. Num inventário rápido, um Service
+headless parece um ClusterIP comum; o que o denuncia é a coluna <code>CLUSTER-IP</code> com
+<code>None</code>. Em time grande, vale uma etiqueta ou uma anotação para marcar os headless — quem procura
+“quem tem IP” não deveria precisar abrir objeto por objeto.</p>
+
+<h2>4. O que o DNS responde</h2>
+
+<p>Aqui está o coração da aula. Quando um cliente consulta o nome de um Service normal, o CoreDNS devolve
+<em>um</em> endereço: o ClusterIP. Quando consulta o nome de um headless, devolve <em>todos</em> os IPs dos
+pods prontos, um por registro. É a mesma consulta, com respostas de naturezas diferentes.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Consulta</th><th>Service normal</th><th>Headless</th></tr>
+</thead>
+<tbody>
+<tr><td>o que o nome resolve</td><td>um IP virtual (ClusterIP)</td><td>um IP por pod pronto</td></tr>
+<tr><td>quem balanceia</td><td>o kube-proxy, por conexão</td><td>o cliente, com a lista que recebeu</td></tr>
+<tr><td>nome por pod</td><td>não existe</td><td>existe com StatefulSet</td></tr>
+<tr><td>pod morre</td><td>a conexão é reencaminhada</td><td>a conexão cai; o cliente reconecta</td></tr>
+<tr><td>uso típico</td><td>site, API sem estado</td><td>banco, cache, filas com identidade</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa resposta múltipla é o que permite ao cliente escolher. Uma biblioteca de cache lê a lista e mantém uma
+conexão com cada réplica; um driver de banco usa a lista para descobrir quem é o primário e quem são as
+réplicas; um serviço de fila conecta em todos para saber o estado do cluster. Em todos os casos, o DNS é só o
+catálogo de endereços — a inteligência está no cliente.</p>
+
+<p>Um detalhe que costuma pegar: como a resposta é uma lista, o cliente escolhe um dos endereços quando faz a
+conexão, e costuma guardar essa escolha. Em linguagens cujo resolvedor tenta o primeiro IP e desiste se ele
+falhar, um pod fora do ar pode causar erro em parte das chamadas até o cache expirar. Bibliotecas boas tentam
+o próximo; bibliotecas simples, não. É um dos motivos pelos quais headless exige cliente adulto.</p>
+
+<h2>5. O headless também precisa de seletor</h2>
+
+<p>Sem ClusterIP, é tentador pensar que o Service “não faz nada”. Ele faz: continua sendo o seletor que gera
+a lista de endpoints e o nome que o DNS publica. Se o seletor não casa com nenhum pod, o nome existe e não
+resolve para lugar nenhum — e o cliente recebe erro de resolução, não erro de conexão.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="campo:Service/cardapio|spec.selector.app=cardapio;;texto:10.244.">
+  <p class="try-task">O Service headless está sem <code>selector</code> e a lista de endpoints está vazia.
+  Acrescente o seletor <code>app: cardapio</code> e rode: o IP do pod tem de aparecer.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  clusterIP: None
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+pod/web created
+service/cardapio created
+
+NAME       ENDPOINTS   AGE
+cardapio   &lt;none&gt;      2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  clusterIP: None
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>O painel do código inicial mostra <code>cardapio &lt;none&gt;</code>: um nome que não leva a lugar nenhum.
+Depois da missão, o IP do pod aparece na lista. Num Service normal, esse mesmo problema apareceria como
+“conexão recusada” no ClusterIP; num headless, aparece antes: o cliente nem resolve o nome, porque não há
+registro para devolver.</p>
+
+<p>É uma diferença de sintoma que ajuda no diagnóstico. Headless com endpoints vazios falha na resolução;
+headless com endpoints cheios e cliente que não conecta aponta para a porta ou para o próprio pod. Nos dois
+casos, o comando é o mesmo: <code>kubectl get endpoints</code>.</p>
+
+<h2>6. Um nome por pod</h2>
+
+<p>O headless tem um superpoder que só aparece na companhia de um StatefulSet: cada pod ganha um nome DNS
+próprio e estável, no formato <code>pod.nome-do-service</code>. O pod <code>web-0</code> do StatefulSet
+<code>web</code>, ligado ao Service <code>cardapio</code>, responde em
+<code>web-0.cardapio</code> — e continua respondendo no mesmo nome mesmo depois de reiniciar e ganhar outro
+IP.</p>
+
+<div class="tryk8s" data-get="endpoints -o yaml" data-goal="campo:Endpoints/cardapio|subsets.0.addresses.1.targetRef.name=web-1;;campo:Endpoints/cardapio|subsets.0.addresses.0.targetRef.name=web-0;;texto:10.244.">
+  <p class="try-task">O StatefulSet está com uma réplica só. Suba para <code>2</code> réplicas e rode: o yaml
+  dos endpoints tem de listar <code>web-0</code> e <code>web-1</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  clusterIP: None
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: cardapio
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+service/cardapio created
+statefulset.apps/web created
+
+apiVersion: v1
+kind: Endpoints
+metadata:
+  labels:
+    endpoints.kubernetes.io/managed-by: endpoint-controller
+  name: cardapio
+  namespace: default
+subsets:
+  - addresses:
+      - ip: 10.244.211.221
+        nodeName: guia-control-plane
+        targetRef:
+          kind: Pod
+          name: web-0
+          namespace: default
+    ports:
+      - port: 8080
+        protocol: TCP
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  clusterIP: None
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: cardapio
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>O yaml do código inicial mostra um endereço só, com <code>targetRef: name: web-0</code>. Depois da missão,
+dois endereços, <code>web-0</code> e <code>web-1</code>, cada um com o seu IP e o seu nó. É a lista que o
+cliente de banco ou de cache precisa: identidade e endereço para cada réplica.</p>
+
+<pre class="term">$ kubectl get pods -o wide
+NAME    READY   STATUS    RESTARTS   AGE   IP               NODE
+web-0   1/1     Running   0          9m    10.244.211.221   guia-control-plane
+web-1   1/1     Running   0          3m    10.244.51.225    guia-worker</pre>
+
+<p>A transcrição acima é a resposta do painel para os pods do StatefulSet. Repare na diferença de nomes em
+relação a um Deployment: <code>web-0</code> e <code>web-1</code>, previsíveis, em vez de
+<code>web-6d8f89b786-88dn9</code>. Essa previsibilidade é o que permite o nome DNS por pod existir — e é por
+isso que o <code>serviceName</code> no StatefulSet não é decoração: é ele que liga o pod ao Service
+headless.</p>
+
+<p>Com o nome por pod, um cliente pode falar com uma réplica específica: <code>web-0.cardapio</code> sempre
+foi, é e será a primeira réplica, mesmo que o pod tenha sido recriado em outro nó. É a base de bancos de dados
+em Kubernetes: cada réplica precisa se reconhecer e ser reconhecida pelo cluster de dados.</p>
+
+<h2>7. Quando usar — e quando não</h2>
+
+<p>Use headless quando o cliente precisa da lista: banco de dados com réplica primária e secundárias, cache
+distribuído, sistemas de fila que descobrem membros, qualquer aplicação que implemente o próprio
+balanceamento. Use também quando você quer nomes por pod, o que praticamente implica StatefulSet.</p>
+
+<p>Não use quando a aplicação espera um endereço único. Um site que faz <code>fetch("http://api")</code> e
+confia no balanceamento do cluster fica pior com headless: ele vai resolver um dos pods e ficar com ele, e
+algumas instâncias vão receber muito mais tráfego que outras. Nesse caso, o Service normal com ClusterIP faz o
+trabalho havia décadas.</p>
+
+<p>Há um caso intermediário que confunde: o cliente que precisa de todos os endereços mas quer o
+balanceamento do cluster para as chamadas comuns. A solução usual é ter os dois — um Service normal para o
+tráfego de leitura e um headless para a descoberta de membros. São dois objetos com nomes diferentes, apontando
+para o mesmo conjunto de pods, e cada um serve ao seu propósito sem atrapalhar o outro.</p>
+
+<p>Também não use como sinônimo de “Service mais avançado”. Headless não é um upgrade: é uma escolha de quem
+balanceia. Trocar um ClusterIP por headless num cliente que não sabe lidar com lista é uma forma silenciosa de
+quebrar disponibilidade — o cliente para de ter para onde cair quando um pod morre.</p>
+
+<h2>8. Os tropeços do headless</h2>
+
+<p>O primeiro é o cliente que espera um IP: bibliotecas antigas leem a primeira resposta do DNS e descartam o
+resto. O resultado é tráfego concentrado em um pod e erros quando ele morre. O segundo é o cache de DNS:
+respostas curtas são boas, mas um cliente que guarda a lista por dez minutos fica desatualizado depois de um
+rollout. O terceiro é tentar usar headless para fora do cluster: sem IP, não há como publicar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td>o nome não resolve</td><td>headless sem seletor ou com endpoints vazios</td><td>conferir
+<code>get endpoints</code> e o seletor</td></tr>
+<tr><td>um pod recebe todo o tráfego</td><td>o cliente escolhe o primeiro IP da resposta</td><td>usar
+ClusterIP, ou um cliente que distribua</td></tr>
+<tr><td>erros intermitentes após um pod cair</td><td>lista em cache no cliente</td><td>reduzir o TTL do
+cache, ou reconectar com a lista nova</td></tr>
+<tr><td>não resolve de fora do cluster</td><td>headless não tem IP para publicar</td><td>expor por Ingress ou
+por um Service normal</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o cache que lia sempre a mesma réplica</h3>
+<p>O time trocou o Service do cache por headless para “distribuir melhor” e o resultado foi o contrário: a
+biblioteca antiga pegava o primeiro IP da resposta e ficava com ele para sempre. Uma réplica recebia todo o
+tráfego e as outras ficavam ociosas. A correção foi voltar ao ClusterIP — o balanceamento por conexão, no
+kube-proxy, já era o que o cliente precisava.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o banco que precisava de nomes</h3>
+<p>O banco da padaria cresceu para três instâncias: uma primária e duas secundárias. O driver precisa saber
+quem é quem, e para isso precisa de nomes estáveis por instância. Com StatefulSet e headless Service, as
+réplicas passaram a responder em <code>banco-0</code>, <code>banco-1</code> e <code>banco-2</code>. Quando
+uma foi recriada em outro nó, o nome continuou o mesmo — o driver nem percebeu.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o headless que ninguém precisava</h3>
+<p>Numa revisão de arquitetura, alguém propôs trocar todos os Services por headless “para eliminar o
+ClusterIP”. A aplicação era um site sem estado, com três réplicas idênticas, e passou a resolver um pod só por
+sessão. Bastou um pod cair para metade dos usuários ver erro. O ClusterIP não é legado: é a escolha certa para
+quem não quer escolher.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que caracteriza um headless Service?</p>
+<label><input type="radio" name="q1"> o tipo <code>Headless</code> no campo <code>type</code></label>
+<label><input type="radio" name="q1"> a ausência de seletor</label>
+<label><input type="radio" name="q1"> <code>clusterIP: None</code>, sem endereço virtual</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O que o DNS devolve para um headless Service?</p>
+<label><input type="radio" name="q2"> um IP por pod pronto</label>
+<label><input type="radio" name="q2"> o ClusterIP do Service</label>
+<label><input type="radio" name="q2"> o IP do nó onde o pod está</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Quem faz o balanceamento de tráfego num headless?</p>
+<label><input type="radio" name="q3"> o kube-proxy, por conexão</label>
+<label><input type="radio" name="q3"> o cliente, a partir da lista que recebeu</label>
+<label><input type="radio" name="q3"> o CoreDNS, a cada requisição</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o campo que remove o IP</h2>
+<p>Complete o manifesto para o Service virar headless:</p>
+<div class="ex-code">spec:
+  <input aria-label="resposta 1" data-answer="clusterIP: None|clusterIP:None" placeholder="...">
+  selector:
+    app: cardapio</div>
+<p class="ex-dica">Dica: é o campo do endereço virtual, com um valor especial em vez de um IP.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Headless Service é um Service sem ClusterIP: <code>clusterIP: None</code>. Ele continua tendo nome, seletor,
+portas e endpoints — mas o DNS responde com os IPs dos pods em vez de um endereço virtual. O cliente recebe a
+lista e decide com quem falar, o que faz sentido para bancos replicados, caches distribuídos e qualquer sistema
+que implemente o próprio balanceamento.</p>
+
+<p>Com StatefulSet, o headless ganha outra função: dar nome estável a cada pod, no formato
+<code>pod.serviço</code>. É o que permite a um banco saber quem é a réplica 0 e a 1, mesmo depois de recriadas
+em outros nós. O campo <code>serviceName</code> do StatefulSet é a ligação entre os dois.</p>
+
+<p>Para o site comum, o ClusterIP continua sendo a escolha certa: endereço único, balanceamento automático e
+tolerância a pod que morre. Headless não é upgrade — é uma transferência de responsabilidade para o cliente.
+E, como todo Service, ele só funciona com endpoints: sem seletor, o nome não resolve para lugar nenhum.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>clusterIP: None</code> é o que faz um Service ser headless.</li>
+  <li>O DNS devolve um IP por pod pronto, em vez de um endereço virtual.</li>
+  <li>Quem balanceia é o cliente — ele precisa saber lidar com lista e com pod que morre.</li>
+  <li>Com StatefulSet e <code>serviceName</code>, cada pod ganha <code>pod-0.nome</code>.</li>
+  <li>Seletor continua obrigatório para haver endpoints.</li>
+  <li>Headless não se publica para fora: não há IP para apontar.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

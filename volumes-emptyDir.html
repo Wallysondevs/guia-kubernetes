@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>emptyDir | Guia Kubernetes</title>
+<meta name="description" content="emptyDir na prática: o volume temporário que nasce com o pod, como dois containers compartilham a mesma pasta, medium Memory, sizeLimit e o que acontece quando o pod morre.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">emptyDir</span></h1>
+<p class="intro">O site da padaria precisa gerar o relatório de vendas do dia e enviá-lo por e-mail. Quem
+gera é o container <code>web</code>; quem envia é um segundo container, o <code>exportador</code>. Os dois
+rodam no mesmo pod e precisam da mesma pasta — e a Ana não quer um banco de dados só para guardar um CSV que
+vive cinco minutos. A resposta é o <strong>emptyDir</strong>: um diretório temporário que nasce com o pod,
+é compartilhado pelos containers dele e desaparece quando o pod desaparece.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um <code>emptyDir</code> e por que ele é o volume mais simples do Kubernetes.</li>
+  <li>As duas peças do manifesto: <code>volumes</code> e <code>volumeMounts</code>.</li>
+  <li>Como dois containers do mesmo pod compartilham a mesma pasta.</li>
+  <li>O ciclo de vida: sobrevive ao reinício do container, morre com o pod.</li>
+  <li><code>medium: Memory</code> e <code>sizeLimit</code>: quando usar e o que eles mudam.</li>
+  <li>Por que <code>emptyDir</code> não é cache compartilhado entre réplicas.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o CSV que ninguém quer guardar</h2>
+
+<p>O relatório do dia é um arquivo de duas mil linhas: pedido, valor, horário. O container
+<code>web</code> monta o arquivo em <code>/dados/vendas.csv</code> e avisa o <code>exportador</code>, que
+lê o mesmo caminho, comprime e manda por e-mail. Se os dois não enxergarem a mesma pasta, o exportador
+espera um arquivo que nunca aparece — e o relatório do dia simplesmente não sai.</p>
+
+<p>A Ana pensou em três soluções antes de chegar na certa. A primeira era gravar dentro do próprio
+container: funciona, mas o arquivo some no próximo deploy, porque o container é recriado do zero. A segunda
+era um bucket externo: funciona, custa latência e credencial para um arquivo descartável. A terceira era um
+banco: exagero para um CSV de cinco minutos. O <code>emptyDir</code> resolve o caso no meio: um diretório no
+nó, preso ao ciclo de vida do pod, montado nos dois containers.</p>
+
+<p>O nome ajuda a lembrar do comportamento: <em>empty directory</em>, diretório vazio. Ele começa vazio
+sempre que o pod nasce — não importa o que havia antes —, e o Kubernetes não se responsabiliza por nada que
+esteja lá depois que o pod morre. É o oposto de um disco persistente: aqui, perder o conteúdo é o
+comportamento esperado, não o acidente.</p>
+
+<h2>2. As duas peças do volume</h2>
+
+<p>Todo volume no Kubernetes aparece duas vezes no manifesto: uma na lista <code>volumes</code> do pod, que
+diz <em>o que existe</em>, e outra em <code>volumeMounts</code>, dentro do container, que diz <em>onde ele
+aparece</em>. O nome é o elo entre as duas — e é a causa mais comum de erro, porque um nome diferente em
+cada lado não gera erro de validação, só um diretório que nunca é montado.</p>
+
+<dl class="anatomy">
+<dt>volume</dt>
+<dd>A declaração do armazenamento no nível do pod, com um nome e um tipo. No caso desta aula, o tipo é
+<code>emptyDir</code>.</dd>
+<dt>volumeMounts</dt>
+<dd>A lista, dentro do container, que diz em qual caminho o volume aparece. Um mesmo volume pode ser montado
+em vários containers.</dd>
+<dt>emptyDir</dt>
+<dd>Um diretório no nó, criado quando o pod é agendado e apagado quando o pod deixa de existir. Começa
+vazio.</dd>
+<dt>medium</dt>
+<dd>Onde o diretório vive: no disco do nó (padrão) ou na memória (<code>Memory</code>). Memória é mais
+rápida e conta contra o limite de memória do pod.</dd>
+<dt>sizeLimit</dt>
+<dd>O tamanho máximo que o <code>emptyDir</code> pode ocupar. Sem ele, o volume pode crescer até encher o
+disco do nó.</dd>
+</dl>
+
+<p>Repare que o <code>emptyDir</code> não tem dono fora do pod: não existe um objeto separado para ele, como
+acontece com o PVC. Ele é criado pelo kubelet no momento em que o pod é agendado, no nó escolhido, e a vida
+dele é a vida do pod. Duas réplicas do mesmo Deployment têm dois <code>emptyDir</code> diferentes, em nós
+possivelmente diferentes — e essa é a parte que mais confunde quem está começando.</p>
+
+<h2>3. A montagem no pod do relatório</h2>
+
+<p>A caixa abaixo tem o pod com os dois containers, mas o volume só está montado no <code>web</code>. A
+tarefa é declarar o volume <code>dados</code> e montá-lo também no <code>exportador</code>, em
+<code>/dados</code>. Só assim os dois enxergam o mesmo arquivo.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/relatorio|spec.volumes.0.name=dados;;campo:Pod/relatorio|spec.containers.1.volumeMounts.0.mountPath=/dados;;texto:Running">
+  <p class="try-task">Declare o volume <code>dados</code> do tipo <code>emptyDir</code> e monte-o no
+  segundo container em <code>/dados</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: relatorio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+    - name: exportador
+      image: exportador:1.0</pre>
+<pre class="out">
+pod/relatorio created
+
+NAME        READY   STATUS    RESTARTS   AGE
+relatorio   2/2     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: relatorio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+    - name: exportador
+      image: exportador:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      emptyDir: {}</pre>
+</div>
+
+<p>O <code>emptyDir: {}</code> é a forma mais curta de dizer “volume temporário, sem opções”. As chaves
+dentro dele são opcionais: sem <code>medium</code>, o diretório fica no disco do nó; sem
+<code>sizeLimit</code>, sem teto. O painel aceita o manifesto e mostra o pod em
+<code>Running</code> com <code>2/2</code> — os dois containers prontos, o que também é o retrato do que se
+espera num cluster de verdade.</p>
+
+<p>Um detalhe que vale conferir sempre: o <code>mountPath</code> é o caminho <em>dentro do container</em>,
+não um caminho do nó. Dois containers podem montar o mesmo volume em caminhos diferentes — o
+<code>web</code> em <code>/dados</code> e o <code>exportador</code> em <code>/entrada</code> — e continuam
+vendo os mesmos arquivos. É o mesmo diretório com duas janelas.</p>
+
+<h2>4. O ciclo de vida: o que morre com o quê</h2>
+
+<p>O <code>emptyDir</code> vive enquanto o pod vive. Se o container <code>web</code> morrer e o kubelet
+reiniciá-lo, o volume continua lá, com os arquivos: o pod é o mesmo, só o processo foi refeito. Mas se o pod
+for apagado — por um deploy, por um <code>kubectl delete</code>, por um nó que caiu —, o volume vai junto, e
+o pod seguinte começa com o diretório vazio.</p>
+
+<p>Essa diferença explica dois comportamentos que parecem contraditórios. Um serviço que grava cache no
+<code>emptyDir</code> sobrevive a um <code>CrashLoopBackOff</code> com o cache intacto, porque os reinícios
+são do container. Mas o mesmo serviço perde tudo no deploy seguinte, porque o Deployment cria pods novos —
+e pods novos, volumes novos. Quem precisa de dados entre deploys está procurando um PVC, não um
+<code>emptyDir</code>.</p>
+
+<p>É também por isso que o <code>emptyDir</code> não funciona como área compartilhada entre réplicas. Duas
+réplicas do cardápio têm dois volumes distintos, em dois nós distintos: o arquivo que a réplica A grava é
+invisível para a B. Se o requisito é “todo mundo lê o mesmo arquivo”, a solução é um PVC compartilhado, um
+bucket ou um banco — nunca um volume local.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="pronto:Deployment/cardapio=2;;campo:Deployment/cardapio|spec.template.spec.volumes.0.name=cache;;conta:pods=2">
+  <p class="try-task">Monte um <code>emptyDir</code> chamado <code>cache</code> em <code>/cache</code> no
+  container do site, com duas réplicas. Cada réplica ganha o seu diretório — o painel mostra os dois pods
+  prontos.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: cache
+          emptyDir: {}</pre>
+</div>
+
+<p>O painel devolve os dois pods prontos, cada um com o seu diretório — copiado do motor:</p>
+
+<pre class="term">deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m</pre>
+
+<p>O volume fica dentro de <code>spec.template.spec</code>, não em <code>spec</code>: ele é parte do modelo
+de pod, e cada réplica recebe o seu. Se você colocar o bloco no lugar errado, o cluster recusa o manifesto
+com um erro de campo desconhecido — e a mensagem aponta a linha, o que ajuda a corrigir rápido.</p>
+
+<h2>5. medium: Memory e sizeLimit</h2>
+
+<p>O <code>emptyDir</code> tem duas opções que mudam o comportamento. A primeira é <code>medium:
+Memory</code>, que monta o diretório num sistema de arquivos em memória (tmpfs): leitura e escrita muito
+mais rápidas, ao custo de contar contra a memória do pod — e de desaparecer no primeiro reinício do nó. A
+segunda é <code>sizeLimit</code>, que impõe um teto ao volume e protege o disco do nó de um processo que
+escreve sem parar.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cache|spec.volumes.0.emptyDir.medium=Memory;;campo:Pod/cache|spec.volumes.0.emptyDir.sizeLimit=64Mi;;texto:Running">
+  <p class="try-task">O cache de sessões do site cabe em 64Mi e precisa ser rápido. Configure o volume com
+  <code>medium: Memory</code> e <code>sizeLimit: 64Mi</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cache
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      volumeMounts:
+        - name: sessoes
+          mountPath: /sessoes
+  volumes:
+    - name: sessoes
+      emptyDir: {}</pre>
+<pre class="out">
+pod/cache created
+
+NAME    READY   STATUS    RESTARTS   AGE
+cache   1/1     Running   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cache
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      volumeMounts:
+        - name: sessoes
+          mountPath: /sessoes
+  volumes:
+    - name: sessoes
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Mi</pre>
+</div>
+
+<p>Com <code>medium: Memory</code>, o volume mora na RAM do nó e o consumo entra na conta de memória do pod.
+Isso tem uma consequência que assusta: um volume em memória cheio pode levar o container ao
+<code>OOMKilled</code> — a morte não vem do processo, vem do diretório. Já o <code>sizeLimit</code> é um
+teto de uso: ao ser atingido, o comportamento é o kubelet despejar o pod, não truncar o arquivo. Os dois
+juntos são a combinação saudável para cache e sessões.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Chave</th><th>Valor</th><th>Efeito</th></tr>
+</thead>
+<tbody>
+<tr><td><code>medium</code></td><td><code>Memory</code></td><td>o diretório fica na RAM; rápido, conta na
+memória do pod</td></tr>
+<tr><td><code>medium</code></td><td>omitido</td><td>o diretório fica no disco do nó; o padrão</td></tr>
+<tr><td><code>sizeLimit</code></td><td><code>64Mi</code></td><td>teto do volume; ao atingir, o pod pode ser
+despejado</td></tr>
+<tr><td><code>sizeLimit</code></td><td>omitido</td><td>sem teto: pode crescer até encher o disco do
+nó</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A leitura prática dessa tabela: para arquivos de passagem — o CSV do relatório, o upload temporário, o
+buffer de compressão —, disco serve. Para o que precisa de latência baixa e é pequeno — cache de sessão,
+índice em memória, arquivo de troca entre containers —, <code>medium: Memory</code> com
+<code>sizeLimit</code> é a escolha. E para tudo que precisa sobreviver ao pod, nenhuma das duas: é PVC.</p>
+
+<h2>6. O que o emptyDir não é</h2>
+
+<p>O Kubernetes tem vários tipos de volume, e confundi-los é a origem de muitos manifestos que parecem
+certos e não funcionam. O <code>emptyDir</code> é o mais simples e o menos ambicioso: não persiste, não
+compartilha entre pods, não tem backup. A tabela abaixo coloca os vizinhos lado a lado.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tipo</th><th>O que é</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>emptyDir</code></td><td>diretório temporário no nó, preso ao pod</td><td>troca de arquivos entre
+containers, cache descartável</td></tr>
+<tr><td><code>configMap</code></td><td>arquivos vindos de um ConfigMap</td><td>configuração somente
+leitura</td></tr>
+<tr><td><code>secret</code></td><td>arquivos vindos de um Secret</td><td>senhas, certificados, chaves</td></tr>
+<tr><td><code>persistentVolumeClaim</code></td><td>disco persistente, independente do pod</td><td>banco de
+dados, uploads, qualquer dado que não pode sumir</td></tr>
+<tr><td><code>hostPath</code></td><td>um caminho do próprio nó</td><td>agentes que precisam ver o nó (assunto
+da próxima aula)</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A diferença entre <code>emptyDir</code> e PVC não é de tamanho nem de velocidade: é de dono. O
+<code>emptyDir</code> pertence ao pod; quando o pod deixa de existir, o volume deixa também. O PVC pertence
+ao cluster e sobrevive a deploys, a reinícios de nó e a mudanças de imagem. Escolher entre os dois é
+responder à pergunta “se este pod morrer agora, o dado pode ir junto?”.</p>
+
+<h2>7. As armadilhas do dia a dia</h2>
+
+<p>A primeira é o nome trocado. <code>volumes[].name</code> e <code>volumeMounts[].name</code> precisam ser
+idênticos, e o Kubernetes não valida isso como erro: um volume declarado e não montado é aceito, e um
+<code>volumeMount</code> apontando para um nome inexistente só aparece quando o pod falha ao subir. Se o
+container não vê a pasta, comece comparando os dois nomes caractere por caractere.</p>
+
+<p>A segunda é montar sobre um diretório que já tem conteúdo. Se você monta um volume em
+<code>/usr/share/nginx/html</code>, o que estava lá é escondido pelo volume vazio — o container passa a
+servir nada. A regra é montar em caminhos novos, criados para isso, e não sobre pastas da imagem.</p>
+
+<p>A terceira é o <code>emptyDir</code> sem teto. Um processo que escreve log ou arquivo temporário sem
+<code>sizeLimit</code> pode encher o disco do nó, e aí o despejo atinge pods que não têm nada a ver com o
+assunto. O limite do volume é a versão local do limite de memória: barato de declarar e caro de
+esquecer.</p>
+
+<p>A quarta é esquecer o <code>emptyDir</code> no caminho de um backup: volume temporário não é
+lugar de dado que alguém vai querer de volta.</p>
+
+<h2>8. O que o painel mostra (e o que ele não mostra)</h2>
+
+<p>O painel valida o manifesto, guarda o volume e os pontos de montagem e mostra os pods como
+<code>Running</code>. Ele não roda container, então não escreve arquivo nenhum: a prova de que o
+<code>emptyDir</code> funciona está nos campos do objeto, não num <code>ls</code> dentro do pod. É por isso
+que as caixas desta aula usam metas de <code>campo</code> — elas conferem o que o manifesto declara, que é
+exatamente o que o kubelet leria no cluster real.</p>
+
+<p>A leitura do resultado num cluster de verdade aparece no <code>describe</code>, na seção
+<code>Volumes</code> e na linha <code>Mounts</code> de cada container. É uma transcrição o que vem a
+seguir — ela mostra o formato que o kubectl imprime para um <code>emptyDir</code> em memória com limite:</p>
+
+<pre class="term">    Mounts:
+      /sessoes from sessoes (rw)
+Volumes:
+  sessoes:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     Memory
+    SizeLimit:  64Mi</pre>
+
+<p>Essa é a transcrição de um <code>kubectl describe pod</code> real, com as duas linhas que importam: o
+caminho montado e o tipo do volume. Quando o volume é um PVC, o tipo muda para
+<code>PersistentVolumeClaim</code> e aparece o nome do claim; quando é ConfigMap, aparece
+<code>ConfigMap</code> e o nome. A seção <code>Volumes</code> é o raio-x do armazenamento do pod, e vale
+olhá-la antes de culpar o aplicativo por “não achar o arquivo”.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o relatório que saía vazio depois do deploy</h3>
+<p>O exportador lia <code>/dados/vendas.csv</code> e, depois de cada deploy, mandava e-mail sem anexo. A
+causa não era o <code>emptyDir</code>: era o pod novo, com volume novo e vazio, recebendo a tarefa que
+estava na fila do pod antigo. O conserto foi gerar o arquivo no mesmo pod que o enviava — e não usar o
+volume como caixa de correio entre deploys.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o cache em memória que derrubou o pod</h3>
+<p>Um cache de sessões foi para <code>medium: Memory</code> sem <code>sizeLimit</code>. Numa tarde de
+promoção, o volume cresceu, o consumo do pod passou do limite de memória e o container morreu com
+<code>OOMKilled</code>. O gráfico mostrava memória subindo em degraus — o padrão de quem está guardando
+sessão em RAM sem teto. O conserto foi <code>sizeLimit: 64Mi</code> e expiração de sessão.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o upload que só funcionava em uma réplica</h3>
+<p>O site passou a aceitar foto de bolo personalizado e gravava o arquivo no <code>emptyDir</code>. Com duas
+réplicas, metade dos clientes via a foto e a outra metade via erro 404: o arquivo estava no volume da
+réplica A e a requisição caía na B. A solução foi um PVC compartilhado — e a lição ficou: volume local não é
+armazenamento compartilhado.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que acontece com o conteúdo de um <code>emptyDir</code>
+quando o pod é apagado?</p>
+<label><input type="radio" name="q1"> fica no nó até alguém limpar</label>
+<label><input type="radio" name="q1"> é apagado junto com o pod</label>
+<label><input type="radio" name="q1"> é copiado para o próximo pod do Deployment</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Dois containers do mesmo pod montam o mesmo
+<code>emptyDir</code> em caminhos diferentes. O que eles veem?</p>
+<label><input type="radio" name="q2"> arquivos diferentes, porque o caminho é diferente</label>
+<label><input type="radio" name="q2"> nada, porque só um pode montar por vez</label>
+<label><input type="radio" name="q2"> os mesmos arquivos, em dois caminhos</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Para que serve o <code>sizeLimit</code>?</p>
+<label><input type="radio" name="q3"> limitar o tamanho do volume e proteger o disco (ou a memória) do
+nó</label>
+<label><input type="radio" name="q3"> definir o tamanho do container</label>
+<label><input type="radio" name="q3"> reservar CPU para o volume</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o volume do relatório</h2>
+<p>No pod do relatório, o volume já está montado no container <code>web</code> em <code>/dados</code>. Para
+o <code>exportador</code> ler o mesmo arquivo, ele precisa do mesmo volume em <code>/dados</code>. Complete
+o caminho que falta no <code>volumeMount</code> do segundo container.</p>
+<div class="ex-code">volumeMounts:
+  - name: dados
+    mountPath: <input aria-label="resposta 1" data-answer="/dados" placeholder="..."></div>
+<p class="ex-dica">Dica: o <code>mountPath</code> é o caminho dentro do container. Pode ser igual ao do outro
+container — é o mesmo volume, com duas janelas.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>emptyDir</code> é um diretório temporário criado com o pod e apagado com ele. Aparece duas vezes no
+manifesto: em <code>spec.volumes</code>, com nome e tipo, e em <code>volumeMounts</code>, dentro de cada
+container, com o caminho. Dois containers do mesmo pod podem montá-lo em caminhos diferentes e veem os
+mesmos arquivos.</p>
+
+<p>O conteúdo sobrevive ao reinício do container, mas não ao fim do pod — e nunca é compartilhado entre
+réplicas. <code>medium: Memory</code> coloca o diretório na RAM (rápido, conta na memória do pod) e
+<code>sizeLimit</code> impõe um teto. Para dado que precisa durar, o caminho é PVC; para agente que precisa
+ver o nó, é <code>hostPath</code>, o assunto da próxima aula.</p>
+
+<p>O painel guarda e valida o manifesto, mas não escreve arquivo: a prova do volume está nos campos e no
+<code>describe</code> de um cluster real, que aparece aqui como transcrição. Na próxima aula a Ana olha para
+fora do pod e monta um diretório do próprio nó — com todo o poder e todo o risco que isso traz.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>emptyDir</code> nasce vazio com o pod e morre com ele; sobrevive só ao reinício do
+  container.</li>
+  <li>Duas peças: <code>volumes</code> (o quê) e <code>volumeMounts</code> (onde), ligadas pelo nome.</li>
+  <li>Não é compartilhado entre réplicas: cada pod tem o seu diretório.</li>
+  <li><code>medium: Memory</code> + <code>sizeLimit</code> para cache pequeno; PVC para o que precisa
+  durar.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

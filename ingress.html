@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ingress | Guia Kubernetes</title>
+<meta name="description" content="Ingress no Kubernetes: uma entrada HTTP para vários serviços, com host, path, pathType e backend, o papel do controller e como ler um Ingress que não roteia.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Ingress</span></h1>
+<p class="intro">O site da padaria cresceu: cardápio, painel de pedidos e uma API de preços, cada um com o seu
+Service. Para o cliente, isso virou um endereço esquisito com porta de cinco dígitos por aplicação. A Ana
+queria o contrário — um endereço só, <code>padaria.test</code>, com cada caminho levando para o serviço
+certo. É exatamente o que um Ingress faz: uma regra de roteamento HTTP escrita em YAML e entregue ao cluster.
+Nesta aula você monta a primeira regra, entende o que ela precisa para funcionar e aprende a achar o erro
+quando o caminho não chega.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um Ingress e por que ele não substitui o Service.</li>
+  <li>O papel do controller de Ingress e o que acontece sem ele.</li>
+  <li>Como ler uma regra: host, path, pathType e backend.</li>
+  <li>O que cada <code>pathType</code> faz na prática.</li>
+  <li>Como apontar um caminho para um Service e o que acontece quando o nome erra.</li>
+  <li>Como descobrir por que um Ingress não roteia, olhando os três elos da corrente.</li>
+</ul>
+</div>
+
+<h2>1. A cena: um endereço por aplicação</h2>
+
+<p>Até ontem, cada parte do site tinha o seu Service do tipo NodePort. O cardápio respondia em uma porta alta,
+o painel em outra, a API de preços em uma terceira. A Ana anotou as três num papel colado no balcão e mandou
+o link para os clientes. Funcionava — do jeito que funciona uma casa com três campainhas na porta.</p>
+
+<p>O problema aparece quando o número de aplicações cresce. Cada porta nova é uma linha a mais no papel, um
+link a mais para explicar e uma chance a mais de o cliente digitar errado. Pior: o certificado HTTPS vale
+para um domínio, não para uma porta. Se o site quer ser <code>padaria.test</code> — e a Ana quer — alguém
+precisa receber o tráfego na porta 80 ou 443 e decidir para onde mandar cada caminho.</p>
+
+<p>Esse “alguém” é o Ingress. Ele é a recepção do prédio: um único endereço na rua, e uma lista na portaria
+dizendo que o 3º andar é o cardápio, o 5º é o painel e o subsolo é a API. O cliente continua vendo um
+endereço só; quem separa é a regra.</p>
+
+<h2>2. O Ingress não substitui o Service</h2>
+
+<p>A confusão mais comum é achar que o Ingress “é o Service novo”. Não é. O Service responde a uma pergunta
+de rede interna: “quais pods atendem esta etiqueta, e em que porta?”. O Ingress responde a uma pergunta de
+HTTP: “para qual Service vai uma requisição com este host e este caminho?”. Um aponta para o outro: o Ingress
+tem um <code>backend</code>, e o backend é um Service.</p>
+
+<dl class="anatomy">
+<dt>Ingress</dt>
+<dd>Objeto que descreve roteamento HTTP: host, caminho e o Service de destino. Não abre porta sozinho; quem
+escuta é o controller.</dd>
+<dt>controller de Ingress</dt>
+<dd>O programa que lê os objetos Ingress e configura o proxy de verdade (nginx, Traefik, HAProxy). Sem ele, o
+Ingress é só um registro no banco do cluster.</dd>
+<dt>ingressClassName</dt>
+<dd>Qual controller deve atender este Ingress. Num cluster com mais de um controller, é o que evita que a
+regra caia no lugar errado.</dd>
+<dt>host</dt>
+<dd>O nome de domínio da regra: <code>padaria.test</code>. Requisição com outro host não entra nessa
+regra.</dd>
+<dt>path e pathType</dt>
+<dd>O caminho (<code>/</code>, <code>/api</code>) e como compará-lo: <code>Prefix</code>,
+<code>Exact</code> ou <code>ImplementationSpecific</code>.</dd>
+<dt>backend</dt>
+<dd>O Service de destino e a porta dele (<code>number</code> ou <code>name</code>). É para cá que o tráfego do
+caminho vai.</dd>
+<dt>defaultBackend</dt>
+<dd>O destino de tudo o que não casou com nenhuma regra. Sem ele, o que não casa recebe 404 do
+controller.</dd>
+</dl>
+
+<p>Guarde essa hierarquia, porque é ela que organiza o diagnóstico: <strong>cliente → controller → Ingress →
+Service → pods</strong>. Se o site não abre, o erro está em um desses cinco elos, e cada um tem um sintoma
+diferente. O Ingress é só o terceiro.</p>
+
+<p>Para fixar a diferença, vale ver os três objetos lado a lado, cada um com a pergunta que responde. É
+essa separação que permite diagnosticar por camada, sem misturar as causas.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Objeto</th><th>Pergunta que responde</th><th>O que ele não faz</th></tr>
+</thead>
+<tbody>
+<tr><td>Service</td><td>quais pods atendem esta etiqueta, em que porta?</td><td>não entende HTTP, host nem
+caminho</td></tr>
+<tr><td>Ingress</td><td>para qual Service vai este host e este caminho?</td><td>não abre porta nem fala com
+pods</td></tr>
+<tr><td>controller</td><td>quem escuta na borda e aplica as regras?</td><td>não cria pods nem altera o
+Service</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare na terceira linha: o controller é software, não um objeto do Kubernetes. Ele roda como um Deployment
+qualquer, com Service e tudo. Isso significa que ele também pode estar fora do ar, sem réplicas prontas ou
+com a versão errada — e nesse caso todos os Ingress do cluster param juntos.</p>
+
+<h2>3. O controller: quem realmente escuta</h2>
+
+<p>Um manifesto de Ingress não abre porta nenhuma. Ele é uma <em>intenção</em> guardada na API. Quem lê essa
+intenção e escreve a configuração do proxy é o controller — no caso mais comum, o ingress-nginx, que roda
+como um Deployment dentro do próprio cluster e fica exposto por um Service do tipo LoadBalancer ou
+NodePort.</p>
+
+<p>Isso explica dois sintomas que assustam. O primeiro: você aplica o Ingress, o <code>kubectl get
+ingress</code> mostra <code>ADDRESS</code> vazio (ou pendente) e nada funciona. O objeto existe; o controller
+é que não está lá para preencher. O segundo: o Ingress aparece com endereço, mas o domínio não resolve —
+porque o DNS do mundo real precisa apontar para esse endereço, e isso é configuração de registro, não de
+Kubernetes.</p>
+
+<p>Neste guia o painel não simula tráfego: ele mostra o que o Kubernetes guardaria e o que o
+<code>kubectl get</code> responderia. O roteamento em si — o proxy recebendo a requisição e escolhendo o pod —
+aparece nas transcrições, sempre identificadas como tal. É a mesma honestidade das aulas de pod: o que é
+cálculo o motor faz; o que depende de rede real vem de fora.</p>
+
+<p>Um jeito rápido de confirmar que o controller está no caminho é olhar o log de acesso dele. Esta é uma
+transcrição de um cluster real, com o ingress-nginx recebendo três requisições:</p>
+
+<pre class="term">192.0.2.54 - - [27/Nov/2026:09:14:02 +0000] "GET / HTTP/1.1" 200 615 "-" "curl/8.5.0"
+192.0.2.54 - - [27/Nov/2026:09:14:07 +0000] "GET /api/precos HTTP/1.1" 200 132 "-" "curl/8.5.0"
+192.0.2.54 - - [27/Nov/2026:09:14:12 +0000] "GET /cardapio HTTP/1.1" 503 190 "-" "curl/8.5.0"</pre>
+
+<p>Três linhas, três histórias. As duas primeiras são 200: o controller achou a regra e o Service respondeu.
+A terceira é 503: a regra existe, mas o backend não tem para onde mandar — Service inexistente ou sem pods
+prontos. Um 404 no fim da linha contaria outra história: nenhuma regra casou com aquele caminho.</p>
+
+<h2>4. A caixa: a regra sem pathType</h2>
+
+<p>O primeiro erro de todo mundo ao escrever um Ingress é esquecer o <code>pathType</code>. Ele não é
+opcional: a API recusa o objeto e diz qual caminho está sem ele. A caixa tem um Ingress apontando para o
+Service <code>cardapio</code>, com o caminho <code>/</code> e sem o tipo.</p>
+
+<div class="tryk8s" data-get="ingress" data-goal="texto:padaria.test;;campo:Ingress/cardapio|spec.rules.0.http.paths.0.pathType=Prefix">
+  <p class="try-task">Falta o <code>pathType</code> do caminho <code>/</code>. Rode e leia o erro; depois
+  acrescente <code>pathType: Prefix</code> embaixo de <code>path</code> e rode de novo.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+<pre class="out">
+The Ingress "cardapio" is invalid: spec.rules[0].http.paths[0].pathType: Required value
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>A resposta é <code>spec.rules[0].http.paths[0].pathType: Required value</code>. O caminho do erro é
+literalmente o endereço do campo dentro do manifesto: regra 0, caminho 0. Com o tipo preenchido, o painel
+mostra <code>ingress.networking.k8s.io/cardapio created</code> e a tabela do <code>get ingress</code> com
+<code>HOSTS padaria.test</code> e <code>ADDRESS 192.0.2.10</code>.</p>
+
+<p>Repare na coluna <code>PORTS</code>: ela mostra <code>80, 443</code> mesmo que o backend seja a porta 80 de
+um Service. Não é engano: o Ingress descreve o que o controller deve escutar na borda — HTTP e HTTPS — e o
+número do backend é outra coisa, resolvida depois, no salto para o Service.</p>
+
+<h2>5. Lendo a regra em voz alta</h2>
+
+<p>Um Ingress se lê como uma frase: “quando o pedido vier para este host, com este caminho, mande para este
+Service nesta porta”. Cada pedaço dessa frase é um campo, e o YAML tem exatamente a mesma ordem. Vale treinar
+a leitura com o manifesto da caixa anterior:</p>
+
+<pre class="file" data-file="ingress-cardapio.yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+
+<p>O <code>apiVersion</code> é <code>networking.k8s.io/v1</code>, e não <code>v1</code>: Ingress mora no grupo
+de rede. Trocar para <code>v1</code> dá aquele erro de “no matches for kind” que você já viu no Deployment. O
+<code>metadata.name</code> é o nome do Ingress; o <code>spec</code> tem as regras.</p>
+
+<p>Dentro de <code>rules</code> há uma lista, e cada item é um host. Um Ingress pode ter vários hosts no mesmo
+objeto: a padaria usa <code>padaria.test</code> para o site e <code>admin.padaria.test</code> para o painel.
+Dentro de cada host, <code>http.paths</code> é outra lista: os caminhos. E cada caminho tem
+<code>backend</code>, que é sempre um Service — nunca um pod direto. Essa é a regra que mais gente esquece:
+Ingress não fala com pod; fala com Service.</p>
+
+<h2>6. A caixa: o backend com nome errado</h2>
+
+<p>O erro seguinte não é de validação: o manifesto é aceito, o Ingress é criado e o cliente recebe um 503 do
+controller. O motivo é que o Service apontado no backend não existe. A caixa tem o nome com uma letra a
+mais.</p>
+
+<div class="tryk8s" data-get="ingress" data-goal="texto:created;;campo:Ingress/cardapio|spec.rules.0.http.paths.0.backend.service.name=cardapio">
+  <p class="try-task">O backend aponta para o Service <code>cardapioo</code>, que não existe. Corrija o
+  nome para <code>cardapio</code> e rode.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapioo
+                port:
+                  number: 80</pre>
+<pre class="out">
+ingress.networking.k8s.io/cardapio created
+
+NAME       CLASS    HOSTS          ADDRESS      PORTS     AGE
+cardapio   &lt;none&gt;   padaria.test   192.0.2.10   80, 443   2m
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>Repare no contraste com a caixa anterior: aqui o <code>apply</code> passa sem reclamar. O Kubernetes não
+verifica se o Service do backend existe — ele guarda a intenção e deixa o controller descobrir na hora de
+configurar. Essa diferença é a razão de o diagnóstico de Ingress ter duas etapas: primeiro “o objeto está
+certo?”, depois “o que ele aponta existe?”.</p>
+
+<p>Nesta transcrição de um cluster real, o controller responde exatamente isso quando o backend não
+existe:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe ingress cardapio
+Name:             cardapio
+Namespace:        default
+Default backend:  default-http-backend:80 (10.244.1.9:8080)
+Rules:
+  Host          Path  Backends
+  ----          ----  --------
+  padaria.test
+                /     cardapioo:80 (10.244.2.7:8080)
+Annotations:    nginx.ingress.kubernetes.io/rewrite-target: /
+Events:
+  Type    Reason  Age                 From                      Message
+  ----    ------  ----                ----                      -------
+  Normal  Sync    12s (x3 over 2m)    nginx-ingress-controller  Scheduled for sync
+  Warning Sync    12s                 nginx-ingress-controller  unexpected error validating ingress class</pre>
+
+<p>A tabela <code>Rules</code> é o coração do <code>describe</code> de um Ingress: cada linha mostra host,
+caminho e o backend com o endereço para onde ele resolve. Se o endereço aparece entre parênteses, o controller
+achou o Service; se o backend aparece com o nome errado e sem endereço, é ali que está o problema.</p>
+
+<h2>7. Prefix, Exact e o caminho que pega tudo</h2>
+
+<p>O <code>pathType</code> decide como o controller compara o caminho da requisição com o caminho da regra.
+São três valores, e a diferença entre eles explica a maioria dos “rotas erradas” que aparecem em produção.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>pathType</th><th>Como compara</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Prefix</code></td><td>casa com o caminho e com tudo abaixo dele, por segmentos:
+<code>/api</code> casa com <code>/api</code> e <code>/api/precos</code></td><td>o caso normal de uma
+aplicação com subrotas</td></tr>
+<tr><td><code>Exact</code></td><td>casa só com o caminho escrito, sem nada depois</td><td>rotas pontuais,
+como <code>/saude</code> ou um <code>/login</code></td></tr>
+<tr><td><code>ImplementationSpecific</code></td><td>deixa a comparação para o controller</td><td>quando você
+usa o modo nativo do nginx ou de outro proxy</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><code>Prefix</code> compara por segmentos, não por letras. Isso importa: <code>/api</code> casa com
+<code>/api/precos</code>, mas não casa com <code>/apice</code> — o segmento seguinte precisa começar depois de
+uma barra. Já <code>Exact</code> com <code>/</code> casa apenas a raiz do site: quem pedir
+<code>/cardapio</code> recebe 404. É um erro clássico de quem quer “a home” e acaba derrubando o site
+inteiro.</p>
+
+<p>Quando duas regras casam, o controller usa a mais específica: o caminho mais longo vence. É assim que a
+Ana pode ter <code>/api</code> para a API de preços e <code>/</code> para o site no mesmo host, sem conflito.
+A ordem em que as regras aparecem no YAML não decide nada — o que decide é o tamanho do caminho.</p>
+
+<h2>8. A caixa: dizendo qual controller deve atender</h2>
+
+<p>Num cluster com mais de um controller — o nginx da padaria e o do provedor de nuvem, por exemplo — um
+Ingress sem <code>ingressClassName</code> fica órfão: cada controller pode ignorá-lo, e o objeto aparece
+criado, com endereço vazio. A caixa tem esse caso.</p>
+
+<div class="tryk8s" data-get="ingress" data-goal="texto:nginx;;campo:Ingress/cardapio|spec.ingressClassName=nginx">
+  <p class="try-task">Acrescente <code>ingressClassName: nginx</code> ao <code>spec</code> e rode. A coluna
+  <code>CLASS</code> da tabela tem de mostrar <code>nginx</code>.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+<pre class="out">
+ingress.networking.k8s.io/cardapio created
+
+NAME       CLASS    HOSTS          ADDRESS      PORTS     AGE
+cardapio   &lt;none&gt;   padaria.test   192.0.2.10   80, 443   2m
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>Com a classe preenchida, a tabela mostra <code>CLASS nginx</code>. Em cluster de um controller só, isso
+costuma ser opcional — o controller assume tudo o que não tem classe. Em cluster compartilhado, é a diferença
+entre a regra funcionar e a regra existir sem efeito, e o sintoma é sempre o mesmo: <code>ADDRESS</code> vazio
+e o cliente recebendo erro de conexão.</p>
+
+<p>Uma nota sobre a versão antiga: você vai encontrar manifestos com
+<code>kubernetes.io/ingress.class</code> nas anotações. Era o jeito antigo de dizer a mesma coisa, e ainda
+funciona em muitos controllers, mas o campo <code>ingressClassName</code> é o moderno e o que a documentação
+recomenda. Se os dois aparecerem e discordarem, o comportamento depende do controller — melhor não
+misturar.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o Ingress criado e o site sem resposta</h3>
+<p>A Ana aplicou o Ingress, viu <code>created</code>, abriu o navegador e nada. O <code>get ingress</code>
+mostrava <code>ADDRESS</code> vazio: o controller não estava instalado no cluster. Instalar o ingress-nginx
+resolveu na hora — e o objeto nem precisou ser reaplicado. O Ingress era uma intenção esperando quem a
+executasse.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o 404 que vinha do pathType</h3>
+<p>O painel do balcão ficava em <code>/admin</code> e o Ingress tinha <code>pathType: Exact</code>. A tela
+inicial abria, mas qualquer link interno dava 404, porque <code>/admin/pedidos</code> não casa com
+<code>Exact /admin</code>. A troca para <code>Prefix</code> resolveu — e a lição foi entender que o caminho de
+uma aplicação quase nunca é um endereço só.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o domínio certo apontando para o lugar errado</h3>
+<p>Depois de tudo funcionando, a Ana comprou o domínio e apontou o DNS para o IP do cluster. O site abria o
+cardápio em <code>/</code>, mas a API respondia 404: o Ingress da API tinha host <code>api.padaria.test</code>
+e o cliente chamava <code>padaria.test/api</code>. A regra estava certa; o pedido chegava com outro host. Um
+segundo caminho no mesmo Ingress resolveu sem tocar no DNS.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que o Ingress faz?</p>
+<label><input type="radio" name="q1"> abre uma porta no nó para cada aplicação</label>
+<label><input type="radio" name="q1"> substitui o Service, falando direto com os pods</label>
+<label><input type="radio" name="q1"> descreve roteamento HTTP por host e caminho, apontando para
+Services</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O Ingress foi criado, mas o <code>ADDRESS</code> está
+vazio e o site não abre. Qual é a causa mais provável?</p>
+<label><input type="radio" name="q2"> não há controller de Ingress atendendo esse objeto</label>
+<label><input type="radio" name="q2"> o Service não tem endpoints</label>
+<label><input type="radio" name="q2"> o <code>pathType</code> está errado</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Qual <code>pathType</code> casa com <code>/api</code> e
+também com <code>/api/precos</code>?</p>
+<label><input type="radio" name="q3"> <code>Exact</code></label>
+<label><input type="radio" name="q3"> <code>Prefix</code></label>
+<label><input type="radio" name="q3"> <code>None</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: aponte o caminho para o Service</h2>
+<p>Complete o campo que diz para qual Service o caminho <code>/</code> deve ir.</p>
+<div class="ex-code">backend:
+  service:
+    <input aria-label="resposta 1" data-answer="name" placeholder="...">: cardapio
+    port:
+      number: 80</div>
+<p class="ex-dica">Dica: é o nome do Service, e ele precisa existir no mesmo namespace do Ingress.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Ingress é a camada HTTP do cluster: um endereço só, com regras que distribuem host e caminho entre
+Services. Ele não abre porta nem fala com pods — quem escuta é o controller, e o destino é sempre um Service.
+Sem controller, o objeto existe e não faz nada; é a primeira coisa a conferir quando o <code>ADDRESS</code>
+está vazio.</p>
+
+<p>A regra se lê como uma frase: host, caminho, tipo de comparação e backend. <code>pathType</code> é
+obrigatório, <code>Prefix</code> é o caso normal, <code>Exact</code> serve para rotas pontuais e o caminho
+mais específico vence quando dois casam. O nome do Service no backend não é validado no <code>apply</code> —
+ele é descoberto na hora de configurar, e é aí que aparece o 503.</p>
+
+<p>Na próxima aula o mesmo Ingress ganha HTTPS: um certificado guardado num Secret, o bloco <code>tls</code>
+apontando para ele e o redirecionamento de HTTP para HTTPS. É o passo que transforma um site de teste num
+site que o cliente pode usar sem aviso do navegador.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Ingress roteia HTTP por host e caminho; o destino é sempre um Service.</li>
+  <li>Sem controller (e sem <code>ingressClassName</code> correto), o Ingress não tem efeito.</li>
+  <li><code>pathType</code> é obrigatório: <code>Prefix</code>, <code>Exact</code> ou
+  <code>ImplementationSpecific</code>.</li>
+  <li>O caminho mais específico vence; a ordem no YAML não importa.</li>
+  <li><code>ADDRESS</code> vazio = controller ausente ou DNS ainda não apontado.</li>
+  <li>Backend errado não dá erro no <code>apply</code>: aparece como 503 ou no <code>describe</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

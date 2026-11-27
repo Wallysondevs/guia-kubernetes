@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rollback | Guia Kubernetes</title>
+<meta name="description" content="Rollback na prática: voltar uma versão com kubectl rollout undo, escolher uma revisão com --to-revision, conferir o resultado e saber quando reaplicar o manifesto antigo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Rollback</span></h1>
+<p class="intro">Sete da manhã de segunda, a 3.0 do site da Ana estava no ar havia quarenta minutos e o
+carrinho de compras começou a esvaziar sozinho: um erro de cálculo somava o frete duas vezes. Ela precisa
+de duas coisas ao mesmo tempo — parar o sangramento agora e descobrir a causa depois. Nesta aula a Ana
+aprende a primeira: voltar para a versão que funcionava com um comando, sem apagar nada, sem reescrever
+manifesto e sem depender de lembrar o que mudou.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que um rollback faz de verdade: publica de novo o modelo anterior.</li>
+  <li>Voltar uma revisão com <code>kubectl rollout undo</code>.</li>
+  <li>Escolher uma revisão específica com <code>--to-revision</code>.</li>
+  <li>Ler o <code>rollout history</code> e entender a numeração.</li>
+  <li>Conferir se o site voltou: <code>rollout status</code>, <code>get pods</code>,
+  <code>describe</code>.</li>
+  <li>Voltar pelo manifesto quando não existe histórico para reaproveitar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o carrinho que somava frete duas vezes</h2>
+
+<p>O bug não era do Kubernetes. O código da 3.0 tinha uma linha a mais no cálculo do frete, e a linha
+passou nos testes porque o teste usava um carrinho com um item só. Em produção, com dois itens, o frete
+entrou duas vezes. Nenhum pod caiu, nenhuma réplica ficou vermelha, o site estava “saudável” — e vendendo
+errado. Esse é o tipo de incidente em que o Kubernetes não ajuda a achar o problema, mas ajuda muito a
+parar o estrago.</p>
+
+<p>A primeira reação de quem está começando é reverter o código no repositório, rodar o pipeline e
+esperar. Leva vinte minutos, no mínimo, e depende de o pipeline estar de pé. A segunda reação é apagar o
+Deployment e aplicar o manifesto antigo — funciona, mas derruba os pods e abre um buraco no atendimento.
+O Kubernetes tem um caminho melhor: ele já guardou o modelo anterior e sabe voltar para ele.</p>
+
+<p>Entre a 1.0 e a 3.0 houve uma 1.1, um remendo de sexta-feira que corrigiu o frete e ficou uma semana no
+ar sem reclamação. É essa a versão para a qual ela quer voltar — e é bom que exista, porque “voltar para a
+anterior” só funciona quando a anterior presta.</p>
+
+<p>A ideia central é contraintuitiva na primeira leitura. Rollback não é “desfazer” como o Ctrl+Z. É
+<em>publicar de novo</em> o modelo antigo, agora, como uma versão nova. O Deployment não volta no tempo;
+ele recebe de volta um template que já existiu e passa pelo mesmo processo de troca de pods de qualquer
+publicação. Entender isso evita a confusão mais comum: procurar o rollback como se fosse um botão de
+“anterior” dentro do objeto.</p>
+
+<h2>2. O vocabulário da volta</h2>
+
+<p>Quatro palavras resolvem esta aula. O <strong>rollback</strong> é a operação de voltar a um modelo
+anterior. A <strong>revisão</strong> é o número que identifica cada modelo já aplicado, começando em 1.
+O <strong>histórico</strong> é a lista dessas revisões, que você lê com <code>rollout history</code>. E o
+<strong>ReplicaSet antigo</strong> é o objeto que ficou guardado com zero réplicas, justamente para que a
+volta seja rápida.</p>
+
+<dl class="anatomy">
+<dt>rollback</dt>
+<dd>Voltar o Deployment a um modelo anterior. Na prática, o controlador copia o template daquela revisão
+para o objeto e dispara uma troca de pods.</dd>
+<dt>revisão</dt>
+<dd>Número inteiro por geração do modelo. A primeira é 1; cada mudança no <code>template</code> cria a
+seguinte.</dd>
+<dt>rollout history</dt>
+<dd>Lista as revisões guardadas do Deployment, com o número e a causa da mudança quando ela foi
+registrada.</dd>
+<dt>--to-revision</dt>
+<dd>Opção do <code>rollout undo</code> que escolhe a revisão de destino. Sem ela, o Kubernetes volta uma
+revisão.</dd>
+<dt>revisionHistoryLimit</dt>
+<dd>Quantas revisões antigas ficam guardadas. O padrão é 10; acima disso, as mais velhas são
+descartadas.</dd>
+</dl>
+
+<p>Repare que o histórico não é um log de eventos: é uma pilha de modelos de pod. Cada item guarda o
+suficiente para recriar os pods daquela geração, e é por isso que voltar é barato. Se o
+<code>revisionHistoryLimit</code> fosse zero, não haveria para onde voltar — e o comando responderia que
+não encontrou a revisão.</p>
+
+<h2>3. kubectl rollout undo: um passo atrás</h2>
+
+<p>O comando é curto: <code>kubectl rollout undo deployment/cardapio</code>. Ele volta <em>uma</em>
+revisão. A caixa abaixo começa com o site na 1.0, publica a 3.0 (a versão com o bug) e volta. A tarefa é
+fazer a volta acontecer: sem o <code>undo</code>, a meta não fecha.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:rolled back;;texto:successfully rolled out;;objeto:Deployment/cardapio">
+  <p class="try-task">Publique a <code>cardapio:3.0</code>, confira o histórico e volte com
+  <code>kubectl rollout undo</code>. Termine com o <code>rollout status</code>.</p>
+<pre class="yaml">kubectl rollout history deployment/cardapio
+kubectl set image deployment/cardapio web=cardapio:3.0
+kubectl rollout status deployment/cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+
+ana@notebook:~$ kubectl set image deployment/cardapio web=cardapio:3.0
+deployment.apps/cardapio image updated
+
+ana@notebook:~$ kubectl rollout status deployment/cardapio
+deployment "cardapio" successfully rolled out
+</pre>
+<pre class="solucao">kubectl set image deployment/cardapio web=cardapio:3.0
+kubectl rollout history deployment/cardapio
+kubectl rollout undo deployment/cardapio
+kubectl rollout status deployment/cardapio</pre>
+</div>
+
+<p>A resposta tem um ritmo reconfortante. <code>deployment.apps/cardapio rolled back</code> é o
+controlador aceitando a volta; <code>deployment "cardapio" successfully rolled out</code> é o fim da troca
+de pods. Entre as duas linhas, o mesmo teatro de sempre: pods novos sobem, ficam prontos, antigos saem.
+Nada de mágica, nada de exclusão — o Deployment continua existindo, com o mesmo nome e o mesmo Service
+apontando para ele.</p>
+
+<p>O <code>undo</code> também é seguro no sentido chato da palavra: se não existir revisão anterior, ele
+responde com um erro claro em vez de apagar o Deployment. E se você rodar duas vezes seguidas, volta duas
+vezes — o que pode ser bom (voltar da 3.0 para a 1.0 passando pela 2.0) ou um desastre silencioso, se você
+não sabia onde estava. Por isso o hábito saudável é olhar o histórico antes, não depois.</p>
+
+<h2>4. Escolhendo a revisão com --to-revision</h2>
+
+<p>Quando a bagunça tem mais de um passo, “uma revisão atrás” não basta. A opção
+<code>--to-revision</code> diz exatamente onde parar: <code>kubectl rollout undo deployment/cardapio
+--to-revision=1</code>. É o comando que a Ana quer quando a 3.0 quebrou e a 2.0 também tinha um problema
+menor — ela volta direto para a versão que ela sabe que funciona.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:rolled back;;texto:REVISION">
+  <p class="try-task">Publique a <code>cardapio:3.0</code>, liste o histórico e volte direto para a
+  revisão <code>1</code> com <code>--to-revision=1</code>. Termine rodando <code>rollout history</code> de
+  novo: as duas revisões continuam registradas.</p>
+<pre class="yaml">kubectl set image deployment/cardapio web=cardapio:3.0
+kubectl rollout history deployment/cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl set image deployment/cardapio web=cardapio:3.0
+deployment.apps/cardapio image updated
+
+ana@notebook:~$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+2          set image
+</pre>
+<pre class="solucao">kubectl set image deployment/cardapio web=cardapio:3.0
+kubectl rollout history deployment/cardapio
+kubectl rollout undo deployment/cardapio --to-revision=1
+kubectl rollout history deployment/cardapio</pre>
+</div>
+
+<p>O painel responde <code>deployment.apps/cardapio rolled back</code> e o histórico segue com as duas
+revisões na tabela — rollback não apaga revisão, só acrescenta. Vale saber o que o motor faz e o que ele não faz aqui, porque a diferença é grande: ele devolve a
+mensagem do comando, mas não reexecuta o histórico para reescrever o template. Num cluster de verdade, o
+controlador copia o modelo da revisão 1 para o Deployment, e o <code>describe</code> passa a mostrar a
+imagem antiga com uma revisão nova. É por isso que a caixa 3 desta aula existe: ela mostra a volta
+acontecendo de um jeito que o painel consegue representar.</p>
+
+<p>Este é o histórico que o painel devolve depois de uma publicação e de uma volta, copiado da caixa
+acima — repare que a tabela tem duas colunas e que a segunda quase sempre está vazia:</p>
+
+<pre class="term">$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+2          &lt;none&gt;
+
+$ kubectl rollout undo deployment/cardapio
+deployment.apps/cardapio rolled back</pre>
+
+<p>A coluna <code>CHANGE-CAUSE</code> é o lugar onde deveria estar o motivo da mudança, e ela só é
+preenchida quando alguém registra esse motivo — o assunto da aula de revisões. Sem esse registro, o
+histórico diz <em>quantas</em> versões existem, mas não <em>por quê</em>. Numa emergência às sete da
+manhã, essa diferença é enorme: saber que a revisão 2 foi “o deploy do frete novo” vale mais do que saber
+que ela existe.</p>
+
+<p>Um detalhe que confunde muita gente boa: depois de um rollback, a revisão <em>não</em> volta para o
+número antigo. O Kubernetes cria uma revisão nova com o conteúdo da antiga — se você estava na 4 e voltou
+para a 2, o histórico passa a ter uma 5 com o template da 2. Isso é saudável: o histórico conta a
+sequência real do que aconteceu, não uma linha do tempo reescrita. Quem procura “revisão 2” depois do
+rollback vai encontrar “revisão 5, igual à 2”.</p>
+
+<h2>5. O que o painel faz (e o que ele não faz)</h2>
+
+<p>Como no resto do guia, vale separar o cálculo do que depende de rodar container. O motor guarda o
+número da revisão, responde <code>rollout undo</code> e <code>rollout history</code> com o mesmo formato
+do kubectl, e recalcula os pods depois do comando. O que ele não guarda é a pilha de templates antigos:
+não há como ele “restaurar” um modelo que nunca foi armazenado.</p>
+
+<p>Num cluster real, essa pilha existe e é o que torna o rollback instantâneo. Também é ela que permite
+voltar para uma revisão específica dias depois, desde que o <code>revisionHistoryLimit</code> ainda não
+tenha descartado aquela entrada. O painel mostra o número da revisão, o que já ajuda a entender a
+numeração; o conteúdo restaurado aparece nas aulas como transcrição identificada ou pelo caminho do
+manifesto.</p>
+
+<p>Não é um detalhe acadêmico: saber o que a ferramenta faz evita a conclusão errada. Se você rodar
+<code>undo</code> no painel e depois <code>get deployment -o yaml</code>, vai ver a imagem que estava lá
+antes — e não a restaurada. Num cluster real, veria a restaurada. O comando é o mesmo; o que muda é o
+quanto do controlador está simulado.</p>
+
+<h2>6. Voltando pelo manifesto antigo</h2>
+
+<p>Existe um caminho que não depende de histórico nenhum: reaplicar o arquivo da versão boa. É o que se
+faz quando o Deployment foi criado por <code>apply</code> e o repositório tem a versão anterior no
+histórico do Git — ou quando o cluster é novo e nunca teve aquela revisão guardada. A caixa abaixo está
+com a 3.0 no arquivo, a versão que quebrou o carrinho. A tarefa é voltar para a <code>1.1</code>, a última
+versão boa (a 1.0 com a correção do frete).</p>
+
+<div class="tryk8s" data-cenario="padaria" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:1.1;;texto:configured">
+  <p class="try-task">Troque a imagem do manifesto para <code>cardapio:1.1</code>, rode e confira o
+  <code>configured</code> na primeira linha do painel.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:3.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio configured
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.1
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>A primeira linha é <code>deployment.apps/cardapio configured</code>, não <code>created</code> — sinal
+de que o objeto já existia e foi ajustado. O template passa a apontar para a 1.1 e o controlador faz a
+troca de pods como em qualquer publicação. A diferença em relação ao <code>undo</code> é de origem: aqui
+o modelo vem do arquivo, não do histórico do cluster.</p>
+
+<p>Esse caminho tem uma vantagem e uma obrigação. A vantagem é ser explícito: o arquivo que você aplicou é
+o que está no ar, e o próximo <code>apply</code> não vai desfazer nada. A obrigação é manter o arquivo
+atualizado — se você voltou pelo <code>undo</code> e deixou o repositório na versão quebrada, o próximo
+deploy reintroduz o bug. Rollback de cluster sem rollback de repositório é dívida com juros.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Caminho</th><th>Quando usar</th><th>O que muda no cluster</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kubectl rollout undo</code></td><td>a revisão anterior está no histórico e serve</td><td>o
+template volta ao da revisão anterior; uma revisão nova é criada</td></tr>
+<tr><td><code>undo --to-revision=N</code></td><td>você sabe exatamente qual versão funcionava</td><td>o
+template volta ao da revisão N; uma revisão nova é criada</td></tr>
+<tr><td><code>kubectl apply -f</code> do manifesto bom</td><td>o arquivo versionado é a fonte da
+verdade</td><td>o template passa a ser o do arquivo; o histórico ganha uma revisão</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>7. Conferindo que voltou</h2>
+
+<p>Rollback sem conferência é fé. Os três comandos de sempre respondem em segundos:
+<code>kubectl rollout status deployment/cardapio</code> até a linha de sucesso,
+<code>kubectl get deployments</code> para ver <code>READY</code> cheio e <code>kubectl describe
+deployment cardapio</code> para olhar a imagem e a anotação de revisão. Se a imagem no
+<code>describe</code> ainda for a quebrada, a volta não aconteceu — e o motivo costuma estar na resposta
+do comando.</p>
+
+<pre class="term">$ kubectl rollout undo deployment/cardapio
+deployment.apps/cardapio rolled back
+
+$ kubectl rollout status deployment/cardapio
+deployment "cardapio" successfully rolled out
+
+$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+
+$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m</pre>
+
+<p>Essa sequência é a que a caixa devolve, copiada do painel. Repare na coluna <code>AGE</code>: os dois
+pods têm idades diferentes, sinal de que foram criados em momentos diferentes. Num cluster real, um
+rollback costuma deixar todos os pods com idade parecida, porque todos foram recriados na mesma operação.
+Idade desigual logo depois de um rollback é pista de que só parte das réplicas foi trocada — e aí vale
+olhar o <code>get replicasets</code> para ver qual geração está no comando.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Comando</th><th>Resposta esperada</th></tr>
+</thead>
+<tbody>
+<tr><td>terminou?</td><td><code>kubectl rollout status deployment/cardapio</code></td><td>
+<code>successfully rolled out</code></td></tr>
+<tr><td>tem réplica suficiente?</td><td><code>kubectl get deployments</code></td><td><code>2/2</code> com
+<code>UP-TO-DATE</code> igual</td></tr>
+<tr><td>qual imagem está no ar?</td><td><code>kubectl describe deployment cardapio</code></td><td>a
+imagem da versão boa, na seção <code>Containers</code></td></tr>
+<tr><td>quantas revisões existem?</td><td><code>kubectl rollout history deployment/cardapio</code></td>
+<td>uma linha por geração, incluindo a do rollback</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. Rollback não é plano B permanente</h2>
+
+<p>Voltar resolve o sintoma e compra tempo; não resolve a causa. Depois que o site está na versão boa, o
+trabalho é descobrir por que a 3.0 passou — e o Kubernetes ajuda pouco nessa parte. O que ele oferece é
+contexto: a revisão que falhou, a hora em que entrou, os pods que rodaram aquele modelo e os logs deles.
+Com isso, a investigação começa no lugar certo.</p>
+
+<p>O ciclo saudável tem três passos e um deles é chato. Primeiro, parar o sangramento com rollback.
+Segundo, corrigir a causa no código e cobrir com teste. Terceiro, publicar de novo — o chamado roll
+forward — com a mesma disciplina de antes: <code>rollout status</code> até o fim e conferência nos números.
+O passo chato é o segundo; sem ele, o time entra em loop de voltar e publicar a mesma coisa.</p>
+
+<p>Também vale saber o que o rollback <em>não</em> desfaz. Ele não reverte migração de banco de dados, não
+apaga mensagem publicada em fila, não desfaz cobrança errada. Se a versão nova alterou o schema, voltar o
+código pode deixar o site falando com um banco que já mudou. É por isso que migração e código precisam ser
+compatíveis nas duas direções — e por que o assunto “deploy sem queda” tem aula própria mais adiante.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o rollback que não resolveu</h3>
+<p>A Ana voltou da 3.0 para a 1.1 e o carrinho continuou errado. O motivo: a 2.0 havia mudado o formato de
+um campo no banco, e a 1.0 não entendia o formato novo. O rollback do código funcionou; o do dado, não.
+A lição é a de sempre — a compatibilidade entre versões é parte do deploy, não um detalhe posterior.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o histórico que já não tinha a versão boa</h3>
+<p>Quinze publicações depois, o <code>revisionHistoryLimit</code> tinha descartado a revisão que funcionava.
+O <code>undo --to-revision=3</code> respondeu que a revisão não existia. A saída foi reaplicar o manifesto
+antigo do repositório. Quem publica muito deve aumentar o limite ou confiar no arquivo, não na memória do
+cluster.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o rollback às pressas que voltou para a versão errada</h3>
+<p>Sem olhar o histórico, alguém rodou <code>undo</code> duas vezes e parou numa versão intermediária que
+ninguém tinha testado. O site voltou a funcionar, mas com um bug antigo que já tinha sido corrigido. O
+hábito certo é uma linha antes do comando: <code>kubectl rollout history</code>. Custa dois segundos e
+evita a segunda emergência.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que <code>kubectl rollout undo</code> faz?</p>
+<label><input type="radio" name="q1"> apaga o Deployment e recria do zero</label>
+<label><input type="radio" name="q1"> volta o template para a revisão anterior e dispara a troca de
+pods</label>
+<label><input type="radio" name="q1"> desfaz a última alteração de qualquer campo do objeto</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Como voltar direto para uma revisão específica?</p>
+<label><input type="radio" name="q2"> <code>kubectl rollout undo deployment/cardapio --revision=1</code></label>
+<label><input type="radio" name="q2"> <code>kubectl rollout back deployment/cardapio 1</code></label>
+<label><input type="radio" name="q2"> <code>kubectl rollout undo deployment/cardapio
+--to-revision=1</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Depois de um rollback, o que acontece com a numeração
+das revisões?</p>
+<label><input type="radio" name="q3"> uma revisão nova é criada com o conteúdo da antiga</label>
+<label><input type="radio" name="q3"> o número volta para o da revisão restaurada</label>
+<label><input type="radio" name="q3"> o histórico é apagado e recomeça em 1</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a volta da 3.0</h2>
+<p>O site está na revisão 4, com um bug. A revisão 2 é a última que funcionava. Complete o comando que
+volta direto para ela e responda: qual comando lista as revisões disponíveis?</p>
+<div class="ex-code">kubectl rollout undo deployment/cardapio --<input aria-label="resposta 1"
+data-answer="to-revision" placeholder="...">=2</div>
+<p class="ex-dica">Dica: a opção tem hífen, “to” e “revision”. O comando que lista é o mesmo que a caixa 2
+roda antes de voltar.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Rollback é publicar de novo um modelo que já existiu. O comando é
+<code>kubectl rollout undo deployment/cardapio</code>, com <code>--to-revision=N</code> quando você sabe
+onde quer chegar. O histórico (<code>rollout history</code>) é a lista de revisões; o
+<code>revisionHistoryLimit</code> decide quantas ficam guardadas.</p>
+
+<p>Depois de voltar, confira: <code>rollout status</code> até a linha de sucesso, <code>get
+deployments</code> com <code>READY</code> cheio e <code>describe</code> com a imagem certa. Se o
+histórico não ajudou — cluster novo, revisão descartada, Deployment criado por arquivo —, reaplique o
+manifesto da versão boa e mantenha o repositório coerente com o que está no ar.</p>
+
+<p>E lembre do que o rollback não faz: não corrige a causa, não desfaz migração, não substitui teste. Ele
+compra tempo, e tempo é o que a Ana precisava às sete da manhã. Na próxima aula ela escolhe
+<em>como</em> a troca de versões acontece: as estratégias de rollout, com <code>Recreate</code> e
+<code>RollingUpdate</code>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl rollout undo deployment/nome</code> volta uma revisão.</li>
+  <li><code>--to-revision=N</code> escolhe a revisão de destino.</li>
+  <li>O rollback cria uma revisão nova com o conteúdo da antiga; a numeração não regride.</li>
+  <li>Depois de voltar, confira com <code>status</code>, <code>get</code> e <code>describe</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

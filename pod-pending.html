@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pod em Pending | Guia Kubernetes</title>
+<meta name="description" content="Pod em Pending: por que o Kubernetes aceita o pod e não o coloca em nó nenhum, como ler o evento FailedScheduling e o que ajustar em requests, nodeSelector e nodeName.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Pod em <span class="hl">Pending</span></h1>
+<p class="intro">A Ana aplicou o manifesto do forno novo, viu <code>pod/forno created</code> e esperou. Passou
+um minuto, dois, cinco. O <code>kubectl get pods</code> mostrava sempre a mesma linha:
+<code>0/1  Pending</code>. Nada de erro, nada de vermelho, nada de log — só um pod parado antes mesmo de
+existir como programa. É o primeiro estado estranho que todo mundo encontra, e o mais mal interpretado:
+<strong>Pending</strong> não quer dizer que o seu programa quebrou. Quer dizer que o cluster ainda não achou
+onde colocá-lo.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que <code>Pending</code> significa e por que ele é diferente dos outros estados.</li>
+  <li>Quem é o agendador e o que ele olha antes de escolher um nó.</li>
+  <li>O que significam <code>requests.cpu</code> e <code>requests.memory</code> na hora de caber.</li>
+  <li>Como prender um pod a um nó com <code>nodeSelector</code> — e o que acontece quando a etiqueta não
+  existe.</li>
+  <li>Como ler o evento <code>FailedScheduling</code> e traduzir a frase em conserto.</li>
+  <li>Como diferenciar <code>Pending</code> de <code>ImagePullBackOff</code> e de
+  <code>CrashLoopBackOff</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o forno que nunca liga</h2>
+
+<p>O forno é o programa que calcula a fila de assados da padaria. É pequeno: lê a lista de encomendas, monta
+a ordem dos pães e responde numa API que o balcão consulta. A Ana escreveu o manifesto com carinho, aplicou
+com <code>kubectl apply -f forno.yaml</code>, e o kubectl respondeu <code>pod/forno created</code>. A
+resposta é positiva — e é aí que mora a confusão.</p>
+
+<p>“Created” quer dizer que o <em>objeto</em> foi aceito pela API do Kubernetes e guardado no banco do
+cluster. É como entregar um pedido no balcão: o atendente anotou, mas o pão ainda não está no forno. Depois
+disso, uma peça chamada <strong>agendador</strong> (scheduler) precisa encontrar um nó com espaço, e outra
+peça, o <strong>kubelet</strong> daquele nó, precisa baixar a imagem e ligar o container. Enquanto o
+agendador não decide, o pod fica em <code>Pending</code> — “pendente”, esperando.</p>
+
+<p>O detalhe cruel é que <code>Pending</code> não gera mensagem no terminal. Quem aplica o manifesto vê
+sucesso e vai tomar um café. Só que o pod pode ficar ali para sempre, porque o agendador não tem para onde
+mandá-lo. A pergunta certa, então, não é “por que o pod falhou?”, e sim <strong>“por que nenhum nó serviu?”</strong>.
+A resposta está sempre num lugar só: nos eventos do <code>describe</code>.</p>
+
+<h2>2. Pending é fila, não é falha</h2>
+
+<p>Vale separar as fases do pod com clareza, porque é essa separação que organiza todo o resto do guia.
+<code>Pending</code> é o estado de quem ainda não foi colocado num nó. <code>Running</code> é o de quem já
+está num nó e com os containers de pé. <code>Succeeded</code> é o de quem rodou até o fim e saiu com zero.
+<code>Failed</code> é o de quem rodou e saiu com erro. E existem os estados de espera do container, que
+aparecem na mesma coluna com outro nome — <code>ImagePullBackOff</code>, <code>CrashLoopBackOff</code> — e
+que são outra história, contada nas próximas aulas.</p>
+
+<dl class="anatomy">
+<dt>Pending</dt>
+<dd>O pod foi aceito e ainda não foi colocado em nenhum nó. Pode ser falta de recurso, seletor que não
+casa, ou o agendador esperando algo acontecer.</dd>
+<dt>agendador</dt>
+<dd>O componente que decide em qual nó cada pod vai rodar. Ele lê os pedidos do pod e a capacidade livre
+de cada nó, e escolhe o primeiro que serve.</dd>
+<dt>requests</dt>
+<dd>O que o pod <em>pede</em> de CPU e memória. O agendador só coloca o pod num nó que tenha pelo menos
+isso livre — mesmo que o programa use menos.</dd>
+<dt>nó</dt>
+<dd>Uma máquina do cluster. Neste guia, o cluster de teste tem três: <code>guia-control-plane</code>,
+<code>guia-worker</code> e <code>guia-worker2</code>.</dd>
+<dt>nó disponível</dt>
+<dd>Um nó que passa em todas as condições: tem recurso livre, casa com o seletor e aceita as restrições do
+pod.</dd>
+<dt>evento</dt>
+<dd>Um registro do que o cluster tentou fazer. Aparece no fim do <code>kubectl describe</code> e é onde o
+motivo do <code>Pending</code> é escrito em português claro.</dd>
+<dt>FailedScheduling</dt>
+<dd>O motivo de evento mais comum para um pod pendente: “não consegui agendar”. A mensagem ao lado diz
+qual condição falhou em cada nó.</dd>
+</dl>
+
+<p>Repare que nada nessa lista fala do programa da Ana. O forno pode estar perfeito: a imagem certa, o
+código certo, a porta certa. Se o pedido dele não cabe em nó nenhum, ele não sai do lugar. É por isso que
+diagnosticar <code>Pending</code> é olhar para o <em>pedido</em> e para o <em>cluster</em>, nunca para o
+código da aplicação.</p>
+
+<h2>3. A caixa: memória que não cabe em lugar nenhum</h2>
+
+<p>A primeira causa é a mais comum e a mais fácil de consertar: o pod pede mais do que existe. Neste
+cluster, cada nó tem 4 GiB de memória e 2 núcleos de CPU. A caixa abaixo pede 64 GiB — dezesseis vezes o
+que um nó tem. Rode assim e veja o que o cluster responde.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/forno|spec.containers.0.resources.requests.memory=512Mi">
+  <p class="try-task">O forno pede <code>64Gi</code> de memória. Troque por <code>512Mi</code> — meio
+  gibibyte, o que o programa realmente usa — e rode de novo: o pod tem de aparecer em
+  <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+  labels:
+    app: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+      resources:
+        requests:
+          memory: "64Gi"</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+  labels:
+    app: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+      resources:
+        requests:
+          memory: "512Mi"</pre>
+</div>
+
+<p>O painel mostra <code>forno  0/1  Pending</code>. O <code>0/1</code> diz que zero dos um containers
+estão prontos, e o <code>Pending</code> diz por quê: o pod nunca chegou a um nó, então não há container
+nenhum para ficar pronto. Com <code>512Mi</code>, o agendador encontra espaço nos três nós e o pod nasce
+<code>Running</code>.</p>
+
+<p>A conta é simples e não tem mágica. Cada nó tem 4 GiB. Se o pod pede 64 GiB, nenhum nó serve, e o
+agendador não tem o direito de “colocar mesmo assim” — ele prefere deixar o pod esperando a arriscar
+derrubar o nó. O mesmo vale para CPU. <code>500m</code> é meio núcleo (o “m” é milésimo de núcleo);
+<code>2</code> é dois núcleos inteiros; <code>2500m</code> é mais do que um nó deste cluster tem.</p>
+
+<p>A lição prática: <code>requests</code> não é “quanto o programa pode usar”, é “quanto o cluster precisa
+reservar para ele”. Pedir demais é o caminho mais curto para um <code>Pending</code> eterno. Pedir de menos
+faz o programa competir por CPU com os vizinhos e ficar lento. O número bom é o do uso real, medido com
+<code>kubectl top pod</code> num cluster que tenha métricas — e não um número escolhido no chute.</p>
+
+<h2>4. A caixa: o nó que você amarrou e que não existe</h2>
+
+<p>A segunda causa não tem nada a ver com tamanho: é seletor. Você pode pedir que o pod rode só em nós com
+determinada etiqueta usando <code>nodeSelector</code>. Se a etiqueta não existir em nó nenhum, o pod fica
+pendente mesmo que o cluster esteja vazio — não há espaço que resolva. A caixa pede a etiqueta
+<code>disco: ssd</code>, que ninguém colocou em nó algum.</p>
+
+<div class="tryk8s" data-goal="texto:Running">
+  <p class="try-task">Nenhum nó do cluster tem a etiqueta <code>disco: ssd</code>. Aponte o
+  <code>nodeSelector</code> para uma etiqueta que existe — <code>kubernetes.io/hostname:
+  guia-worker</code> — e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+  labels:
+    app: forno
+spec:
+  nodeSelector:
+    disco: ssd
+  containers:
+    - name: forno
+      image: forno:1.0
+      resources:
+        requests:
+          memory: "512Mi"</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+  labels:
+    app: forno
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: guia-worker
+  containers:
+    - name: forno
+      image: forno:1.0
+      resources:
+        requests:
+          memory: "512Mi"</pre>
+</div>
+
+<p>Enquanto o seletor aponta para uma etiqueta inexistente, o pod fica <code>Pending</code> e o evento diz
+<code>node(s) didn't match Pod's node affinity/selector</code> — “os nós não casaram com o seletor do pod”.
+A tradução para o dia a dia: o agendador olhou os três nós, viu que nenhum tinha <code>disco=ssd</code>, e
+parou. Com <code>kubernetes.io/hostname: guia-worker</code>, ele encontra exatamente um nó que casa e coloca
+o pod lá.</p>
+
+<p>Todo nó nasce com a etiqueta <code>kubernetes.io/hostname</code> igual ao nome dele. É a única que você
+pode usar sem preparar nada antes. As outras você cria com <code>kubectl label node</code> — por exemplo,
+marcar um nó como <code>disco=ssd</code> porque ele tem o disco rápido — e é assim que se separa carga em
+cluster grande. Só que etiqueta é contrato: se ninguém marcou, o pod espera.</p>
+
+<p>Um cuidado com o <code>nodeSelector</code>: ele é uma condição exata. <code>disco: ssd</code> não casa
+com <code>disco: nvme</code>, nem com nó que tenha <code>disco: ssd-padaria</code>. Errar uma letra ou um
+hífen é o suficiente para o pod ficar pendente, e a mensagem do evento não mostra o que você digitou — ela
+só diz que não casou. Conferir as etiquetas dos nós à mão, com <code>kubectl get nodes --show-labels</code>,
+é parte do diagnóstico.</p>
+
+<h2>5. A caixa: ler o evento sem adivinhar</h2>
+
+<p>Nas duas caixas anteriores o problema estava no manifesto, e o painel só mostrava a tabela. Na vida real,
+o pod já está lá, pendente, e você não sabe por quê. Aí entra o <code>kubectl describe</code>: ele abre o
+objeto inteiro e, no fim, mostra os eventos. A caixa começa com o cluster já contendo um pod pendente — o
+forno que pediu CPU e memória demais.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="pod-pendente" data-goal="texto:Pending;;texto:FailedScheduling;;texto:Insufficient cpu">
+  <p class="try-task">Rode como está: o <code>get pods</code> mostra o <code>Pending</code>, mas não diz o
+  motivo. Acrescente <code>kubectl describe pod forno</code> na segunda linha e rode de novo, para ver o
+  evento com a frase que explica o problema.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">kubectl get pods
+kubectl describe pod forno</pre>
+</div>
+
+<p>No fim da saída aparece a seção <code>Events</code>, com uma linha <code>Warning FailedScheduling</code> e
+a mensagem <code>0/3 nodes are available: 3 Insufficient cpu</code>. Ela quer dizer: dos três nós, nenhum
+serve, e o motivo é CPU insuficiente nos três. Se fosse memória, a frase seria
+<code>Insufficient memory</code>; se fosse seletor, <code>didn't match Pod's node affinity/selector</code>;
+se fosse restrição de nó, <code>untolerated taint</code>. A frase é sempre específica — e é ela que decide o
+seu próximo passo.</p>
+
+<p>Repare em dois detalhes do <code>describe</code> que ajudam antes mesmo dos eventos. O campo
+<code>Node:</code> está vazio, e o <code>Status:</code> diz <code>Pending</code>: os dois confirmam que o
+pod não foi agendado, e não que ele esteja reiniciando. E o <code>QoS Class:</code> aparece como
+<code>Burstable</code>, porque o pod declara pedidos — bom sinal, é o que permite ao agendador fazer a
+conta.</p>
+
+<p>Este é o comando que resolve a maioria dos casos desta aula. Se você só puder decorar uma coisa hoje,
+decore esta: <strong>pod em Pending se investiga com <code>kubectl describe pod</code>, na seção
+Events</strong>. O <code>get</code> diz que algo está errado; o <code>describe</code> diz o quê.</p>
+
+<h2>6. As quatro famílias de motivo</h2>
+
+<p>Toda mensagem de <code>FailedScheduling</code> pertence a uma destas quatro famílias. Saber qual é a sua
+economiza meia hora de tentativa e erro.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Família</th><th>Mensagem no evento</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td>recurso</td><td><code>Insufficient cpu</code> ou <code>Insufficient memory</code></td>
+<td>baixar o <code>requests</code>, acrescentar nós ou tirar carga dos nós</td></tr>
+<tr><td>seletor</td><td><code>didn't match Pod's node affinity/selector</code></td>
+<td>corrigir o <code>nodeSelector</code> ou criar a etiqueta no nó</td></tr>
+<tr><td>nó fixo</td><td><code>didn't match Pod's node name</code></td>
+<td>corrigir o nome em <code>nodeName</code> (ou tirar o campo)</td></tr>
+<tr><td>restrição</td><td><code>untolerated taint</code></td>
+<td>adicionar o <code>toleration</code> certo ou usar outro nó</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma transcrição de cluster real, do caso de memória, mostra o formato exato com que a primeira família
+aparece. O pod pedia mais memória do que qualquer nó tinha:</p>
+
+<pre class="term">Events:
+  Type     Reason            Age   From               Message
+  ----     ------            ----  ----               -------
+  Warning  FailedScheduling  37s   default-scheduler  0/3 nodes are available: 3 Insufficient memory.
+  preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.</pre>
+
+<p>Leia de trás para a frente: “3 Insufficient memory” quer dizer “três nós com memória insuficiente”; o
+“0/3” antes é o resumo — zero de três nós serviram. A segunda linha, sobre preempção, é o cluster avisando
+que também não achou pod algum para despejar e abrir espaço. É a mesma frase que você vai encontrar em
+qualquer cluster, com o número de nós e o motivo trocados.</p>
+
+<p>As duas primeiras são as que você vai ver nesta semana. A terceira aparece quando alguém prende o pod a
+um nó específico com <code>spec.nodeName</code> — o atalho bruto, que pula o agendador e manda o pod direto
+para o nó nomeado. Se o nome estiver errado (um <code>guia-worker9</code> que não existe), o pod fica
+pendente e a mensagem fala de “node name”. É o mesmo sintoma, com outra frase.</p>
+
+<p>A quarta é assunto de cluster mais maduro: <em>taints</em> são marcas que um nó carrega para repelir pods
+(“não quero carga comum aqui”), e <em>tolerations</em> são as permissões que o pod carrega para ser aceito
+apesar da marca. Nós de controle, por exemplo, costumam ter uma marca dessas. Se você vir
+<code>untolerated taint</code> num cluster de teste de uma máquina só, provavelmente o único nó disponível é
+o de controle — e o caminho é usar um cluster com nós de trabalho.</p>
+
+<h2>7. O que o agendador olha no seu manifesto</h2>
+
+<p>O agendador não é misterioso: ele percorre os nós e aplica uma lista de condições. Se o nó passa em todas,
+é candidato; se nenhum passa, o pod volta para a fila com a primeira condição que falhou em cada nó. Estes
+são os campos do seu manifesto que entram na conta.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>O que faz</th><th>Efeito colateral</th></tr>
+</thead>
+<tbody>
+<tr><td><code>resources.requests.cpu</code></td><td>reserva CPU no nó</td><td>pedido alto = poucos nós
+servem</td></tr>
+<tr><td><code>resources.requests.memory</code></td><td>reserva memória no nó</td><td>idem, e memória é o
+pedido que mais erra</td></tr>
+<tr><td><code>nodeSelector</code></td><td>exige etiquetas iguais nas do nó</td><td>etiqueta inexistente =
+nenhum nó serve</td></tr>
+<tr><td><code>nodeName</code></td><td>manda o pod para um nó pelo nome</td><td>pula o agendador; nome errado
+= pendente</td></tr>
+<tr><td><code>tolerations</code></td><td>aceita as marcas (taints) de um nó</td><td>sem a toleration certa, o
+nó é descartado</td></tr>
+<tr><td><code>affinity</code></td><td>regras mais finas de proximidade</td><td>mais poderoso e mais fácil de
+errar</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Dá para ver o pedido que o agendador usa sem abrir o manifesto: o <code>describe</code> mostra o
+<code>QoS Class</code> e, em clusters reais, a seção de recursos do container. O caminho mais direto, porém,
+é ler o próprio YAML aplicado com <code>kubectl get pod forno -o yaml</code> e conferir o que ficou gravado.
+Manifesto aplicado é a verdade; o arquivo na sua pasta pode estar diferente do que está no cluster.</p>
+
+<pre class="file" data-file="forno.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "256Mi"
+        limits:
+          memory: "512Mi"</pre>
+
+<p>Esse é o formato que a Ana passou a usar depois do susto: pedido pequeno e honesto, limite um pouco
+maior. O <code>requests</code> decide se o pod cabe; o <code>limits</code> decide o que acontece se ele
+exagerar. Nenhum dos dois é enfeite — e nenhum dos dois tem valor “certo” universal. O certo é o do seu
+programa.</p>
+
+<h2>8. Pending não é o mesmo que imagem quebrada</h2>
+
+<p>Misturar os estados é o erro que faz a Ana perder tempo: ela viu <code>Pending</code>, lembrou de um
+problema de imagem e foi mexer no registro. A tabela do <code>get pods</code> ajuda a separar, porque cada
+estado aponta para um culpado diferente. Esta é uma transcrição de um cluster real, com três pods em
+situações distintas:</p>
+
+<pre class="term">NAME                        READY   STATUS             RESTARTS      AGE
+cardapio-5cbfb4c44d-4jjxx   1/1     Running            0             2d
+forno-7d9f8c6b5-2xk4p       0/1     Pending            0             6m
+relatorio-6b8f7d9c4-9qv2m   0/1     CrashLoopBackOff   7 (2m ago)    9m</pre>
+
+<p>O primeiro está bem. O segundo nunca foi agendado: <code>0/1</code>, <code>Pending</code>,
+<code>RESTARTS</code> zero. O terceiro foi agendado, rodou, morreu e está sendo reiniciado:
+<code>RESTARTS</code> em 7, com a espera crescente que o <code>BackOff</code> do nome indica. Cada um pede um
+comando diferente — <code>describe</code> para o segundo, <code>logs</code> e <code>describe</code> para o
+terceiro.</p>
+
+<p>A regra que a Ana adotou: <strong>primeiro a coluna STATUS, depois o comando</strong>. Se o status é
+<code>Pending</code>, o problema é de lugar: recursos, seletor, restrição. Se o status é
+<code>ImagePullBackOff</code>, é de imagem: nome errado, tag errada, registro privado sem credencial. Se o
+status é <code>CrashLoopBackOff</code>, é do programa: ele está morrendo sozinho. Três sintomas, três
+aulas — esta é a do <code>Pending</code>.</p>
+
+<p>Um caso intermediário confunde muita gente: <code>Running</code> com <code>0/1</code>. Ali o pod foi
+agendado e o container subiu, mas não passa na verificação de prontidão. Não é <code>Pending</code>, e o
+<code>describe</code> mostra a condição <code>Ready</code> como <code>False</code> com o motivo. Guarde a
+diferença: <code>Pending</code> é antes do nó; <code>0/1 Running</code> é depois.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o cluster cheio sem ninguém notar</h3>
+<p>A Ana aplicou três Deployments de teste e esqueceu de apagar. Semanas depois, o forno novo ficou
+pendente com <code>Insufficient memory</code>, e ela jurou que o pedido era pequeno. Era: 256Mi. O problema
+era o cluster, com metade da memória presa em pods de teste que ninguém usava. O conserto não foi no
+manifesto, foi em <code>kubectl get pods -A</code> e <code>kubectl delete deployment</code> nos restos de
+guerra.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a etiqueta que só existia na cabeça</h3>
+<p>O manifesto do relatório pedia <code>nodeSelector: tipo: worker</code>, copiado de um tutorial. No
+cluster da Ana nenhum nó tinha <code>tipo</code> — a etiqueta nunca foi criada. O pod ficou pendente por
+duas horas, e a mensagem <code>didn't match Pod's node affinity/selector</code> parecia falar de outra
+coisa. O conserto foi trocar o seletor por <code>kubernetes.io/hostname</code>, que todo nó tem.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o pod que só precisava de tempo</h3>
+<p>Nem todo <code>Pending</code> é erro. Quando um Deployment sobe cinco pods de uma vez e o cluster está
+quase cheio, alguns ficam pendentes por segundos até outros terminarem e liberarem espaço. O sinal de que é
+isso é o <code>AGE</code> mudando e o evento dizendo <code>Insufficient cpu</code> num nó que estava cheio
+naquele instante. Se o pod sai do <code>Pending</code> sozinho, era fila; se fica, é configuração.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que <code>Pending</code> quer dizer?</p>
+<label><input type="radio" name="q1"> o container subiu e morreu em seguida</label>
+<label><input type="radio" name="q1"> o pod foi aceito, mas nenhum nó serviu para colocá-lo</label>
+<label><input type="radio" name="q1"> a imagem não pôde ser baixada</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Onde está o motivo de um pod em <code>Pending</code>?</p>
+<label><input type="radio" name="q2"> na coluna <code>AGE</code> do <code>get pods</code></label>
+<label><input type="radio" name="q2"> no campo <code>spec.status</code> do manifesto</label>
+<label><input type="radio" name="q2"> nos eventos do <code>kubectl describe pod</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O pod pede <code>memory: 64Gi</code> e os nós têm 4 GiB.
+O que acontece?</p>
+<label><input type="radio" name="q3"> fica em <code>Pending</code> com <code>Insufficient memory</code></label>
+<label><input type="radio" name="q3"> roda normalmente e usa só 4 GiB</label>
+<label><input type="radio" name="q3"> entra em <code>CrashLoopBackOff</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: dê espaço ao forno</h2>
+<p>O pod abaixo não agenda porque pede memória demais para um nó de 4 GiB. Complete o valor com
+<code>512Mi</code>, que é o que o forno usa de verdade.</p>
+<div class="ex-code">resources:
+  requests:
+    memory: "<input aria-label="resposta 1" data-answer="512Mi" placeholder="...">"</div>
+<p class="ex-dica">Dica: <code>Mi</code> é mebibyte (1024 × 1024 bytes); <code>Gi</code> é gibibyte, mil
+vezes maior. O agendador compara esse número com a memória livre de cada nó.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>Pending</code> é o pod aceito e ainda sem nó. Não é falha do programa: é o agendador dizendo que
+nenhum nó passou nas condições. As condições são sempre as mesmas quatro famílias — recurso, seletor, nó
+fixo e restrição — e a mensagem que diz qual delas falhou está nos eventos do
+<code>kubectl describe pod</code>.</p>
+
+<p>Do lado do manifesto, os campos que decidem o agendamento são <code>resources.requests</code>,
+<code>nodeSelector</code>, <code>nodeName</code> e <code>tolerations</code>. Pedir demais é o erro mais
+comum; apontar para uma etiqueta que não existe é o segundo. E vale lembrar que um pod pode ficar pendente
+por alguns segundos só porque o cluster estava cheio naquele instante — nesse caso, ele sai sozinho.</p>
+
+<p>Com o pod no ar, o próximo susto é outro: ele foi agendado, mas a imagem não desce, e o status muda para
+<code>ErrImagePull</code> e depois <code>ImagePullBackOff</code>. É o assunto da próxima aula, com as três
+causas de sempre e o comando que mostra o motivo exato.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>Pending</code> = aceito, sem nó. <code>Running</code> com <code>0/1</code> = com nó, sem
+  prontidão.</li>
+  <li>O motivo do <code>Pending</code> está nos eventos do <code>kubectl describe pod</code>.</li>
+  <li><code>requests</code> é reserva, não limite: pedir 64Gi num nó de 4Gi nunca agenda.</li>
+  <li><code>nodeSelector</code> exige etiqueta existente; <code>kubernetes.io/hostname</code> sempre existe.</li>
+  <li><code>nodeName</code> pula o agendador e erra fácil; prefira <code>nodeSelector</code>.</li>
+  <li><code>Insufficient</code>, <code>didn't match</code> e <code>untolerated taint</code> são as frases
+  que você vai ler.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

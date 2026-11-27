@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CronJob | Guia Kubernetes</title>
+<meta name="description" content="CronJob no Kubernetes: os cinco campos do schedule, concurrencyPolicy, startingDeadlineSeconds, suspend, histórico de Jobs e como testar sem esperar o horário.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">CronJob</span></h1>
+<p class="intro">O backup do banco da padaria tem de rodar às três da manhã, todo dia, sem ninguém lembrar. A
+Ana já fez isso com <code>cron</code> na máquina dela: uma linha no <code>crontab</code> e pronto. Só que
+aquela máquina dorme, reinicia, muda de dono — e o backup parou por três semanas sem ninguém notar. O
+<strong>CronJob</strong> é a mesma ideia, dentro do cluster: um relógio que cria Jobs no horário que você
+mandar, com histórico do que rodou.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Como ler e escrever os cinco campos do <code>schedule</code>.</li>
+  <li>O que o CronJob faz — e o que ele <em>não</em> faz na hora em que você aplica.</li>
+  <li><code>concurrencyPolicy</code>: e quando a execução anterior ainda não terminou?</li>
+  <li><code>startingDeadlineSeconds</code>: o horário passou e o cluster estava ocupado.</li>
+  <li><code>suspend</code>, histórico de Jobs e <code>timeZone</code>.</li>
+  <li>Como testar sem esperar até as três da manhã.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o backup que ninguém viu falhar</h2>
+
+<p>Durante um ano, o backup da padaria rodou num <code>crontab</code> da máquina da Ana. Funcionava. Até a
+máquina ser trocada numa terça-feira; o <code>crontab</code> não foi junto, e ninguém percebeu porque ninguém
+confere backup que “sempre deu certo”. O problema apareceu dois meses depois, quando a contabilidade pediu o
+histórico de vendas de um mês antigo e o arquivo não existia.</p>
+
+<p>O CronJob resolve três coisas que o cron de máquina não resolve. Primeiro, ele não depende de uma máquina
+específica: quem agenda é o controlador do cluster, e o Job roda onde houver espaço. Segundo, cada execução
+fica registrada — você consegue listar os Jobs criados, ver quais falharam e ler o log de cada um. Terceiro,
+ele herda tudo o que você já aprendeu sobre Job: <code>backoffLimit</code>, <code>restartPolicy</code>,
+limites de recurso, imagem versionada.</p>
+
+<p>A relação entre os dois objetos é simples e vale guardar: o CronJob é o <em>relógio</em>, o Job é a
+<em>tarefa</em>. O CronJob não executa nada; ele cria Jobs. Cada horário que chega vira um Job novo, com nome
+derivado do CronJob e um sufixo de tempo, e é esse Job que cria o pod que roda o seu container.</p>
+
+<h2>2. Anatomia de um CronJob</h2>
+
+<p>Um CronJob tem duas partes: os campos do relógio, em <code>spec</code>, e o molde do Job, em
+<code>spec.jobTemplate</code>. Quase todos os erros de configuração moram na fronteira entre as duas — um campo
+do relógio escrito dentro do molde, ou o <code>restartPolicy</code> esquecido lá no fundo.</p>
+
+<dl class="anatomy">
+<dt>spec.schedule</dt>
+<dd>Obrigatório. Cinco campos separados por espaço: minuto, hora, dia do mês, mês, dia da semana.</dd>
+<dt>spec.jobTemplate</dt>
+<dd>O molde do Job: <code>spec.template</code> com os containers, <code>restartPolicy</code>,
+<code>backoffLimit</code>. É o mesmo Job da aula anterior, só que embrulhado.</dd>
+<dt>spec.concurrencyPolicy</dt>
+<dd><code>Allow</code> (padrão), <code>Forbid</code> ou <code>Replace</code>: o que fazer se o Job anterior
+ainda estiver rodando quando chegar a hora.</dd>
+<dt>spec.startingDeadlineSeconds</dt>
+<dd>Quanto atraso o CronJob tolera. Se o horário passou e ele não conseguiu começar dentro desse prazo, aquela
+execução é perdida em vez de atrasada.</dd>
+<dt>spec.suspend</dt>
+<dd><code>true</code> pausa o relógio sem apagar nada. Nenhum Job novo é criado; os que já existem continuam
+existindo.</dd>
+<dt>spec.successfulJobsHistoryLimit</dt>
+<dd>Quantos Jobs concluídos ficam guardados. Padrão 3.</dd>
+<dt>spec.failedJobsHistoryLimit</dt>
+<dd>Quantos Jobs falhos ficam guardados. Padrão 1.</dd>
+<dt>spec.timeZone</dt>
+<dd>Fuso do <code>schedule</code>. Sem ele, o relógio é UTC. <code>America/Sao_Paulo</code> é o valor que a
+Ana usa.</dd>
+</dl>
+
+<p>Repare que não existe campo para “rodar agora”. O CronJob é passivo: ele olha o relógio e dispara. Para
+rodar na hora, você cria um Job a partir dele — e isso tem seção própria mais adiante.</p>
+
+<h2>3. O schedule: cinco campos, nenhum a mais</h2>
+
+<p>O formato é o do cron clássico, com cinco posições. A leitura é sempre da esquerda para a direita, do menor
+para o maior intervalo:</p>
+
+<p><code>minuto</code> (0–59), <code>hora</code> (0–23), <code>dia do mês</code> (1–31), <code>mês</code>
+(1–12), <code>dia da semana</code> (0–6, domingo é 0). Um asterisco significa “todos”. Então
+<code>0 3 * * *</code> quer dizer: no minuto zero, da hora três, de qualquer dia, de qualquer mês, de qualquer
+dia da semana — ou seja, três da manhã, todo dia.</p>
+
+<p>O erro mais comum é escrever o schedule com quatro campos, tentando usar o atalho <code>*/5</code> e
+esquecendo uma posição. O servidor recusa e a mensagem é bem didática:</p>
+
+<pre class="term">$ kubectl apply -f backup.yaml
+The CronJob "backup" is invalid: spec.schedule: Invalid value: "*/5 * * *": expected exactly 5 fields, found 4: [minuto hora dia-do-mês mês dia-da-semana]</pre>
+
+<p>A caixa começa com o CronJob sem <code>schedule</code> nenhum — o erro é <code>spec.schedule: Required
+value</code>. A missão é completar o relógio e o <code>restartPolicy</code> dentro do molde, e depois olhar o
+painel: ele mostra <code>kubectl get jobs</code>, e a resposta é “nenhum”. Isso não é falha, é o
+comportamento — nada é disparado fora do horário.</p>
+
+<div class="tryk8s" data-get="jobs" data-goal="campo:CronJob/backup|spec.schedule=0 3 * * *;;campo:CronJob/backup|spec.jobTemplate.spec.template.spec.restartPolicy=OnFailure;;texto:No resources found">
+  <p class="try-task">Acrescente <code>schedule: "0 3 * * *"</code> em <code>spec</code> e
+  <code>restartPolicy: OnFailure</code> dentro de <code>jobTemplate.spec.template.spec</code>. Rode e repare
+  que ainda não existe nenhum Job: o relógio só dispara às três da manhã.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: backup:2.0
+              command: ["pg_dump", "-f", "/dados/backup.sql"]</pre>
+<pre class="out">
+The CronJob "backup" is invalid: spec.schedule: Required value; spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+</pre>
+  <pre class="solucao">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup
+spec:
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: backup:2.0
+              command: ["pg_dump", "-f", "/dados/backup.sql"]</pre>
+</div>
+
+<p>Um detalhe do fuso que morde muita gente: sem <code>timeZone</code>, o Kubernetes interpreta o
+<code>schedule</code> em UTC. Três da manhã em UTC é meia-noite em São Paulo. Se o backup tem de rodar às 3h
+daqui, ou você escreve <code>0 6 * * *</code> pensando em UTC, ou — melhor — declara
+<code>timeZone: America/Sao_Paulo</code> e escreve o horário como você fala em voz alta.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Schedule</th><th>Quando roda</th><th>Uso típico na padaria</th></tr>
+</thead>
+<tbody>
+<tr><td><code>0 3 * * *</code></td><td>todo dia às 3h</td><td>backup do banco</td></tr>
+<tr><td><code>*/15 * * * *</code></td><td>a cada 15 minutos</td><td>sincronizar o catálogo com o site</td></tr>
+<tr><td><code>0 6 * * 1</code></td><td>segunda-feira às 6h</td><td>relatório semanal para a sócia</td></tr>
+<tr><td><code>30 2 1 * *</code></td><td>dia 1 de cada mês, 2h30</td><td>fechamento mensal</td></tr>
+<tr><td><code>0 */4 * * *</code></td><td>de 4 em 4 horas, na hora cheia</td><td>limpar sessões expiradas</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Note que <code>*/15</code> é “a cada 15”, não “aos 15 minutos”. E evite schedules com o dia do mês e o dia
+da semana preenchidos ao mesmo tempo: no cron clássico, quando os dois estão preenchidos, a regra é “ou um ou
+outro”, e quase ninguém lembra disso na hora de depurar.</p>
+
+<h2>4. Quando o horário chega, o que aparece</h2>
+
+<p>Chegou o horário: o controlador do CronJob cria um Job, e o Job faz o que você já sabe — cria pod, tenta de
+novo se falhar, para quando termina. O nome do Job é o nome do CronJob mais um sufixo numérico de tempo, e é
+por isso que você vê vários objetos parecidos no <code>get jobs</code> depois de alguns dias.</p>
+
+<p>Esta é a transcrição de um cluster de prova, com o CronJob de backup rodando há três dias:</p>
+
+<pre class="term">$ kubectl get jobs
+NAME               COMPLETIONS   DURATION   AGE
+backup-29388120    1/1           38s        2d
+backup-29389560    1/1           41s        1d
+backup-29391000    1/1           37s        5h
+
+$ kubectl get cronjobs
+NAME     SCHEDULE    SUSPEND   ACTIVE   LAST SCHEDULE   AGE
+backup   0 3 * * *   False     0        5h              3d</pre>
+
+<p>Três Jobs, um por noite — e nenhum além disso, porque <code>successfulJobsHistoryLimit</code> está no padrão
+3. Se o backup de ontem tivesse falhado, ele apareceria com <code>0/1</code> e o histórico de falha guardaria
+apenas o mais recente (<code>failedJobsHistoryLimit: 1</code>). É por isso que muita gente sobe esse número:
+um Job falho por dia, guardado por um único dia, apaga a evidência justamente quando você precisa dela.</p>
+
+<p>Num cluster real, o <code>get cronjobs</code> também mostra a coluna <code>LAST SCHEDULE</code> e
+<code>ACTIVE</code>, que respondem “quando rodou pela última vez” e “tem execução em andamento agora”. Essas
+duas colunas são o começo de qualquer investigação de “o backup rodou ontem?”. No painel do guia não há
+controlador de CronJob, então nada é disparado: o que ele prova é o manifesto — e a ausência de Jobs é parte
+da lição.</p>
+
+<h2>5. concurrencyPolicy: e se a execução anterior ainda estiver rodando?</h2>
+
+<p>O backup costuma levar quarenta segundos. Mas num dia de banco grande ele leva duas horas — e o horário
+seguinte chega. O que fazer? Essa é a pergunta que <code>concurrencyPolicy</code> responde, e as três
+respostas mudam bastante o comportamento do cluster.</p>
+
+<p><code>Allow</code>, o padrão, não faz nada de especial: cria mais um Job e deixa os dois rodando juntos. É
+cômodo para tarefa independente e um desastre para backup que escreve no mesmo arquivo.
+<code>Forbid</code> simplesmente pula a execução nova: se a anterior ainda está rodando, a daquele horário não
+acontece. <code>Replace</code> apaga o Job em andamento e começa um novo — bom para sincronização, onde o dado
+mais novo importa mais que terminar o antigo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Política</th><th>Com execução anterior rodando</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Allow</code></td><td>cria outra em paralelo</td><td>duas gravações no mesmo destino</td></tr>
+<tr><td><code>Forbid</code></td><td>pula a nova; a próxima tentativa é no horário seguinte</td><td>execução pulada não gera
+alarme; olhe o histórico</td></tr>
+<tr><td><code>Replace</code></td><td>mata a anterior e começa a nova</td><td>trabalho interrompido pela metade</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Junto com a política vem o prazo: <code>startingDeadlineSeconds</code>. Ele responde a outra pergunta — “se
+o cluster estava sem recurso no horário, até quando ainda vale começar?”. Sem esse campo, o controlador
+considera perdidas as execuções que atrasaram mais de 100 execuções perdidas ou o último horário bem-sucedido;
+na prática, ele tenta recuperar o atraso e pode disparar uma rajada de Jobs. Com
+<code>startingDeadlineSeconds: 120</code>, se não deu para começar em dois minutos, aquela execução é
+descartada e a vida segue.</p>
+
+<p>A caixa põe as duas coisas juntas no backup: proibir execução simultânea e tolerar no máximo dois minutos de
+atraso.</p>
+
+<div class="tryk8s" data-get="cronjobs" data-goal="campo:CronJob/backup|spec.concurrencyPolicy=Forbid;;campo:CronJob/backup|spec.startingDeadlineSeconds=120">
+  <p class="try-task">Acrescente <code>concurrencyPolicy: Forbid</code> e
+  <code>startingDeadlineSeconds: 120</code> em <code>spec</code>. Rode e confira o CronJob criado.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Allow
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: backup:2.0</pre>
+<pre class="out">
+cronjob.batch/backup created
+
+NAME     AGE
+backup   7m
+</pre>
+  <pre class="solucao">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: backup:2.0</pre>
+</div>
+
+<h2>6. Quantas tentativas dentro de um Job agendado</h2>
+
+<p>Aqui é onde as duas aulas se encontram. O <code>concurrencyPolicy</code> decide o que acontece entre
+execuções; o <code>backoffLimit</code> decide o que acontece <em>dentro</em> de uma execução. Eles são
+independentes, e os dois importam para o mesmo backup.</p>
+
+<p>O <code>backoffLimit</code> fica em <code>jobTemplate.spec.backoffLimit</code>, não em
+<code>spec</code> — é o erro de indentação mais comum em CronJob. O padrão é 6, herdado do Job. Para um backup
+que falha por rede, 6 é razoável; para um script que não pode repetir (o caso da migração da aula anterior),
+zero é a resposta. E o <code>restartPolicy</code> também vive lá no fundo, em
+<code>jobTemplate.spec.template.spec.restartPolicy</code>, aceitando <code>OnFailure</code> ou
+<code>Never</code>.</p>
+
+<p>A diferença de comportamento entre as duas políticas dentro do Job aparece na contagem: com
+<code>OnFailure</code>, o mesmo pod reinicia e o <code>RESTARTS</code> sobe; com <code>Never</code>, cada
+tentativa é um pod novo, e o <code>get pods</code> mostra vários pods com sufixo do mesmo Job. Os dois
+caminhos terminam no mesmo lugar: <code>status.succeeded</code> igual a 1 ou condição
+<code>Failed</code>.</p>
+
+<h2>7. Pausar sem apagar: suspend e o histórico</h2>
+
+<p>Chega a noite de inventário. O backup atrapalha, o banco está travado para contagem, e o time quer que o
+CronJob <em>pare</em> por algumas horas — sem perder a configuração, sem alguém lembrar de recriar depois. É
+para isso que existe <code>suspend</code>. Com <code>true</code>, o relógio para: nenhum Job novo é criado. Os
+Jobs que já existiam continuam lá, com seus logs, e voltar é só mudar para <code>false</code>.</p>
+
+<p>No mesmo pacote vem a limpeza. <code>successfulJobsHistoryLimit</code> e
+<code>failedJobsHistoryLimit</code> são contadores, não prazos: o controlador apaga os Jobs mais antigos
+quando a conta passa do limite. Com <code>successfulJobsHistoryLimit: 1</code> você guarda só o último sucesso;
+com <code>failedJobsHistoryLimit: 3</code>, guarda três falhas para investigar. Zerar o limite de sucesso é
+comum em CronJob que roda a cada minuto — nesse ritmo, três Jobs por minuto viram quatro mil por dia.</p>
+
+<p>A caixa junta a pausa com a limpeza no CronJob do relatório horário, que começa com os padrões do
+cluster.</p>
+
+<div class="tryk8s" data-get="cronjobs" data-goal="campo:CronJob/relatorio|spec.suspend=true;;campo:CronJob/relatorio|spec.successfulJobsHistoryLimit=1;;campo:CronJob/relatorio|spec.failedJobsHistoryLimit=3">
+  <p class="try-task">O relatório horário vai ficar pausado durante o inventário e precisa de histórico mais
+  enxuto: <code>suspend: true</code>, <code>successfulJobsHistoryLimit: 1</code> e
+  <code>failedJobsHistoryLimit: 3</code> em <code>spec</code>. Rode e confira o CronJob.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: relatorio
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: relatorio
+              image: relatorio:1.0</pre>
+<pre class="out">
+cronjob.batch/relatorio created
+
+NAME        AGE
+relatorio   2m
+</pre>
+  <pre class="solucao">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: relatorio
+spec:
+  schedule: "0 * * * *"
+  suspend: true
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: relatorio
+              image: relatorio:1.0</pre>
+</div>
+
+<p>Uma armadilha de operação: <code>suspend: true</code> esquecido é o CronJob que “parou de funcionar” sem
+erro nenhum. Quando alguém perguntar por que o relatório não roda, a primeira coisa a olhar é a coluna
+<code>SUSPEND</code> do <code>get cronjobs</code> — antes de suspeitar da imagem, do horário ou do
+cluster.</p>
+
+<h2>8. Testar sem esperar até as três da manhã</h2>
+
+<p>Ninguém quer descobrir que o manifesto está errado às 3h. O Kubernetes permite criar um Job a partir de um
+CronJob existente, na hora, sem tocar no relógio:</p>
+
+<pre class="term">$ kubectl create job backup-teste --from=cronjob/backup
+job.batch/backup-teste created</pre>
+
+<p>Esse é o teste de fumaça padrão: o Job herda o molde do CronJob (imagem, comando, <code>restartPolicy</code>,
+<code>backoffLimit</code>) e roda agora. Se falhar, você vê o motivo em segundos, não no dia seguinte. Depois,
+apague o Job de teste para não confundir o histórico: <code>kubectl delete job backup-teste</code>.</p>
+
+<p>No painel do guia, esse comando é aceito, mas o Job criado fica sem o molde do <code>jobTemplate</code> — o
+motor não copia o modelo, e a lição continua honesta porque o que interessa é o hábito: testar na hora. Num
+cluster real, o molde vem junto.</p>
+
+<p>Outro cuidado de fuso: o <code>timeZone</code> só existe em versões recentes do Kubernetes. Se você aplicar
+um CronJob com <code>timeZone</code> num cluster antigo, o campo é ignorado e o horário passa a ser UTC sem
+avisar — o tipo de bug silencioso que faz o backup rodar três horas antes do previsto. Confira a versão do
+cluster antes de confiar no fuso.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o backup que rodava duas vezes</h3>
+<p>Num sábado o banco cresceu e o backup passou de quarenta segundos para cinquenta minutos. Às 4h, o horário
+seguinte disparou outro Job enquanto o primeiro ainda escrevia. Dois dumps no mesmo arquivo, um corrompido. A
+correção foi <code>concurrencyPolicy: Forbid</code> mais <code>startingDeadlineSeconds: 300</code>: nunca dois
+ao mesmo tempo, e se o atraso passar de cinco minutos, aquela noite fica sem backup e o alarme toca — melhor
+do que dois arquivos ruins.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o relatório que encheu o cluster</h3>
+<p>Um CronJob de sincronização rodava a cada minuto com os padrões de histórico: três Jobs de sucesso e um de
+falha guardados. Em uma semana, o <code>get jobs</code> tinha mais de trinta mil linhas e o
+<code>kubectl get</code> ficou lento para todo mundo. O ajuste foi
+<code>successfulJobsHistoryLimit: 0</code> e <code>failedJobsHistoryLimit: 5</code>: sucesso não precisa de
+lembrança, falha precisa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a pausa que ninguém desfez</h3>
+<p>Durante o inventário, o time suspendeu o CronJob do relatório. O inventário acabou, a pessoa que suspendeu
+saiu de férias, e por duas semanas o relatório não rodou — sem erro, sem alerta, porque
+<code>suspend: true</code> é um estado válido. A lição virou rotina: quem suspende abre uma tarefa com data
+para religar, e o <code>get cronjobs</code> entra no checklist semanal.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. Quantos campos tem o <code>schedule</code> de um CronJob?</p>
+<label><input type="radio" name="q1"> três</label>
+<label><input type="radio" name="q1"> seis, contando os segundos</label>
+<label><input type="radio" name="q1"> cinco</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">2. O que acontece ao aplicar um CronJob na hora errada?</p>
+<label><input type="radio" name="q2"> um Job é criado imediatamente</label>
+<label><input type="radio" name="q2"> nada: ele só cria Jobs no horário do <code>schedule</code></label>
+<label><input type="radio" name="q2"> o CronJob roda um pod e dorme</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. A execução anterior ainda está rodando quando chega a hora.
+Qual política pula a nova execução?</p>
+<label><input type="radio" name="q3"> <code>Forbid</code></label>
+<label><input type="radio" name="q3"> <code>Allow</code></label>
+<label><input type="radio" name="q3"> <code>Replace</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o schedule do fechamento</h2>
+<p>A Ana quer o fechamento mensal no dia 1 de cada mês, às 2h30 da manhã. Complete o campo:</p>
+<div class="ex-code">schedule: "<input aria-label="resposta 1" data-answer="30 2 1 * *" placeholder="...">"</div>
+<p class="ex-dica">Dica: são cinco posições na ordem minuto, hora, dia do mês, mês, dia da semana. Só as três
+primeiras têm valor; o resto é asterisco.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>CronJob é um relógio que cria Jobs. O <code>schedule</code> tem exatamente cinco campos — minuto, hora, dia
+do mês, mês, dia da semana — e, sem <code>timeZone</code>, é lido em UTC. Aplicar um CronJob não executa nada
+na hora; ele dispara quando o horário chega, e o que aparece no cluster é um Job, com sufixo de tempo no
+nome.</p>
+
+<p>Os três campos de comportamento respondem a três perguntas diferentes. <code>concurrencyPolicy</code>: e se
+a anterior ainda estiver rodando? (<code>Allow</code>, <code>Forbid</code>, <code>Replace</code>.)
+<code>startingDeadlineSeconds</code>: até quando vale começar atrasado? <code>suspend</code>: está pausado?
+Já os <code>historyLimit</code> cuidam da memória: quantos Jobs ficam guardados antes de o controlador apagar
+os antigos.</p>
+
+<p>E o hábito que evita as três da manhã acordadas: teste com
+<code>kubectl create job teste --from=cronjob/nome</code>, leia o log do Job que apareceu, e só então confie
+no relógio. Na próxima parte do guia os workloads mudam de forma outra vez — em vez de “rodar até terminar” ou
+“no horário marcado”, vamos ver o objeto que precisa existir em <em>todos</em> os nós: o DaemonSet.</p>
+
+<div class="note">
+<h3>Para lembrar</h3>
+<ul>
+<li><code>schedule</code> tem 5 campos; 4 ou 6 são recusados com mensagem explícita.</li>
+<li>Sem <code>timeZone</code>, o horário é UTC.</li>
+<li>Aplicar um CronJob não cria Job nenhum: ele espera o horário.</li>
+<li><code>concurrencyPolicy</code>: <code>Allow</code>, <code>Forbid</code> ou <code>Replace</code>.</li>
+<li><code>startingDeadlineSeconds</code> limita o atraso aceito.</li>
+<li><code>suspend: true</code> pausa sem apagar — e é fácil de esquecer ligado.</li>
+<li><code>successfulJobsHistoryLimit</code> e <code>failedJobsHistoryLimit</code> contam Jobs, não tempo.</li>
+<li><code>restartPolicy</code> e <code>backoffLimit</code> ficam dentro de <code>jobTemplate</code>.</li>
+<li><code>kubectl create job --from=cronjob/nome</code> testa na hora.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

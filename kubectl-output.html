@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Saída do kubectl | Guia Kubernetes</title>
+<meta name="description" content="Saída do kubectl: ler a tabela sem se enganar, pedir o objeto com -o yaml e -o json, usar -o name para encadear comandos e separar stdout de erro e código de saída.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Saída do <span class="hl">kubectl</span></h1>
+<p class="intro">A Ana já sabe pedir as coisas ao cluster. O problema agora é o contrário: entender o que
+volta. Ela manda um print da tabela do <code>get pods</code> no ticket e o colega responde “e a imagem?”. Ela
+roda <code>get deployment</code> e não vê o <code>status</code>. Ela copia a tabela para uma planilha e
+descobre que a coluna <code>AGE</code> não é data. Nesta aula a Ana aprende que o kubectl tem várias
+<em>formas</em> de responder a mesma pergunta — e que escolher a forma é metade do trabalho.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que a tabela padrão mostra e o que ela esconde.</li>
+  <li>As colunas de cada tipo — pod, Deployment, Service, namespace.</li>
+  <li><code>-o name</code> e o formato <code>tipo/nome</code> que serve de alvo para o próximo comando.</li>
+  <li><code>-o wide</code>, <code>-o yaml</code> e <code>-o json</code>: quando cada um resolve.</li>
+  <li>A diferença entre a resposta do cluster, o erro e o código de saída.</li>
+  <li>Por que <code>No resources found</code> não é erro — e quando o é.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o print que não respondia</h2>
+
+<p>O site da padaria começou a mostrar o cardápio antigo. A Ana abriu o terminal, rodou
+<code>kubectl get pods</code>, tirou print e colou no ticket:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          3d</pre>
+
+<p>O colega respondeu com uma pergunta simples: “qual imagem está rodando nesse pod?”. A Ana olhou o print e
+não havia resposta ali. Não é falha do kubectl: a tabela é um <em>resumo</em>, feita para você bater o olho e
+saber se está tudo de pé. Para saber <em>o que</em> está rodando, é preciso pedir outra forma de saída. E é
+aí que a aula começa.</p>
+
+<p>Pense na diferença entre o extrato do banco e o comprovante da transferência. O extrato tem data, valor e
+saldo — o suficiente para conferir se algo saiu. O comprovante tem o número da operação, a conta de destino,
+o horário exato. Os dois falam da mesma coisa; a pergunta é que decide qual você precisa. No kubectl, o
+extrato é a tabela e o comprovante é o <code>-o yaml</code>.</p>
+
+<h2>2. A tabela: o que ela mostra e o que ela cala</h2>
+
+<p>A saída padrão do <code>kubectl get</code> é uma tabela com cabeçalho em maiúsculas, alinhada por coluna.
+As colunas mudam conforme o tipo pedido — e é por isso que metade das dúvidas de iniciante é sobre uma coluna
+que não existe naquele tipo. O vocabulário que aparece em toda saída:</p>
+
+<dl class="anatomy">
+<dt>tabela</dt>
+<dd>A saída padrão do <code>get</code>: cabeçalho, uma linha por objeto, colunas fixas por tipo. Feita para
+leitura humana, não para programa.</dd>
+<dt>-o</dt>
+<dd>A opção que escolhe a forma da resposta (<em>output</em>). Ela não muda o cluster nem a consulta: muda
+só como o resultado é impresso.</dd>
+<dt>objeto</dt>
+<dd>Um recurso do cluster (um pod, um Deployment). Em <code>-o yaml</code>, aparece com
+<code>apiVersion</code>, <code>kind</code>, <code>metadata</code>, <code>spec</code> e
+<code>status</code>.</dd>
+<dt>lista</dt>
+<dd>O que o <code>get</code> devolve quando você não informa nome: um objeto de <code>kind: List</code> com
+<code>items</code> dentro. Em tabela, a lista vira linhas.</dd>
+<dt>código de saída</dt>
+<dd>O número que o comando devolve ao shell: <code>0</code> quando deu certo (mesmo com lista vazia),
+diferente de zero quando houve erro.</dd>
+</dl>
+
+<p>As colunas do pod merecem ser lidas em ordem, porque cada uma responde a uma pergunta diferente. A tabela
+abaixo é a legenda que vale colar ao lado do terminal:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Coluna</th><th>Pergunta que responde</th><th>Onde engana</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NAME</code></td><td>como o objeto se chama</td><td>em pod de Deployment o nome é comprido e muda a cada troca; o estável é a label</td></tr>
+<tr><td><code>READY</code></td><td>quantos containers estão prontos (<code>prontos/total</code>)</td><td><code>0/1</code> com <code>Running</code> não é erro de imagem: é falta de prontidão</td></tr>
+<tr><td><code>STATUS</code></td><td>a fase do pod</td><td><code>Running</code> não quer dizer que o programa responde; quem diz é o <code>READY</code></td></tr>
+<tr><td><code>RESTARTS</code></td><td>quantas vezes o container reiniciou</td><td>número subindo é sintoma, não causa: a causa está nos eventos e nos logs</td></tr>
+<tr><td><code>AGE</code></td><td>há quanto tempo o objeto existe</td><td>é idade, não data; pod com <code>AGE</code> de segundos acabou de nascer ou de renascer</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Nos outros tipos, as colunas mudam. O Deployment mostra <code>READY</code>,
+<code>UP-TO-DATE</code> (quantos pods já estão na versão nova), <code>AVAILABLE</code> (quantos estão
+disponíveis para atender) e <code>AGE</code>. O Service mostra <code>TYPE</code>, <code>CLUSTER-IP</code>,
+<code>EXTERNAL-IP</code>, <code>PORT(S)</code> e <code>AGE</code>. O namespace mostra <code>NAME</code>,
+<code>STATUS</code> e <code>AGE</code>. A regra é sempre a mesma: a tabela responde “existe, está de pé, há
+quanto tempo”, e nada além disso.</p>
+
+<h2>3. <code>-o name</code>: a lista que serve de alvo</h2>
+
+<p>Quando o objetivo é usar o resultado no comando seguinte, a tabela atrapalha: ela tem espaços, cabeçalho e
+colunas. O <code>-o name</code> imprime uma linha por objeto, no formato <code>tipo/nome</code>, que é
+exatamente o que <code>describe</code>, <code>logs</code> e <code>delete</code> aceitam. O cluster da padaria
+já está de pé na caixa abaixo, com o Deployment e seus dois pods.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:pod/cardapio-">
+  <p class="try-task">A caixa lista os pods em tabela. Peça a mesma lista no formato <code>tipo/nome</code>
+  (<code>-o name</code>) e veja cada pod virar um alvo pronto para o próximo comando.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl get pods -o name</pre>
+</div>
+
+<p>A diferença parece pequena e não é. Na tabela, o nome está no meio de cinco colunas; em
+<code>-o name</code>, a linha inteira é o alvo: <code>pod/cardapio-wj4jsx2tcw-q65ng</code>. Copiar daqui
+elimina o erro de digitação que gera o famoso <code>not found</code>, e encadear comandos fica trivial no
+shell de verdade: <code>kubectl logs $(kubectl get pods -o name | head -1)</code> faz o <code>logs</code>
+receber o primeiro pod da lista sem ninguém digitar nada.</p>
+
+<h2>4. O prefixo do <code>-o name</code> muda com o tipo</h2>
+
+<p>O formato <code>tipo/nome</code> não é sempre igual, e isso pega muita gente. Pods vêm do grupo
+<code>v1</code> (o grupo central da API) e aparecem como <code>pod/nome</code>. Objetos de outros grupos
+carregam o grupo no prefixo: <code>deployment.apps/cardapio</code>,
+<code>replicaset.apps/cardapio-abc</code> — o <code>.apps</code> é o grupo da API. Não é enfeite: é o que
+permite que dois tipos com nomes parecidos não se confundam na hora de colar o alvo num comando.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:deployment.apps/cardapio">
+  <p class="try-task">O Deployment do cardápio existe no cluster. Peça a lista de Deployments com
+  <code>-o name</code> e repare no prefixo <code>deployment.apps/</code>, diferente do <code>pod/</code> da
+  caixa anterior.</p>
+<pre class="yaml">kubectl get deployments</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">kubectl get deployments -o name</pre>
+</div>
+
+<p>Na tabela, esse mesmo Deployment mostra <code>READY</code>, <code>UP-TO-DATE</code>,
+<code>AVAILABLE</code> e <code>AGE</code> — informação que o <code>-o name</code> joga fora de propósito.
+Quem precisa do alvo usa o nome; quem precisa saber quantas réplicas estão prontas usa a tabela ou o
+<code>-o yaml</code>. As duas perguntas são legítimas; só não cabem na mesma linha de comando.</p>
+
+<p>O mesmo raciocínio vale para qualquer tipo com grupo próprio. Um Service do grupo central aparece como
+<code>service/cardapio</code>; um Ingress, do grupo <code>networking.k8s.io</code>, aparece como
+<code>ingress.networking.k8s.io/cardapio</code>. Por isso copiar o alvo do <code>-o name</code> é melhor que
+digitar: o prefixo certo vem de graça, e o <code>delete</code> aceita exatamente aquela string.</p>
+
+<h2>5. <code>-o wide</code>: a mesma tabela, mais colunas</h2>
+
+<p>Entre a tabela econômica e o YAML gigante existe um meio-termo: a saída larga. Ela mantém as colunas de
+sempre e acrescenta <code>IP</code>, <code>NODE</code>, <code>NOMINATED NODE</code> e
+<code>READINESS GATES</code>. É a resposta para “onde esse pod caiu?” e “dois pods foram para o mesmo nó?”,
+sem precisar abrir o objeto inteiro. Em Service, a saída larga acrescenta a coluna
+<code>SELECTOR</code> — o seletor que o Service usa para achar os pods, que é a primeira coisa a conferir
+quando não há endpoint.</p>
+
+<p>Vale saber o que <code>NOMINATED NODE</code> e <code>READINESS GATES</code> significam, mesmo que apareçam
+como <code>&lt;none&gt;</code> em quase toda linha. O primeiro só tem valor quando o agendador já escolheu um
+nó mas o pod ainda não foi aceito por ele; o segundo existe para pods que usam condições extras de
+prontidão. Ver <code>&lt;none&gt;</code> ali é normal — não é campo faltando.</p>
+
+<p>O que a saída larga <em>não</em> resolve é a pergunta da Ana no começo da aula: a imagem. Nenhuma coluna
+de tabela mostra imagem, porque imagem é <code>spec</code>, e tabela mostra estado resumido. Para isso existe
+a próxima seção.</p>
+
+<h2>6. <code>-o yaml</code>: o objeto como o cluster guarda</h2>
+
+<p>O <code>-o yaml</code> imprime o objeto inteiro — o mesmo que o cluster guarda, com
+<code>apiVersion</code>, <code>kind</code>, <code>metadata</code>, <code>spec</code> e
+<code>status</code>. É a resposta definitiva para “como isso está configurado?”, e é onde a imagem aparece.
+A caixa abaixo cria o Deployment e pede o objeto:</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:kind: Deployment;;texto:image: cardapio:1.0;;texto:replicas: 1">
+  <p class="try-task">Crie o Deployment <code>cardapio</code> com a imagem <code>cardapio:1.0</code> e peça o
+  objeto inteiro com <code>-o yaml</code>, para encontrar a imagem e o número de réplicas.</p>
+<pre class="yaml">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl get deployment cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create deployment cardapio --image=cardapio:1.0
+deployment.apps/cardapio created
+
+ana@notebook:~$ kubectl get deployment cardapio
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   1/1     1            1           2m
+</pre>
+<pre class="solucao">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl get deployment cardapio -o yaml</pre>
+</div>
+
+<p>O arquivo que aparece tem quatro blocos, e cada um responde a uma coisa. <code>apiVersion</code> e
+<code>kind</code> dizem o que o objeto é. <code>metadata</code> traz nome, namespace, labels e annotations.
+<code>spec</code> é o que você pediu — réplicas, seletor, molde do pod e a imagem dentro dele.
+<code>status</code> é o que o cluster conta de volta: quantas réplicas estão prontas, quais condições estão
+verdadeiras. O <code>status</code> você nunca escreve: ele é calculado.</p>
+
+<p>Uma observação que evita confusão: quando o comando não tem nome
+(<code>kubectl get pods -o yaml</code>), a resposta é uma <em>lista</em> —
+<code>kind: List</code> com <code>items:</code> e cada objeto indentado embaixo. Com nome
+(<code>kubectl get deployment cardapio -o yaml</code>), a resposta é o objeto sozinho. As duas formas são
+válidas; a lista é o que um programa costuma consumir, e o objeto é o que você lê.</p>
+
+<h2>7. <code>-o json</code>: a mesma informação para programa</h2>
+
+<p>O <code>-o json</code> entrega o mesmo conteúdo do YAML em JSON — chaves entre aspas, chaves separadas por
+vírgula, sem indentação significativa. Para quem lê com os olhos, YAML ganha: menos pontuação, mais silêncio.
+Para quem lê com um programa, JSON ganha: é o formato nativo de quase toda linguagem e de quase toda
+ferramenta de automação.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Saída</th><th>O que traz</th><th>Use quando</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td>padrão</td><td>tabela com cinco colunas</td><td>bater o olho e ver se está tudo de pé</td><td>não tem imagem, IP, nó nem labels</td></tr>
+<tr><td><code>-o wide</code></td><td>tabela com <code>IP</code> e <code>NODE</code></td><td>descobrir onde o pod está</td><td>só em tipos que têm essas colunas</td></tr>
+<tr><td><code>--show-labels</code></td><td>tabela com a coluna <code>LABELS</code></td><td>conferir etiqueta antes de filtrar</td><td>valor longo quebra o alinhamento</td></tr>
+<tr><td><code>-o name</code></td><td><code>tipo/nome</code>, uma linha por objeto</td><td>alimentar o próximo comando</td><td>o prefixo varia com o grupo da API</td></tr>
+<tr><td><code>-o yaml</code></td><td>o objeto inteiro, legível</td><td>entender configuração e status</td><td>é longo; muita rolagem</td></tr>
+<tr><td><code>-o json</code></td><td>o objeto inteiro em JSON</td><td>levar para script ou ferramenta</td><td>ilegível a olho nu sem filtro</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Falta um formato na tabela, e ele é o preferido de quem automatiza: o <code>-o jsonpath</code>, que recebe
+um caminho dentro do objeto e imprime só aquele pedaço. <code>kubectl get pod cardapio -o
+jsonpath='{.status.phase}'</code> devolve uma palavra, sem tabela nem YAML em volta. É a ferramenta certa para
+um script que precisa de um valor só, e o painel deste guia não a implementa — lá, o caminho é pedir o YAML e
+procurar o campo com os olhos. No cluster do trabalho, vale decorar a sintaxe: ela resolve em uma linha o que
+antes exigia <code>grep</code> e boa vontade.</p>
+
+<p>Repare que nenhuma linha da tabela diz “melhor”. Cada formato é a resposta de uma pergunta diferente, e o
+erro clássico é usar o mais completo para tudo: quem faz <code>get pods -o yaml</code> para ver se o pod
+subiu perde trinta segundos por comando e não vê nada de errado na tela. O caminho normal é começar na
+tabela, desconfiar de uma linha e aprofundar no objeto — não o contrário.</p>
+
+<h2>8. O que é resposta, o que é erro e o que é código de saída</h2>
+
+<p>O kubectl escreve em dois canais diferentes, e o shell os trata de forma diferente. A resposta — tabela,
+YAML, <code>No resources found</code> — vai para a <strong>saída padrão</strong>
+(<em>stdout</em>). A mensagem de erro vai para a <strong>saída de erro</strong>
+(<em>stderr</em>). Por isso um script pode guardar a resposta num arquivo e ainda ver o erro na tela. Além
+disso, o comando deixa um código de saída: <code>0</code> quando deu certo, diferente de zero quando não.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pod cardapio
+Error from server (NotFound): pods "cardapio" not found
+
+ana@notebook:~$ echo $?
+1</pre>
+
+<p>A primeira lição dessa transcrição: “não achei” é <em>erro</em>, não lista vazia — o código de saída é
+<code>1</code>. É por isso que um script com <code>set -e</code> para na primeira linha quando o pod não
+existe, e é bom que pare: quase sempre a próxima linha assumiria que ele existe.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods -n teste
+No resources found in teste namespace.
+
+ana@notebook:~$ echo $?
+0</pre>
+
+<p>A segunda lição é a que mais confunde: <code>No resources found</code> é <strong>sucesso</strong>. A
+consulta foi feita, o cluster respondeu, e a resposta é “não há nada aqui”. Código de saída
+<code>0</code>. Um script que trata isso como falha vai parar em cluster vazio sem motivo; e um script que
+trata <code>NotFound</code> como vazio vai seguir adiante quando o objeto está simplesmente em outro
+namespace. São duas situações diferentes com mensagens parecidas, e a diferença está no tipo do erro, não no
+texto.</p>
+
+<p>Uma nota sobre o painel deste guia: ele mostra a sessão como se fosse um terminal, mas não é um shell — não
+há <code>echo $?</code> nem redirecionamento ali. O que você vê no painel é o texto que o kubectl
+imprimiria; os códigos de saída e a separação entre os dois canais são do terminal de verdade, e é por isso
+que eles aparecem nas transcrições acima e não numa caixa.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a imagem que ninguém sabia</h3>
+<p>O site servia o cardápio antigo e a tabela dizia <code>Running</code>, <code>1/1</code>, zero reinícios.
+O problema não era saúde, era <em>versão</em>. Um <code>kubectl get deployment cardapio -o yaml</code>
+mostrou <code>image: cardapio:1.0</code> onde deveria estar <code>1.1</code>. Tabela diz se está de pé; só o
+objeto diz o que está vestindo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o script que parava no cluster vazio</h3>
+<p>Um script de conferência rodava <code>kubectl get pods -n teste</code> e abortava quando a saída não tinha
+linhas. Em cluster novo, com o namespace recém-criado, ele “falhava” sempre — porque
+<code>No resources found</code> não é erro e o código de saída é zero. A correção foi olhar o código de saída
+e o tipo da mensagem, em vez de contar linhas.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o nome copiado com o prefixo errado</h3>
+<p>Alguém copiou <code>deployment.apps/cardapio</code> e tentou usar como nome de pod no
+<code>logs</code>. O kubectl respondeu <code>NotFound</code>, porque o prefixo era de outro tipo e de outro
+grupo. O <code>-o name</code> salva quando o copiar/colar vem da linha certa — e engana quando vem da linha
+errada. Conferir o prefixo antes de colar economiza a rodada.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="1"><p class="mc-q">1. Qual saída mostra a imagem que o pod está rodando?</p>
+<label><input type="radio" name="q1"> <code>kubectl get pod nome -o yaml</code></label>
+<label><input type="radio" name="q1"> <code>kubectl get pods</code></label>
+<label><input type="radio" name="q1"> <code>kubectl get pods -o wide</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o <code>-o name</code> devolve?</p>
+<label><input type="radio" name="q2"> o nome do cluster</label>
+<label><input type="radio" name="q2"> uma tabela com a coluna <code>NAME</code> só</label>
+<label><input type="radio" name="q2"> uma linha por objeto no formato <code>tipo/nome</code></label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. <code>No resources found in default namespace.</code>
+significa:</p>
+<label><input type="radio" name="q3"> erro de conexão com o cluster</label>
+<label><input type="radio" name="q3"> consulta bem-sucedida com lista vazia (código de saída 0)</label>
+<label><input type="radio" name="q3"> que o namespace não existe</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o alvo pronto para colar</h2>
+<p>Você precisa pegar o nome de um pod para usar no <code>kubectl logs</code>. Complete a opção do
+<code>get</code> que imprime uma linha por objeto no formato <code>tipo/nome</code>:</p>
+<div class="ex-code">kubectl get pods <input aria-label="resposta 1" data-answer="-o name" placeholder="..."></div>
+<p class="ex-dica">Dica: a opção é a mesma família do <code>-o yaml</code> e do <code>-o json</code> — o
+<code>-o</code> escolhe a forma da saída. O valor <code>name</code> é o que imprime só o identificador, no
+formato que o próprio kubectl entende como alvo.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>A tabela do <code>get</code> é um resumo para bater o olho: diz se existe, se está pronto e há quanto
+tempo. Ela não mostra imagem, seletor nem <code>status</code> — e não é falha, é escolha. Quando a pergunta
+muda, muda a forma da resposta: <code>-o wide</code> para IP e nó, <code>--show-labels</code> para etiqueta,
+<code>-o name</code> para o alvo, <code>-o yaml</code> para ler o objeto inteiro e <code>-o json</code> para
+entregar a um programa.</p>
+
+<p>O formato <code>tipo/nome</code> do <code>-o name</code> carrega o grupo da API quando existe:
+<code>pod/cardapio</code> mas <code>deployment.apps/cardapio</code>. Copiar dali evita erro de digitação; usar
+a linha errada gera <code>NotFound</code> na hora seguinte.</p>
+
+<p>E as duas frases que todo mundo confunde: <code>Error from server (NotFound)</code> é erro, sai na saída
+de erro e devolve código diferente de zero; <code>No resources found</code> é sucesso, sai na saída padrão e
+devolve zero. Na próxima aula a Ana aprende a mudar o objeto sem reaplicar o manifesto inteiro — com
+<a href="edit-e-patch.html"><code>edit</code> e <code>patch</code></a>, e com as alternativas que sempre
+funcionam.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+<li>Tabela = resumo. Imagem, seletor e <code>status</code> só no objeto.</li>
+<li><code>-o name</code> imprime <code>tipo/nome</code>: <code>pod/x</code>,
+<code>deployment.apps/x</code>, <code>service/x</code>.</li>
+<li><code>-o wide</code> acrescenta <code>IP</code> e <code>NODE</code> (e <code>SELECTOR</code> em
+Service).</li>
+<li><code>-o yaml</code> e <code>-o json</code> mostram o objeto inteiro: <code>spec</code> é o pedido,
+<code>status</code> é a resposta.</li>
+<li><code>NotFound</code> é erro (código 1); <code>No resources found</code> é lista vazia (código 0).</li>
+<li>Erro vai para a saída de erro, resposta vai para a saída padrão.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

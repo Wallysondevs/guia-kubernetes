@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ConfigMap | Guia Kubernetes</title>
+<meta name="description" content="ConfigMap na prática: tirar preços e horários de dentro da imagem, criar o objeto em YAML, ler a tabela do get configmaps e entregar as chaves ao pod, uma a uma ou todas juntas.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>O <span class="hl">ConfigMap</span></h1>
+<p class="intro">A Ana já tem o site da padaria rodando no cluster, dentro de uma imagem chamada
+<code>cardapio:1.0</code>. Só que o preço do pão está escrito <em>dentro</em> dessa imagem: toda vez que o
+preço muda, ela precisa montar a imagem de novo, publicar e reiniciar o pod. Nesta aula ela tira a
+configuração de dentro do programa e a coloca num objeto do cluster — o ConfigMap — para mudar o preço sem
+tocar na imagem. E, no caminho, aprende a entregar essas chaves ao pod de duas maneiras diferentes, com o
+painel mostrando o que o cluster responderia em cada uma.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que a configuração não deve morar dentro da imagem.</li>
+  <li>O que é um ConfigMap, o que ele guarda e o que ele <em>não</em> faz.</li>
+  <li>Escrever o manifesto de um ConfigMap com <code>data</code> e as suas chaves.</li>
+  <li>Ler a tabela do <code>kubectl get configmaps</code> e a coluna <code>DATA</code>.</li>
+  <li>Entregar <strong>uma</strong> chave ao pod com <code>valueFrom.configMapKeyRef</code>.</li>
+  <li>Entregar <strong>todas</strong> as chaves de uma vez com <code>envFrom</code>.</li>
+  <li>Reconhecer os erros de sempre: nome errado, chave errada, namespace errado e valor numérico.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o preço que mora dentro da imagem</h2>
+
+<p>O pão de queijo custava quatro e cinquenta na segunda-feira. Na quinta, a farinha subiu e a Ana precisou
+cobrar cinco e vinte. Parece uma mudança de dez minutos — mas o preço estava escrito no código do site, que
+estava empacotado na imagem <code>cardapio:1.0</code>, que estava rodando no pod. Para mudar um número, a
+Ana precisou: editar o código, montar a imagem outra vez, publicar no registro, trocar a imagem no pod e
+esperar subir. Quarenta minutos para um número.</p>
+
+<p>Pior: no dia seguinte ela queria <em>testar</em> um preço novo antes de valer na loja. Com o preço dentro
+da imagem, testar significa uma imagem por preço — e o cluster passa a ter duas imagens que só diferem por
+um número. Isso não é configuração; é um código diferente disfarçado.</p>
+
+<p>A ideia que resolve isso é antiga e simples: <strong>separe o que o programa faz do que ele está
+configurado para fazer</strong>. O programa é o mesmo em todo lugar — o mesmo binário, a mesma imagem, os
+mesmos testes. O que muda de um ambiente para outro é um punhado de valores: preço, horário de
+funcionamento, endereço do banco, tempo de espera. Esses valores ficam guardados fora da imagem, num objeto
+do cluster, e o pod os recebe ao iniciar. Esse objeto é o <strong>ConfigMap</strong>.</p>
+
+<h2>2. O que é um ConfigMap, na prática</h2>
+
+<p>ConfigMap é uma <em>tabela de chave e valor</em> guardada no cluster, com nome e namespace como qualquer
+outro objeto. Ele não roda nada, não consome CPU, não reinicia ninguém: é só um lugar onde você escreve
+texto e o pod lê. Pense na ficha que fica pregada na parede da cozinha — “preço do pão: 4,50; abre às 6h” —
+que todo mundo consulta, e que a Ana troca quando precisa, sem trocar o fogão.</p>
+
+<p>O conteúdo vai em <code>data</code>, e cada linha é <code>chave: valor</code>. A chave é o nome que o
+programa vai procurar; o valor é sempre texto. Repare nessa palavra: <strong>texto</strong>. Você escreve
+<code>"4.50"</code> entre aspas no YAML não por capricho, mas porque o ConfigMap guarda strings — um
+<code>4.50</code> sem aspas vira número na leitura do YAML e o cluster recusa o objeto. O programa converte
+o texto em número quando precisar.</p>
+
+<dl class="anatomy">
+<dt>ConfigMap</dt>
+<dd>O objeto do cluster que guarda configuração em pares de chave e valor. Tem nome, namespace e
+<code>data</code>. Não roda nada e não pertence a nenhum pod.</dd>
+<dt><code>data</code></dt>
+<dd>O mapa de chaves e valores. <code>preco: "4.50"</code> cria a chave <code>preco</code> com o valor
+<code>4.50</code>. Limite de 1 MiB por objeto.</dd>
+<dt>chave</dt>
+<dd>O nome que o programa procura. Só letras, números, hífen, ponto e sublinhado — nada de acento, espaço
+ou barra.</dd>
+<dt><code>envFrom</code></dt>
+<dd>O campo do pod que diz “pegue todas as chaves deste ConfigMap e transforme em variáveis de
+ambiente”.</dd>
+<dt><code>valueFrom</code></dt>
+<dd>O campo que diz “esta variável, e só esta, vem daquela chave daquele ConfigMap”.</dd>
+</dl>
+
+<p>Duas coisas que o ConfigMap não faz, e que confundem no começo. Primeira: ele não é um cofre — para isso
+existe o <a href="secret.html">Secret</a>. O conteúdo
+fica legível para quem tem permissão de ler o objeto, e aparece inteiro num <code>kubectl get</code>. Senha,
+token e chave de API não vão aqui — existe um objeto próprio para isso, o Secret, que é a aula depois da
+próxima. Segunda: ele não pertence ao pod. É um objeto independente, com vida própria: você cria, o pod
+consome, e apagar o pod não apaga o ConfigMap.</p>
+
+<h2>3. O primeiro ConfigMap em YAML</h2>
+
+<p>O manifesto tem a mesma anatomia do pod: <code>apiVersion</code>, <code>kind</code>,
+<code>metadata</code> e o conteúdo. A diferença é que no lugar do <code>spec</code> vem o
+<code>data</code>. A caixa abaixo começa com o preço só, e a missão é acrescentar o horário de
+funcionamento — a segunda chave que o site precisa para montar o rodapé.</p>
+
+<div class="tryk8s" data-goal="objeto:ConfigMap/cardapio;;campo:ConfigMap/cardapio|data.horario=6h as 19h;;texto:configmap/cardapio created">
+  <p class="try-task">Acrescente a chave <code>horario</code> com o valor <code>6h as 19h</code> embaixo de
+  <code>data</code> e rode. A tabela tem de mostrar <code>cardapio</code> com <code>DATA</code> em
+  <code>2</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"</pre>
+<pre class="out">
+configmap/cardapio created
+
+NAME       DATA   AGE
+cardapio   1      2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+  horario: 6h as 19h</pre>
+</div>
+
+<p>O painel mostra <code>configmap/cardapio created</code> e a tabela do <code>get configmaps</code>. Repare
+na coluna <code>DATA</code>: ela conta <em>quantas chaves</em> o ConfigMap tem, não o tamanho de nada. Um
+ConfigMap com duas chaves mostra <code>2</code>; com vinte, mostra <code>20</code>. É o primeiro número que
+você olha para saber se o objeto é o que você esperava.</p>
+
+<p>Repare também no que <em>não</em> aparece: o conteúdo. A tabela não mostra o preço nem o horário. Para
+ver o conteúdo, o caminho é o <code>kubectl describe configmap cardapio</code>, que lista as chaves com os
+valores — ou o <code>get configmap cardapio -o yaml</code>, que devolve o manifesto inteiro como o cluster
+guardou. Esse segundo comando é o que salva quando você jura que aplicou uma coisa e o cluster tem
+outra.</p>
+
+<h2>4. Onde a configuração pode morar</h2>
+
+<p>Antes de seguir, vale comparar os lugares possíveis. Cada um tem um custo e uma consequência, e a
+escolha entre eles é a decisão de arquitetura desta aula.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Onde fica</th><th>Mudar exige</th><th>Serve para segredo?</th></tr>
+</thead>
+<tbody>
+<tr><td>dentro da imagem</td><td>montar e publicar a imagem outra vez</td><td>não — a imagem fica
+no registro, para sempre</td></tr>
+<tr><td>variável escrita no manifesto do pod</td><td>editar o manifesto e recriar o pod</td><td>não — fica
+no repositório, à vista</td></tr>
+<tr><td>ConfigMap</td><td>editar um objeto pequeno e reiniciar o pod (ou esperar o arquivo
+atualizar)</td><td>não — use Secret</td></tr>
+<tr><td>Secret</td><td>o mesmo do ConfigMap</td><td>sim, com cuidado: é base64, não
+criptografia</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A linha do ConfigMap é a que interessa hoje. Repare que ela não promete “mudar sem reiniciar”: quando a
+configuração chega ao pod como variável de ambiente, ela é lida uma vez, no start do container. Mudar o
+ConfigMap não muda a variável de um pod que já está rodando — o assunto da última aula deste grupo. O que o
+ConfigMap garante é outra coisa, e é muito: <strong>a mesma imagem, com configurações diferentes</strong>.
+Teste com <code>preco: "3.90"</code>, produção com <code>preco: "4.50"</code>, mesma imagem.</p>
+
+<pre class="term">NAME             DATA   AGE
+cardapio         2      2m
+cardapio-teste   2      1m
+frete            2      3m</pre>
+
+<p>A tabela acima é a resposta de um cluster de prova com três ConfigMaps: o da loja, o do ambiente de
+teste e o da tabela de frete. Nomes diferentes, o mesmo formato, e cada um com o seu punhado de chaves. Note
+que o nome é livre, mas vale a convenção: um ConfigMap por assunto, com nome que diga o assunto
+(<code>cardapio</code>, <code>frete</code>, <code>banco-config</code>). Um ConfigMap gigante para tudo é o
+equivalente a um arquivo de configuração de duas mil linhas — funciona, e ninguém acha nada.</p>
+
+<h2>5. Uma chave, com nome escolhido</h2>
+
+<p>Agora o pod. O jeito mais controlado de consumir um ConfigMap é escolher chave por chave. No
+<code>env</code> do container, em vez de <code>value</code> com o texto, você escreve
+<code>valueFrom.configMapKeyRef</code> com o nome do ConfigMap e o nome da chave. O Kubernetes lê o valor
+no start do container e entrega como variável de ambiente.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.containers.0.env.0.valueFrom.configMapKeyRef.name=cardapio;;texto:Running">
+  <p class="try-task">O pod tem o preço escrito à mão. Troque o <code>value: "4.50"</code> por um
+  <code>valueFrom</code> que leia a chave <code>preco</code> do ConfigMap <code>cardapio</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: PRECO
+          value: "4.50"</pre>
+<pre class="out">
+configmap/cardapio created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: PRECO
+          valueFrom:
+            configMapKeyRef:
+              name: cardapio
+              key: preco</pre>
+</div>
+
+<p>O painel mostra os dois objetos criados e o pod em <code>Running</code>. O que mudou, na prática: o valor
+<code>4.50</code> não está mais no manifesto do pod. Ele está num objeto separado, com nome — e é esse nome
+que o pod aponta. Se amanhã a Ana criar um ConfigMap <code>cardapio</code> com <code>preco: "5.20"</code>
+num cluster de teste, o mesmo manifesto de pod serve.</p>
+
+<p>O <code>name: PRECO</code> é o nome da variável <em>dentro do container</em>, e o <code>key: preco</code>
+é o nome da chave <em>dentro do ConfigMap</em>. São dois nomes diferentes de propósito: a aplicação pode
+esperar <code>PRECO</code> em maiúsculas (a convenção das variáveis de ambiente) e o ConfigMap pode ter a
+chave em minúsculas. Se você errar a chave, o container não sobe: o cluster não encontra o valor e o pod
+fica em <code>CreateContainerConfigError</code> — “erro ao montar a configuração do container”. É um erro
+silencioso no manifesto e barulhento no pod.</p>
+
+<p>Uma consequência importante: o valor é lido no start. Se você editar o ConfigMap com o pod rodando e o
+pod não reiniciar, a variável continua com o valor antigo. O <code>describe</code> do pod mostra
+<code>Environment: PRECO: &lt;set to the key 'preco' of config map 'cardapio'&gt;</code> — a referência, não
+o valor —, o que ajuda a lembrar que ali mora um ponteiro, e não uma cópia.</p>
+
+<h2>6. Todas as chaves de uma vez, com envFrom</h2>
+
+<p>Quando o ConfigMap tem cinco chaves e o programa quer todas como variáveis, listar uma a uma vira
+trabalho repetido e uma fonte de erro. O <code>envFrom</code> resolve isso: você aponta o ConfigMap e o
+cluster transforma <em>cada chave</em> numa variável de ambiente com o mesmo nome da chave.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.containers.0.envFrom.0.configMapRef.name=cardapio;;conta:configmaps=1;;texto:Running">
+  <p class="try-task">O pod aponta para um ConfigMap que ainda não existe e só conhece uma chave. Crie o
+  ConfigMap <code>cardapio</code> com <code>preco</code>, <code>horario</code> e <code>moeda</code>, e troque
+  o <code>env</code> por um <code>envFrom</code> que pegue todas as chaves.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: PRECO
+          valueFrom:
+            configMapKeyRef:
+              name: cardapio
+              key: preco</pre>
+<pre class="out">
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+  moeda: BRL
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      envFrom:
+        - configMapRef:
+            name: cardapio</pre>
+</div>
+
+<p>O painel do código inicial mostra o pod criado — e só. O ConfigMap não existe, e é por isso que a meta
+cobra <code>conta:configmaps=1</code>. Depois da missão, aparecem as duas linhas de criação e o pod em
+<code>Running</code>. A tabela do <code>get pods</code> não mostra variáveis: para conferir o que o pod
+recebeu, o caminho é o <code>describe</code> ou, dentro do container, um <code>env</code>.</p>
+
+<p>Com <code>envFrom</code>, o nome da variável é o nome da chave, sem tradução: a chave <code>preco</code>
+vira a variável <code>preco</code>, em minúsculas. Se a aplicação espera <code>PRECO</code>, use
+<code>prefix: PRECO_</code> — que gera <code>PRECO_preco</code> — ou volte para o <code>env</code> explícito.
+Esse descompasso entre “o nome que está no ConfigMap” e “o nome que o programa lê” é a causa número um de
+“a variável não chegou”.</p>
+
+<p>E há uma armadilha de ordem: se a mesma variável vier do <code>envFrom</code> e também de um
+<code>env</code> explícito, o <code>env</code> ganha. Não é erro; é precedência. Só não conte com isso como
+estratégia — quem lê o manifesto depois de você não vai saber qual das duas valeu.</p>
+
+<h2>7. Os tropeços: nome, chave, namespace e aspas</h2>
+
+<p>Quatro erros explicam quase todo ConfigMap que “não funciona”. O primeiro é o <strong>nome</strong>.
+Como todo objeto do cluster, o nome segue a regra minúscula com hífen: <code>Cardapio</code> é recusado na
+hora, com a régua inteira na mensagem. O segundo é a <strong>chave</strong>: <code>preco</code> e
+<code>preço</code> são chaves diferentes, e a segunda nem é aceita — chave de ConfigMap só admite letras,
+números, hífen, ponto e sublinhado. O terceiro é o <strong>namespace</strong>: um ConfigMap do namespace
+<code>default</code> não é visível para um pod do namespace <code>padaria</code>, e o sintoma é o pod parado
+em <code>CreateContainerConfigError</code> com um “not found” que parece mentira, porque o objeto está ali
+— em outro namespace.</p>
+
+<p>O quarto é o mais bobo e o mais comum: o <strong>YAML</strong>. Um espaço a mais, um tab, uma aspa
+faltando, e o cluster recusa o arquivo inteiro antes de olhar o conteúdo. O painel responde com a mensagem
+do interpretador, que é feia mas aponta a linha:</p>
+
+<pre class="term">error: error parsing cardapio.yaml: error converting YAML to JSON: yaml: line 1: tab characters must not be used in indentation</pre>
+
+<p>Traduzindo: “caractere de tabulação não pode ser usado na indentação”. YAML não aceita tab — só espaços,
+sempre em múltiplos de dois. É o primeiro erro de todo mundo que copia um manifesto de um editor que
+“ajuda” convertendo espaços em tab. A caixa abaixo é o erro de nome, para você ver a frase exata uma vez e
+reconhecê-la para sempre.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td><code>CreateContainerConfigError</code></td><td>o ConfigMap ou a chave não existe (ou está em
+outro namespace)</td><td>conferir nome, namespace e chave com <code>get</code> e
+<code>describe</code></td></tr>
+<tr><td><code>DATA</code> menor do que o esperado</td><td>faltou uma chave no <code>data</code></td><td>editar
+o manifesto e aplicar de novo</td></tr>
+<tr><td>variável vazia dentro do container</td><td>chave com nome diferente do que o programa lê
+(<code>preco</code> × <code>PRECO</code>)</td><td><code>env</code> explícito com <code>name</code>, ou
+<code>prefix</code></td></tr>
+<tr><td>o cluster recusa o arquivo</td><td>valor sem aspas, tab, indentação torta</td><td>aspas nos valores e
+dois espaços por nível</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tryk8s" data-goal="objeto:ConfigMap/cardapio;;texto:configmap/cardapio created">
+  <p class="try-task">Rode do jeito que está e leia o erro. Depois troque o nome para <code>cardapio</code> e
+  rode de novo.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: Cardapio
+data:
+  preco: "4.50"</pre>
+<pre class="out">
+The ConfigMap "Cardapio" is invalid: metadata.name: Invalid value: "Cardapio": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"</pre>
+</div>
+
+<p>A mensagem é a mesma regra que você já viu no pod, com outra roupa: “a lowercase RFC 1123 subdomain must
+consist of lower case alphanumeric characters, '-' or '.'...”. Guarde o resumo: <em>minúsculas, hífen no
+meio, começa e termina com letra ou número</em>. O Kubernetes usa essa mesma régua para pods, services,
+configmaps e secrets — aprender uma vez serve para todos.</p>
+
+<h2>8. O que o ConfigMap não resolve</h2>
+
+<p>Com o ConfigMap no lugar, a Ana mudou o preço sem tocar na imagem. Mas três coisas continuam fora do
+alcance dele, e é bom saber antes de tentar. A primeira é <strong>segredo</strong>: o conteúdo do ConfigMap
+é texto aberto, aparece no <code>get</code> e no <code>describe</code> para qualquer pessoa com permissão de
+leitura. Senha de banco, token de gateway e chave de API vão no Secret — que também é um mapa de chave e
+valor, com uma diferença importante: o valor é guardado em base64 e o cluster trata o objeto com mais
+cuidado.</p>
+
+<p>A segunda é o <strong>tamanho</strong>. O limite é 1 MiB por objeto, e o motivo é prático: o conteúdo
+viaja inteiro para cada nó que precise dele, e não é lugar para arquivo grande. Se a configuração é um JSON
+de dez linhas, cabe. Se é um banco de dados de preços com dez mil linhas, o lugar é um banco de dados — não
+um ConfigMap.</p>
+
+<p>A terceira é a <strong>forma de entrega</strong>. Variável de ambiente serve para valores pequenos e
+lidos no start; arquivo serve para configuração estruturada, lida (e relida) pelo programa. Montar um
+ConfigMap como arquivo dentro do container é a <a href="configmap-como-volume.html">próxima aula</a>, e é
+onde o ConfigMap brilha de verdade: cada
+chave vira um arquivo, e o programa lê o arquivo como leria qualquer outro.</p>
+
+<p>E uma quarta, que é de organização: ConfigMap não valida nada. Se você escrever
+<code>horario: seis da manhã</code>, o cluster aceita — é texto. Quem valida é a aplicação, na hora de ler, e
+o erro aparece no log dela. Vale muito ter, no programa, uma checagem de configuração no boot: falhar cedo,
+com uma mensagem clara, é melhor do que servir o preço errado por três dias.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o preço de teste vazou para a loja</h3>
+<p>A Ana criou um ConfigMap <code>cardapio</code> no namespace <code>padaria</code> para testar, e o pod de
+produção, no namespace <code>default</code>, continuou lendo o ConfigMap antigo — com o preço velho. Nada
+quebrou, e ninguém percebeu. O sintoma foi o cliente reclamando de preço diferente na vitrine. ConfigMap é
+por namespace, e o nome sozinho não diz nada: o par nome + namespace é que identifica o objeto.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a variável que não chegou</h3>
+<p>O programador do site esperava <code>DATABASE_URL</code> e o ConfigMap tinha
+<code>database_url</code>. Com <code>envFrom</code>, a variável chega com o nome da chave: minúscula. O
+container sobe, o site responde, e o banco não conecta — porque a aplicação leu uma variável vazia e usou o
+padrão. A correção é chata e definitiva: nomes de variável em maiúsculas, com <code>env</code> explícito
+quando o programa não é flexível, e um teste de boot que falhe quando a variável falta.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: muitas chaves, um objeto só</h3>
+<p>O site da padaria chegou a vinte e duas chaves: preço, horário, frete por bairro, tempo de forno,
+mensagem de boas-vindas. Tudo num ConfigMap <code>cardapio</code>. Funcionou por meses, até a Ana querer
+mudar só o frete e levar meia hora para achar a linha. A regra que ela adotou depois: um ConfigMap por
+assunto, com nome que diga o assunto — <code>cardapio</code>, <code>frete</code>,
+<code>mensagens</code>.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Para que serve um ConfigMap?</p>
+<label><input type="radio" name="q1"> para rodar um programa auxiliar ao lado do container</label>
+<label><input type="radio" name="q1"> para guardar configuração fora da imagem, em pares de chave e
+valor</label>
+<label><input type="radio" name="q1"> para guardar senhas com segurança</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que a coluna <code>DATA</code> mostra no
+<code>get configmaps</code>?</p>
+<label><input type="radio" name="q2"> o tamanho do objeto em bytes</label>
+<label><input type="radio" name="q2"> quantos pods usam o ConfigMap</label>
+<label><input type="radio" name="q2"> quantas chaves o ConfigMap tem</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual campo entrega <em>todas</em> as chaves como variáveis
+de ambiente?</p>
+<label><input type="radio" name="q3"> <code>envFrom.configMapRef</code></label>
+<label><input type="radio" name="q3"> <code>env.valueFrom.configMapKeyRef</code></label>
+<label><input type="radio" name="q3"> <code>volumes.configMap</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a chave que vira variável</h2>
+<p>Um container espera a variável <code>PRECO</code> e o ConfigMap <code>cardapio</code> tem a chave
+<code>preco</code>. Complete o trecho do <code>env</code> que faz essa ligação:</p>
+<div class="ex-code">env:
+  - name: PRECO
+    valueFrom:
+      <input aria-label="resposta 1" data-answer="configMapKeyRef" placeholder="...">:
+        name: cardapio
+        key: preco</div>
+<p class="ex-dica">Dica: <code>configMapKeyRef</code> aponta para uma chave de ConfigMap;
+<code>secretKeyRef</code> aponta para uma chave de Secret.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>ConfigMap é o objeto que tira a configuração de dentro da imagem: um mapa de chave e valor, com nome e
+namespace, que o pod consome. Você escreve <code>data</code> com pares <code>chave: valor</code> — valores
+de texto, entre aspas — e aplica com <code>kubectl apply -f</code>. O <code>get configmaps</code> mostra
+nome, quantidade de chaves e idade; o <code>describe</code> e o <code>-o yaml</code> mostram o
+conteúdo.</p>
+
+<p>A entrega ao pod tem dois caminhos. O <code>env</code> com <code>valueFrom.configMapKeyRef</code> pega
+uma chave e dá a ela o nome que você quiser — o jeito controlado. O <code>envFrom</code> com
+<code>configMapRef</code> transforma todas as chaves em variáveis com o mesmo nome — o jeito prático, desde
+que os nomes combinem. Nos dois casos o valor é lido no start do container: mudar o ConfigMap não muda o pod
+que já está rodando.</p>
+
+<p>E o que fica de fora: senha e token, que são assunto do Secret; arquivo grande, que não cabe no 1 MiB; e
+arquivo mesmo, que é o assunto da próxima aula — quando cada chave do ConfigMap vira um pedacinho de papel
+dentro de uma pasta do container.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>ConfigMap guarda configuração; a imagem guarda o programa. Misturar os dois custa um rebuild por
+  preço.</li>
+  <li><code>data:</code> é mapa de texto: sempre com aspas, e chave sem acento nem espaço.</li>
+  <li><code>DATA</code> na tabela é o número de chaves — o primeiro sinal de que algo faltou.</li>
+  <li>Uma chave: <code>env.valueFrom.configMapKeyRef</code>. Todas: <code>envFrom.configMapRef</code>.</li>
+  <li>O valor é lido no start: mudou o ConfigMap, o pod precisa reiniciar para ver.</li>
+  <li>ConfigMap não é cofre e não passa de 1 MiB.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

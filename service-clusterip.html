@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service ClusterIP | Guia Kubernetes</title>
+<meta name="description" content="Service ClusterIP na prática: dar um endereço fixo aos pods que vão e vêm, ligar selector a endpoints, acertar port e targetPort e ler o get services sem se perder.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Service <span class="hl">ClusterIP</span></h1>
+<p class="intro">O site da padaria já roda num Deployment com duas réplicas, e a Ana aprendeu que cada pod
+nasce com um IP próprio. O problema aparece no dia seguinte: o pod morre, outro nasce com outro IP, e o
+endereço que ela tinha anotado deixa de existir. Nesta aula ela conhece o objeto que resolve isso — o
+<strong>Service</strong> do tipo ClusterIP, um endereço fixo dentro do cluster que sempre aponta para os pods
+certos, não importa quantos sejam nem por quanto tempo vivam.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que o IP do pod não serve como endereço de um serviço.</li>
+  <li>O que é o ClusterIP e o que ele faz (e não faz) por você.</li>
+  <li>Como o <code>selector</code> do Service vira a lista de endpoints.</li>
+  <li>A diferença entre <code>port</code> e <code>targetPort</code> — e o erro que ela causa.</li>
+  <li>Ler o <code>kubectl get services</code> e o <code>describe</code> com segurança.</li>
+  <li>Criar o Service na mão ou com <code>kubectl expose</code>.</li>
+  <li>Por que o IP do Service não responde a um <code>ping</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o IP que muda de dono</h2>
+
+<p>Na segunda-feira a Ana subiu o site com <code>kubectl apply</code> e anotou o IP de um dos pods,
+<code>10.244.111.241</code>, para testar no navegador. Funcionou. Na terça, o cluster precisou drenar o nó
+onde aquele pod estava, o pod foi recriado em outro nó e ganhou o IP <code>10.244.57.236</code>. O endereço
+anotado passou a dar erro de conexão — pior, podia passar a apontar para outro pod qualquer, porque o IP
+liberado volta para a fila do cluster.</p>
+
+<p>Esse é o comportamento normal de um pod: ele é descartável por desenho. Nome comprido, IP novo a cada
+nascimento, nada nele é estável. Se o seu site, o seu banco ou o seu serviço de e-mail precisam de um
+endereço para conversar com ele, esse endereço não pode ser o do pod. Precisa haver uma camada na frente —
+um objeto que tenha nome e IP estáveis e que saiba, a cada instante, quem são os pods por trás.</p>
+
+<p>Esse objeto é o <strong>Service</strong>. Ele recebe um IP virtual (o <em>cluster IP</em>), um nome DNS
+derivado do nome, e uma regra: “mande o tráfego para os pods que tiverem estas etiquetas”. Quando um pod
+morre e outro nasce, o Service continua o mesmo — o que muda é a lista de destinos que ele mantém por baixo.
+O cliente nunca soube que o pod trocou.</p>
+
+<h2>2. O que é um ClusterIP, na prática</h2>
+
+<p><code>ClusterIP</code> é o tipo padrão de Service: um endereço que só existe dentro do cluster. Nenhuma
+máquina de fora chega nele, nem o seu notebook, nem a internet. Quem usa é o que está dentro: outro pod, um
+Job, um CronJob. É o Service que liga o front-end ao back-end, o back-end ao banco, o exportador de métricas
+ao coletor.</p>
+
+<dl class="anatomy">
+<dt>Service</dt>
+<dd>O objeto que dá um endereço estável a um conjunto de pods. Tem nome, tipo, IP virtual e uma lista de
+portas.</dd>
+<dt>clusterIP</dt>
+<dd>O IP virtual do Service, dentro da faixa de serviços do cluster (aqui, <code>10.96.x.y</code>).
+Não pertence a nenhuma máquina.</dd>
+<dt>selector</dt>
+<dd>O mapa de etiquetas que decide quais pods recebem tráfego. Sem casa, o Service existe e não
+entrega.</dd>
+<dt><code>port</code></dt>
+<dd>A porta que o Service escuta. É a porta que o cliente usa: <code>http://cardapio:80</code>.</dd>
+<dt><code>targetPort</code></dt>
+<dd>A porta onde o container escuta. O Service recebe em <code>port</code> e entrega em
+<code>targetPort</code>.</dd>
+<dt>endpoint</dt>
+<dd>Cada par IP e porta de um pod pronto que casa com o seletor. A lista inteira é o objeto
+Endpoints.</dd>
+</dl>
+
+<p>Um detalhe que confunde no começo: o ClusterIP não é um processo, não é uma máquina e não tem interface
+de rede em lugar nenhum. Ele é uma <em>regra</em> distribuída pelos nós — o kube-proxy de cada nó instala
+regras que dizem “pacote para 10.96.147.79 na porta 80 vai para um destes IPs na porta 8080”. É por isso que
+o IP responde quando você abre a porta certa e não responde a quase todo o resto, como veremos adiante.</p>
+
+<p>Outra coisa importante: o Service é do namespace, como tudo o mais. Um Service em <code>default</code> só
+encontra pods em <code>default</code>. E o nome do Service vira nome DNS — o que faz dele o jeito recomendado
+de chamar qualquer coisa dentro do cluster, em vez de decorar IPs.</p>
+
+<h2>3. O primeiro Service em YAML</h2>
+
+<p>O manifesto tem a anatomia de sempre, com um <code>spec</code> curto: o seletor, a lista de portas e — se
+você quiser — o tipo. A caixa abaixo tem o Deployment do site e um Service que escuta na 80, mas entrega na
+porta errada. Repare na tabela de endpoints: os IPs aparecem com a porta de destino, e é ali que o erro fica
+visível.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="campo:Service/cardapio|spec.ports.0.targetPort=8080;;texto:10.244.;;conta:pods[app=cardapio]=2">
+  <p class="try-task">O site escuta na <code>8080</code> e o Service entrega na <code>3000</code>. Corrija o
+  <code>targetPort</code> e rode: os dois endpoints têm de aparecer com a porta 8080.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 3000</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME       ENDPOINTS                                AGE
+cardapio   10.244.111.241:3000,10.244.56.236:3000   2m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>Antes do conserto, a tabela de endpoints mostra <code>10.244.111.241:3000,10.244.56.236:3000</code>: os
+pods estão certos, o seletor está certo, e o tráfego é entregue na porta onde ninguém escuta. Depois, os
+mesmos IPs com <code>:8080</code>. O Service não valida se a porta existe no container — ele não tem como
+saber. Ele entrega, e quem recusa é o programa do outro lado.</p>
+
+<p>Repare também que não há campo <code>type</code> no manifesto e o Service funciona. <code>ClusterIP</code>
+é o padrão: quando você não diz nada, é esse o tipo. Declarar explicitamente
+(<code>type: ClusterIP</code>) é opcional, e ajuda quem lê o arquivo a saber que a escolha foi consciente.</p>
+
+<h2>4. Lendo o get services</h2>
+
+<p>A tabela do <code>kubectl get services</code> tem seis colunas, e cada uma responde a uma pergunta
+diferente. Vale conhecer todas antes do primeiro incidente.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Coluna</th><th>O que significa</th><th>Quando assusta</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NAME</code></td><td>nome do Service, que também é o nome DNS</td><td>nome diferente do que a
+aplicação chama</td></tr>
+<tr><td><code>TYPE</code></td><td><code>ClusterIP</code>, <code>NodePort</code>,
+<code>LoadBalancer</code>…</td><td><code>NodePort</code> quando você queria só interno</td></tr>
+<tr><td><code>CLUSTER-IP</code></td><td>o IP virtual</td><td><code>None</code>: é um Service headless (aula
+própria)</td></tr>
+<tr><td><code>EXTERNAL-IP</code></td><td>IP de fora, para LoadBalancer</td><td><code>&lt;pending&gt;</code>
+por muito tempo: o provedor não entregou</td></tr>
+<tr><td><code>PORT(S)</code></td><td>porta do Service e, se houver, a do nó</td><td>
+<code>80:31655/TCP</code> num ClusterIP: alguém trocou o tipo</td></tr>
+<tr><td><code>AGE</code></td><td>idade do objeto</td><td>Service recém-criado com <code>AGE</code> de
+segundos a cada olhada: algo o recria</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas linhas de leitura completam o quadro. O <code>kubectl get services -o wide</code> acrescenta a coluna
+<code>SELECTOR</code>, que mostra o mapa de etiquetas em forma de texto —
+<code>app=cardapio</code>. E o <code>kubectl describe service cardapio</code> abre o objeto: seletor, tipo,
+IP, porta, <code>TargetPort</code> e, no fim, a linha <code>Endpoints</code> com os pares IP e porta que o
+Service está usando naquele instante.</p>
+
+<pre class="term">Name:             cardapio
+Namespace:        default
+Selector:         app=cardapio
+Type:             ClusterIP
+IP:               10.96.147.79
+Port:             80/TCP
+TargetPort:       8080/TCP
+Endpoints:        10.244.111.241:8080,10.244.56.236:8080
+Session Affinity: None
+Events:  &lt;none&gt;</pre>
+
+<p>Essa transcrição é a resposta do painel para o Service do site com dois pods. Ela conta a história
+inteira em oito linhas: o Service se chama <code>cardapio</code>, está no namespace <code>default</code>,
+escolhe pods com <code>app=cardapio</code>, é do tipo ClusterIP, tem o IP <code>10.96.147.79</code>, escuta
+na 80, entrega na 8080 e, agora, tem dois destinos. Se a linha <code>Endpoints</code> estivesse vazia, o
+problema seria um dos três de sempre: seletor que não casa, pod que não está pronto ou namespace
+diferente.</p>
+
+<h2>5. O Service que perdeu os pods</h2>
+
+<p>O caso mais comum na vida real não é o Service escrito errado da primeira vez: é o Service que estava
+certo e deixou de estar. Alguém muda a etiqueta no molde do Deployment (de <code>app: cardapio</code> para
+<code>app: cardapio-v2</code>, numa migração), o Service continua procurando a etiqueta antiga e a lista de
+endpoints esvazia. Nada dá erro: o site simplesmente para de responder pelo endereço do Service.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="campo:Service/cardapio|spec.selector.app=cardapio;;texto:10.244.">
+  <p class="try-task">Os pods estão marcados com <code>app: cardapio</code> e o Service procura
+  <code>app: vitrine</code>. Faça o seletor casar com os pods e veja a lista de endpoints sair de
+  <code>&lt;none&gt;</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: vitrine
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME       ENDPOINTS   AGE
+cardapio   &lt;none&gt;      2m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>O painel do código inicial mostra <code>cardapio &lt;none&gt;</code> na tabela de endpoints: um Service
+sem destinos. Depois da correção, os dois IPs aparecem com a porta 8080. O que faz esse erro ser traiçoeiro é
+que os dois objetos estão “certos” isoladamente — o Deployment tem dois pods rodando e o Service tem um
+seletor válido. O que não combina é o par de etiquetas, e nenhum comando avisa disso: a única evidência é a
+lista vazia.</p>
+
+<p>Por isso a regra prática: ao mexer em etiqueta de pod, procure quem mais usa aquela etiqueta. O seletor do
+Deployment, o seletor do Service, as queries de <code>kubectl get -l</code> e as NetworkPolicies apontam para
+ela. Renomear é fácil; descobrir quem dependia, não.</p>
+
+<h2>6. O Service em um comando: kubectl expose</h2>
+
+<p>Para Service simples, existe o atalho <code>kubectl expose</code>: ele lê o seletor do Deployment e cria o
+Service com esse seletor. É útil em teste e em emergência, e tem a mesma desvantagem de todo comando
+imperativo: não fica guardado em lugar nenhum. A caixa abaixo usa o cluster com o site já no ar.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:service/cardapio exposed;;campo:Service/cardapio|spec.ports.0.targetPort=8080">
+  <p class="try-task">Exponha o Deployment <code>cardapio</code> na porta 80, entregando na 8080, e confira o
+  Service criado.</p>
+<pre class="yaml">kubectl expose deployment cardapio --port=80
+kubectl get services
+kubectl get endpoints cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl expose deployment cardapio --port=80
+service/cardapio exposed
+
+ana@notebook:~$ kubectl get services
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        80/TCP    2m
+
+ana@notebook:~$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                            AGE
+cardapio   10.244.111.241:80,10.244.56.236:80   2m
+</pre>
+  <pre class="solucao">kubectl expose deployment cardapio --port=80 --target-port=8080
+kubectl get services
+kubectl get endpoints cardapio</pre>
+</div>
+
+<p>O painel do código inicial mostra o Service criado com <code>--port=80</code> e mais nada: sem
+<code>--target-port</code>, o <code>expose</code> usa a mesma porta para escutar e para entregar. A tabela de
+endpoints denuncia — <code>10.244.111.241:80</code>, quando o container escuta na 8080. Depois da missão, os
+endpoints aparecem na 8080 e o comando responde <code>service/cardapio exposed</code>.</p>
+
+<p>Uma coisa que o <code>expose</code> herda do Deployment e que vale conferir: o seletor. Ele copia
+<code>spec.selector.matchLabels</code> do Deployment, e não as etiquetas do molde. Se o Deployment foi criado
+de forma estranha, com seletor e etiquetas diferentes, o Service nasce apontando para o seletor — que é o
+certo, porque é ele que o controlador usa. Confira com um <code>get endpoints</code> antes de seguir.</p>
+
+<h2>7. O IP que não responde ping</h2>
+
+<p>Toda pessoa que cria o primeiro Service tenta fazer <code>ping 10.96.147.79</code>, não recebe resposta e
+conclui que o Service está quebrado. Não está. O ClusterIP não existe em interface nenhuma: ele é um
+endereço virtual que o kube-proxy traduz em regras de encaminhamento para TCP e UDP nas portas declaradas.
+ICMP — o protocolo do ping — não está na lista, então não há para onde ir.</p>
+
+<p>O teste certo é abrir a porta declarada. De dentro de outro pod, <code>curl</code> na
+<code>http://cardapio:80</code> ou <code>wget</code> no IP e porta; de fora, não dá — e é exatamente esse o
+limite do ClusterIP. Ele resolve a comunicação <em>interna</em>. Para o cliente da rua chegar no site,
+existem o NodePort e o LoadBalancer (as próximas aulas) e o Ingress, que fica na frente deles.</p>
+
+<p>Outro teste errado e comum: usar <code>kubectl port-forward</code> para o Service. O comando aceita
+recursos como <code>service/cardapio</code>, mas o que ele faz é abrir um túnel a partir do seu computador —
+útil para depurar, e sem nenhuma relação com o tráfego real dos pods. Se o site não responde pelo Service
+dentro do cluster, o túnel também não vai resolver; ele só esconde o problema no seu terminal.</p>
+
+<h2>8. Os tropeços e onde olhar</h2>
+
+<p>Quatro sintomas cobrem quase todos os problemas de ClusterIP. O primeiro é o <code>ENDPOINTS</code> em
+<code>&lt;none&gt;</code>: seletor que não casa, pod não pronto ou namespace diferente. O segundo é endpoint
+com a porta errada: <code>targetPort</code> não é a porta onde o container escuta. O terceiro é o nome: a
+aplicação chama <code>cardapio</code> e o Service se chama <code>cardapio-svc</code>; o DNS não resolve e o
+log diz “no such host”. O quarto é a porta do cliente: o programa aponta para a 8080 em vez da 80, e o
+Service só escuta na porta declarada.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Onde olhar</th><th>Causa provável</th></tr>
+</thead>
+<tbody>
+<tr><td><code>get endpoints</code> mostra <code>&lt;none&gt;</code></td><td>etiquetas dos pods ×
+<code>selector</code> do Service</td><td>etiqueta renomeada, pod em outro namespace ou pod não pronto</td></tr>
+<tr><td>endpoint com porta estranha</td><td><code>describe service</code>, linha
+<code>TargetPort</code></td><td><code>targetPort</code> diferente do <code>containerPort</code></td></tr>
+<tr><td>“no such host”</td><td>nome do Service e namespace de quem chama</td><td>nome errado, ou Service em
+outro namespace</td></tr>
+<tr><td>conexão recusada mesmo com endpoints</td><td>porta usada pelo cliente</td><td>cliente na porta do
+container em vez da porta do Service</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="term">$ kubectl get services
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        80/TCP    2m
+frete      ClusterIP   10.96.10.44    &lt;none&gt;        80/TCP    3m
+
+$ kubectl get endpoints
+NAME       ENDPOINTS                                AGE
+cardapio   10.244.111.241:8080,10.244.56.236:8080   2m
+frete      &lt;none&gt;                                   3m</pre>
+
+<p>A transcrição acima é a resposta do painel para dois Services: o do site, com dois destinos, e o do frete,
+sem nenhum. A leitura é imediata: <code>frete</code> não tem pod com a etiqueta que ele procura. Num cluster
+com muitos serviços, esse par de tabelas — <code>get services</code> e <code>get endpoints</code> — é o
+primeiro comando de qualquer investigação de rede. Se os dois batem, o problema está acima; se não batem, o
+problema está no seletor.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o serviço de frete que ninguém conseguia chamar</h3>
+<p>O time do frete subiu o Deployment com a etiqueta <code>app: frete-api</code> e o Service com
+<code>app: frete</code>. Tudo verde no <code>get deployments</code>, tudo vermelho no <code>get endpoints</code>.
+Depois de duas horas procurando em log de aplicação, alguém rodou o par de comandos certo e viu
+<code>&lt;none&gt;</code>. A correção foi de um caractere; o custo foi a tarde.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o IP que virou de outro dono</h3>
+<p>Um script antigo da Ana tinha o IP do pod escrito à mão, num arquivo de configuração de um Job noturno.
+Quando o pod morreu, o IP foi reaproveitado por outro pod, e o Job passou a mandar relatórios para o lugar
+errado — sem erro nenhum, porque o outro pod também respondia HTTP. Depois disso, IP de pod virou proibição
+no repositório: dentro do cluster, chama-se pelo nome do Service.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: dois ambientes, um nome</h3>
+<p>Teste e produção usavam o mesmo nome de Service (<code>cardapio</code>), em namespaces diferentes. O
+programa chamava <code>cardapio</code> e funcionava nos dois, porque cada namespace resolve o seu. A confusão
+começou quando alguém rodou um Job no namespace de produção apontando para o Service de teste, por engano.
+A partir daí, o time passou a usar o nome completo do serviço nas configurações críticas.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Para que serve o ClusterIP de um Service?</p>
+<label><input type="radio" name="q1"> para dar um IP fixo a cada pod</label>
+<label><input type="radio" name="q1"> para dar um endereço estável ao conjunto de pods, dentro do
+cluster</label>
+<label><input type="radio" name="q1"> para abrir a aplicação para a internet</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O Service declara <code>port: 80</code> e
+<code>targetPort: 8080</code>. O cliente chama qual porta?</p>
+<label><input type="radio" name="q2"> a 8080, porque é onde o container escuta</label>
+<label><input type="radio" name="q2"> qualquer uma das duas, o Service aceita as duas</label>
+<label><input type="radio" name="q2"> a 80, porque é a porta que o Service escuta</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O <code>get endpoints</code> mostra <code>&lt;none&gt;</code>.
+Qual é a causa mais provável?</p>
+<label><input type="radio" name="q3"> o seletor do Service não casa com nenhum pod pronto</label>
+<label><input type="radio" name="q3"> o cluster está sem memória</label>
+<label><input type="radio" name="q3"> o ClusterIP foi desalocado</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a porta que o Service escuta</h2>
+<p>O site escuta na <code>8080</code> e o cliente vai chamar o Service na <code>80</code>. Complete a porta
+de entrega:</p>
+<div class="ex-code">ports:
+  - port: 80
+    <input aria-label="resposta 1" data-answer="targetPort" placeholder="...">: 8080</div>
+<p class="ex-dica">Dica: <code>port</code> é o que o Service escuta; <code>targetPort</code> é onde o
+container escuta.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Pod tem IP que nasce e morre com ele; Service tem nome e IP estáveis. O ClusterIP é o tipo padrão: um
+endereço virtual, válido só dentro do cluster, que o kube-proxy transforma em regras de encaminhamento para
+os pods que casam com o <code>selector</code>. O conjunto de destinos é o objeto Endpoints, e ele muda
+sozinho conforme os pods entram e saem.</p>
+
+<p>O manifesto é curto — seletor e portas — e o par <code>port</code>/<code>targetPort</code> é o ponto de
+erro mais comum: o cliente chama a porta do Service, e o Service entrega na porta do container. Já o
+<code>kubectl expose</code> cria o mesmo objeto em um comando, herdando o seletor do Deployment, ao preço de
+não deixar rastro no repositório.</p>
+
+<p>Na hora do problema, dois comandos: <code>get services</code> e <code>get endpoints</code>. Se a lista de
+destinos está vazia, o problema é a etiqueta; se está preenchida e o cliente não chega, o problema é a porta
+ou o nome. E o ClusterIP não é para fora: quem atende a rua é o NodePort, o LoadBalancer ou o Ingress — o
+assunto das próximas aulas.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Service dá endereço estável; o pod continua descartável.</li>
+  <li><code>selector</code> escolhe pods por etiqueta; sem casa, o Service não entrega.</li>
+  <li><code>port</code> é a do Service; <code>targetPort</code> é a do container.</li>
+  <li><code>get endpoints</code> é o primeiro comando quando algo não responde.</li>
+  <li>ClusterIP não responde ping: o virtual não encaminha ICMP.</li>
+  <li>ClusterIP é interno; para fora, existem NodePort, LoadBalancer e Ingress.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

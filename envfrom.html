@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>envFrom | Guia Kubernetes</title>
+<meta name="description" content="envFrom no Kubernetes: todas as chaves de um ConfigMap ou Secret como variáveis, prefixo para evitar colisão, ordem de precedência e o que não atualiza sozinho.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>env<span class="hl">From</span></h1>
+<p class="intro">O site da Ana tem doze valores de configuração: preço, horário, moeda, nome da loja, e-mail de
+contato, endereço, limite de pedido. Escrever doze blocos <code>env</code> no manifesto é chato, e a Ana já errou
+o nome de uma chave — o pão saiu com preço vazio por dois dias. O <code>envFrom</code> resolve isso de uma vez:
+aponta para o ConfigMap e todas as chaves viram variáveis de ambiente, com o nome que já têm. Nesta aula ela
+aprende o atalho, o prefixo que evita colisão, a ordem que decide quem vence e o que <em>não</em> se atualiza
+sozinho.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o <code>envFrom</code> faz que o <code>env</code> não faz.</li>
+  <li>Como o nome da chave vira nome da variável — e como o <code>prefix</code> muda isso.</li>
+  <li>O que acontece quando dois <code>envFrom</code> têm a mesma chave.</li>
+  <li>Quem vence quando existe um <code>env</code> explícito com o mesmo nome.</li>
+  <li>Quais chaves o Kubernetes recusa como variável de ambiente.</li>
+  <li>Quando usar <code>optional: true</code> e o que muda sem ele.</li>
+  <li>Por que a variável não muda quando o ConfigMap muda.</li>
+  <li>Como conferir o que o container recebeu.</li>
+</ul>
+</div>
+
+<h2>1. A cena: doze variáveis e um erro de digitação</h2>
+
+<p>O manifesto do site da padaria cresceu sem ninguém perceber. Começou com duas variáveis, depois cinco,
+depois doze. Cada uma é um bloco de três linhas, com <code>name</code> e <code>valueFrom</code>, e cada nome
+repetido é uma chance de errar. A Ana errou um: escreveu <code>HORARIO</code> no pod e <code>horario</code> no
+ConfigMap, e o container subiu com a variável vazia.</p>
+
+<p>O <code>envFrom</code> existe para esse caso. Em vez de listar chave por chave, você aponta para o ConfigMap
+inteiro e diz “transforme cada chave em variável de ambiente com o mesmo nome”. Uma linha por fonte, em vez de
+três linhas por valor. Se amanhã a Ana acrescentar <code>telefone</code> ao ConfigMap, o pod novo já recebe sem
+mexer no manifesto.</p>
+
+<p>É importante entender o que ele <em>não</em> faz: não renomeia chaves (para isso existe o
+<code>prefix</code>), não mistura fontes (cada <code>envFrom</code> é uma fonte), não atualiza o container em
+execução e não filtra: todas as chaves do objeto entram. Se o ConfigMap tem uma chave de debug que você não
+queria no container, ela vai junto.</p>
+
+<p>A analogia que ajuda: <code>env</code> é você ditando cada ingrediente para o padeiro; <code>envFrom</code>
+é entregar a receita inteira e dizer “use tudo o que está aí”. A receita precisa estar legível — nomes válidos,
+valores de texto —, mas você não redigita nada.</p>
+
+<h2>2. Como a chave vira variável</h2>
+
+<p>Um ConfigMap é um mapa de chaves e valores de texto. O <code>envFrom</code> percorre esse mapa e cria uma
+variável para cada chave, usando o nome exato da chave. Sem maiúsculas automáticas, sem conversão de hífen,
+sem tradução. Se a chave é <code>preco</code>, a variável é <code>preco</code> — não <code>PRECO</code>.</p>
+
+<dl class="anatomy">
+<dt><code>envFrom</code></dt>
+<dd>lista de fontes de configuração. Cada item é um ConfigMap ou um Secret, e cada chave do objeto vira uma
+variável de ambiente do container.</dd>
+<dt><code>configMapRef</code></dt>
+<dd>o item que aponta para um ConfigMap pelo <code>name</code>. Só o nome: não há chave nem versão, e o objeto
+precisa existir no mesmo namespace do pod.</dd>
+<dt><code>secretRef</code></dt>
+<dd>o mesmo, para um Secret. Os valores chegam decodificados em texto, prontos para uso — o base64 é só o
+formato de transporte no manifesto.</dd>
+<dt><code>prefix</code></dt>
+<dd>texto colado ao nome de cada variável daquela fonte. Sem conversão de caixa e sem separador automático:
+<code>CARDAPIO_</code> com <code>preco</code> produz <code>CARDAPIO_preco</code>.</dd>
+<dt><code>optional</code></dt>
+<dd>quando <code>true</code>, a ausência da fonte não impede o container de subir. Sem ele, o pod fica em
+<code>CreateContainerConfigError</code> e não inicia.</dd>
+<dt>precedência</dt>
+<dd>a regra que decide o valor final quando o mesmo nome vem de mais de um lugar: a última fonte da lista vence,
+e o <code>env</code> explícito vence todas as fontes.</dd>
+</dl>
+
+<pre class="file" data-file="cardapio.yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+  moeda: BRL</pre>
+
+<p>Com esse ConfigMap, o pod que usa <code>envFrom</code> recebe três variáveis: <code>preco=4.50</code>,
+<code>horario=6h as 19h</code> e <code>moeda=BRL</code>. Todas minúsculas, porque as chaves estão minúsculas.
+A convenção de variável de ambiente em maiúsculas é só convenção: o Linux não liga, mas o seu programa pode
+estar escrito esperando <code>PRECO</code>.</p>
+
+<p>É aí que começa o primeiro problema real. O código da Ana lê <code>process.env.PRECO</code>, e o
+<code>envFrom</code> entrega <code>preco</code>. A variável existe, o container sobe, e o preço aparece vazio.
+A solução é escolher: ou o ConfigMap usa chaves em maiúsculas, ou o código passa a ler minúsculas, ou você usa
+um <code>env</code> explícito para renomear. Não dá para ter as duas coisas de graça.</p>
+
+<p>Para o caso de renomear poucas chaves, o <code>env</code> explícito continua sendo a ferramenta certa:
+<code>name: PRECO</code> com <code>valueFrom.configMapKeyRef.key: preco</code>. O
+<code>envFrom</code> ganha quando são muitas chaves e o código aceita os nomes como estão — ou quando o prefixo
+resolve o padrão.</p>
+
+<h2>3. O prefixo que evita colisão</h2>
+
+<p>O campo <code>prefix</code> entra dentro do item do <code>envFrom</code> e é adicionado ao nome de cada
+variável daquela fonte. Com <code>prefix: CARDAPIO_</code>, a chave <code>preco</code> vira
+<code>CARDAPIO_preco</code>. Não há conversão de caixa: o prefixo é colado ao nome como está.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.containers.0.envFrom.0.configMapRef.name=cardapio;;campo:Pod/web|spec.containers.0.envFrom.0.prefix=CARDAPIO_;;texto:Running">
+  <p class="try-task">O pod lista as três variáveis uma a uma. Troque por um <code>envFrom</code> do ConfigMap
+  <code>cardapio</code> com <code>prefix: CARDAPIO_</code>, para que as três venham de uma vez.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+  moeda: BRL
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: PRECO
+          valueFrom:
+            configMapKeyRef:
+              name: cardapio
+              key: preco
+        - name: HORARIO
+          valueFrom:
+            configMapKeyRef:
+              name: cardapio
+              key: horario</pre>
+<pre class="out">
+configmap/cardapio created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+  moeda: BRL
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      envFrom:
+        - configMapRef:
+            name: cardapio
+          prefix: CARDAPIO_</pre>
+</div>
+
+<p>O painel mostra o pod criado e em <code>Running</code>, e o manifesto guarda os dois campos: a referência e o
+prefixo. Num cluster real, o container receberia <code>CARDAPIO_preco</code>, <code>CARDAPIO_horario</code> e
+<code>CARDAPIO_moeda</code>. Repare que a terceira chave (<code>moeda</code>) entrou mesmo sem estar no pedido
+original — é o efeito “tudo o que está aí”.</p>
+
+<p>O prefixo tem dois usos. O primeiro é evitar colisão entre fontes: dois ConfigMaps com a chave
+<code>url</code> viram <code>BANCO_url</code> e <code>CACHE_url</code>. O segundo é deixar claro de onde a
+variável veio, o que ajuda muito na hora de depurar um container com trinta variáveis. O custo é que o código
+precisa ler o nome composto.</p>
+
+<p>Cuidado com o sublinhado no fim do prefixo. <code>CARDAPIO</code> sem <code>_</code> produz
+<code>CARDAPIOpreco</code>, que é válido mas ilegível. E prefixo com hífen produz nomes inválidos, que o
+Kubernetes ignora — o assunto da seção 6.</p>
+
+<h2>4. Duas fontes, a mesma chave</h2>
+
+<p>Quando o pod precisa de configuração e de credenciais, o normal é declarar dois <code>envFrom</code>: um para
+o ConfigMap e um para o Secret. Se os dois têm uma chave com o mesmo nome — <code>usuario</code>, por exemplo —
+o resultado depende da ordem, e a ordem é a da lista no manifesto.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.containers.0.envFrom.0.prefix=CARDAPIO_;;campo:Pod/web|spec.containers.0.envFrom.1.prefix=BANCO_;;texto:Running">
+  <p class="try-task">Os dois <code>envFrom</code> têm a chave <code>usuario</code>, e a do Secret está
+  sobrescrevendo a do ConfigMap. Dê um prefixo a cada fonte: <code>CARDAPIO_</code> e <code>BANCO_</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  usuario: cardapio
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: senhas
+type: Opaque
+data:
+  usuario: YW5h
+  senha: czNuaDQ=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      envFrom:
+        - configMapRef:
+            name: cardapio
+        - secretRef:
+            name: senhas</pre>
+<pre class="out">
+configmap/cardapio created
+secret/senhas created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  usuario: cardapio
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: senhas
+type: Opaque
+data:
+  usuario: YW5h
+  senha: czNuaDQ=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      envFrom:
+        - configMapRef:
+            name: cardapio
+          prefix: CARDAPIO_
+        - secretRef:
+            name: senhas
+          prefix: BANCO_</pre>
+</div>
+
+<p>Sem os prefixos, o container receberia <code>usuario</code> uma vez só — a do Secret, porque é a última fonte
+da lista. A do ConfigMap seria silenciosamente descartada. Com os prefixos, as duas convivem:
+<code>CARDAPIO_usuario=cardapio</code> e <code>BANCO_usuario=ana</code>. O código escolhe qual usar, e ninguém
+perde informação por acidente.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Fonte</th><th>Ordem na lista</th><th>Quem vence na chave repetida</th></tr>
+</thead>
+<tbody>
+<tr><td>primeiro <code>envFrom</code></td><td>1º</td><td>perde para os seguintes</td></tr>
+<tr><td>segundo <code>envFrom</code></td><td>2º</td><td>vence o primeiro</td></tr>
+<tr><td>último <code>envFrom</code></td><td>por último</td><td>vence todos os anteriores</td></tr>
+<tr><td><code>env</code> explícito</td><td>independente</td><td>vence qualquer <code>envFrom</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa regra é simples e traiçoeira: mudar a ordem dos blocos no YAML muda o valor que o programa lê. Se um dia
+alguém reorganizar o manifesto “só para ficar mais bonito”, o comportamento pode mudar sem nenhuma linha de
+código diferente. Prefixo é a única forma de tornar isso explícito.</p>
+
+<h2>5. O env explícito sempre vence</h2>
+
+<p>Existe um caso em que a mistura é intencional: você quer quase tudo vindo do ConfigMap, mas um valor
+específico precisa ser diferente naquele pod. O <code>env</code> explícito resolve, porque ele tem precedência
+sobre qualquer <code>envFrom</code>, não importa a ordem no arquivo.</p>
+
+<p>É um recurso útil e perigoso. Útil porque permite sobrescrever um valor sem duplicar o ConfigMap inteiro.
+Perigoso porque o valor efetivo deixa de estar no ConfigMap: quem olha só o objeto de configuração vê
+<code>4.50</code>, e o container está rodando com <code>5.20</code>. Em time grande, isso vira arqueologia.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.containers.0.env.0.name=PRECO;;campo:Pod/web|spec.containers.0.env.0.value=5.20;;campo:Pod/web|spec.containers.0.envFrom.0.configMapRef.name=cardapio">
+  <p class="try-task">O pod recebe tudo do ConfigMap, mas o preço deste pod precisa ser
+  <code>5.20</code>. Acrescente um <code>env</code> explícito com <code>name: PRECO</code> e
+  <code>value: "5.20"</code>, mantendo o <code>envFrom</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      envFrom:
+        - configMapRef:
+            name: cardapio</pre>
+<pre class="out">
+configmap/cardapio created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: PRECO
+          value: "5.20"
+      envFrom:
+        - configMapRef:
+            name: cardapio</pre>
+</div>
+
+<p>O painel guarda o <code>env</code> antes do <code>envFrom</code> e o pod sobe. Num cluster real, o container
+teria <code>PRECO=5.20</code> e <code>preco=4.50</code> ao mesmo tempo — duas variáveis diferentes, uma
+maiúscula e uma minúscula, com valores diferentes. O programa lê a que conhece; o humano que investiga encontra
+as duas e perde dez minutos.</p>
+
+<p>A regra prática: se você precisa sobrescrever muita coisa, provavelmente precisa de outro ConfigMap (ou de um
+prefixo diferente). Sobrescrita pontual é aceitável; sobrescrita sistemática é sinal de que a configuração está
+no lugar errado.</p>
+
+<h2>6. Chaves que não viram variável</h2>
+
+<p>Nem toda chave de ConfigMap pode ser variável de ambiente. O nome de uma variável no Linux precisa começar
+com letra ou sublinhado e conter apenas letras, números e sublinhado. Chaves com hífen, ponto ou que começam com
+número não são aceitas — e o Kubernetes não impede o pod de subir por causa disso.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Chave no ConfigMap</th><th>Vira variável?</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td><code>preco</code></td><td>sim</td><td>só letras</td></tr>
+<tr><td><code>limite_pedido</code></td><td>sim</td><td>sublinhado é permitido</td></tr>
+<tr><td><code>preco-promocao</code></td><td>não</td><td>hífen não é válido em nome de variável</td></tr>
+<tr><td><code>2x1</code></td><td>não</td><td>começa com número</td></tr>
+<tr><td><code>app.config</code></td><td>não</td><td>ponto não é válido</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O comportamento é silencioso do ponto de vista do pod: ele sobe, as chaves válidas entram, e as inválidas são
+descartadas. O aviso aparece num evento, e é fácil não ver. Esta é a transcrição de um cluster real, com um
+ConfigMap que tinha duas chaves problemáticas:</p>
+
+<pre class="term">Events:
+  Type     Reason                 Age   From      Message
+  ----     ------                 ----  ----      -------
+  Warning  InvalidVariableNames   8s    kubelet   Skipped invalid env vars in container/web: [preco-promocao, 2x1]</pre>
+
+<p>Traduzindo: “pulei variáveis de ambiente inválidas no container web”. Se o seu programa reclama que falta
+uma configuração e o ConfigMap tem a chave lá, comece conferindo o nome dela. Hífen é o campeão — muita gente
+escreve <code>db-host</code> no ConfigMap e depois não entende por que a variável não existe.</p>
+
+<p>Para esses casos, o caminho é <code>env</code> explícito com <code>configMapKeyRef.key</code>, que aceita
+qualquer chave e permite dar um nome válido à variável. Ou renomear a chave para <code>db_host</code>, o que
+costuma ser melhor: um ConfigMap com nomes válidos serve para <code>envFrom</code>, para volume e para
+inspeção, sem surpresa.</p>
+
+<h2>7. Quando a fonte pode faltar</h2>
+
+<p>Se o ConfigMap referenciado não existe, o pod não sobe: o kubelet tenta montar a configuração do container,
+não encontra a fonte e deixa o pod em <code>CreateContainerConfigError</code>. É um erro de configuração, não de
+imagem, e o <code>describe</code> mostra a mensagem
+<code>configmap "cardapio" not found</code>.</p>
+
+<p>Quando a ausência é aceitável, existe <code>optional: true</code> dentro do item do <code>envFrom</code>. Com
+ele, um ConfigMap ausente não impede o container de subir: as variáveis daquela fonte simplesmente não existem,
+e o programa precisa saber lidar com isso. É útil para configurações de conveniência — um ajuste fino que nem
+todo ambiente tem.</p>
+
+<p>Não use <code>optional</code> para esconder erro de digitação. O sintoma clássico é o pod subir sem nenhuma
+das variáveis e o programa cair num valor padrão silencioso, que ninguém testou. Se a configuração é
+obrigatória, deixe o pod falhar alto e cedo: é mais fácil consertar um
+<code>CreateContainerConfigError</code> do que um preço errado que só aparece no relatório do mês.</p>
+
+<p>O painel deste guia não simula a ausência da fonte: ele guarda a referência e agenda o pod. A distinção entre
+pod que sobe e pod que fica em <code>CreateContainerConfigError</code> aparece nas transcrições e no cluster de
+verdade — vale saber que ela existe antes de precisar dela.</p>
+
+<h2>8. Variável não é arquivo: o que atualiza</h2>
+
+<p>Aqui está a diferença que mais gente esquece. Variável de ambiente é lida no start do container. Se você
+editar o ConfigMap com o pod rodando, a variável continua com o valor antigo até o container reiniciar. O
+volume, ao contrário, é remontado e o arquivo muda sozinho depois de alguns segundos.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Como a configuração chega</th><th>Atualiza sem reiniciar?</th><th>Bom para</th></tr>
+</thead>
+<tbody>
+<tr><td><code>env</code> explícito</td><td>não</td><td>poucos valores, nomes escolhidos</td></tr>
+<tr><td><code>envFrom</code></td><td>não</td><td>muitos valores, nomes iguais aos do objeto</td></tr>
+<tr><td>volume de ConfigMap</td><td>sim, com atraso</td><td>arquivos, JSON, certificados</td></tr>
+<tr><td>volume de Secret</td><td>sim, com atraso</td><td>credenciais em arquivo</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Isso explica por que a Ana precisou reiniciar o Deployment quando mudou o preço no ConfigMap: o pod estava
+com <code>preco=4.50</code> na memória e continuou vendendo a 4,50. A aula
+<a href="recarregar-config.html">Recarregar configuração</a> mostra os caminhos — reiniciar o Deployment,
+montar como volume ou avisar o programa por sinal.</p>
+
+<p>Depois de reiniciar, vale conferir o que o container recebeu de verdade. Este é o comando, numa transcrição
+de cluster real:</p>
+
+<pre class="term">$ kubectl exec web -- printenv | sort
+CARDAPIO_horario=6h as 19h
+CARDAPIO_moeda=BRL
+CARDAPIO_preco=4.50
+PATH=/usr/local/bin:/usr/bin:/bin</pre>
+
+<p><code>printenv</code> lista todas as variáveis; <code>sort</code> ordena para facilitar a leitura. É o teste
+definitivo: se o nome não aparece ali, o programa não tem como ler. E repare que as variáveis do cluster não
+aparecem em maiúsculas mágicas — o prefixo é <code>CARDAPIO_</code>, como escrito no manifesto.</p>
+
+<p>No painel, o <code>describe</code> do pod mostra <code>Environment:</code> apenas para os
+<code>env</code> explícitos; as variáveis vindas de <code>envFrom</code> não são listadas. Não é bug do guia: o
+simulador não executa o container, então não tem como saber o que ele recebeu. Use o
+<code>printenv</code> do cluster de verdade como referência e confie no manifesto para a estrutura.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o preço apareceu vazio</h3>
+<p>O ConfigMap tinha <code>preco</code>, o programa lia <code>PRECO</code>. O container subiu, nenhum erro
+apareceu, e a vitrine mostrou “R$ ” em branco. A correção foi renomear as chaves do ConfigMap para maiúsculas,
+já que todos os programas do time leem assim. Se não der para renomear, um <code>env</code> explícito com
+<code>configMapKeyRef</code> resolve caso a caso.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Secret apagou a configuração</h3>
+<p>Os dois <code>envFrom</code> tinham a chave <code>usuario</code>, e o Secret estava por último. O pod recebeu
+só a credencial do banco, e o nome de usuário da loja sumiu. Ninguém viu porque o programa usava um padrão. A
+solução foi prefixar as duas fontes: <code>BANCO_usuario</code> e <code>CARDAPIO_usuario</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a variável que não existia</h3>
+<p>A chave era <code>limite-max</code>, com hífen. O pod subiu, a variável não entrou, e o programa usou o
+padrão de 10 pedidos em vez de 50. O evento <code>InvalidVariableNames</code> estava lá, ignorado. Renomear a
+chave para <code>limite_max</code> resolveu — e o mesmo ConfigMap passou a servir para volume, onde hífen não
+incomoda.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o <code>envFrom</code> faz?</p>
+<label><input type="radio" name="q1"> renomeia todas as chaves para maiúsculas</label>
+<label><input type="radio" name="q1"> transforma cada chave do ConfigMap ou Secret em uma variável com o mesmo
+nome</label>
+<label><input type="radio" name="q1"> monta o ConfigMap como arquivo dentro do container</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Com dois <code>envFrom</code> e a mesma chave, quem vence?</p>
+<label><input type="radio" name="q2"> o primeiro da lista</label>
+<label><input type="radio" name="q2"> o ConfigMap, sempre à frente do Secret</label>
+<label><input type="radio" name="q2"> o último da lista — e um <code>env</code> explícito vence todos</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Quando a variável de um <code>envFrom</code> é atualizada?</p>
+<label><input type="radio" name="q3"> só quando o container reinicia; o valor é lido no start</label>
+<label><input type="radio" name="q3"> assim que o ConfigMap muda, em segundos</label>
+<label><input type="radio" name="q3"> nunca, nem com reinício</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o prefixo das duas fontes</h2>
+<p>Complete o <code>envFrom</code> que recebe as chaves do Secret <code>senhas</code> sem colidir com as do
+ConfigMap.</p>
+<div class="ex-code">envFrom:
+  - configMapRef:
+      name: cardapio
+    prefix: CARDAPIO_
+  - secretRef:
+      name: senhas
+    <input aria-label="resposta 1" data-answer="prefix" placeholder="...">: BANCO_</div>
+<p class="ex-dica">Dica: é o campo que é colado ao nome de cada variável daquela fonte.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>envFrom</code> transforma todas as chaves de um ConfigMap ou Secret em variáveis de ambiente com o
+mesmo nome da chave. É o atalho para muitas variáveis e a fonte da maioria dos erros de nome: não há conversão
+de caixa nem de hífen. O <code>prefix</code> acrescenta um texto ao nome de cada variável daquela fonte e é a
+forma limpa de evitar colisão entre ConfigMap e Secret.</p>
+
+<p>Quando duas fontes têm a mesma chave, vence a última da lista; um <code>env</code> explícito vence todas.
+Chaves com hífen, ponto ou começando com número são descartadas, e o aviso aparece no evento
+<code>InvalidVariableNames</code>. Fonte ausente deixa o pod em <code>CreateContainerConfigError</code>, a não
+ser com <code>optional: true</code>.</p>
+
+<p>E o ponto que volta em toda aula de configuração: variável de ambiente é lida no start. Mudou o ConfigMap,
+o container continua com o valor antigo até reiniciar. Volume atualiza; variável, não. Confira sempre com
+<code>printenv</code> e desconfie de nome antes de desconfiar do cluster.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>envFrom</code> = todas as chaves como variáveis, com o nome da chave.</li>
+  <li><code>prefix</code> evita colisão e deixa claro de onde a variável veio.</li>
+  <li>Última fonte vence; <code>env</code> explícito vence qualquer <code>envFrom</code>.</li>
+  <li>Hífen, ponto e número no começo invalidam a variável; o evento avisa, o pod sobe.</li>
+  <li><code>optional: true</code> permite fonte ausente — use com critério.</li>
+  <li>Variável é lida no start; volume atualiza com atraso.</li>
+  <li><code>kubectl exec pod -- printenv | sort</code> mostra o que o container recebeu.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HPA | Guia Kubernetes</title>
+<meta name="description" content="Horizontal Pod Autoscaler na prática: a fórmula do HPA, minReplicas e maxReplicas, o que o kubectl get hpa mostra e como o objeto escreve no Deployment da padaria da Ana.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">HPA</span></h1>
+<p class="intro">O site da padaria da Ana tem um horário de pico: entre meio-dia e uma da tarde o movimento
+triplica, e às três da tarde volta ao normal. Até agora ela resolvia isso na mão — abria o terminal,
+rodava <code>kubectl scale</code> para seis réplicas ao meio-dia e esquecia de voltar para duas. Resultado:
+cluster caro à tarde, site lento nos dias em que ela almoçava fora. O objeto que resolve isso tem nome
+comprido e apelido curto: <strong>HorizontalPodAutoscaler</strong>, ou <strong>HPA</strong>. Ele lê uma
+métrica, faz uma conta e escreve o número de réplicas no Deployment — sozinho, a cada quinze segundos.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o HPA faz e o que ele <em>não</em> faz (ele não cria pods).</li>
+  <li>A fórmula do autoscaler e o exemplo numérico com as réplicas do cardápio.</li>
+  <li><code>minReplicas</code> como piso e <code>maxReplicas</code> como teto.</li>
+  <li>Ler o <code>kubectl get hpa</code>: <code>REFERENCE</code>, <code>TARGETS</code>,
+  <code>MINPODS</code>, <code>MAXPODS</code> e <code>REPLICAS</code>.</li>
+  <li>O que o <code>describe hpa</code> conta quando o número não aparece.</li>
+  <li><code>behavior</code>: por que subir é rápido e descer é devagar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o meio-dia da padaria</h2>
+
+<p>O site do cardápio roda com duas réplicas. Às onze e meia da manhã, quando o pessoal começa a olhar o
+almoço pelo celular, cada réplica passa a atender o dobro de pedidos por segundo e o tempo de resposta sai
+de 80 ms para 900 ms. A Ana abre o terminal e escala para seis. À uma e meia o movimento cai, e as seis
+réplicas continuam lá, ociosas, consumindo memória que ela paga.</p>
+
+<p>O trabalho dela tem três partes: perceber que precisa de mais, decidir quantas e desfazer quando passa.
+As três são mecânicas, e máquina faz coisa mecânica melhor do que gente cansada. O HPA cuida das três:
+observa uma métrica (no caso, o uso de CPU em relação ao que cada pod pediu), calcula quantas réplicas
+seriam necessárias para essa métrica ficar dentro do alvo e escreve o resultado no Deployment. Quando o
+movimento cai, a conta dá menos e ele escreve menos.</p>
+
+<p>Repare no verbo: <em>escreve</em>. O HPA não cria pod nenhum. Ele muda o campo <code>spec.replicas</code>
+do Deployment que você apontou, e o Deployment — que já sabe transformar réplicas em pods desde a aula de
+escala — faz o resto. Isso explica dois comportamentos que confundem: um HPA sem Deployment alvo não faz
+nada, e um HPA que aponta para o alvo errado escreve no lugar errado.</p>
+
+<h2>2. As três peças: alvo, faixa e métrica</h2>
+
+<p>Todo HPA tem três decisões escritas no manifesto. A primeira é <strong>quem</strong> ele controla:
+<code>scaleTargetRef</code>, com o tipo do objeto (<code>Deployment</code>), o nome e a versão da API. A
+segunda é <strong>a faixa</strong>: <code>minReplicas</code> e <code>maxReplicas</code>, o piso e o teto
+entre os quais o número pode variar. A terceira é <strong>o alvo da métrica</strong>: o que significa
+“estar bem”, em porcentagem de CPU, por exemplo.</p>
+
+<dl class="anatomy">
+<dt>spec.scaleTargetRef</dt>
+<dd>Quem o HPA controla: <code>apiVersion</code>, <code>kind</code> e <code>name</code> do alvo. Na
+prática é um Deployment; StatefulSet também serve, Job não faz sentido.</dd>
+<dt>spec.minReplicas</dt>
+<dd>O piso. A conta nunca resulta em menos que isso, mesmo com a métrica em zero. Padrão 1.</dd>
+<dt>spec.maxReplicas</dt>
+<dd>O teto. A conta nunca resulta em mais que isso; é o freio contra laço de realimentação e contra
+conta de nuvem surpresa.</dd>
+<dt>spec.metrics</dt>
+<dd>O que medir e qual o alvo. No caso mais comum, <code>type: Resource</code>, <code>name: cpu</code> e
+<code>averageUtilization</code> em porcentagem do request.</dd>
+<dt>spec.behavior</dt>
+<dd>As regras de velocidade: políticas de subida e descida e as janelas de estabilização de cada lado.
+Opcional; sem ele valem os padrões do controlador.</dd>
+</dl>
+
+<p>Com as três, o controlador faz uma conta simples a cada ciclo: divide o valor atual da métrica pelo
+valor desejado, multiplica pelo número de réplicas que existem hoje e arredonda para cima. Se a média de
+CPU está em 140% do pedido e o alvo é 70%, a razão é 2 — ele dobra o número de réplicas. Se está em 35% e
+o alvo é 70%, a razão é 0,5 — ele corta pela metade. O resultado é sempre aparado entre o piso e o teto
+antes de ser escrito.</p>
+
+<p>Há uma tolerância de 10% para evitar nervosismo: se a razão fica entre 0,9 e 1,1, o HPA não mexe em
+nada. Sem ela, uma oscilação de 1% na métrica viraria uma troca de réplicas a cada quinze segundos, e o
+cluster passaria o dia criando e matando pods. Essa histerese é o motivo de o número no
+<code>kubectl get hpa</code> não mudar a cada olhada, mesmo com o tráfego variando.</p>
+
+<p>Um detalhe de aritmética que vale guardar: o HPA arredonda <em>para cima</em>. Com 3 réplicas e razão
+1,1, o resultado é 3,3 — e ele escreve 4. Arredondar para cima é proposital: é melhor sobrar um pod do que
+faltar capacidade num pico. O preço é que o número final quase nunca é exatamente o que a conta daria.</p>
+
+<h2>3. <code>minReplicas</code>: o piso que o HPA nunca fura</h2>
+
+<p><code>minReplicas</code> é o número mínimo de réplicas que o alvo pode ter, aconteça o que acontecer com
+a métrica. Se o uso de CPU está em 1% e o piso é 3, o HPA escreve 3 — não 1. Isso protege o site de um
+problema clássico: métrica baixa não significa “ninguém está usando”, significa “ninguém está usando
+<em>agora</em>”; se o HPA reduzir a uma réplica e o pico chegar no segundo seguinte, o usuário paga a
+conta do tempo de subida.</p>
+
+<p>O padrão de <code>minReplicas</code> é 1, e num serviço de produção esse padrão costuma ser errado. Uma
+réplica só é um ponto único de falha: se aquele pod morrer, o site fica fora do ar até o Deployment criar
+outro. Duas é o mínimo honesto para um site pequeno; três, para algo que não pode parar.</p>
+
+<p>A caixa abaixo mostra o piso em ação. O Deployment nasce com uma réplica; o HPA pede no mínimo três. O
+controlador calcula, apara no piso e escreve 3 no <code>spec.replicas</code> do Deployment — e é isso que a
+meta confere, tanto no HPA (<code>status.desiredReplicas</code>) quanto no próprio Deployment.</p>
+
+<div class="tryk8s" data-goal="campo:HorizontalPodAutoscaler/cardapio|status.desiredReplicas=3;;campo:HorizontalPodAutoscaler/cardapio|spec.minReplicas=3;;campo:Deployment/cardapio|spec.replicas=3" data-get="hpa">
+  <p class="try-task">O HPA do cardápio está com <code>minReplicas: 1</code> e o Deployment com uma
+  réplica. Suba o piso para <code>3</code> e rode: o HPA tem de escrever 3 no Deployment.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 200m
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 1
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70</pre>
+<pre class="out">
+deployment.apps/cardapio created
+horizontalpodautoscaler.autoscaling/cardapio created
+
+NAME       REFERENCE             TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+cardapio   Deployment/cardapio   70%/70%   1         6         1          2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 200m
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 3
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70</pre>
+</div>
+
+<p>Duas coisas para ler no painel. Primeiro: depois da troca, o HPA aparece na tabela com <code>MINPODS 3</code> e
+<code>MAXPODS 6</code>; o campo <code>REPLICAS</code> mostra quantas réplicas o alvo tinha no começo do
+ciclo, antes de a conta ser aplicada — num cluster de verdade esse número se ajusta no ciclo seguinte, e é
+por isso que ele parece “atrasado” por alguns segundos. Segundo: o campo <code>TARGETS</code> mostra a
+métrica atual e o alvo, no formato <code>atual%/desejado%</code>. É a primeira coisa a olhar quando o HPA
+não faz o que você esperava.</p>
+
+<h2>4. <code>maxReplicas</code>: o teto que protege o cluster</h2>
+
+<p><code>maxReplicas</code> é o outro lado, e ele existe por um motivo que a Ana aprendeu do jeito difícil:
+sem teto, um bug de métrica pode transformar o cluster inteiro em pods do cardápio. Se o alvo da métrica
+estiver baixo demais (digamos, 5% de CPU), a razão fica enorme e o HPA tenta criar dezenas de réplicas — que
+consomem CPU, deixam a média ainda mais alta e pedem mais réplicas. É um laço de realimentação, e o teto é
+o freio.</p>
+
+<p>O teto também é o que protege o nó. Cada réplica nova precisa de requests de CPU e memória; quando o
+cluster não tem mais espaço, os pods novos ficam em <code>Pending</code> e o HPA continua pedindo mais. O
+sintoma é uma tabela com <code>REPLICAS</code> no máximo e metade dos pods pendurados — e a solução não é
+aumentar o <code>maxReplicas</code>, é aumentar o cluster (aí entra o cluster autoscaler, que é outro
+assunto).</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/cardapio|spec.replicas=3;;campo:HorizontalPodAutoscaler/cardapio|status.desiredReplicas=3" data-get="hpa">
+  <p class="try-task">O cardápio está com seis réplicas e o HPA com <code>maxReplicas: 6</code>, então nada
+  muda. Abaixe o teto para <code>3</code> e rode: o HPA tem de aparar as réplicas do Deployment em 3.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 200m
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70</pre>
+<pre class="out">
+deployment.apps/cardapio created
+horizontalpodautoscaler.autoscaling/cardapio created
+
+NAME       REFERENCE             TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+cardapio   Deployment/cardapio   70%/70%   2         6         6          2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 200m
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70</pre>
+</div>
+
+<p>O painel mostra o <code>spec.replicas</code> do Deployment já em 3, que é a prova de que o HPA escreve
+no alvo. Os seis pods antigos ainda existem neste retrato — o Deployment os encerra no ciclo seguinte,
+respeitando o <code>maxUnavailable</code> do rolling update. É a mesma dança de sempre: alguém muda a
+intenção (<code>spec</code>) e o controlador converge para ela; o HPA é só mais um autor dessa
+intenção.</p>
+
+<h2>5. Lendo o <code>kubectl get hpa</code></h2>
+
+<p>A tabela do HPA tem seis colunas e cada uma responde uma pergunta diferente. Ela é curta porque o HPA é
+um objeto pequeno — e é densa porque cada coluna é um pedaço da história.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Coluna</th><th>O que mostra</th><th>Leitura de problema</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NAME</code></td><td>nome do HPA</td><td>—</td></tr>
+<tr><td><code>REFERENCE</code></td><td>o alvo, no formato <code>Kind/nome</code></td><td><code>unknown</code>
+ou um nome que não existe: o alvo sumiu</td></tr>
+<tr><td><code>TARGETS</code></td><td>métrica atual / alvo</td><td><code>&lt;unknown&gt;/70%</code>: o HPA não
+consegue ler a métrica</td></tr>
+<tr><td><code>MINPODS</code></td><td>o piso</td><td>1 num serviço de produção: ponto único de falha</td></tr>
+<tr><td><code>MAXPODS</code></td><td>o teto</td><td>no máximo e pods em <code>Pending</code>: falta
+cluster</td></tr>
+<tr><td><code>REPLICAS</code></td><td>réplicas atuais do alvo</td><td>parado no teto com
+<code>TARGETS</code> alto: teto pequeno</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Num cluster de verdade, com o cardápio no meio do almoço, a tabela fica assim. Repare que o
+<code>get hpa</code> e o <code>get deploy</code> contam a mesma história por ângulos diferentes:</p>
+
+<pre class="term">$ kubectl get hpa
+NAME       REFERENCE             TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+cardapio   Deployment/cardapio   142%/70%  2         6         6          3d4h
+
+$ kubectl get deploy cardapio
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   6/6     6            6           3d4h</pre>
+
+<p>O <code>TARGETS</code> em <code>142%/70%</code> quer dizer que cada pod está usando 142% da CPU que
+pediu, e o alvo é 70%. Como o número está acima do alvo, o HPA tentaria subir — mas já está no teto, então
+não faz nada. Essa combinação, <code>REPLICAS</code> igual a <code>MAXPODS</code> com
+<code>TARGETS</code> acima do alvo, é o sinal clássico de “o teto está apertado”: ou você aumenta o
+<code>maxReplicas</code>, ou otimiza o programa, ou aceita que o site fica lento no pico.</p>
+
+<h2>6. Quando o número não aparece</h2>
+
+<p>O caso mais comum de HPA que “não funciona” é o <code>TARGETS</code> em
+<code>&lt;unknown&gt;/70%</code>. Não é bug do HPA: é falta de métrica. O autoscaler pede a métrica ao
+servidor de métricas do cluster, e se ninguém estiver publicando — ou se o pod não tiver
+<code>requests</code> de CPU definidos — a conta não tem numerador ou denominador. A <a href="hpa-metricas.html">próxima aula</a> é
+justamente sobre isso; aqui o que importa é saber onde olhar.</p>
+
+<p>O <code>kubectl describe hpa</code> é o segundo lugar. Ele traz as condições do controlador
+(<code>AbleToScale</code>, <code>ScalingActive</code>) e os eventos com o motivo exato da falha. Uma
+condição <code>ScalingActive: False</code> com motivo <code>FailedGetResourceMetric</code> quer dizer que a
+leitura da métrica falhou; <code>AbleToScale: False</code> costuma indicar problema no alvo, como nome
+errado ou Deployment inexistente.</p>
+
+<pre class="term">$ kubectl describe hpa cardapio
+Name:                                                  cardapio
+Namespace:                                             default
+Reference:                                             Deployment/cardapio
+Metrics:                                               ( current / target )
+  resource cpu on pods  (as a percentage of request):  142% (284m) / 70%
+Min replicas:                                          2
+Max replicas:                                          6
+Deployment pods:                                       6 current / 6 desired
+Conditions:
+  Type            Status  Reason              Message
+  --------------  ------  ------------------  ----------------------------------
+  AbleToScale     True    ReadyForNewScale    recommended size matches current size
+  ScalingActive   True    ValidMetricFound    the HPA was able to successfully calculate a replica count
+  ScalingLimited  True    TooManyReplicas     the desired replica count is more than the maximum
+Events:
+  Type     Reason             Age    From                       Message
+  Normal   SuccessfulRescale  2m     horizontal-pod-autoscaler  New size: 6; reason: cpu resource utilization above target</pre>
+
+<p>A leitura que interessa está na condição <code>ScalingLimited</code>: <code>TooManyReplicas</code> quer
+dizer “eu queria mais, mas o teto não deixa”. <code>TooFewReplicas</code> é o espelho, no piso. Se as duas
+aparecem como <code>False</code> e o <code>TARGETS</code> está normal, o HPA está saudável e o problema é
+outro — provavelmente o site está lento por um motivo que não é falta de réplica.</p>
+
+<h2>7. O HPA não é o único autoscaler</h2>
+
+<p>Vale conhecer os vizinhos para não usar a ferramenta errada. O <strong>HPA</strong> muda a
+<em>quantidade</em> de pods (escala horizontal). O <strong>VPA</strong> muda os <em>requests</em> de um pod
+(escala vertical): em vez de mais cópias, uma cópia maior. E o <strong>cluster autoscaler</strong> muda o
+número de <em>nós</em>: quando não há mais espaço para os pods que o HPA quer criar, ele pede máquina nova
+ao provedor.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Objeto</th><th>O que muda</th><th>Quem executa</th><th>Limite típico</th></tr>
+</thead>
+<tbody>
+<tr><td>HPA</td><td>a quantidade de pods</td><td>o Deployment (que cria os pods)</td><td>o teto de
+<code>maxReplicas</code></td></tr>
+<tr><td>VPA</td><td>os requests de um pod</td><td>o Deployment, recriando o pod</td><td>o tamanho do
+nó</td></tr>
+<tr><td>cluster autoscaler</td><td>o número de nós</td><td>o provedor de nuvem</td><td>a cota da conta e
+o custo</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Os três se completam numa escada: o HPA pede mais pods, o cluster autoscaler nota que eles não cabem e
+pede mais nós, e o VPA cuida dos casos em que o programa precisa de mais memória numa cópia só. O erro
+clássico é achar que o HPA aumenta o nó — ele não aumenta; ele só pede pods. Se o cluster está cheio, o HPA
+vai criar pods em <code>Pending</code> e continuar tentando, e quem resolve é o autoscaler de cluster.</p>
+
+<p>Também não é trabalho do HPA reagir a evento de negócio. “Escalar quando a fila de pedidos passa de
+mil” é métrica customizada, com um adaptador no meio; “escalar quando der 18h” é agendamento, e se faz com
+CronJob ou com um HPA baseado em tempo (que não existe no core). O HPA do dia a dia olha CPU e memória, e
+faz isso muito bem.</p>
+
+<h2>8. Subir rápido, descer devagar</h2>
+
+<p>O comportamento padrão do HPA é assimétrico de propósito: para cima, ele reage na hora; para baixo, ele
+espera. A janela de estabilização do <em>scale down</em> é de 300 segundos (cinco minutos): o controlador
+olha as recomendações dos últimos cinco minutos e escolhe a <em>maior</em> delas. Se o movimento caiu agora
+mas estava alto há dois minutos, ele não reduz ainda — espera para ver se a queda é real.</p>
+
+<p>Sem essa janela, um vaivém de tráfego viraria um vaivém de pods: sobe, desce, sobe, desce, e cada
+subida custa tempo de inicialização e cada descida custa conexões derrubadas. Esse fenômeno tem nome —
+<em>flapping</em> — e a janela de estabilização é o remédio. É também por isso que, ao testar um HPA, você
+sobe o tráfego e vê reação em segundos, mas baixa o tráfego e não vê nada por cinco minutos. Não está
+quebrado; está esperando.</p>
+
+<p>Quando o padrão não serve, o campo <code>behavior</code> dá controle fino: políticas de quantos pods
+podem subir ou descer por período, e janelas de estabilização separadas para cima e para baixo. É o mesmo
+tipo de controle que o <code>maxUnavailable</code> dá ao rolling update, aplicado à escala.</p>
+
+<div class="tryk8s" data-goal="campo:HorizontalPodAutoscaler/cardapio|spec.behavior.scaleDown.stabilizationWindowSeconds=600;;campo:HorizontalPodAutoscaler/cardapio|spec.behavior.scaleDown.policies.0.value=50;;texto:horizontalpodautoscaler.autoscaling/cardapio created" data-get="hpa">
+  <p class="try-task">O HPA do cardápio não tem <code>behavior</code>. Acrescente um
+  <code>scaleDown</code> com janela de estabilização de 600 segundos e uma política
+  <code>Percent</code> de valor 50 por 60 segundos, para descer no máximo metade das réplicas por minuto.</p>
+<pre class="yaml">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70</pre>
+<pre class="out">
+horizontalpodautoscaler.autoscaling/cardapio created
+
+NAME       REFERENCE             TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+cardapio   Deployment/cardapio   0%/70%    2         6         0          2m
+</pre>
+<pre class="solucao">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 6
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70</pre>
+</div>
+
+<p>Repare que nesta caixa não há Deployment no manifesto: o HPA é criado, aparece na tabela e fica
+esperando um alvo que não existe — <code>REPLICAS 0</code>. Num cluster de verdade ele mostraria
+<code>TARGETS &lt;unknown&gt;</code> e a condição <code>AbleToScale: False</code>; no painel aparece
+<code>0%/70%</code>, porque não há pod para medir. É uma boa lembrança de que o HPA é um objeto passivo:
+ele não inventa o alvo, ele só lê e escreve nele.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o HPA brigando com o GitOps</h3>
+<p>A Ana mudou o número de réplicas no arquivo do repositório e deu <code>apply</code>: três réplicas. Dois
+minutos depois o HPA escreveu seis, porque o almoço estava cheio. Na madrugada, a esteira de deploy rodou
+de novo, aplicou o arquivo com três e o HPA voltou a subir. O sintoma é uma briga de números. A solução é
+tirar <code>replicas</code> do arquivo versionado — o número passa a ser do HPA — ou usar uma ferramenta
+que ignore o campo. Manifesto e autoscaler não podem mandar no mesmo campo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o HPA no teto com pods pendurados</h3>
+<p>O <code>get hpa</code> mostra <code>REPLICAS 6</code> e <code>MAXPODS 6</code>, o <code>TARGETS</code>
+segue acima do alvo, e o <code>get pods</code> tem quatro pods em <code>Pending</code> com
+<code>Insufficient cpu</code>. Não é o HPA que está errado: o cluster não tem onde colocar os pods. A
+decisão é de capacidade — aumentar o <code>maxReplicas</code> só aumenta a fila de pendurados; o que
+resolve é nó novo (cluster autoscaler ou máquina à mão).</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a métrica que some</h3>
+<p>Depois de uma atualização do servidor de métricas, o <code>TARGETS</code> virou
+<code>&lt;unknown&gt;/70%</code> e o HPA parou de mexer no número — nem sobe, nem desce. O comportamento é
+seguro por desenho: sem métrica, o autoscaler não chuta. O <code>describe hpa</code> mostra
+<code>FailedGetResourceMetric</code> nos eventos. Enquanto isso, a escala manual (<code>kubectl
+scale</code>) continua funcionando, e é o plano B até a métrica voltar.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<p>Três perguntas sobre a conta e sobre os limites.</p>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O alvo é 70% de CPU, a média atual é 140% e existem 3
+réplicas. Quantas o HPA tenta deixar?</p>
+<label><input type="radio" name="q1"> 3, porque o número só muda de 10 em 10%</label>
+<label><input type="radio" name="q1"> 6, porque a razão é 2 (140 dividido por 70)</label>
+<label><input type="radio" name="q1"> 9, porque ele soma as réplicas à razão</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o HPA faz quando a métrica não está
+disponível?</p>
+<label><input type="radio" name="q2"> escala para o <code>maxReplicas</code> por segurança</label>
+<label><input type="radio" name="q2"> apaga o Deployment e recria com uma réplica</label>
+<label><input type="radio" name="q2"> não mexe no número e registra a falha nos eventos</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Um HPA com <code>minReplicas: 3</code> e CPU em 1%. O
+Deployment fica com quantas réplicas?</p>
+<label><input type="radio" name="q3"> 3, porque o piso manda mais que a métrica</label>
+<label><input type="radio" name="q3"> 1, porque a métrica está baixa</label>
+<label><input type="radio" name="q3"> 0, porque ninguém está usando o site</label>
+</div>
+
+<h2>Exercício: o HPA do almoço</h2>
+
+<p>Escreva o <code>HorizontalPodAutoscaler</code> <code>cardapio</code>, apontando para o Deployment
+<code>cardapio</code>, com piso 2, teto 8 e alvo de 60% de CPU. Depois responda: qual campo do HPA diz
+<em>quem</em> ele controla?</p>
+
+<div class="exercise">
+<div class="ex-code">spec.<input aria-label="resposta 1" data-answer="scaleTargetRef" placeholder="...">.name: cardapio</div>
+<p class="ex-dica">Dica: o alvo tem <code>apiVersion</code>, <code>kind</code> e <code>name</code>; a faixa
+fica em <code>minReplicas</code> e <code>maxReplicas</code>, e a métrica em <code>metrics</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O HPA é um controlador que lê uma métrica do alvo, calcula quantas réplicas seriam necessárias
+(<code>ceil(réplicas × atual / alvo)</code>, com 10% de tolerância) e escreve o resultado no
+<code>spec.replicas</code> do Deployment apontado por <code>scaleTargetRef</code>. Ele não cria pods: quem
+cria é o Deployment. <code>minReplicas</code> é o piso e <code>maxReplicas</code> é o teto; o resultado é
+sempre aparado entre os dois antes de virar intenção.</p>
+
+<p>A tabela do <code>get hpa</code> é o painel de leitura: <code>TARGETS</code> mostra métrica atual e
+alvo, <code>REPLICAS</code> mostra o tamanho atual, e <code>MINPODS</code>/<code>MAXPODS</code> mostram a
+faixa. <code>TARGETS &lt;unknown&gt;</code> é falta de métrica; <code>REPLICAS</code> no teto com alvo
+estourado é falta de espaço ou de teto. O <code>describe hpa</code> traz as condições
+<code>AbleToScale</code>, <code>ScalingActive</code> e <code>ScalingLimited</code>, que dizem em uma linha
+o que está acontecendo.</p>
+
+<p>Subir é rápido e descer é devagar: a janela de estabilização de 300 segundos existe para o número não
+ficar dançando. Quando o padrão não basta, <code>behavior</code> dá o controle fino — e o HPA nunca
+substitui o cluster autoscaler, que é quem compra máquina quando os pods não cabem.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>HPA escreve <code>spec.replicas</code> no alvo; não cria pod, não aumenta nó.</li>
+  <li>Conta: <code>ceil(réplicas × atual / alvo)</code>, aparada entre <code>min</code> e
+  <code>max</code>.</li>
+  <li><code>minReplicas</code> protege o serviço; <code>maxReplicas</code> protege o cluster.</li>
+  <li><code>TARGETS &lt;unknown&gt;/70%</code> = falta de métrica, não bug do HPA.</li>
+  <li>Descer demora: janela de estabilização de 300s por padrão.</li>
+  <li>Manifesto com <code>replicas</code> fixo briga com o HPA.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

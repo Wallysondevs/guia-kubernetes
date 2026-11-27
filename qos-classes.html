@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Classes de QoS | Guia Kubernetes</title>
+<meta name="description" content="Classes de QoS na prática: como o cluster chega em Guaranteed, Burstable e BestEffort, como ler a classe no describe e por que ela decide quem é despejado primeiro.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Classes de <span class="hl">QoS</span></h1>
+<p class="intro">Numa madrugada de inverno o nó do site da Ana ficou sem memória e o kubelet precisou
+escolher quem morrer. Morreram os dois pods do cardápio — os que não tinham nenhum recurso declarado — e
+sobreviveu o banco, que reservava exatamente o que consumia. Não foi azar: o cluster tinha uma etiqueta
+para cada pod, calculada a partir dos números do manifesto, e usou essa etiqueta para decidir. O nome dela é
+<strong>QoS Class</strong>, e é o assunto desta aula.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>As três classes — <code>Guaranteed</code>, <code>Burstable</code> e <code>BestEffort</code>.</li>
+  <li>A regra exata que o cluster usa para calcular a classe, container por container.</li>
+  <li>Onde ler a classe no <code>kubectl describe pod</code>.</li>
+  <li>Por que um sidecar esquecido rebaixa o pod inteiro.</li>
+  <li>O que a classe muda no dia do aperto — e o que ela não muda.</li>
+  <li>Como proteger o site da Ana sem transformar tudo em <code>Guaranteed</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: quem morre quando o nó aperta</h2>
+
+<p>O cluster da Ana tem três nós de 4 GiB. Numa madrugada, o robô de relatórios carregou uma planilha
+enorme, o nó encheu e o kubelet precisou liberar memória. Ele não escolheu o pod mais gordo nem o mais
+antigo: escolheu pela classe. Os dois pods do cardápio eram <code>BestEffort</code> — nenhum
+<code>requests</code>, nenhum <code>limits</code> — e saíram primeiro. O banco, que declarava
+<code>requests</code> igual a <code>limits</code>, ficou.</p>
+
+<p>QoS é uma classificação que o próprio cluster calcula. Você não escreve <code>qosClass: Guaranteed</code>
+em lugar nenhum: escreve números em <code>resources</code> e o Kubernetes lê o formato. Três formatos
+possíveis, três classes. A classe não muda o consumo, não muda o limite e não muda o agendamento — ela
+muda a <em>ordem</em> em que os pods são sacrificados quando o nó fica sem memória ou sem disco.</p>
+
+<p>Vale entender por que essa ordem existe. Se todos os pods fossem iguais, o kubelet teria de escolher no
+escuro, e poderia matar o banco para salvar um coletor de métricas. A classe é a forma de o manifesto dizer
+“este aqui é descartável” ou “este aqui é essencial” sem precisar de configuração extra. Quem declara
+direito ganha proteção de graça; quem não declara nada entra na fila dos primeiros.</p>
+
+<h2>2. As três classes</h2>
+
+<p>A regra é curta, mas tem detalhes que pegam. Ela é aplicada ao pod inteiro, olhando <em>todos</em> os
+containers: basta um container fora do padrão para o pod todo cair de classe. E ela olha apenas CPU e
+memória — não existe classe por disco ou por GPU.</p>
+
+<dl class="anatomy">
+<dt>Guaranteed</dt>
+<dd>Todos os containers têm <code>requests</code> e <code>limits</code> de CPU e de memória, com os dois
+valores iguais em cada recurso. É a classe mais protegida.</dd>
+<dt>Burstable</dt>
+<dd>Pelo menos um container declara algum recurso, mas o pod não se encaixa no <code>Guaranteed</code>.
+É o meio do caminho — e onde vive a maioria dos serviços de produção.</dd>
+<dt>BestEffort</dt>
+<dd>Nenhum container declara nada: sem <code>requests</code>, sem <code>limits</code>. É a primeira classe a
+ser despejada.</dd>
+<dt>QoS Class</dt>
+<dd>O campo calculado pelo cluster e exibido no fim do <code>describe pod</code>. Não é editável: muda
+quando o manifesto muda.</dd>
+<dt>eviction</dt>
+<dd>O despejo de pods feito pelo kubelet quando o nó está sob pressão de memória ou de disco. A ordem
+segue a classe.</dd>
+</dl>
+
+<p>Uma confusão comum é achar que <code>Guaranteed</code> significa “mais rápido” ou “mais CPU”. Não
+significa: significa “reserva e teto iguais”, ou seja, o pod não usa o espaço ocioso do vizinho porque não
+tem folga entre os dois números. Um pod <code>Guaranteed</code> de <code>100m</code> é mais protegido e mais
+limitado que um <code>Burstable</code> de 2 núcleos de teto.</p>
+
+<h2>3. BestEffort: quando não se declara nada</h2>
+
+<p>A caixa abaixo cria um pod do jeito mais simples possível, sem nenhum bloco
+<code>resources</code>, e depois o descreve. O que interessa é a última linha do <code>describe</code>, com
+a classe. A tarefa é chegar até ela.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:QoS Class: BestEffort;;texto:Restart Count">
+  <p class="try-task">Crie o pod <code>vitrine</code> sem nenhum recurso e descreva-o. Encontre a linha
+  <code>QoS Class:</code>.</p>
+<pre class="yaml">kubectl run vitrine --image=cardapio:1.0</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run vitrine --image=cardapio:1.0
+pod/vitrine created
+</pre>
+<pre class="solucao">kubectl run vitrine --image=cardapio:1.0
+kubectl describe pod vitrine</pre>
+</div>
+
+<p>Este é um trecho do painel da caixa, copiado do motor, já com a linha da classe no lugar:</p>
+
+<pre class="term">$ kubectl describe pod vitrine
+Name:            vitrine
+Namespace:       default
+Node:            guia-control-plane/192.0.2.28
+Status:          Running
+IP:              10.244.133.30
+Controlled By:   &lt;none&gt;
+
+Containers:
+  vitrine:
+    Image:          cardapio:1.0
+    Port:           80/TCP
+    State:          Running
+    Ready:          True
+    Restart Count:  0
+QoS Class:                   BestEffort
+Node-Selectors:              &lt;none&gt;</pre>
+
+<p>O <code>describe</code> mostra o pod inteiro: nome, namespace, nó, IP, containers, condições, volumes e,
+no fim, <code>QoS Class: BestEffort</code> — seguida de <code>Node-Selectors</code> e
+<code>Tolerations</code>. Sem <code>resources</code>, o agendador conta zero de CPU e zero de memória, e o
+pod entra no nó como quem entra sem reserva: qualquer um pode ocupar o lugar, e ele é o primeiro a sair
+quando falta.</p>
+
+<p>Para o agendador, esse pod pede zero de CPU e zero de memória — e zero é um número perigoso. Ele
+cabe em qualquer nó, inclusive num que já está com 99% da capacidade reservada, porque a soma continua
+abaixo do teto. Você pode empilhar vinte pods BestEffort num nó de 2 núcleos e o cluster vai aceitar todos,
+feliz, até o dia em que eles competirem pela mesma CPU. É a diferença entre “cabe” e “funciona”: o
+agendador garante o primeiro, ninguém garante o segundo.</p>
+
+<p>BestEffort não é “pod sem limite de propósito”: é o padrão de quem não pensou no assunto. Um
+<code>kubectl run</code> de teste é BestEffort; um pod de produção também, se ninguém escreveu os números.
+O perigo é que ele parece saudável — <code>Running</code>, <code>RESTARTS 0</code> — até o dia em que o nó
+aperta, e aí ele morre sem ter feito nada de errado.</p>
+
+<h2>4. Burstable: o meio do caminho</h2>
+
+<p>Burstable é a classe de quem declara <em>alguma</em> coisa. Pode ser um <code>requests</code> sem
+<code>limits</code>, um <code>limits</code> sem <code>requests</code> ou os dois com valores diferentes. É
+a faixa mais comum, porque é o formato natural de quem quer caber (request baixo) e aguentar pico (limit
+alto). A caixa abaixo descreve um pod que já existe no cluster de exemplo e que tem exatamente esse
+formato.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="pod-pendente" data-goal="texto:QoS Class: Burstable;;texto:FailedScheduling">
+  <p class="try-task">Descreva o pod <code>forno</code> e leia a classe e o evento. Ele pede muito e não
+  cabe em nó nenhum — mas a classe já está definida.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">kubectl describe pod forno
+kubectl get events</pre>
+</div>
+
+<p>A resposta tem duas informações que são fáceis de confundir. O <code>Status: Pending</code> diz que o
+pod não foi agendado; o <code>QoS Class: Burstable</code> diz qual será o comportamento dele quando estiver
+rodando. As duas coisas são independentes: um pod pode ser Burstable e ficar em Pending por pedir demais, e
+pode ser BestEffort e rodar feliz por meses. A classe fala do futuro do pod no aperto, não do presente dele
+na fila.</p>
+
+<p>O evento <code>FailedScheduling</code> mostra o motivo da fila: o pedido de CPU de 8 núcleos não cabe em
+nenhum dos três nós. É a mesma leitura da aula de requests e limits — e a mesma conclusão: baixar o pedido
+resolve o Pending, mas não muda a classe. O que muda a classe é a relação entre os dois números, não o
+tamanho deles.</p>
+
+<h2>5. Guaranteed: reserva igual ao teto</h2>
+
+<p>Para o pod ser <code>Guaranteed</code>, cada container precisa ter os quatro valores: CPU e memória em
+<code>requests</code> e em <code>limits</code>, com request igual a limit em cada um. Não basta declarar um
+recurso; não basta declarar só CPU. E não basta o container principal: se o sidecar não tiver os quatro, o
+pod inteiro volta para <code>Burstable</code>.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/banco|spec.containers.0.resources.requests.cpu=500m;;campo:Pod/banco|spec.containers.0.resources.limits.memory=256Mi;;texto:Running">
+  <p class="try-task">O pod do banco precisa ser <code>Guaranteed</code>. Complete o bloco
+  <code>resources</code> com <code>500m</code> de CPU e <code>256Mi</code> de memória nos dois lados.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: banco
+spec:
+  containers:
+    - name: banco
+      image: banco:1.0
+      ports:
+        - containerPort: 5432
+      resources:
+        requests:
+          cpu: 500m
+        limits:
+          cpu: 500m</pre>
+<pre class="out">
+pod/banco created
+
+NAME    READY   STATUS    RESTARTS   AGE
+banco   1/1     Running   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: banco
+spec:
+  containers:
+    - name: banco
+      image: banco:1.0
+      ports:
+        - containerPort: 5432
+      resources:
+        requests:
+          cpu: 500m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi</pre>
+</div>
+
+<p>O manifesto acima, com CPU igual e memória igual, é o formato que o cluster classifica como
+<code>Guaranteed</code>. O painel confere os campos e mostra o pod em <code>Running</code>; a classe em si
+não aparece no modo manifesto, porque ela só é exibida no <code>describe</code>. Num cluster de verdade, o
+fim do describe fica assim (trecho de uma transcrição real, sem as seções de condições e volumes):</p>
+
+<pre class="term">Containers:
+  banco:
+    Image:          banco:1.0
+    Port:           5432/TCP
+    State:          Running
+      Started:      Fri, 27 Nov 2026 15:51:04 +0000
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:     500m
+      memory:  256Mi
+    Requests:
+      cpu:     500m
+      memory:  256Mi
+    Environment:    &lt;none&gt;
+    Mounts:         &lt;none&gt;
+QoS Class:                   Guaranteed</pre>
+
+<p>Repare que o <code>describe</code> lista <code>Limits</code> antes de <code>Requests</code>, e que os
+quatro valores aparecem duas vezes. É assim que se confere a classe sem adivinhar: se os quatro pares
+batem, é <code>Guaranteed</code>; se falta algum, é <code>Burstable</code>; se não há nenhum, é
+<code>BestEffort</code>.</p>
+
+<h2>6. A tabela das classes e as pegadinhas</h2>
+
+<p>A tabela abaixo é o resumo que vale colar no monitor. A coluna da direita é a parte que quase nunca é
+lembrada: a classe só importa no aperto, e o aperto é raro — até não ser.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Classe</th><th>Regra exata</th><th>No aperto do nó</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Guaranteed</code></td><td>todos os containers com requests = limits de CPU e de
+memória</td><td>último a ser despejado</td></tr>
+<tr><td><code>Burstable</code></td><td>algum recurso declarado, sem se encaixar na regra
+acima</td><td>despejado depois do BestEffort, e antes do Guaranteed</td></tr>
+<tr><td><code>BestEffort</code></td><td>nenhum container com requests ou limits</td><td>primeiro da
+fila</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A primeira pegadinha é o sidecar. Um pod com o container principal perfeitamente
+<code>Guaranteed</code> e um proxy sem <code>resources</code> é <code>Burstable</code> — o pod inteiro, não
+só o proxy. É o erro mais comum em times que adotaram service mesh: o proxy entra por injeção automática e
+ninguém revisou os números dele.</p>
+
+<p>A segunda é declarar só CPU. Quem escreve <code>requests</code> e <code>limits</code> de CPU iguais e
+esquece a memória fica em <code>Burstable</code>, porque faltam dois dos quatro valores. A terceira é
+declarar só <code>limits</code>: o Kubernetes copia o limite para o request quando o request está ausente,
+e o resultado pode ser um <code>Guaranteed</code> que você não pediu — com reserva maior do que pretendia e
+menos pods por nó.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Manifesto</th><th>Classe</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>sem <code>resources</code></td><td><code>BestEffort</code></td><td>nada declarado</td></tr>
+<tr><td>só <code>requests</code></td><td><code>Burstable</code></td><td>falta o teto</td></tr>
+<tr><td>request 100m, limit 500m</td><td><code>Burstable</code></td><td>os valores não são iguais</td></tr>
+<tr><td>iguais em CPU, sem memória</td><td><code>Burstable</code></td><td>faltam dois dos quatro
+valores</td></tr>
+<tr><td>iguais em CPU e memória, em todos os containers</td><td><code>Guaranteed</code></td><td>regra
+completa</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma consequência prática: a classe não é um campo que você edita, é um resultado que muda quando o
+manifesto muda. Ao aplicar um Deployment com números diferentes, o controlador cria um ReplicaSet novo,
+os pods antigos saem e os novos nascem com a classe nova. É por isso que “o pod era Guaranteed ontem” não
+garante nada hoje — o que vale é o objeto que está no cluster agora, e o
+<code>kubectl get pod -o yaml</code> é quem mostra os containers de verdade, inclusive os que entraram por
+injeção automática.</p>
+
+<p>Vale decorar a lógica em vez da lista: <em>Guaranteed é tudo igual e completo; BestEffort é nada; o resto
+é Burstable</em>. Com essa frase você acerta qualquer combinação — inclusive as que ainda não existem no seu
+manifesto.</p>
+
+<h2>7. O que a classe muda (e o que não muda)</h2>
+
+<p>A classe não interfere no agendamento: quem decide onde o pod cabe é o <code>requests</code>, não o nome
+da classe. Também não interfere no consumo: um <code>BestEffort</code> pode usar toda a CPU ociosa do nó,
+porque não tem teto. O que a classe muda é o comportamento do kubelet sob pressão e o chamado <em>OOM
+score</em> — a pontuação que o kernel usa para escolher qual processo matar quando a memória do nó acaba.</p>
+
+<p>Na prática, a ordem de despejo é: primeiro os <code>BestEffort</code>, depois os <code>Burstable</code>
+que passaram do request, e por último os <code>Guaranteed</code>. Dentro da mesma classe, quem consome mais
+acima do que reservou tende a sair antes. O sistema não é justo: é previsível. E previsibilidade é o que
+permite planejar — saber que o site vai ser o primeiro a morrer é informação, não fatalidade.</p>
+
+<p>Uma ressalva que evita muita confusão: <code>Guaranteed</code> não é vacina contra morte. Se o processo
+de dentro passar do próprio limite de memória, o kernel mata o container do mesmo jeito, com
+<code>OOMKilled</code> e exit code 137. A classe protege contra o despejo causado pela pressão do nó — o
+vizinho barulhento, o relatório gigante, a planilha de fim de mês —, não contra o próprio apetite. Quem
+confunde as duas coisas passa a achar que “Guaranteed não funciona” quando, na verdade, o limite é que
+estava baixo.</p>
+
+<p>Isso tem um custo que ninguém comenta: transformar tudo em <code>Guaranteed</code> é caro. Cada pod passa
+a reservar exatamente o que pode consumir, e a soma dos requests sobe. Em cluster pequeno, o resultado é
+fila de <code>Pending</code>. O equilíbrio usual é: banco, fila e pagamento em <code>Guaranteed</code>;
+serviços web em <code>Burstable</code> com request honesto e limit generoso; jobs e coletadores em
+<code>BestEffort</code>, desde que possam ser interrompidos.</p>
+
+<h2>8. O que o painel mostra (e o que ele não calcula)</h2>
+
+<p>O painel exibe a classe no <code>describe</code> quando o pod existe no cluster simulado — e é por isso
+que as caixas desta aula usam terminal: <code>kubectl run</code> para o <code>BestEffort</code> e o cenário
+com o pod pendente para o <code>Burstable</code>. O cálculo é o mesmo do cluster para esses dois casos.</p>
+
+<p>O que não dá para ver aqui é o <code>Guaranteed</code> no <code>describe</code>, porque o painel não
+aplica manifesto no modo terminal: o caminho é escrever o manifesto (caixa 3) e conferir a classe num
+cluster real, com a transcrição acima como referência. E o despejo em si — o pod virando
+<code>Evicted</code> — também não é calculado, porque não há kubelet nem pressão de memória de verdade. A
+próxima aula trata exatamente desse momento.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o site que virou BestEffort sem querer</h3>
+<p>Um deploy “de limpeza” removeu o bloco <code>resources</code> do manifesto do cardápio, porque “o nó tem
+memória sobrando”. O pod continuou saudável por semanas e virou o primeiro da fila de despejo. Numa
+madrugada de pico, foi embora e o site caiu. O <code>git diff</code> mostrava a remoção; o
+<code>describe</code> mostrava a classe. Ninguém tinha olhado nenhum dos dois.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Guaranteed que não cabia mais</h3>
+<p>O time decidiu que “tudo em produção seria Guaranteed”. Com request igual ao limit em todos os pods, a
+soma dos requests passou da capacidade dos três nós e metade dos pods ficou em <code>Pending</code>. A
+solução foi voltar os serviços web para <code>Burstable</code> e manter <code>Guaranteed</code> só no que
+não pode morrer. Classe é ferramenta, não troféu.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o sidecar invisível</h3>
+<p>Um pod de pagamento era <code>Guaranteed</code> até a injeção automática do proxy. O proxy entrou sem
+<code>resources</code> e o pod inteiro virou <code>Burstable</code> — ninguém percebeu, porque o manifesto
+no repositório continuava impecável. O que mudou foi o objeto no cluster. Só o
+<code>kubectl get pod -o yaml</code> mostrava o container extra.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que define a classe de QoS de um pod?</p>
+<label><input type="radio" name="q1"> o tamanho do request</label>
+<label><input type="radio" name="q1"> a prioridade declarada no manifesto</label>
+<label><input type="radio" name="q1"> a relação entre requests e limits em todos os containers do
+pod</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Um pod com dois containers: o principal com requests =
+limits de CPU e memória, e um sidecar sem nenhum recurso. Qual é a classe?</p>
+<label><input type="radio" name="q2"> Burstable</label>
+<label><input type="radio" name="q2"> Guaranteed</label>
+<label><input type="radio" name="q2"> BestEffort</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Quando o nó fica sem memória, quem é despejado
+primeiro?</p>
+<label><input type="radio" name="q3"> os pods <code>Guaranteed</code></label>
+<label><input type="radio" name="q3"> os pods <code>BestEffort</code></label>
+<label><input type="radio" name="q3"> os pods mais antigos, independentemente da classe</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o pod do banco</h2>
+<p>Para o pod do banco ser <code>Guaranteed</code>, ele precisa de quatro valores iguais dois a dois. O
+manifesto já tem <code>requests.cpu: 500m</code> e <code>limits.cpu: 500m</code>. Complete a memória do
+lado dos <code>limits</code>, sabendo que o request já é <code>256Mi</code>.</p>
+<div class="ex-code">limits:
+  memory: <input aria-label="resposta 1" data-answer="256Mi" placeholder="..."></div>
+<p class="ex-dica">Dica: para a classe ser <code>Guaranteed</code>, o teto tem de ser igual à reserva — o
+mesmo número do request, com o mesmo sufixo.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>QoS é uma etiqueta calculada pelo cluster a partir do formato de <code>resources</code>. Sem nada,
+<code>BestEffort</code>; com algum valor mas sem a igualdade completa, <code>Burstable</code>; com
+<code>requests</code> igual a <code>limits</code> de CPU e de memória em todos os containers,
+<code>Guaranteed</code>.</p>
+
+<p>A classe aparece no fim do <code>describe pod</code> e decide a ordem de despejo quando o nó fica sob
+pressão: <code>BestEffort</code> primeiro, <code>Guaranteed</code> por último. Ela não muda o agendamento
+nem o consumo — só o comportamento no aperto. Um sidecar sem recursos rebaixa o pod inteiro.</p>
+
+<p>O painel calcula a classe para os pods que ele consegue criar no terminal e não simula despejo; o
+<code>Guaranteed</code> aparece como transcrição. Na próxima aula a Ana vai exatamente ao momento do
+aperto: eviction, <code>OOMKilled</code> e o que fazer quando o nó não tem mais memória.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>Guaranteed</code> = tudo igual e completo; <code>BestEffort</code> = nada; o resto é
+  <code>Burstable</code>.</li>
+  <li>A regra vale para todos os containers: um sidecar sem recursos rebaixa o pod.</li>
+  <li>Ordem de despejo: <code>BestEffort</code>, depois <code>Burstable</code>, depois
+  <code>Guaranteed</code>.</li>
+  <li>A classe aparece no <code>describe pod</code>, no fim, junto de volumes e tolerations.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

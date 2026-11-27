@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Endpoints | Guia Kubernetes</title>
+<meta name="description" content="Endpoints na prática: a lista de IPs e portas que fica atrás de um Service, quem a preenche, o que o yaml do objeto mostra e o que fazer quando ela está vazia.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Os <span class="hl">Endpoints</span></h1>
+<p class="intro">Na aula passada a Ana aprendeu que o Service entrega para “os pods que casam com o seletor”.
+Mas quem é essa lista, onde ela mora e como conferi-la? Existe um objeto no cluster só para isso, chamado
+<strong>Endpoints</strong>: a lista de IPs e portas que o Service tem para onde mandar tráfego naquele
+instante. Nesta aula a Ana abre esse objeto, vê quem o preenche, entende o que ele revela quando está vazio —
+e por que ele é o primeiro lugar de qualquer investigação de rede.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é o objeto Endpoints e como ele se relaciona com o Service.</li>
+  <li>Quem preenche a lista e por que ela muda sozinha.</li>
+  <li>O que o <code>get endpoints -o yaml</code> mostra: subsets, addresses, ports e
+  <code>targetRef</code>.</li>
+  <li>O que significa <code>&lt;none&gt;</code> e o que investigar a partir dele.</li>
+  <li>Por que só pod <em>pronto</em> entra na lista.</li>
+  <li>O padrão de Service sem seletor, para alcançar algo que não está no cluster.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o Service que responde “conexão recusada”</h2>
+
+<p>O site da padaria começou a dar erro na sexta-feira. O log da aplicação dizia
+<code>connect ECONNREFUSED 10.96.147.79:80</code> — conexão recusada no endereço do Service. A Ana rodou
+<code>kubectl get services</code> e viu o Service lá, com IP e porta: <code>80/TCP</code>. Rodou
+<code>kubectl get pods</code> e viu dois pods em <code>Running</code>. Tudo parecia certo, e nada funcionava.</p>
+
+<p>Foi então que ela aprendeu o comando que deveria ter sido o primeiro: <code>kubectl get endpoints</code>.
+A resposta era uma tabela com uma linha e a palavra <code>&lt;none&gt;</code> no lugar dos destinos. O Service
+existia, os pods existiam, e a lista que liga os dois estava vazia. O problema não era de rede, de firewall nem
+de imagem: era uma etiqueta que não combinava.</p>
+
+<p>O objeto que a Ana acabou de descobrir é a peça que fica entre o Service e os pods. O Service é a
+<em>porta de entrada</em> com nome; os Endpoints são a <em>lista de quem atende</em> naquele momento. Os dois
+têm o mesmo nome e vivem no mesmo namespace, e é por isso que quase todo mundo confunde: são dois objetos, com
+duas vidas, um cuidando do outro.</p>
+
+<h2>2. O que é o objeto Endpoints</h2>
+
+<p>Endpoints é um objeto do cluster como o Service, o ConfigMap ou o pod. Ele não tem manifesto que você
+escreve no dia a dia — é criado e mantido automaticamente — e sua estrutura é diferente: em vez de
+<code>spec</code>, ele tem <strong>subsets</strong>, que são grupos de endereços com as suas portas.</p>
+
+<dl class="anatomy">
+<dt>Endpoints</dt>
+<dd>O objeto que guarda os destinos de um Service: IPs e portas dos pods que atendem àquele nome.</dd>
+<dt>subset</dt>
+<dd>Um grupo de endereços que compartilham as mesmas portas. A maioria dos Services tem um subset só.</dd>
+<dt>address</dt>
+<dd>O IP de um pod (e, no yaml, o nó onde ele está e uma referência ao objeto de origem).</dd>
+<dt><code>targetRef</code></dt>
+<dd>A referência ao pod que originou aquele endereço: tipo, nome e namespace. É a prova de <em>quem</em> está
+atrás do Service.</dd>
+<dt><code>notReadyAddresses</code></dt>
+<dd>Endereços que existem mas não estão prontos para receber tráfego. Serviços headless usam essa lista;
+os comuns, não.</dd>
+<dt>endpoint controller</dt>
+<dd>O controlador do cluster que observa pods e Services e mantém a lista em dia, várias vezes por
+segundo.</dd>
+</dl>
+
+<p>Repare que o Endpoints não pertence ao Service como uma parte dele: é um objeto separado, com o mesmo nome.
+Quem cria e atualiza é o <em>endpoint controller</em>, um pedaço do controlador do cluster que fica olhando os
+pods. Se você ler o yaml do objeto, encontra uma etiqueta que denuncia isso:
+<code>endpoints.kubernetes.io/managed-by: endpoint-controller</code>. É o aviso oficial de “não edite à
+mão”.</p>
+
+<p>E por que isso importa? Porque explica o comportamento que mais confunde: você cria um pod e, segundos
+depois, ele já aparece na lista; você apaga o pod e ele desaparece. Não há <code>apply</code> de endpoints no
+meio. A lista é um <em>retrato</em> do cluster, refeito continuamente — e um retrato desatualizado por alguns
+segundos é normal.</p>
+
+<h2>3. A lista que se preenche sozinha</h2>
+
+<p>A caixa abaixo mostra o caso mais instrutivo: o Service existe, o Deployment existe com zero réplicas, e
+não há ninguém para atender. A missão é dar trabalho ao Service — três réplicas — e ver a lista encher.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="conta:pods[app=cardapio]=3;;texto:10.244.">
+  <p class="try-task">O Deployment está com <code>replicas: 0</code> e o Service não tem destinos. Suba para
+  <code>3</code> réplicas e rode: a tabela de endpoints tem de mostrar três IPs.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME       ENDPOINTS   AGE
+cardapio   &lt;none&gt;      2m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>Com zero réplicas, o painel mostra <code>cardapio &lt;none&gt;</code>. Com três, três endereços na coluna,
+cada um no formato <code>IP:porta</code>. A porta é a <code>targetPort</code> do Service — 8080 —, e não a
+porta do Service. Essa é a notação que você vai ver em todo lugar: o endpoint é sempre o destino final, o lugar
+onde a conexão realmente chega.</p>
+
+<p>Vale reparar no que a tabela <em>não</em> mostra: o nome do pod. Para saber qual pod está por trás de cada
+IP, o caminho é o yaml do objeto (a próxima seção) ou cruzar com o <code>get pods -o wide</code>, que tem a
+coluna <code>IP</code>. Nos dois casos a resposta existe; a tabela só não foi feita para isso.</p>
+
+<pre class="term">$ kubectl get endpoints
+NAME       ENDPOINTS                                AGE
+cardapio   10.244.111.241:8080,10.244.56.236:8080   2m
+frete      &lt;none&gt;                                   3m</pre>
+
+<p>A transcrição acima é a resposta do painel para dois Services: o do site, com dois destinos, e o do frete,
+vazio. Note que a idade do Endpoints é a do objeto, não a da última mudança — um Endpoints antigo com
+<code>&lt;none&gt;</code> costuma ser um Service que perdeu os pods e ninguém percebeu.</p>
+
+<h2>4. O yaml do Endpoints</h2>
+
+<p>A tabela é um resumo. O objeto inteiro aparece no <code>-o yaml</code>, e ele responde perguntas que a
+tabela não responde: qual pod está por trás do IP, em que nó ele está, com que protocolo e porta o tráfego
+sai. A caixa abaixo tem dois pods com etiquetas diferentes e um Service apontando para o pod errado — a missão
+é fazer o Service escolher a vitrine de verdade.</p>
+
+<div class="tryk8s" data-get="endpoints -o yaml" data-goal="campo:Endpoints/cardapio|subsets.0.addresses.0.targetRef.name=web;;texto:10.244.">
+  <p class="try-task">O Service está apontando para o pod <code>vitrine</code>. Faça o seletor casar com o pod
+  <code>web</code> e rode: no yaml, o <code>targetRef</code> tem de mostrar <code>name: web</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: vitrine
+  labels:
+    app: vitrine
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: vitrine
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+pod/vitrine created
+pod/web created
+service/cardapio created
+
+apiVersion: v1
+kind: Endpoints
+metadata:
+  labels:
+    endpoints.kubernetes.io/managed-by: endpoint-controller
+  name: cardapio
+  namespace: default
+subsets:
+  - addresses:
+      - ip: 10.244.135.30
+        nodeName: guia-control-plane
+        targetRef:
+          kind: Pod
+          name: vitrine
+          namespace: default
+    ports:
+      - port: 8080
+        protocol: TCP
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: vitrine
+  labels:
+    app: vitrine
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>Antes da correção, o yaml mostra <code>targetRef: name: vitrine</code> — o Service <code>cardapio</code>
+entregando para um pod chamado <code>vitrine</code>. Depois, <code>name: web</code>. É a prova mais direta que
+existe de “quem está atendendo este Service”, e vale decorar o caminho para usar em investigação: primeiro
+<code>targetRef</code>, depois <code>nodeName</code>, depois a porta.</p>
+
+<p>Os campos que aparecem nesse yaml merecem uma leitura. <code>subsets</code> é a lista de grupos;
+<code>addresses</code> traz os IPs prontos; <code>targetRef</code> diz de qual objeto cada IP veio;
+<code>nodeName</code> mostra o nó; e <code>ports</code> traz a porta e o protocolo que o Service usa para
+entregar. Uma etiqueta no topo, <code>endpoints.kubernetes.io/managed-by: endpoint-controller</code>, confirma
+que o objeto é gerado — se ela não estiver lá, alguém criou o Endpoints à mão.</p>
+
+<h2>5. Só pod pronto entra na lista</h2>
+
+<p>O endpoint controller não olha só etiqueta: ele olha o estado do pod. Pod em <code>Pending</code>, pod com
+container em <code>CrashLoopBackOff</code> ou pod cujo <em>readiness probe</em> está falhando não entra na
+lista de endereços prontos. É isso que faz o Service deixar de mandar tráfego para uma réplica doente sem que
+ninguém precise mexer em nada.</p>
+
+<p>Esse é o mecanismo por trás de uma frase que aparece em toda documentação de Kubernetes: “o pod só recebe
+tráfego quando está pronto”. O <code>READY</code> do <code>get pods</code> e a lista de endpoints são a mesma
+informação vista de dois ângulos. Quando a Ana viu <code>0/1</code> em um pod e o Service continuando a
+responder, era porque as outras réplicas estavam prontas e assumindo o trabalho.</p>
+
+<p>Uma nota de honestidade sobre o painel deste guia: ele não roda container, então não executa probe nenhum e
+não simula pod doente — o que ele calcula é a lista de endereços a partir dos pods que existem e casam com o
+seletor. Na vida real, a transição de “pod pronto” para “fora da lista” leva alguns segundos, e é comum ver um
+pod recém-criado ainda fora dos endpoints enquanto o programa dele termina de subir.</p>
+
+<h2>6. O Service sem seletor</h2>
+
+<p>Existe um caso em que o Endpoints é escrito à mão: quando o destino não é um pod do cluster. O banco de
+dados da padaria mora numa máquina fora, com IP fixo; para o resto do sistema chamar esse banco pelo nome
+<code>banco</code>, cria-se um Service <strong>sem <code>selector</code></strong> e um Endpoints com o mesmo
+nome, apontando para o IP e a porta do banco externo. O Service vira um apelido interno para algo que não está
+ali.</p>
+
+<p>Esse desenho tem dois detalhes. O primeiro: sem seletor, o endpoint controller não tem o que observar, e o
+objeto que você escreveu é respeitado como está — é o único caso em que editar Endpoints à mão faz sentido. O
+segundo: o Service precisa de um <code>clusterIP</code> explícito em algumas versões, e o Endpoints precisa
+estar no mesmo namespace e com o mesmo nome do Service, senão são dois objetos sem ligação nenhuma.</p>
+
+<p>Como o painel deste guia calcula endpoints a partir dos pods, esse padrão não roda nas caixas — ele
+aparece aqui como desenho, e vale conhecer porque é o jeito canônico de ligar um cluster a um recurso externo
+sem abrir mão do DNS interno. A alternativa é usar um Service do tipo <code>ExternalName</code>, que resolve
+para um nome DNS externo, com menos controle sobre porta e protocolo.</p>
+
+<h2>7. Quem depende de quem</h2>
+
+<p>Vale fixar a cadeia, porque ela explica quase todo problema de rede no cluster. O pod tem etiquetas. O
+Service tem um seletor que compara com essas etiquetas. O endpoint controller observa os dois e escreve a lista
+de endereços. O kube-proxy lê essa lista e programa as regras de encaminhamento do nó. O cliente chama o nome,
+o DNS resolve para o ClusterIP, e o pacote segue a regra até um pod.</p>
+
+<p>Se qualquer elo dessa corrente se rompe, o sintoma é parecido: “não conecta”. Por isso a ordem de
+investigação é sempre de baixo para cima. Primeiro <code>get pods</code> — os pods existem e estão prontos?
+Depois <code>get endpoints</code> — eles entraram na lista? Depois <code>describe service</code> — a porta e o
+<code>targetPort</code> estão certos? Só então vale olhar a aplicação e o firewall.</p>
+
+<p>A caixa abaixo exercita a ordem de investigação no cluster com o site no ar: primeiro a lista, depois
+o <code>describe</code> do Service, que traz a linha <code>Endpoints</code> com os mesmos pares IP e porta.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:Endpoints:;;campo:Service/cardapio|spec.selector.app=cardapio;;texto:10.244.">
+  <p class="try-task">Consultar os endpoints do Service <code>cardapio</code> e depois descrevê-lo, para ver a
+  mesma lista na linha <code>Endpoints</code>. São dois comandos.</p>
+<pre class="yaml">kubectl get endpoints cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                                AGE
+cardapio   10.244.111.241:8080,10.244.56.236:8080   2m
+</pre>
+  <pre class="solucao">kubectl get endpoints cardapio
+kubectl describe service cardapio</pre>
+</div>
+
+<p>O painel do código inicial mostra só a tabela de endpoints — dois IPs e a porta 8080. Depois da missão,
+aparece também o <code>describe</code>, com seletor, IP do Service, porta, <code>TargetPort</code> e a linha
+<code>Endpoints</code> repetindo os mesmos destinos. São duas vistas do mesmo fato, e é essa repetição que dá
+confiança no diagnóstico: se as duas concordam, o problema está adiante; se discordam, o objeto está sendo
+alterado por outra coisa.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Elo</th><th>Objeto</th><th>Comando</th></tr>
+</thead>
+<tbody>
+<tr><td>quem atende</td><td>Pod</td><td><code>kubectl get pods --show-labels</code></td></tr>
+<tr><td>quem entra na lista</td><td>Endpoints</td><td><code>kubectl get endpoints</code></td></tr>
+<tr><td>quem escolhe e traduz porta</td><td>Service</td><td><code>kubectl describe service</code></td></tr>
+<tr><td>quem encaminha no nó</td><td>kube-proxy</td><td>regras do nó (fora do kubectl)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. Os tropeços e o que eles dizem</h2>
+
+<p>O primeiro sintoma é <code>&lt;none&gt;</code>: nenhum pod casou. Pode ser etiqueta diferente, pod em outro
+namespace, pod não pronto ou Deployment com zero réplicas. O segundo é a lista com IPs e o cliente sem
+resposta: aí o problema está depois da lista — porta errada, programa que não escuta, ou firewall. O terceiro
+é a lista que “pisca”: durante um rollout, pods novos entram e antigos saem, e ver a lista com três IPs por
+alguns segundos é normal.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>O que significa</th><th>Próximo passo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;none&gt;</code></td><td>nenhum pod pronto casa com o seletor</td><td>comparar etiquetas e
+namespace</td></tr>
+<tr><td>menos IPs que pods</td><td>parte dos pods não está pronta</td><td><code>get pods</code> e olhar a
+coluna <code>READY</code></td></tr>
+<tr><td>IP na lista, conexão recusada</td><td>o pod está lá, o programa não escuta naquela porta</td><td>conferir
+<code>targetPort</code> e a porta do container</td></tr>
+<tr><td>lista muda a cada minuto</td><td>pods reiniciando ou rollout em andamento</td><td><code>get pods</code>
+e <code>rollout status</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="term">$ kubectl get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE   IP               NODE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m    10.244.111.241   guia-control-plane
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m   10.244.56.236    guia-worker</pre>
+
+<p>A transcrição acima é a resposta do painel para os dois pods do site. Cruzada com a tabela de endpoints
+(<code>10.244.111.241:8080,10.244.56.236:8080</code>), ela fecha o mapa: os dois IPs da lista são esses dois
+pods, um em cada nó. Quando a lista e a tabela de pods não batem, o que falta é justamente o elo do meio — o
+pod existe, mas não entrou na lista.</p>
+
+<p>Uma última ferramenta, que a Ana passou a usar junto: <code>kubectl get pods -o wide</code>. Ele traz o IP
+e o nó de cada pod, e cruzar essa tabela com a de endpoints responde “qual pod é este IP?” em segundos. Com
+<code>get endpoints -o yaml</code>, a resposta é ainda mais direta: o <code>targetRef</code> já diz o nome.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o Service que apontava para a vitrine</h3>
+<p>Numa migração, o time criou o pod novo com a etiqueta <code>app: vitrine</code> e deixou o Service apontando
+para ela. O site respondia — com o conteúdo da vitrine, não do cardápio. Nenhum alarme tocou, porque o Service
+respondia 200. Só olhando o <code>targetRef</code> do Endpoints (ou o HTML entregue) daria para perceber que o
+destino era o objeto errado.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o banco fora do cluster</h3>
+<p>O banco da padaria ficava numa máquina dedicada, com IP fixo e porta 5432. Em vez de espalhar esse IP por
+todos os manifestos, a Ana criou um Service <code>banco</code> sem seletor e um Endpoints com o IP da máquina.
+Os programas passaram a usar <code>banco:5432</code>. No dia em que o banco mudou de endereço, a alteração foi
+em um objeto só.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a lista que esvaziou durante o deploy</h3>
+<p>Num deploy, o Deployment foi configurado para derrubar os pods antigos antes de subir os novos. Durante
+quarenta segundos a lista de endpoints ficou vazia, e o cliente viu erro 503. A correção não foi no Service: foi
+no <code>maxUnavailable</code> do Deployment, para que sempre houvesse pelo menos um pod pronto na lista. O
+endpoint vazio foi o sintoma, não a causa.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Quem preenche o objeto Endpoints?</p>
+<label><input type="radio" name="q1"> o desenvolvedor, no mesmo arquivo do Service</label>
+<label><input type="radio" name="q1"> o endpoint controller, olhando pods e seletores</label>
+<label><input type="radio" name="q1"> o kubelet do nó, a cada requisição</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o <code>targetRef</code> do Endpoints diz?</p>
+<label><input type="radio" name="q2"> a porta que o cliente deve usar</label>
+<label><input type="radio" name="q2"> o nome do ClusterIP</label>
+<label><input type="radio" name="q2"> de qual objeto (pod) veio aquele endereço</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Um pod que existe mas não está pronto…</p>
+<label><input type="radio" name="q3"> fica fora da lista de endereços prontos</label>
+<label><input type="radio" name="q3"> aparece na lista e recebe metade do tráfego</label>
+<label><input type="radio" name="q3"> impede o Service de ser criado</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o comando da lista</h2>
+<p>Complete o comando que mostra os destinos de um Service:</p>
+<div class="ex-code">kubectl get <input aria-label="resposta 1" data-answer="endpoints" placeholder="..."> cardapio</div>
+<p class="ex-dica">Dica: é o nome do objeto que fica entre o Service e os pods.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Endpoints é o objeto que guarda a lista de IPs e portas para onde um Service entrega. Ele tem o mesmo nome
+do Service, vive no mesmo namespace e é mantido pelo endpoint controller a partir das etiquetas dos pods e do
+estado de prontidão de cada um. A tabela mostra <code>IP:porta</code>; o yaml mostra também
+<code>targetRef</code>, <code>nodeName</code> e a porta de saída.</p>
+
+<p>Lista vazia (<code>&lt;none&gt;</code>) quer dizer que nenhum pod pronto casou com o seletor — e é o
+primeiro lugar de qualquer investigação, antes de olhar firewall, DNS ou aplicação. Lista com IPs e cliente sem
+resposta aponta para a porta: o <code>targetPort</code> do Service precisa ser a porta onde o programa escuta.</p>
+
+<p>E existe o caso manual: Service sem seletor mais Endpoints escrito à mão, para alcançar algo que mora fora
+do cluster. É a exceção que confirma a regra — no dia a dia, ninguém escreve Endpoints; observa-se.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Endpoints = lista de destinos de um Service, com o mesmo nome e namespace.</li>
+  <li>Quem mantém é o endpoint controller; a etiqueta <code>managed-by</code> denuncia isso.</li>
+  <li>Só pod pronto entra; pod doente sai sem ninguém mexer.</li>
+  <li><code>&lt;none&gt;</code> = seletor sem casa. É o primeiro comando da investigação.</li>
+  <li><code>-o yaml</code> revela o <code>targetRef</code>: qual pod está por trás do IP.</li>
+  <li>Service sem seletor + Endpoints manual é o jeito de apontar para um recurso fora do cluster.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

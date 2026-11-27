@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>O manifesto do Pod | Guia Kubernetes</title>
+<meta name="description" content="O manifesto do pod campo por campo: apiVersion, kind, metadata, spec e o status que você nunca escreve, mais os padrões que o servidor preenche e os erros de validação.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>O manifesto do <span class="hl">Pod</span></h1>
+<p class="intro">A Ana já aplicou um pod, já viu o <code>created</code> e já sabe ler o YAML. Agora ela quer
+entender o arquivo inteiro: o que é obrigatório, o que é opcional, o que o servidor acrescenta sozinho e o
+que ela nunca deve escrever. Nesta aula cada bloco do manifesto do pod é aberto com calma —
+<code>apiVersion</code>, <code>kind</code>, <code>metadata</code>, <code>spec</code> e o <code>status</code>
+que só o cluster preenche —, com os erros de validação mais comuns aparecendo na caixa de verdade. No fim,
+ela vai olhar um manifesto de trinta linhas e saber quais linhas pode tirar.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Os quatro blocos que você escreve e o quinto, que é resposta do cluster.</li>
+  <li>O que vai em <code>metadata</code>: nome, namespace, etiquetas e anotações.</li>
+  <li>O que vai em <code>spec</code>: a lista de containers e as decisões do pod.</li>
+  <li>Os padrões que o servidor preenche sozinho e que não aparecem no seu arquivo.</li>
+  <li>Por que <code>status</code>, <code>uid</code> e <code>resourceVersion</code> não se escrevem.</li>
+  <li>O que significa cada tipo de erro de validação e onde olhar.</li>
+  <li>Como usar <code>kubectl explain</code> para descobrir um campo sem abrir a internet.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o manifesto de trinta linhas</h2>
+
+<p>O <code>cardapio.yaml</code> da Ana cresceu. Começou com sete linhas, hoje tem trinta: etiquetas,
+anotações, política de reinício, limite de memória e um bloco de portas. Funciona — ela aplicou e o pod subiu.
+Mas ela não sabe dizer o que cada linha faz, e isso incomoda: se alguém perguntar “por que essa linha está
+aqui?”, a resposta honesta é “veio do exemplo”.</p>
+
+<p>O pior é o medo de mexer. Toda vez que ela apaga uma linha, o pod “não sobe” ou sobe diferente, e ela
+devolve a linha. O arquivo vira uma relíquia que ninguém entende e todos copiam. É o começo do fim de um
+manifesto: quando ninguém sabe o que é obrigatório, tudo vira obrigatório.</p>
+
+<p>Este é o problema que a aula resolve. Um pod não tem cem campos possíveis na prática: tem quatro blocos,
+e dentro deles pouca coisa realmente obrigatória — <code>metadata.name</code> e
+<code>spec.containers[].name</code> e <code>image</code>. Todo o resto é opcional, tem padrão, ou é resposta
+do cluster. Quando você sabe quais são os três, o arquivo encolhe e o medo vai embora.</p>
+
+<h2>2. Os quatro blocos, e o quinto que é resposta</h2>
+
+<p>Todo manifesto do Kubernetes, de pod a Ingress, tem a mesma moldura. <code>apiVersion</code> diz qual
+versão da API conhece aquele tipo. <code>kind</code> diz o tipo. <code>metadata</code> guarda a identidade.
+<code>spec</code> guarda o que você quer. E o <code>status</code> guarda o que o cluster conta de volta — esse
+você não escreve nunca.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Bloco</th><th>Obrigatório?</th><th>O que tem</th><th>Quem escreve</th></tr>
+</thead>
+<tbody>
+<tr><td><code>apiVersion</code></td><td>sim</td><td>a versão da API: <code>v1</code> para Pod</td><td>você</td></tr>
+<tr><td><code>kind</code></td><td>sim</td><td>o tipo do objeto: <code>Pod</code></td><td>você</td></tr>
+<tr><td><code>metadata</code></td><td>sim, pelo menos o nome</td><td>nome, namespace, etiquetas,
+anotações</td><td>você</td></tr>
+<tr><td><code>spec</code></td><td>sim</td><td>containers, portas, política de reinício, volumes</td><td>você</td></tr>
+<tr><td><code>status</code></td><td>não</td><td>fase, IP, nó, condições, reinícios</td><td>o cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>apiVersion</code> é o campo que mais confunde quem copia manifesto. Ele não é “a versão do
+Kubernetes” nem “a versão da sua aplicação”: é o endereço da API que define aquele tipo. Pod mora no grupo
+antigo, sem nome, e por isso é só <code>v1</code>. Deployment mora em <code>apps/v1</code>. Job, em
+<code>batch/v1</code>. Se você trocar o <code>apiVersion</code> do pod para <code>apps/v1</code>, o cluster
+não tenta adivinhar: responde que não conhece aquele tipo naquela versão. A caixa abaixo tem esse erro.</p>
+
+<div class="tryk8s" data-goal="texto:pod/cardapio created;;texto:Running">
+  <p class="try-task">O pod está declarado em <code>apps/v1</code>, que é o grupo dos workloads, não do pod.
+  Troque para a versão certa (<code>v1</code>) e rode.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: apps/v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no matches for kind "Pod" in version "apps/v1"
+ensure CRDs are installed first
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>A resposta é <code>error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no
+matches for kind "Pod" in version "apps/v1"</code>, seguida de <code>ensure CRDs are installed first</code>.
+Traduzindo: “não achei o mapeamento desse recurso; nenhum tipo Pod combina com a versão apps/v1”. O
+“namespace vazio” é porque o manifesto também não disse o namespace. E a linha sobre CRDs é um conselho
+genérico do kubectl: ele sugere que talvez você esteja usando um tipo instalado por um operador — não é o
+caso, é só a versão errada.</p>
+
+<p>Existe um jeito de não errar mais nisso: <code>kubectl api-resources</code> lista todos os tipos que o
+cluster conhece, com a versão e o escopo de cada um. Quando bater dúvida sobre <code>apiVersion</code>, é ali
+que se confere — não no blog de 2019.</p>
+
+<h2>3. metadata: a identidade do pod</h2>
+
+<p><code>metadata</code> responde “quem é este objeto”. Quatro campos importam no começo. <code>name</code> é
+o nome, obrigatório, em minúsculas com hífen. <code>namespace</code> é a divisão lógica onde ele mora; se você
+não disser nada, vai para <code>default</code>. <code>labels</code> são etiquetas usadas por seletores — o
+assunto da próxima aula. <code>annotations</code> são anotações livres, para ferramentas e para gente, que
+nenhum seletor usa.</p>
+
+<p>Etiqueta e anotação parecem a mesma coisa e não são. A etiqueta é indexada: o cluster consegue filtrar por
+ela, e é assim que um Service encontra os pods (<code>kubectl get pods -l app=cardapio</code>). A anotação é
+depósito: o controlador de Ingress guarda ali a configuração, o time guarda o link do chamado, o
+Versionamento guarda o commit. Nenhuma das duas muda o comportamento do pod sozinha — quem muda é quem as
+lê.</p>
+
+<p>O detalhe que pega iniciante: <strong>etiqueta é sempre texto</strong>. O YAML adivinha tipos, e
+<code>versao: 2</code> vira número. O cluster recusa com <code>metadata.labels: Invalid value: "2": must be a
+string</code>. Escreva <code>versao: "2"</code> — entre aspas — e passa. O mesmo vale para
+<code>versao: true</code>, que viraria booleano. A caixa abaixo tem o caso.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cardapio|metadata.labels.versao=2;;texto:pod/cardapio created">
+  <p class="try-task">A etiqueta <code>versao</code> está como número. Ponha o valor entre aspas para ele
+  virar texto e rode de novo.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    versao: 2
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: metadata.labels: Invalid value: "2": must be a string
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    versao: "2"
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>Repare que a mensagem não fala de aspas nem de YAML: ela diz “must be a string”, “precisa ser texto”. A
+tradução para a vida real é sempre a mesma — o valor chegou como número, e o campo só aceita texto. Números
+com aspas, booleanos com aspas, e o problema desaparece. Quando o valor é uma versão como
+<code>1.0</code>, aspas são obrigatórias de qualquer jeito: sem elas, o YAML lê como número e imprime
+<code>1</code>.</p>
+
+<p>Sobre <code>name</code>: o nome é a identidade e não muda. Não existe “renomear pod”: o que existe é criar
+outro e apagar o antigo. É por isso que o nome do pod importa menos do que parece — em produção quem cria
+pods é o Deployment, com nomes gerados. Mas enquanto você aprende, com pod solto, o nome é o endereço do
+objeto em todo comando: <code>kubectl describe pod cardapio</code>, <code>kubectl logs cardapio</code>,
+<code>kubectl delete pod cardapio</code>.</p>
+
+<h2>4. spec: o que você quer que exista</h2>
+
+<p><code>spec</code> é o coração do manifesto: a descrição do pod. Dentro dele há duas categorias. A
+primeira é o que o pod tem — a lista <code>containers</code>, os volumes, as variáveis. A segunda é como o
+pod se comporta — a política de reinício, o nó preferido, a conta de serviço, o tempo de tolerância para
+encerrar.</p>
+
+<p>A lista de containers é obrigatória e não pode ser vazia. Um pod sem container é recusado com
+<code>spec.containers: Required value</code>. Cada item tem três campos essenciais: <code>name</code> (o nome
+do container dentro do pod, obrigatório e único), <code>image</code> (de qual imagem ele nasce, obrigatório)
+e <code>ports</code> (a lista de portas que ele expõe, opcional). Portas, aqui, são documentação: o cluster
+não abre nem fecha nada por causa delas. Elas servem para o Service encontrar o alvo e para o leitor do
+manifesto saber onde a aplicação escuta.</p>
+
+<p>O nome do container não é o nome do pod. Um pod chamado <code>cardapio</code> pode ter um container
+chamado <code>web</code>. Isso importa em dois momentos: quando você pede log de um container específico
+(<code>kubectl logs cardapio -c web</code>) e quando há mais de um container no pod. Os dois nomes seguem a
+mesma regra de formato — minúsculas, hífen no meio — mas são independentes.</p>
+
+<p>As decisões de pod mais usadas são poucas. <code>restartPolicy</code> diz o que fazer quando o container
+morre: <code>Always</code> (o padrão), <code>OnFailure</code> ou <code>Never</code>. <code>nodeSelector</code>
+prende o pod a nós com certas etiquetas. <code>serviceAccountName</code> escolhe a identidade que a aplicação
+usa para falar com a API. <code>terminationGracePeriodSeconds</code> é quanto tempo o cluster espera antes de
+matar o processo à força — 30 segundos por padrão.</p>
+
+<h2>5. A lista de containers, campo por campo</h2>
+
+<p>Vale abrir um container inteiro, porque é onde 90% dos manifestos passam o tempo:</p>
+
+<pre class="file" data-file="cardapio.yaml">spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      env:
+        - name: MODO
+          value: producao</pre>
+
+<p>Leia de fora para dentro. <code>containers</code> é uma lista (hífen). Cada item é um mapa com
+<code>name</code>, <code>image</code>, <code>ports</code> e <code>env</code>. <code>ports</code> também é uma
+lista, e o item dela é um mapa com <code>containerPort</code>. <code>env</code> é lista de mapas com
+<code>name</code> e <code>value</code>. Lista dentro de mapa dentro de lista — e é sempre o recuo que diz onde
+você está.</p>
+
+<p>Os nomes dos campos são exatos, e o YAML não perdoa erro de digitação. <code>containers</code> no plural,
+<code>containerPort</code> com P maiúsculo no meio, <code>image</code> sem “n”. Escrever
+<code>container:</code> no singular não gera “campo desconhecido” — gera
+<code>spec.containers: Required value</code>, porque o cluster procurou a lista obrigatória e não achou. É a
+mensagem mais enganosa do começo, e a caixa abaixo mostra ela acontecendo.</p>
+
+<dl class="anatomy">
+<dt><code>name</code></dt>
+<dd>O nome do container dentro do pod, obrigatório e único no pod. É ele que você cita em
+<code>kubectl logs cardapio -c web</code>. Não confunda com o nome do pod.</dd>
+<dt><code>image</code></dt>
+<dd>De onde o container nasce: <code>cardapio:1.0</code>. Obrigatório. Sem tag,
+<code>latest</code> é assumido — e o cluster passa a tentar baixar a imagem sempre.</dd>
+<dt><code>ports</code></dt>
+<dd>Lista de portas que a aplicação escuta, com <code>containerPort</code> obrigatório. É documentação e
+contrato: o cluster não abre nada por causa dela.</dd>
+<dt><code>env</code></dt>
+<dd>Lista de variáveis de ambiente, cada uma com <code>name</code> e <code>value</code>. Texto sempre,
+mesmo quando o valor parece número.</dd>
+<dt><code>resources</code></dt>
+<dd>O que o container pede e o que ele pode consumir, em <code>requests</code> e <code>limits</code>. Sem
+isso, o pod é <code>BestEffort</code> e recebe o que sobrar.</dd>
+</dl>
+
+<div class="tryk8s" data-goal="texto:pod/cardapio created;;conta:pods=1">
+  <p class="try-task">O campo está escrito <code>container</code>, no singular, e por isso o cluster não vê a
+  lista obrigatória. Corrija o nome para <code>containers</code> e rode.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  container:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.containers: Required value
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p><code>The Pod "cardapio" is invalid: spec.containers: Required value</code>. “Required value” quer dizer
+“campo obrigatório sem valor”. Você olha o arquivo, vê que o bloco está lá e não entende. A explicação é que
+o campo <code>container</code> não existe: o cluster ignorou o que ele não conhece e reclamou do que faltou.
+A regra prática é boa: quando a mensagem diz “Required value” num campo que você jurou ter escrito, procure
+letra trocada ou plural faltando nesse campo.</p>
+
+<p>Para conferir o nome exato sem sair do terminal existe <code>kubectl explain</code>. Ele mostra a
+documentação do campo, tirada do próprio cluster: <code>kubectl explain pod</code> traz a descrição do tipo,
+<code>kubectl explain pod.spec</code> desce um nível, e assim por diante. A saída é em inglês e um pouco
+seca, mas é a fonte mais confiável que existe — é a versão do cluster que você está usando, não a de um site
+qualquer.</p>
+
+<h2>6. O que o servidor acrescenta</h2>
+
+<p>O seu arquivo é menor do que o objeto que o cluster guarda. O servidor preenche os campos que você omitiu
+com valores padrão, e é por isso que o pod funciona mesmo com um manifesto de sete linhas. Conhecer os
+padrões evita duas coisas: repetir no arquivo o que já é padrão, e ser surpreendido por um comportamento que
+você não pediu.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Padrão</th><th>O que muda quando você define</th></tr>
+</thead>
+<tbody>
+<tr><td><code>restartPolicy</code></td><td><code>Always</code></td><td><code>Never</code> deixa o container
+morrer sem reiniciar; <code>OnFailure</code> só reinicia com erro</td></tr>
+<tr><td><code>dnsPolicy</code></td><td><code>ClusterFirst</code></td><td>usa o DNS do cluster para achar
+serviços por nome</td></tr>
+<tr><td><code>serviceAccountName</code></td><td><code>default</code></td><td>muda a identidade que a aplicação
+usa para falar com a API</td></tr>
+<tr><td><code>terminationGracePeriodSeconds</code></td><td><code>30</code></td><td>quanto tempo o processo tem
+para terminar antes do <code>SIGKILL</code></td></tr>
+<tr><td><code>imagePullPolicy</code></td><td><code>IfNotPresent</code> (com tag fixa)</td><td>com
+<code>:latest</code> vira <code>Always</code>: o cluster sempre tenta baixar</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Além dos padrões, o cluster preenche tudo o que só ele sabe: o IP do pod, o nó onde ele caiu, o horário de
+início, as condições (<code>PodScheduled</code>, <code>Initialized</code>, <code>Ready</code>) e o
+<code>status</code> de cada container. É isso que aparece quando você descreve o pod:</p>
+
+<pre class="term">$ kubectl describe pod cardapio
+Name:            cardapio
+Namespace:       default
+Priority:        0
+Service Account: default
+Node:            guia-control-plane/192.0.2.28
+Start Time:      Fri, 27 Nov 2026 15:50:25 +0000
+Labels:          run=cardapio
+Annotations:     &lt;none&gt;
+Status:          Running
+IP:              10.244.3.71
+IPs:             IP:  10.244.3.71
+Controlled By:   &lt;none&gt;
+
+Containers:
+  cardapio:
+    Image:          cardapio:1.0
+    Port:           80/TCP
+    State:          Running
+    Ready:          True
+    Restart Count:  0
+    Environment:    &lt;none&gt;</pre>
+
+<p>Traduzindo o que veio de onde: <code>Name</code> e <code>Namespace</code> você escreveu;
+<code>Service Account: default</code> o servidor preencheu; <code>Node</code>, <code>Start Time</code>,
+<code>Status</code> e <code>IP</code> o agendador e o cluster informaram; <code>Labels: run=cardapio</code> foi
+o <code>kubectl run</code> que colocou (um manifesto com <code>labels</code> mostraria as suas);
+<code>Ready</code> e <code>Restart Count</code> são o estado do container. Nada disso estava no arquivo.</p>
+
+<p>A mesma informação em forma de tabela, com <code>-o wide</code>, mostra o que o agendador decidiu:</p>
+
+<pre class="term">$ kubectl get pods -o wide
+NAME       READY   STATUS    RESTARTS   AGE   IP            NODE                 NOMINATED NODE   READINESS GATES
+cardapio   1/1     Running   0          2m    10.244.3.71   guia-control-plane   &lt;none&gt;           &lt;none&gt;</pre>
+
+<p>Duas colunas que não existem no seu manifesto: <code>IP</code>, que o cluster atribuiu, e
+<code>NODE</code>, que o agendador escolheu. O pod não pediu nó nenhum — foi o agendador que olhou a
+capacidade dos três e escolheu um. Se amanhã você prender o pod a um nó com <code>nodeSelector</code>, essa
+coluna passa a ser sua decisão, não do acaso.</p>
+
+<h2>7. O que não se escreve no manifesto</h2>
+
+<p>Existe um erro de iniciante que merece seção própria: pegar o resultado de
+<code>kubectl get pod cardapio -o yaml</code>, colar num arquivo e tentar aplicar. O resultado tem campos que o
+servidor recusa, porque são dele. Os principais:</p>
+
+<p><code>status</code> inteiro — fase, IP, condições, estado dos containers. Você não descreve o status; você
+descreve o que quer e o cluster conta se conseguiu. Tentar escrever status é o equivalente a preencher o
+campo “resultado” antes da prova.</p>
+
+<p><code>metadata.uid</code> e <code>metadata.resourceVersion</code> — identificadores internos. O
+<code>uid</code> é único para sempre; o <code>resourceVersion</code> muda a cada alteração e é como o cluster
+controla concorrência. Mandar um <code>resourceVersion</code> antigo num apply com controle de versão faz o
+cluster recusar com <code>the object has been modified</code> — é o mecanismo funcionando, não um defeito.</p>
+
+<p><code>metadata.creationTimestamp</code> e <code>metadata.generation</code> — carimbo de tempo e contador de
+mudanças, também do servidor. E <code>metadata.ownerReferences</code>, que diz quem é o dono do pod: quando é o
+Deployment, é ele que apaga o pod ao reduzir réplicas. Escrever isso à mão é assumir um vínculo que você não
+controla.</p>
+
+<p>A regra é simples e vale para todo tipo de objeto: no manifesto vão <code>apiVersion</code>,
+<code>kind</code>, <code>metadata</code> (sem os campos do servidor) e <code>spec</code>. O resto é resposta.
+Se um dia precisar copiar o objeto do cluster para um arquivo, apague o <code>status</code>, o
+<code>uid</code>, o <code>resourceVersion</code> e o <code>creationTimestamp</code> antes.</p>
+
+<h2>8. Quando o manifesto é recusado</h2>
+
+<p>Toda recusa de conteúdo segue o mesmo formato: <code>The <em>Kind</em> "nome" is invalid:</code> seguido do
+caminho do campo e do motivo. O caminho é a parte útil — ele desce por <code>spec</code>,
+<code>containers</code>, índice da lista e campo, tudo com ponto e colchete. Aprender a lê-lo é o que separa
+“deu erro” de “deu erro no <code>containerPort</code> do primeiro container”.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>Tradução</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td><code>metadata.name: Required value</code></td><td>falta o nome</td><td>acrescente
+<code>name</code> em <code>metadata</code></td></tr>
+<tr><td><code>metadata.name: Invalid value: "Cardapio"</code></td><td>nome com maiúscula</td><td>minúsculas,
+hífen no meio</td></tr>
+<tr><td><code>spec.containers: Required value</code></td><td>a lista não existe (ou o nome do campo está
+errado)</td><td>confira <code>containers</code>, no plural</td></tr>
+<tr><td><code>spec.containers[0].image: Required value</code></td><td>o container não tem imagem</td><td>todo
+container precisa de <code>image</code></td></tr>
+<tr><td><code>metadata.labels: Invalid value: "2": must be a string</code></td><td>etiqueta numérica</td><td>ponha
+o valor entre aspas</td></tr>
+<tr><td><code>no matches for kind "Pod" in version "apps/v1"</code></td><td><code>apiVersion</code> não combina
+com o <code>kind</code></td><td>Pod é <code>v1</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas notas sobre o que a mensagem não diz. A primeira: ela mostra um erro por vez, e o primeiro pode
+esconder o segundo. Conserte, rode de novo, veja o próximo — é um processo, não um veredito. A segunda: o
+caminho usa índices a partir de zero, então <code>[0]</code> é o primeiro item da lista. Se você tem três
+containers e o erro fala de <code>containers[1]</code>, é o segundo.</p>
+
+<p>E existe o erro que não é erro de validação: o campo que o cluster aceita e ignora. Versões recentes do
+kubectl validam contra o esquema do tipo e reclamam de campo desconhecido, mas nem toda instalação está
+configurada assim. Se um campo parece não fazer efeito, confira a grafia em <code>kubectl explain</code> antes
+de suspeitar do cluster.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o manifesto que veio do <code>-o yaml</code></h3>
+<p>A Ana copiou o objeto do cluster para um arquivo e tentou aplicar em outro ambiente. O cluster recusou por
+causa do <code>resourceVersion</code> e do <code>status</code>. O conserto foi apagar os campos do servidor e
+ficar só com <code>apiVersion</code>, <code>kind</code>, <code>metadata</code> e <code>spec</code>. Regra
+prática: <code>-o yaml</code> serve para ler, não para virar manifesto sem limpeza.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod que subia sem a porta</h3>
+<p>Ela tirou o bloco <code>ports</code> para “enxugar” o manifesto e o pod continuou subindo — então concluiu
+que portas não servem para nada. Semanas depois, o Service não achava o alvo, porque o <code>targetPort</code>
+apontava para uma porta que o manifesto não declarava. Porta de container não abre nada, mas é contrato: ela
+documenta onde a aplicação escuta e é o que o Service usa para casar.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: dois times, o mesmo nome de campo</h3>
+<p>O colega dela usou <code>containerPorts</code> e o manifesto passou, sem efeito nenhum. A versão do
+kubectl dele não estava em modo estrito e o campo desconhecido foi descartado em silêncio. Descobriram porque
+o <code>describe</code> mostrava <code>Port: &lt;none&gt;</code>. O hábito que ficou: depois de aplicar,
+descrever o objeto e conferir se os campos que importam apareceram.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Quais campos são realmente obrigatórios num pod?</p>
+<label><input type="radio" name="q1"> <code>apiVersion</code>, <code>kind</code>, <code>metadata.name</code> e
+<code>spec.containers</code> com nome e imagem</label>
+<label><input type="radio" name="q1"> todos os blocos, incluindo <code>status</code></label>
+<label><input type="radio" name="q1"> apenas <code>apiVersion</code> e <code>kind</code>: o resto é
+opcional</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Por que não se escreve <code>status</code> no
+manifesto?</p>
+<label><input type="radio" name="q2"> porque o YAML não aceita listas dentro de <code>status</code></label>
+<label><input type="radio" name="q2"> porque o campo é grande demais para o arquivo</label>
+<label><input type="radio" name="q2"> porque o status é o que o cluster conta de volta, não o que você
+pede</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que <code>spec.containers: Required value</code> costuma
+significar?</p>
+<label><input type="radio" name="q3"> que o campo está com nome errado ou sem a lista, e o cluster não achou
+<code>containers</code></label>
+<label><input type="radio" name="q3"> que o cluster está sem memória para o container</label>
+<label><input type="radio" name="q3"> que a imagem do container não foi encontrada</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o padrão que reinicia sempre</h2>
+<p>Você quer um pod que <em>não</em> reinicie quando o programa terminar. Complete o valor da política de
+reinício:</p>
+<div class="ex-code">spec:
+  restartPolicy: <input aria-label="resposta 1" data-answer="Never" placeholder="..."></div>
+<p class="ex-dica">Dica: são três políticas — <code>Always</code> (o padrão), <code>OnFailure</code> e a que
+nunca reinicia. Maiúscula na primeira letra, exatamente como o cluster escreve.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O manifesto do pod tem quatro blocos que você escreve e um que o cluster devolve. <code>apiVersion</code> e
+<code>kind</code> dizem o que o objeto é (Pod é <code>v1</code>); <code>metadata</code> guarda identidade —
+nome obrigatório, namespace opcional, etiquetas e anotações; <code>spec</code> guarda o que você quer, com a
+lista <code>containers</code> obrigatória e, em cada item, <code>name</code> e <code>image</code>. O
+<code>status</code> é resposta e não entra no arquivo.</p>
+
+<p>O servidor preenche padrões que você nem escreveu: <code>restartPolicy: Always</code>,
+<code>dnsPolicy: ClusterFirst</code>, conta de serviço <code>default</code>, 30 segundos de tolerância e a
+política de pull que depende da tag. Ele também preenche o que só ele sabe — IP, nó, condições e horário —, e
+é isso que aparece no <code>describe</code> e no <code>-o wide</code>. Copiar o objeto do cluster e reaplicar
+sem limpar é pedir recusa: <code>uid</code>, <code>resourceVersion</code>, <code>creationTimestamp</code> e
+<code>status</code> são do servidor.</p>
+
+<p>Erro de validação sempre vem no formato <code>The Pod "nome" is invalid: caminho: motivo</code>, e o
+caminho é o mapa. “Required value” num campo que você jurou ter escrito significa nome errado ou plural
+faltando. Com o manifesto entendido, a próxima pergunta é <a href="labels-e-selectors.html">como o cluster
+encontra um pod</a> no meio de tantos —
+e a resposta está em três palavras do <code>metadata</code>: etiqueta, seletor e o casamento entre as duas.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Pod é <code>apiVersion: v1</code>; Deployment é <code>apps/v1</code>; Job é
+  <code>batch/v1</code>.</li>
+  <li>Obrigatórios: <code>metadata.name</code> e <code>spec.containers[].name</code> e <code>image</code>.</li>
+  <li>Etiquetas e anotações são texto; número vira erro <code>must be a string</code>.</li>
+  <li>O servidor preenche <code>restartPolicy</code>, <code>dnsPolicy</code>, conta de serviço e
+  tolerância.</li>
+  <li><code>status</code>, <code>uid</code>, <code>resourceVersion</code> e <code>creationTimestamp</code> não
+  se escrevem.</li>
+  <li><code>kubectl explain pod.spec</code> mostra o campo certo sem sair do terminal.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

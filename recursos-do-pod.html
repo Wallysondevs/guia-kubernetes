@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Requests e limits | Guia Kubernetes</title>
+<meta name="description" content="Requests e limits na prática: quanto o pod reserva e quanto pode consumir, como o agendador usa esses números, o que é QoS Class e por que o pod fica em Pending.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Requests e <span class="hl">limits</span></h1>
+<p class="intro">A Ana descobriu que o pod do site divide o cluster com o pod do robô de relatórios — e que,
+numa tarde de movimento, o relatório comeu a máquina toda e o site ficou lento. O Kubernetes tem dois
+números para resolver isso: um que <em>reserva</em> espaço para o pod e outro que <em>limita</em> até onde
+ele pode ir. São os campos <code>requests</code> e <code>limits</code>, dentro de
+<code>resources</code>. Nesta aula a Ana aprende a escolher esses números, vê o pod parar em
+<code>Pending</code> por pedir demais e entende por que o mesmo pod pode ser morto por falta de
+memória.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que <code>requests</code> reserva e o que <code>limits</code> proíbe.</li>
+  <li>Como escrever CPU (<code>250m</code>, <code>1</code>) e memória (<code>128Mi</code>,
+  <code>1Gi</code>).</li>
+  <li>Por que pedir CPU demais deixa o pod em <code>Pending</code> com
+  <code>Insufficient cpu</code>.</li>
+  <li>O que acontece quando o limite de memória é atingido: <code>OOMKilled</code> e exit code
+  <code>137</code>.</li>
+  <li>As três classes de QoS — <code>BestEffort</code>, <code>Burstable</code> e
+  <code>Guaranteed</code> — e onde lê-las.</li>
+  <li>Como decidir os números do site da padaria sem chutar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: dois pods, uma máquina</h2>
+
+<p>Até agora a Ana criou pods um de cada vez e nunca pensou em tamanho. O cluster de teste dela tem três
+nós, e cada nó tem 2 vCPUs e 4 GiB de memória. É pouco, e é suficiente — desde que ninguém peça mais do que
+precisa.</p>
+
+<p>O problema apareceu numa terça. O pod do site (<code>cardapio</code>) e o do robô de relatórios
+(<code>relatorio</code>) caíram no mesmo nó. O relatório varria as vendas do mês em paralelo, usando todos
+os núcleos que encontrava. O site não caiu, mas passou a responder em três segundos. No dia seguinte, o
+contrário: o relatório carregou uma planilha enorme, a memória do nó acabou e o kernel matou
+<em>o site</em> — o vizinho inocente.</p>
+
+<p>Os dois problemas têm a mesma raiz: ninguém disse ao cluster quanto cada pod precisava, nem quanto cada
+um podia usar. Sem esses números, o agendador trata todos os pods como se eles não ocupassem nada, e o
+runtime deixa cada um consumir o quanto quiser. <code>requests</code> e <code>limits</code> são a conversa
+que faltava.</p>
+
+<h2>2. Reserva e teto: as duas ideias</h2>
+
+<p>Pense num restaurante. O <strong>request</strong> é a reserva de mesa: você liga, diz "somos quatro" e o
+restaurante guarda aquela mesa — mesmo que você chegue às oito e meia da noite e ainda não tenha chegado
+ninguém, a mesa está lá, e outra pessoa não pode sentar. O <strong>limit</strong> é outra coisa: é o quanto
+o garçom deixa você pedir, um teto de consumo. Passou do teto, o pedido é cortado — não a sua mesa.</p>
+
+<p>No Kubernetes funciona igual, e as duas coisas têm donos diferentes. O <code>requests</code> é lido pelo
+<strong>agendador</strong>, na hora de escolher o nó: ele soma os requests de todos os pods que já estão lá,
+compara com a capacidade e decide se o novo pod cabe. O <code>limits</code> é lido pelo
+<strong>kubelet</strong> e pelo runtime, já com o pod rodando: é o teto que o cgroup impõe ao processo.</p>
+
+<dl class="anatomy">
+<dt>requests</dt>
+<dd>O mínimo garantido. O agendador reserva esse valor no nó; ninguém mais pode usá-lo.</dd>
+<dt>limits</dt>
+<dd>O máximo permitido para o container. Passar disso tem consequência — corte de CPU ou morte por
+memória.</dd>
+<dt>cpu</dt>
+<dd>Medida em núcleos e em milésimos: <code>1</code> é um núcleo, <code>500m</code> é meio núcleo,
+<code>250m</code> é um quarto.</dd>
+<dt>memory</dt>
+<dd>Medida em bytes com sufixo binário: <code>128Mi</code>, <code>1Gi</code>. Não é a mesma coisa que
+<code>M</code> e <code>G</code>, que são decimais.</dd>
+<dt>QoS Class</dt>
+<dd>A etiqueta que o cluster calcula a partir dos seus números: <code>Guaranteed</code>,
+<code>Burstable</code> ou <code>BestEffort</code>. Decide quem é despejado primeiro.</dd>
+<dt>OOMKilled</dt>
+<dd>O motivo de morte quando o container passa do limite de memória. Aparece no
+<code>describe</code>, com exit code <code>137</code>.</dd>
+</dl>
+
+<p>Uma regra que economiza discussão: <strong>request não é o consumo esperado, é o piso que você
+garante</strong>. Um site que usa 40 milésimos de CPU em repouso e 600 em pico pode pedir 100m e limitar
+800m. O request baixo faz o pod caber em qualquer nó; o limite alto deixa o pico acontecer sem
+sofrimento.</p>
+
+<h2>3. Requests: o que o agendador reserva</h2>
+
+<p>Quando o pod chega sem <code>requests</code>, o agendador conta zero. Ele pode colocar dez pods no mesmo
+nó, todos achando que têm a máquina inteira — e é exatamente aí que nasce a briga da seção 1. Escrevendo o
+request, a conta muda: cada pod reserva um pedaço, e o nó vai enchendo de forma previsível.</p>
+
+<pre class="file" data-file="cardapio.yaml">spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi</pre>
+
+<p>Com esse manifesto, o agendador procura um nó com pelo menos 100 milésimos de CPU e 128 MiB de memória
+livres. Ache, ele reserva; não ache, o pod fica em <code>Pending</code> e o evento diz por quê. O nó de
+teste da Ana tem 2000m e 4096Mi, então cabem, em tese, vinte pods como esse — sempre descontando o que o
+próprio cluster consome.</p>
+
+<p>Se você informar <code>limits</code> e omitir <code>requests</code>, o Kubernetes copia o limite para o
+request. É um padrão que confunde: o pod passa a reservar o teto, e o que era para ser folga vira aperto.
+Escreva os dois de propósito.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/forno|spec.containers.0.resources.requests.cpu=300m">
+  <p class="try-task">O forno pede 4 núcleos — mais do que qualquer nó do cluster tem — e fica em
+  <code>Pending</code>. Baixe o pedido de CPU para <code>300m</code> e rode de novo.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: "4"
+          memory: 128Mi</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: "300m"
+          memory: 128Mi</pre>
+</div>
+
+<p>Com <code>cpu: "4"</code> o pedido é de quatro núcleos inteiros. Nenhum dos três nós tem isso livre, e o
+pod nunca sai do lugar: <code>STATUS</code> em <code>Pending</code>, <code>READY</code> em
+<code>0/1</code>, <code>AGE</code> subindo. Com <code>"300m"</code> são 0,3 núcleo — cabe, agenda e sobe.
+Repare nas aspas: em YAML, <code>"4"</code> e <code>"300m"</code> são textos, que é o que o campo espera.
+Número solto também funciona, mas a consistência evita surpresa.</p>
+
+<h2>4. Limits: o teto e o que acontece quando ele chega</h2>
+
+<p>O limite é aplicado pelo runtime, e as duas unidades se comportam de maneira <em>diferente</em> — essa é a
+parte que quase todo mundo erra no começo. CPU é um recurso elástico: passar do limite faz o processo
+esperar. Memória não é: passar do limite faz o processo morrer.</p>
+
+<p>No caso da CPU, o kernel simplesmente não entrega mais tempo de processamento àquele container no
+período. O programa continua rodando, só mais devagar — o nome disso é <em>throttling</em>. Não há erro, não
+há reinício, não há log: o site fica lento e, se você olhar só o <code>get pods</code>, está tudo verde. É o
+tipo de problema que só aparece quando você compara o limite com o uso.</p>
+
+<p>No caso da memória, o kernel não tem como "emprestar menos": ou o processo usa a página, ou não usa. Ao
+atingir o limite, o <code>OOM killer</code> mata o container. O pod não fica em erro de aplicação — o
+container é morto, o cluster reinicia, e o motivo aparece no <code>describe</code>:</p>
+
+<pre class="term">    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+      Started:      Fri, 27 Nov 2026 15:48:02 +0000
+      Finished:     Fri, 27 Nov 2026 15:48:09 +0000
+    Restart Count:  3
+    Limits:
+      cpu:     500m
+      memory:  64Mi</pre>
+
+<p>Essa é a transcrição de um <code>kubectl describe pod</code> real de um pod com
+<code>memory: 64Mi</code>. O exit code <code>137</code> é 128 + 9, o sinal de kill. Quando você vir
+<code>OOMKilled</code> e <code>RESTARTS</code> subindo de três em três minutos, o conserto é um destes dois:
+aumentar o limite (o programa precisa mesmo disso) ou procurar o vazamento de memória (o programa está
+guardando o que não devia). Aumentar sem investigar só adia o problema.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Escrita</th><th>Quer dizer</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cpu: 250m</code></td><td>0,25 de um núcleo</td><td>é o jeito mais comum; <code>m</code> é milésimo</td></tr>
+<tr><td><code>cpu: 1</code></td><td>um núcleo inteiro</td><td>igual a <code>1000m</code></td></tr>
+<tr><td><code>cpu: 0.5</code></td><td>meio núcleo</td><td>funciona, mas <code>500m</code> é mais legível</td></tr>
+<tr><td><code>memory: 128Mi</code></td><td>128 × 1024 × 1024 bytes</td><td>binário: <code>Mi</code>, <code>Gi</code></td></tr>
+<tr><td><code>memory: 1G</code></td><td>um bilhão de bytes</td><td>decimal, menor que <code>1Gi</code></td></tr>
+<tr><td><code>memory: 64</code></td><td>64 bytes</td><td>quase sempre um erro: faltou o sufixo</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A última linha é uma armadilha real: <code>memory: 64</code> sem sufixo quer dizer 64 bytes, o pod sobe e
+morre no primeiro suspiro. Se o seu pod reinicia sem parar e o describe mostra <code>OOMKilled</code> com um
+limite ridículo, provavelmente foi isso.</p>
+
+<h2>5. Garantido, elástico ou nenhum dos dois</h2>
+
+<p>O cluster olha para os números de todos os containers do pod e calcula uma etiqueta: a
+<strong>QoS Class</strong>. Ela não muda nada no funcionamento normal — muda no aperto. Quando um nó fica sem
+memória, o kubelet precisa despejar pods para sobreviver, e a ordem do despejo é a ordem das classes.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>QoS Class</th><th>Como o cluster chega nela</th><th>Na hora do aperto</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BestEffort</code></td><td>nenhum container tem request nem limit</td><td>é o primeiro a ser despejado</td></tr>
+<tr><td><code>Burstable</code></td><td>tem request, mas request e limit não são iguais</td><td>despejado depois do BestEffort</td></tr>
+<tr><td><code>Guaranteed</code></td><td>todo container tem request igual ao limit, de CPU e de memória</td><td>é o último a ser despejado; o mais protegido</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A caixa abaixo é um terminal. Ela descreve um pod criado sem nenhum recurso declarado: a classe sai
+<code>BestEffort</code>. Rode como está primeiro, para ver o erro de descrever um pod que ainda não existe —
+depois conserte a ordem.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:QoS Class: BestEffort;;texto:Restart Count: 0">
+  <p class="try-task">O <code>describe</code> está antes do pod existir. Crie o pod primeiro e descreva
+  depois. Procure a linha <code>QoS Class:</code> na resposta.</p>
+<pre class="yaml">kubectl describe pod forno
+kubectl run forno --image=forno:1.0</pre>
+<pre class="out">
+ana@notebook:~$ kubectl describe pod forno
+Error from server (NotFound): pods "forno" not found
+
+ana@notebook:~$ kubectl run forno --image=forno:1.0
+pod/forno created
+</pre>
+<pre class="solucao">kubectl run forno --image=forno:1.0
+kubectl describe pod forno</pre>
+</div>
+
+<p>O <code>QoS Class</code> aparece no fim do describe, logo depois dos volumes, junto com
+<code>Node-Selectors</code> e <code>Tolerations</code>. Para chegar a <code>Guaranteed</code>, os números
+precisam ser iguais dois a dois — no exemplo da seção 3 (request 100m / limit 500m) o pod é
+<code>Burstable</code>. É o meio do caminho, e é onde a maioria dos pods de produção vive: reserva pequena
+para caber, teto maior para os picos.</p>
+
+<p>Vale saber a consequência prática do <code>Guaranteed</code>: ele só existe quando você aceita que o pod
+reserve exatamente o que pode consumir. É a escolha certa para o banco de dados e para o serviço de
+pagamento, e quase sempre exagero para o site de cardápio, que vive de picos curtos.</p>
+
+<h2>6. O pod que não agenda por falta de memória</h2>
+
+<p>O sintoma é o mesmo do CPU — <code>Pending</code>, <code>0/1</code> — mas o motivo no evento é outro, e
+saber diferenciar economiza meia hora. O evento de um pod que pediu CPU demais é este (transcrição de um
+cluster de três nós, no formato que o agendador escreve):</p>
+
+<pre class="term">Events:
+  Type     Reason            Age   From               Message
+  ----     ------            ----  ----               -------
+  Warning  FailedScheduling  11s   default-scheduler  0/3 nodes are available: 3 Insufficient cpu.
+  preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.</pre>
+
+<p>Traduzindo: os três nós foram avaliados, os três recusaram por CPU insuficiente, e não havia nada que
+pudesse ser despejado para abrir espaço. Se a palavra fosse <code>Insufficient memory</code>, o raciocínio
+seria idêntico, trocando o recurso. O agendador nunca "quase" coloca um pod: ou cabe inteiro, ou não
+entra.</p>
+
+<p>A caixa abaixo tem o caso da memória. O pod pede 16 GiB num cluster onde cada nó tem 4 — vai ficar em
+<code>Pending</code> para sempre. Reduza o pedido para <code>256Mi</code> e acrescente um limite de
+<code>512Mi</code>.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/receita|spec.containers.0.resources.requests.memory=256Mi;;campo:Pod/receita|spec.containers.0.resources.limits.memory=512Mi">
+  <p class="try-task">O pedido de memória é maior do que o nó inteiro. Ponha <code>requests.memory</code>
+  em <code>256Mi</code> e crie o bloco <code>limits</code> com <code>memory: 512Mi</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: receita
+spec:
+  containers:
+    - name: receita
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: 100m
+          memory: 16Gi</pre>
+<pre class="out">
+pod/receita created
+
+NAME      READY   STATUS    RESTARTS   AGE
+receita   0/1     Pending   0          9m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: receita
+spec:
+  containers:
+    - name: receita
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi</pre>
+</div>
+
+<p>Depois de rodar, o painel mostra o pod em <code>Running</code>. A conta que o agendador fez foi: "4096 MiB
+no nó, 256 MiB pedidos, cabe com folga". Antes da correção ele via 16 384 MiB e desistia — sem olhar o
+consumo real, porque consumo real ele não tem como saber antes de o programa rodar.</p>
+
+<h2>7. Como escolher os números sem chutar</h2>
+
+<p>A pergunta inevitável é "que valor eu ponho?". A resposta honesta: comece pelo que você sabe e ajuste
+com medida. O ciclo é curto e não precisa de ferramenta paga.</p>
+
+<p>Primeiro, o request de CPU: observe o consumo em repouso, arredonde para cima e use isso. Um site Node
+que serve dez requisições por segundo vive confortável em <code>100m</code>. Segundo, o limite de CPU: o
+dobro ou o triplo do request, para o pico não virar lentidão. Terceiro, a memória: meça o processo em
+operação normal e ponha o limit em 1,5 ou 2 vezes — memória é a única que mata, então aqui se dá folga.</p>
+
+<p>Quarto, e mais importante: <strong>deixe o request de memória igual ao consumo típico</strong>, não ao
+pico. Se você reservar o pico, o nó enche e pods ficam em <code>Pending</code> sem necessidade. O pico de
+memória de um pod que roda sozinho no nó é desperdício.</p>
+
+<p>Para medir, o caminho é <code>kubectl top pod</code> (quando o Metrics API está instalado) ou o painel de
+monitoramento do cluster. O painel do guia não calcula consumo real — ele simula o agendamento, então
+<code>top</code> responde <code>error: Metrics API not available</code>. Aliás: <code>kubectl top</code>
+mostrando essa mensagem não é problema do seu pod, é o cluster sem métricas.</p>
+
+<h2>8. Recursos são por container, o pod é a soma</h2>
+
+<p>Um detalhe que passa batido enquanto o pod tem um container só: <code>resources</code> fica dentro de
+<strong>cada container</strong>, não no nível do <code>spec</code>. Quando o pod ganha um segundo container
+— o exportador de métricas, o proxy, o coletor de logs —, cada um declara o seu próprio bloco, e o
+agendador soma tudo para decidir se o pod cabe.</p>
+
+<pre class="file" data-file="duplo.yaml">spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+    - name: metricas
+      image: metricas:1.0
+      resources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi</pre>
+
+<p>Para o agendador, esse pod pede 120m de CPU e 160Mi de memória — a soma dos dois. Se você esquecer o
+bloco do container novo, ele entra como zero e o pod passa a pedir menos do que realmente consome; o
+resultado aparece semanas depois, como nó cheio sem explicação. A regra é simples: container novo, bloco de
+recursos novo.</p>
+
+<p>A mesma lógica vale para a QoS Class, e aqui está uma pegadinha. Para o pod ser
+<code>Guaranteed</code>, <em>todos</em> os containers precisam ter request igual ao limit, de CPU e de
+memória. Basta um container sem nada declarado para o pod inteiro virar <code>Burstable</code> — inclusive
+aquele sidecar de duas linhas que ninguém lembrou de configurar.</p>
+
+<p>E tem uma consequência de diagnóstico: no <code>describe</code>, o bloco <code>Limits</code> aparece
+dentro de cada container, enquanto o <code>QoS Class</code> aparece uma vez, no fim, valendo pelo pod todo.
+Se o describe mostra <code>QoS Class: Burstable</code> e você jura que declarou tudo igual, procure o
+container que ficou de fora — quase sempre é o segundo.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o relatório que não cabia em lugar nenhum</h3>
+<p>O robô de relatórios pedia <code>cpu: "2"</code> e <code>memory: 2Gi</code> — cabia num nó vazio, e só.
+Quando o site estava rodando, o pedido não fechava e o relatório ficava em <code>Pending</code> a noite
+inteira. A Ana baixou o pedido para 500m e 512Mi e deixou o limite alto. O relatório passou a rodar mais
+devagar e a terminar, o que era o objetivo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o site lento com tudo verde</h3>
+<p>Todos os pods em <code>Running</code>, <code>RESTARTS</code> zero, e o site respondendo em três segundos.
+O limite de CPU do site era <code>200m</code>, e o processo precisava de 400 no horário de pico: o kernel
+cortava o tempo e o programa esperava. Nenhum evento, nenhum erro — só lentidão. Subir o limite para
+<code>800m</code> resolveu, e o request ficou em <code>100m</code> para o pod continuar cabendo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o vizinho que matou o site</h3>
+<p>O pod do relatório não tinha limite de memória. Numa planilha grande ele passou de 3 GiB, o nó ficou sem
+memória e o kubelet despejou o pod de menor prioridade — o do site, que era <code>BestEffort</code>. A lição
+custou uma tarde: <em>todo pod precisa de limite de memória</em>. Sem teto, o consumo de um vira o problema
+de todos.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Quem lê o <code>requests</code> e decide se o pod
+cabe?</p>
+<label><input type="radio" name="q1"> o kubelet, na hora de iniciar o container</label>
+<label><input type="radio" name="q1"> o agendador, ao escolher o nó</label>
+<label><input type="radio" name="q1"> o programa, quando começa a consumir</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O pod passou do limite de memória. O que acontece?</p>
+<label><input type="radio" name="q2"> o container fica mais lento, sem reiniciar</label>
+<label><input type="radio" name="q2"> o pod inteiro vira <code>Pending</code> e espera espaço</label>
+<label><input type="radio" name="q2"> o container é morto com <code>OOMKilled</code> e exit code
+<code>137</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que dá a classe <code>Guaranteed</code>?</p>
+<label><input type="radio" name="q3"> request igual ao limit, de CPU e de memória, em todo container</label>
+<label><input type="radio" name="q3"> não declarar nenhum recurso</label>
+<label><input type="radio" name="q3"> declarar só o <code>limits</code> e esquecer o
+<code>requests</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o pod do cardápio com reserva e teto</h2>
+<p>Complete o bloco de recursos do pod <code>cardapio</code> para reservar um quarto de núcleo e 128 MiB,
+podendo chegar a meio núcleo e 256 MiB.</p>
+<div class="ex-code">      resources:
+        requests:
+          cpu: 250m
+          memory: <input aria-label="resposta 1" data-answer="128Mi" placeholder="...">
+        limits:
+          cpu: <input aria-label="resposta 2" data-answer="500m" placeholder="...">
+          memory: 256Mi</div>
+<p class="ex-dica">Dica: <code>m</code> é milésimo de núcleo e <code>Mi</code> é mebibyte (1024 × 1024
+bytes). Sem o sufixo, o número vira byte — e o pod morre no primeiro suspiro.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Recursos se declaram em <code>resources</code>, divididos em <code>requests</code> e
+<code>limits</code>. O request é a reserva que o agendador desconta do nó: sem ele, o cluster trata o pod
+como se ele não ocupasse nada e amontoa vizinhos. O limit é o teto do runtime: em CPU, passar do limite
+deixa o pod lento (<em>throttling</em>); em memória, passar do limite mata o container
+(<code>OOMKilled</code>, exit code <code>137</code>).</p>
+
+<p>Os números têm sintaxe. CPU em núcleos ou milésimos (<code>1</code> = <code>1000m</code>); memória com
+sufixo binário (<code>128Mi</code>, <code>1Gi</code>). Pedir mais do que qualquer nó tem deixa o pod em
+<code>Pending</code>, com um evento <code>FailedScheduling</code> dizendo se faltou CPU ou memória — e
+nenhum ajuste de aplicação resolve isso.</p>
+
+<p>A combinação dos dois números gera a classe de QoS. Sem nada: <code>BestEffort</code>, o primeiro a ser
+despejado. Com request diferente do limit: <code>Burstable</code>, o caso mais comum. Com request igual ao
+limit: <code>Guaranteed</code>, o mais protegido. Para o site da Ana, a receita é request modesto, limite
+generoso em CPU e um limite de memória sempre presente — mesmo que você ainda não saiba medir. Na próxima
+aula ela abre a porta do pod para ver o que ele responde: <code>containerPort</code>,
+<code>port-forward</code> e as confusões entre porta da aplicação, do container e do cluster.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>requests</code> = reserva para o agendador. <code>limits</code> = teto para o runtime.</li>
+  <li>CPU passou do limite: fica lento. Memória passou: morre com <code>OOMKilled</code>.</li>
+  <li><code>250m</code> é um quarto de núcleo; <code>128Mi</code> é 128 × 1024 × 1024 bytes.</li>
+  <li><code>memory: 64</code> sem sufixo são 64 bytes — erro clássico.</li>
+  <li><code>Pending</code> com <code>Insufficient cpu</code> é pedido grande demais, não programa
+  lento.</li>
+  <li>Request igual ao limit em tudo = <code>Guaranteed</code>, o último a ser despejado.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Containers e imagens | Guia Kubernetes</title>
+<meta name="description" content="Container e imagem no Kubernetes: a anatomia do nome da imagem, tags e digest, imagePullPolicy, portas do container e vários containers dentro do mesmo pod.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Containers e <span class="hl">imagens</span></h1>
+<p class="intro">O pod da Ana está no ar, mas ela não sabe explicar o que está rodando dentro dele. Nesta aula
+ela abre a caixa: o que é um container de verdade, de onde vem a imagem, o que significa cada pedaço do nome
+<code>cardapio:1.0</code>, por que a tag importa tanto e o que a política de pull faz com ela. Depois aprende
+a declarar portas, a colocar um segundo container no mesmo pod e a ler o <code>2/2</code> que aparece na
+tabela. É a aula que transforma “subiu” em “eu sei o que subiu e por quê”.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um container e por que ele precisa de uma imagem.</li>
+  <li>A anatomia do nome da imagem: registro, repositório, tag e digest.</li>
+  <li>Por que <code>latest</code> é uma armadilha e o que a tag fixa resolve.</li>
+  <li>O que <code>imagePullPolicy</code> faz e qual é o padrão em cada caso.</li>
+  <li>O que <code>containerPort</code> significa — e o que ele não faz.</li>
+  <li>Vários containers no mesmo pod: rede compartilhada, <code>localhost</code> e o <code>2/2</code>.</li>
+  <li>Onde ficam <code>command</code>, <code>args</code>, <code>env</code> e os recursos.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o site subiu com a versão velha</h2>
+
+<p>A Ana publicou o site novo: mesma imagem, tag <code>latest</code>, mesmo manifesto. Rodou o apply, o pod
+reiniciou, e a página continuou mostrando o cardápio antigo. Ela conferiu o arquivo, conferiu o apply, o
+painel dizia <code>configured</code>. Tudo certo — e o preço velho na tela.</p>
+
+<p>O problema estava na palavra <code>latest</code>. Tag não é “a versão mais nova”: é um apelido que alguém
+empurra para uma imagem. Se o seu pipeline publica a imagem nova com a tag <code>latest</code>, o nome no
+manifesto não muda — e é o nome que o cluster compara. Para ele, nada mudou. E, dependendo do nó, a imagem
+antiga já estava baixada: o container sobe do cache e mostra o cardápio de ontem.</p>
+
+<p>A versão de verdade é <code>cardapio:1.4</code>: um nome que muda quando o conteúdo muda. Com tag fixa, o
+cluster vê que a imagem mudou, baixa a nova e o site acompanha. Parece detalhe de organização, e é a
+diferença entre publicar e rezar.</p>
+
+<p>Antes de chegar na tag, porém, vale entender o que é aquilo que a tag aponta. Container e imagem são duas
+coisas diferentes, e a confusão entre as duas custa tempo em quase toda aula de Kubernetes.</p>
+
+<h2>2. O que é um container, afinal</h2>
+
+<p>Imagem é um pacote fechado: o programa, as bibliotecas que ele precisa, o sistema de arquivos mínimo e a
+instrução de qual processo começar. É um arquivo grande, imutável, guardado num registro. Container é o que
+acontece quando alguém executa esse pacote: um processo rodando na máquina, isolado do resto, com o sistema de
+arquivos da imagem por cima.</p>
+
+<p>A analogia da padaria: a imagem é a receita impressa e plastificada, com a lista de ingredientes e o modo
+de preparo. O container é o pão sendo assado naquele momento. Várias fornadas podem sair da mesma receita, e
+todas são parecidas — mas cada uma tem o seu tempo e o seu forno. Quem apaga a fornada não apaga a receita; e
+mudar a receita não muda o pão que já saiu.</p>
+
+<p>No Kubernetes, o container nunca aparece sozinho: ele mora dentro de um pod. O pod é a caixa que o cluster
+agenda, e o container é o que roda dentro. Um pod pode ter um container (o caso comum) ou vários. Quem
+configura o container no manifesto é você: nome, imagem, portas, variáveis, limites. Quem baixa a imagem e
+inicia o processo é o kubelet do nó, muito depois que o seu apply terminou.</p>
+
+<p>Daí sai a primeira consequência prática: o manifesto não “roda” nada. Ele descreve o que o nó deve rodar,
+e o nó faz o trabalho. Se a imagem não existir, se o registro exigir senha ou se a rede do nó estiver
+bloqueada, o pod é criado e o container não sobe — e o status conta essa história. É o assunto de uma aula
+própria, mais adiante; aqui o foco é o que você escreve.</p>
+
+<h2>3. A anatomia do nome da imagem</h2>
+
+<p>O campo <code>image</code> é uma string com até quatro pedaços, e quase todo mundo usa só dois deles:</p>
+
+<dl class="anatomy">
+<dt>registro</dt>
+<dd>O servidor onde a imagem mora: <code>ghcr.io</code>, <code>registry.loja.test</code>. Sem registro, o
+padrão é o Docker Hub (<code>docker.io</code>).</dd>
+<dt>repositório</dt>
+<dd>O caminho dentro do registro: <code>ana/cardapio</code>, <code>library/nginx</code>. Costuma incluir o
+nome do time ou do projeto.</dd>
+<dt>tag</dt>
+<dd>O apelido da versão: <code>1.0</code>, <code>1.4</code>, <code>latest</code>. Muda quando alguém
+publica de novo com o mesmo nome. Sem tag, o padrão é <code>latest</code>.</dd>
+<dt>digest</dt>
+<dd>O identificador calculado do conteúdo: <code>sha256:9f2a…</code>. Nunca muda para a mesma imagem. É o
+jeito de apontar para uma imagem exata.</dd>
+<dt>imagePullPolicy</dt>
+<dd>A regra de quando o nó baixa a imagem de novo: <code>Always</code>, <code>IfNotPresent</code> ou
+<code>Never</code>. O padrão depende da tag.</dd>
+</dl>
+
+<p>Juntando, <code>ghcr.io/ana/cardapio:1.4</code> quer dizer: registro <code>ghcr.io</code>, repositório
+<code>ana/cardapio</code>, tag <code>1.4</code>. E <code>nginx</code> sozinho quer dizer
+<code>docker.io/library/nginx:latest</code> — tudo preenchido por padrão, o que explica por que o comando
+curto funciona.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>No manifesto</th><th>O que significa</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cardapio</code></td><td><code>docker.io/library/cardapio:latest</code></td><td>teste rápido;
+nunca em produção</td></tr>
+<tr><td><code>cardapio:1.0</code></td><td>Docker Hub, tag fixa</td><td>o caso normal do dia a dia</td></tr>
+<tr><td><code>ghcr.io/ana/cardapio:1.0</code></td><td>imagem no registro do time</td><td>projeto com
+repositório próprio</td></tr>
+<tr><td><code>cardapio@sha256:9f2a…</code></td><td>uma imagem específica, pelo conteúdo</td><td>produção que
+exige imutabilidade</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O digest merece uma frase. Tag é apelido e pode ser reescrita; digest é calculado do conteúdo e não pode.
+Por isso times grandes publicam com tag (para o humano ler) e fixam o digest no manifesto de produção (para o
+cluster não ter dúvida). Para quem está começando, tag fixa resolve — digest é refinamento para quando o
+processo já está maduro.</p>
+
+<h2>4. Tag, cache e a política de pull</h2>
+
+<p>Quando o pod precisa da imagem, o kubelet pergunta ao nó: “já tenho essa imagem baixada?”. A resposta
+depende da política. <code>Always</code> manda consultar o registro sempre; <code>IfNotPresent</code> usa o
+que já está no nó e só baixa se faltar; <code>Never</code> proíbe baixar e falha se não estiver lá. O padrão é
+inteligente e segue a tag: com <code>latest</code> (ou sem tag), é <code>Always</code>; com qualquer outra
+tag, é <code>IfNotPresent</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Política</th><th>O que faz</th><th>É padrão quando</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Always</code></td><td>consulta o registro a cada início de container</td><td>tag
+<code>latest</code> ou ausente</td></tr>
+<tr><td><code>IfNotPresent</code></td><td>usa o cache do nó; baixa só se faltar</td><td>tag fixa, como
+<code>1.0</code></td></tr>
+<tr><td><code>Never</code></td><td>nunca baixa; falha se a imagem não estiver no nó</td><td>nunca, por
+padrão</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>É uma troca consciente. <code>Always</code> garante que o nó pergunte ao registro a cada início — e é
+justamente o que faz dois nós rodarem coisas diferentes com o mesmo nome, quando um já tem a imagem em cache e
+o outro não. <code>IfNotPresent</code> com tag fixa é previsível: o nome identifica o conteúdo, e o cache
+acerta sempre. Para produção, tag fixa com <code>IfNotPresent</code> é o padrão que a maioria usa.</p>
+
+<p>A caixa abaixo tem a imagem com <code>latest</code>. Rode e depois fixe a tag em <code>1.0</code>: o
+cluster muda a política sozinho, e a missão confere isso no objeto.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cardapio|spec.containers.0.imagePullPolicy=IfNotPresent;;texto:Running">
+  <p class="try-task">A imagem está em <code>latest</code>, e por isso a política de pull é
+  <code>Always</code>. Troque a tag para <code>1.0</code> e rode: com tag fixa, o cluster passa a usar
+  <code>IfNotPresent</code>.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:latest</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>O painel mostra o pod em <code>Running</code>, e por baixo o objeto ficou com
+<code>imagePullPolicy: IfNotPresent</code> — você não escreveu esse campo em nenhum momento. É o servidor
+preenchendo o padrão a partir da tag. Se um dia quiser forçar, escreva a política no manifesto: ela vence o
+padrão. Só não escreva <code>Always</code> com tag fixa sem motivo, porque isso joga fora o cache e deixa o
+início do pod mais lento.</p>
+
+<p>Vale saber o que acontece quando a imagem não existe, mesmo sem ver ao vivo: o pod existe, o container não
+sobe, e o status passa por <code>ErrImagePull</code> e depois <code>ImagePullBackOff</code> — o cluster
+tentando de novo com espera crescente. O <code>describe</code> mostra o motivo exato no evento, e as causas
+são sempre três: nome errado, registro privado sem credencial, ou registro fora do ar. O painel deste guia não
+roda container, então esse estado aparece nas aulas de diagnóstico como transcrição de um cluster real.</p>
+
+<h2>5. As portas do container</h2>
+
+<p>Todo container que escuta em rede declara a porta no manifesto. E aqui vai a informação que mais
+desaponta: <strong>declarar não abre nada</strong>. O <code>containerPort</code> não é regra de firewall nem
+redirecionamento — é documentação com consequência, porque é o valor que o Service usa como alvo.</p>
+
+<pre class="file" data-file="cardapio.yaml">spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+          protocol: TCP</pre>
+
+<p><code>protocol</code> é <code>TCP</code> por padrão, e os detalhes de nome e protocolo têm aula própria
+mais adiante. O que vale fixar agora é a faixa: de 1 a 65535. Um zero a mais transforma 8080 em 80800 e o
+cluster recusa o manifesto inteiro. A caixa abaixo tem esse erro.</p>
+
+<div class="tryk8s" data-goal="texto:pod/cardapio created;;campo:Pod/cardapio|spec.containers.0.ports.0.containerPort=8080">
+  <p class="try-task">A porta está com um zero a mais (80800) e o cluster recusa. Corrija para
+  <code>8080</code> e rode.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 80800</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.containers[0].ports[0].containerPort: Invalid value: 80800: must be between 1 and 65535, inclusive
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+</div>
+
+<p>A mensagem é <code>spec.containers[0].ports[0].containerPort: Invalid value: 80800: must be between 1 and
+65535, inclusive</code>. “Inclusive” quer dizer que 1 e 65535 valem; o resto está fora. Note que ela repete o
+valor recusado — bom para achar o dígito a mais — e aponta o índice do container e o da porta, o que importa
+em pod com vários containers.</p>
+
+<p>Se a aplicação escuta em 8080 e você declara <code>containerPort: 80</code>, nada quebra na hora: o
+container continua escutando em 8080 e o pod fica <code>Running</code>. O que quebra é o Service, que vai
+mandar tráfego para a porta errada. Porta declarada errada não dá erro de validação; dá erro de conexão
+recusada, três camadas depois. Por isso vale conferir a porta com o time que escreveu a aplicação, e não
+copiar do manifesto anterior.</p>
+
+<h2>6. Vários containers no mesmo pod</h2>
+
+<p><code>spec.containers</code> é uma lista, e a lista aceita mais de um item. Os containers do mesmo pod não
+são vizinhos distantes: eles compartilham o endereço de rede, o namespace de rede e os volumes. Na prática,
+dois containers no mesmo pod conversam por <code>localhost</code>, e cada um enxerga a porta do outro sem
+saber o IP de nada.</p>
+
+<p>O uso clássico é o <em>sidecar</em>: a aplicação no container principal e um ajudante ao lado — um
+exportador de métricas, um proxy que fala TLS, um coletor de log. O ajudante não é um serviço separado, é
+parte do pod: sobe junto, morre junto, e compartilha o ciclo de vida.</p>
+
+<pre class="file" data-file="cardapio.yaml">spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+    - name: metricas
+      image: cardapio-metricas:1.0
+      ports:
+        - containerPort: 9090</pre>
+
+<p>Repare que cada item da lista repete o hífen e recomeça o mapa com <code>name</code> e <code>image</code>.
+O recuo é o mesmo do primeiro item, e é isso que faz os dois serem irmãos, não um dentro do outro. Um erro
+comum é esquecer o segundo hífen: o YAML entende que as chaves do segundo container pertencem ao primeiro, e
+o resultado é um manifesto estranho que reescreve campos.</p>
+
+<p>A consequência de ter dois containers aparece na primeira coluna da tabela. <code>READY</code> mostra
+prontos sobre total: <code>2/2</code> significa que os dois containers estão prontos. Se um só estiver
+pronto, é <code>1/2</code> — e o pod inteiro é considerado não pronto, então o Service para de mandar
+tráfego para ele. Container no mesmo pod é casamento: um problema de um vira problema dos dois.</p>
+
+<p>A caixa abaixo tem um pod com um container só. Acrescente o segundo, com nome <code>metricas</code> e
+imagem <code>cardapio-metricas:1.0</code>, e veja a tabela mudar.</p>
+
+<div class="tryk8s" data-goal="texto:2/2;;campo:Pod/cardapio|spec.containers.1.image=cardapio-metricas:1.0">
+  <p class="try-task">O pod só tem o container <code>web</code>. Acrescente um segundo container chamado
+  <code>metricas</code>, com a imagem <code>cardapio-metricas:1.0</code>, e rode: a coluna
+  <code>READY</code> tem de mostrar <code>2/2</code>.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+    - name: metricas
+      image: cardapio-metricas:1.0
+      ports:
+        - containerPort: 9090</pre>
+</div>
+
+<p>Antes, a tabela mostrava <code>1/1</code>. Depois, <code>2/2</code> — e o <code>describe</code> lista os
+dois containers, cada um com a sua imagem, o seu estado e o seu contador de reinícios:</p>
+
+<pre class="term">$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   2/2     Running   0          2m</pre>
+
+<p>Uma linha, dois containers. É a única pista que a tabela dá sobre a quantidade de processos dentro do pod,
+e por isso o <code>describe</code> é o próximo passo de quem precisa saber qual dos dois está com
+problema:</p>
+
+<pre class="term">$ kubectl describe pod cardapio
+Name:            cardapio
+Namespace:       default
+Priority:        0
+Service Account: default
+Node:            guia-control-plane/192.0.2.28
+Status:          Running
+IP:              10.244.3.71
+
+Containers:
+  cardapio:
+    Image:          cardapio:1.0
+    Port:           80/TCP
+    State:          Running
+    Ready:          True
+    Restart Count:  0</pre>
+
+<p>Um <code>Restart Count</code> por container é o que permite diagnosticar “o site está no ar mas as métricas
+não”: o pod está <code>Running</code>, o <code>READY</code> mostra <code>1/2</code>, e o container que
+reinicia é o segundo. Sem entender que são dois processos separados no mesmo pod, esse sintoma parece
+contraditório.</p>
+
+<h2>7. O resto do container: command, args e recursos</h2>
+
+<p>Três blocos completam o container, e cada um tem aula própria mais adiante. Vale saber o que são e onde
+ficam, para reconhecer quando aparecerem num manifesto.</p>
+
+<p><code>command</code> substitui o processo de entrada da imagem, e <code>args</code> substitui os argumentos
+que a imagem passa para esse processo. Sem eles, o container roda exatamente o que a imagem manda — o que é o
+desejável na maioria dos casos. Quem mexe em <code>command</code> sem saber o que a imagem já faz costuma
+descobrir um container que sobe e sai na hora, e o pod fica em <code>CrashLoopBackOff</code>.</p>
+
+<p><code>env</code> é a lista de variáveis de ambiente, cada uma com <code>name</code> e <code>value</code>.
+Ela existe porque a mesma imagem precisa rodar em teste e em produção apontando para lugares diferentes, e
+variável de ambiente é o jeito de dizer isso sem reconstruir a imagem. É assunto da próxima aula, e é onde a
+Ana vai aprender a não colocar senha no manifesto.</p>
+
+<p><code>resources</code> declara o que o container pede e o que ele pode consumir, em
+<code>requests</code> e <code>limits</code>. <code>requests</code> é o que o agendador reserva para decidir em
+qual nó o pod cabe; <code>limits</code> é o teto. Sem nada declarado, o pod é <code>BestEffort</code> e recebe
+o que sobrar — funciona em teste e sofre em nó apertado. Limite de memória estourado vira
+<code>OOMKilled</code>, que também é aula própria.</p>
+
+<p>Nada disso é obrigatório para o pod subir, e é por isso que o manifesto mínimo é tão curto. O que é
+obrigatório em cada container: <code>name</code> e <code>image</code>. Tudo o mais tem padrão, ou é
+opcional.</p>
+
+<h2>8. Trocar de imagem sem perder o rumo</h2>
+
+<p>Trocar a imagem é a mudança mais comum na vida de um pod, e o caminho é sempre o mesmo: editar o
+manifesto, rodar o dry-run, aplicar. O cluster vê a diferença e responde <code>configured</code>. O que
+acontece depois depende do dono do pod: pod solto é recriado por você; pod de Deployment é recriado pelo
+controlador, que faz isso aos poucos (o assunto do rolling update, mais adiante).</p>
+
+<p>Existe também o atalho <code>kubectl set image</code>, que muda a imagem sem editar arquivo. Ele serve em
+emergência e é ótimo para aprender, mas tem o mesmo problema de todo comando imperativo: o manifesto no
+repositório fica desatualizado, e o próximo apply desfaz a mudança. Se usar, atualize o arquivo depois.</p>
+
+<p>O hábito que evita o susto da seção 1 cabe em três linhas. Primeira: tag fixa, nunca
+<code>latest</code> em manifesto que você guarda. Segunda: a imagem nova entra com tag nova — <code>1.4</code>
+depois de <code>1.3</code> —, e o manifesto muda junto. Terceira: se a tag mudou e o pod não pegou, olhe
+<code>imagePullPolicy</code> antes de culpar o cluster, porque com <code>IfNotPresent</code> o nó pode estar
+servindo o cache.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: dois nós, duas versões</h3>
+<p>A Ana tinha três réplicas com <code>cardapio:latest</code> e <code>Always</code>. Dois nós tinham a imagem
+velha em cache e um baixou a nova no meio do dia. Durante horas, metade dos acessos mostrou o cardápio certo e
+metade o antigo — o clássico “para mim funciona”. O conserto foi parar de usar <code>latest</code> e publicar
+cada versão com a sua tag.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o sidecar que derrubou o Service</h3>
+<p>O time acrescentou um exportador de métricas no pod e o site começou a dar erro intermitente. O pod estava
+<code>Running</code> com <code>READY 1/2</code>: o exportador não passava na verificação de prontidão, e o pod
+inteiro saía da lista de endpoints. A lição foi separar quem é essencial de quem é acessório — e, quando o
+acessório não pode derrubar o principal, repensar se ele deve estar no mesmo pod.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a porta que ninguém declarou</h3>
+<p>O manifesto não tinha <code>ports</code> e o site funcionava dentro do cluster. Quando o Service entrou, o
+tráfego ia para a porta errada, porque não havia declaração nenhuma para conferir. O conserto foi declarar
+<code>containerPort: 8080</code> e o <code>targetPort: 8080</code> no Service. Porta não abre nada, mas é o
+contrato entre as duas peças — e contrato que não está escrito ninguém confere.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual é a diferença entre imagem e container?</p>
+<label><input type="radio" name="q1"> nenhuma: são dois nomes para a mesma coisa</label>
+<label><input type="radio" name="q1"> a imagem é o pacote imutável; o container é o processo rodando a partir
+dela</label>
+<label><input type="radio" name="q1"> o container é o arquivo no registro; a imagem é o que roda no nó</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Por que <code>cardapio:latest</code> costuma causar
+problema?</p>
+<label><input type="radio" name="q2"> porque o Kubernetes não aceita a tag <code>latest</code></label>
+<label><input type="radio" name="q2"> porque a imagem fica maior e o pod demora a subir</label>
+<label><input type="radio" name="q2"> porque o nome não muda quando o conteúdo muda, então o cluster pode
+seguir com a versão em cache</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que o <code>2/2</code> na coluna READY quer dizer?</p>
+<label><input type="radio" name="q3"> dois containers no pod, e os dois estão prontos</label>
+<label><input type="radio" name="q3"> duas réplicas do pod estão no ar</label>
+<label><input type="radio" name="q3"> dois reinícios do container principal</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a política que vem da tag</h2>
+<p>Você declarou a imagem sem tag fixa. Complete a política de pull que o cluster aplica sozinho nesse
+caso:</p>
+<div class="ex-code">image: cardapio:latest
+imagePullPolicy: <input aria-label="resposta 1" data-answer="Always" placeholder="..."></div>
+<p class="ex-dica">Dica: é a política que consulta o registro a cada início de container. Com tag fixa, o
+padrão seria <code>IfNotPresent</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Imagem é o pacote imutável; container é o processo que roda a partir dela; pod é a caixa que o cluster
+agenda e que pode ter um ou vários containers. O nome da imagem tem registro, repositório, tag e,
+opcionalmente, digest. Sem registro, é Docker Hub; sem tag, é <code>latest</code> — e <code>latest</code> não
+significa “a mais nova”, significa “um apelido que pode apontar para outra coisa sem o nome mudar”.</p>
+
+<p>A política de pull segue a tag: <code>Always</code> com <code>latest</code>, <code>IfNotPresent</code> com
+tag fixa. Tag fixa e cache previsível andam juntos. <code>containerPort</code> documenta onde a aplicação
+escuta e é o que o Service usa como alvo; ele não abre porta nenhuma, e erra a faixa (1 a 65535) derruba o
+manifesto inteiro.</p>
+
+<p>Vários containers no mesmo pod compartilham rede e volumes, conversam por <code>localhost</code> e dividem
+o destino: se um não fica pronto, o pod não fica pronto, e o <code>READY</code> mostra <code>1/2</code>. O
+resto do container — <code>command</code>, <code>args</code>, <code>env</code> e <code>resources</code> — é
+opcional e tem aula própria. A <a href="variaveis-de-ambiente.html">próxima</a> é justamente a que dá voz à
+aplicação sem reconstruir a imagem: as variáveis de ambiente.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Imagem é pacote; container é processo; pod é a caixa que roda um ou vários.</li>
+  <li><code>cardapio</code> é <code>docker.io/library/cardapio:latest</code>, por padrão.</li>
+  <li>Use tag fixa; <code>latest</code> esconde mudança de conteúdo.</li>
+  <li><code>Always</code> com <code>latest</code>; <code>IfNotPresent</code> com tag fixa.</li>
+  <li><code>containerPort</code> documenta e serve de alvo; não abre porta.</li>
+  <li>Porta fora de 1 a 65535: o cluster recusa o manifesto.</li>
+  <li>Dois containers no pod dividem <code>localhost</code>, volumes e o <code>READY</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

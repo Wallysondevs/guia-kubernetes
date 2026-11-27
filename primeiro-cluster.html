@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>O primeiro cluster | Guia Kubernetes</title>
+<meta name="description" content="Criar o primeiro cluster Kubernetes com kind: o que cada linha da saída significa, o que já vem instalado dentro, quanta memória isso consome e como apagar sem medo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>O primeiro <span class="hl">cluster</span></h1>
+<p class="intro">Com o <code>kubectl</code> e o <code>kind</code> instalados, chegou a hora que a Ana estava
+esperando: ver um cluster nascer. Ela vai rodar um comando, acompanhar as seis etapas da criação, entender o
+que cada emoji daquela saída significa, olhar os nós que apareceram, descobrir o que já vem instalado dentro
+do cluster e apagar tudo no fim — sem dó e sem medo. No painel, ela faz o mesmo, com as respostas reais que o
+cluster dá.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o <code>kind create cluster</code> faz, etapa por etapa.</li>
+  <li>Por que os nós de um cluster kind são containers.</li>
+  <li>Como conferir que o cluster está no ar com <code>cluster-info</code>.</li>
+  <li>Os namespaces que já existem antes de você criar qualquer coisa.</li>
+  <li>Quanta memória e CPU o cluster consome.</li>
+  <li>Apagar e recriar do zero — e por que isso é uma vantagem.</li>
+</ul>
+</div>
+
+<h2>1. A cena: cinco minutos e um cluster</h2>
+
+<p>“Um cluster inteiro em cinco minutos?” A Ana não acreditou. Ela já tinha visto instalação de banco de
+dados levar uma tarde, com senha, porta, serviço e arquivo de configuração. Mas o kind existe exatamente para
+isso: ele baixa uma imagem de nó pronta, sobe containers que se comportam como máquinas e, dentro deles,
+inicia o Kubernetes completo — servidor de API, banco de dados do cluster, escalonador, controladores.</p>
+
+<p>O comando é um só. A saída tem seis linhas de etapas e três de instruções. E, no fim, existe um cluster de
+verdade respondendo a comandos — com a diferença de que ele mora dentro do seu computador, ocupa alguns
+gigabytes de disco e pode ser apagado com outro comando. Nada de cartão de crédito, nada de nuvem.</p>
+
+<p>Antes de rodar, o cuidado de sempre: o Docker precisa estar no ar. Se o motor estiver parado, a criação
+falha na primeira etapa com uma mensagem sobre o daemon. É o mesmo pré-requisito da aula anterior, e vale
+repetir porque é o tropeço número um de quem chega aqui.</p>
+
+<h2>2. O comando que cria o cluster</h2>
+
+<p>O kind trabalha com <em>clusters com nome</em>. Se você não passar nome nenhum, ele usa o padrão
+<code>kind</code>. Passar um nome explícito é boa prática: você pode ter mais de um cluster local ao mesmo
+tempo, e cada um vira um contexto separado no kubeconfig. Vamos usar <code>guia</code>, o mesmo nome do
+cluster que o painel já tem.</p>
+
+<div class="tryk8s" data-modo="terminal" data-get="nodes" data-goal="texto:Creating cluster &quot;guia&quot;;;texto:guia-control-plane;;texto:Ready">
+  <p class="try-task">A primeira linha cria o cluster; a segunda tenta buscar um nó chamado só
+  <code>guia</code>, que não existe. Troque a segunda por <code>kubectl get nodes</code> e veja os três nós
+  com o prefixo do cluster no nome.</p>
+<pre class="yaml">kind create cluster --name guia
+kubectl get node guia</pre>
+<pre class="out">
+ana@notebook:~$ kind create cluster --name guia
+Creating cluster "guia" ...
+ • Ensuring node image (kindest/node:v1.37.3) 🐳
+ • Preparing nodes 📦
+ • Writing configuration 📜
+ • Starting control-plane 👷
+ • Installing CNI 💉
+ • Installing StorageClass 📦
+Set kubectl context to "kind-guia"
+You can now use your cluster with:
+
+kubectl cluster-info --context kind-guia
+
+ana@notebook:~$ kubectl get node guia
+Error from server (NotFound): nodes "guia" not found
+</pre>
+<pre class="solucao">kind create cluster --name guia
+kubectl get nodes</pre>
+</div>
+
+<p>A mensagem <code>Error from server (NotFound): nodes "guia" not found</code> é didática: o nó não se chama
+<code>guia</code>, e sim <code>guia-control-plane</code>, <code>guia-worker</code> e
+<code>guia-worker2</code>. O kind prefixa o nome de cada nó com o nome do cluster — é assim que ele sabe
+quais containers pertencem a qual cluster na hora de apagar. Se você criar um cluster chamado
+<code>padaria</code>, os nós serão <code>padaria-control-plane</code> e assim por diante.</p>
+
+<p>Quando você roda <code>kubectl get nodes</code>, a resposta tem três linhas com <code>STATUS Ready</code>.
+“Ready” é o estado que importa: significa que o nó está registrado no cluster, com o kubelet conversando com
+o servidor de API e com a rede do cluster pronta. Um nó <code>NotReady</code> aparece quando o kubelet cai,
+quando a rede do cluster falha ou quando o container que faz o papel de nó está sem memória.</p>
+
+<h2>3. Lendo a saída da criação</h2>
+
+<p>Vale ler o que o kind imprime, porque cada linha corresponde a uma peça real que está sendo montada. A
+saída é sempre parecida com esta:</p>
+
+<pre class="term">ana@notebook:~$ kind create cluster --name guia
+Creating cluster "guia" ...
+ • Ensuring node image (kindest/node:v1.37.3) 🐳
+ • Preparing nodes 📦
+ • Writing configuration 📜
+ • Starting control-plane 👷
+ • Installing CNI 💉
+ • Installing StorageClass 📦
+Set kubectl context to "kind-guia"
+You can now use your cluster with:
+
+kubectl cluster-info --context kind-guia</pre>
+
+<p><strong>Ensuring node image</strong> é o download (ou reaproveitamento do cache) da imagem
+<code>kindest/node</code>, que nada mais é do que um sistema Debian com containerd e os binários do
+Kubernetes dentro. Na primeira vez são alguns minutos e centenas de megabytes; nas seguintes, segundos.</p>
+
+<p><strong>Preparing nodes</strong> cria os containers que farão o papel de máquinas e injeta a configuração
+de cada um. <strong>Writing configuration</strong> gera o arquivo do kubeconfig e o endereço da API.
+<strong>Starting control-plane</strong> sobe os componentes de controle dentro do primeiro nó.
+<strong>Installing CNI</strong> instala a rede de pods (no kind, o kindnet) — sem ela, pod não consegue falar
+com pod. E <strong>Installing StorageClass</strong> instala o provisionador de disco local, que permite usar
+volume persistente sem nuvem.</p>
+
+<p>No fim, <code>Set kubectl context to "kind-guia"</code>: o kubectl já sai sabendo com quem falar. Repare
+no prefixo <code>kind-</code> — o contexto tem nome diferente do cluster para não colidir com clusters de
+outros provedores que você venha a configurar na mesma máquina. E o kind ainda imprime o comando com
+<code>--context kind-guia</code>, que é útil quando você tem vários clusters e não quer depender do contexto
+atual.</p>
+
+<p>Seis etapas, seis conceitos. Vale guardar o vocabulário, porque ele volta em toda mensagem de erro que
+você vai encontrar pela frente — inclusive nas aulas de diagnóstico, no Nível 3:</p>
+
+<dl class="anatomy">
+<dt>plano de controle</dt>
+<dd>O conjunto de componentes que decide e guarda o estado: API, etcd, escalonador, controladores.</dd>
+<dt>nó</dt>
+<dd>A máquina que roda os pods. No kind, um container; na nuvem, uma instância.</dd>
+<dt>kubelet</dt>
+<dd>O agente que roda em cada nó e conversa com a API para manter os pods vivos.</dd>
+<dt>CNI</dt>
+<dd>O padrão de rede de pods. Sem ele instalado, pod não recebe IP e não conversa com ninguém.</dd>
+<dt>etcd</dt>
+<dd>O banco de dados do cluster: guarda tudo o que existe nele. Perder o etcd é perder o cluster.</dd>
+<dt>StorageClass</dt>
+<dd>O modelo de disco que o cluster oferece quando um pod pede volume persistente.</dd>
+</dl>
+
+<h2>4. O cluster está no ar?</h2>
+
+<p>Criar não é garantia de que está tudo certo. A pergunta seguinte é sempre a mesma: o cluster responde? O
+comando <code>kubectl cluster-info</code> faz uma chamada simples à API e imprime o endereço do plano de
+controle e dos serviços internos que estão de pé. É o equivalente a discar para o número e ouvir o “alô”.</p>
+
+<div class="tryk8s" data-modo="terminal" data-get="nodes" data-goal="texto:Kubernetes control plane is running at;;texto:CoreDNS;;texto:kube-system">
+  <p class="try-task">A primeira linha está com um espaço onde deveria ter hífen, e o kubectl trata
+  <code>cluster</code> como se fosse um verbo. Corrija para <code>kubectl cluster-info</code> e acrescente
+  <code>kubectl get namespaces</code> — que é o mesmo que <code>get ns</code>.</p>
+<pre class="yaml">kubectl cluster info
+kubectl get ns</pre>
+<pre class="out">
+ana@notebook:~$ kubectl cluster info
+error: unknown command "cluster" for "kubectl"
+
+ana@notebook:~$ kubectl get ns
+NAME          AGE
+default       8m
+kube-system   9m
+</pre>
+<pre class="solucao">kubectl cluster-info
+kubectl get namespaces</pre>
+</div>
+
+<p>A resposta <code>Kubernetes control plane is running at https://127.0.0.1:6443</code> confirma três coisas
+de uma vez: o cluster existe, a API responde e ela está na porta 6443 da sua própria máquina. Em cluster de
+nuvem, esse endereço seria um nome público. Depois vem a linha do CoreDNS, o serviço que resolve nome de
+serviço dentro do cluster — se ele está de pé, descoberta de serviço funciona.</p>
+
+<p>O <code>--context kind-guia</code> que o kind sugeriu também aparece aqui em forma de dica: se você tiver
+dois clusters e o contexto atual for o outro, o comando fala com o cluster errado e você perde tempo
+depurando um problema que não existe. Quando estiver em dúvida, olhe o contexto antes de qualquer coisa.</p>
+
+<h2>5. O que já vem dentro</h2>
+
+<p>Ao criar o cluster, você não recebe uma tela em branco: recebe uma casa mobiliada. Existem
+<em>namespaces</em> — divisórias lógicas que separam grupos de objetos — já criados, e dentro deles rodam os
+componentes do próprio Kubernetes. O único que você vai usar no dia a dia é o <code>default</code>, onde seus
+pods nascem quando você não especifica nada.</p>
+
+<p>O outro é o <code>kube-system</code>, onde moram as peças do sistema: servidor de API, banco de dados do
+cluster, escalonador, controladores, DNS, proxy de rede. Você não cria nada ali; você olha quando precisa
+investigar por que um pod não sobe. Uma transcrição de cluster real mostra a casa mobiliada de verdade:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get ns
+NAME                 STATUS   AGE
+default              Active   8m
+kube-node-lease      Active   8m
+kube-public          Active   8m
+kube-system          Active   8m
+local-path-storage   Active   8m
+
+ana@notebook:~$ kubectl get pods -n kube-system
+NAME                                          READY   STATUS    RESTARTS   AGE
+coredns-6f9b8c7d4b-2xj9k                      1/1     Running   0          7m
+etcd-guia-control-plane                       1/1     Running   0          7m
+kindnet-4mzqp                                 1/1     Running   0          7m
+kube-apiserver-guia-control-plane             1/1     Running   0          7m
+kube-controller-manager-guia-control-plane    1/1     Running   0          7m
+kube-proxy-t8w6r                              1/1     Running   0          7m
+kube-scheduler-guia-control-plane             1/1     Running   0          7m
+local-path-provisioner-7b8f5d9c4d-hq2vn       1/1     Running   0          7m</pre>
+
+<p>Esses nomes valem ouro na hora do problema. O <code>etcd</code> guarda o estado do cluster: se ele cai, o
+cluster inteiro fica sem memória do que existe. O <code>kube-apiserver</code> é a porta de entrada — todo
+comando do <code>kubectl</code> bate nele. O <code>kube-controller-manager</code> é quem roda os
+controladores que comparam desejado com real. O <code>kube-scheduler</code> decide em qual nó cada pod vai.
+O <code>coredns</code> resolve nomes. O <code>kube-proxy</code> cuida das regras de rede de cada nó.</p>
+
+<p>Uma nota honesta sobre o painel: ele simplifica e mostra apenas <code>default</code> e
+<code>kube-system</code>, e não modela os pods do sistema. Então <code>kubectl get pods -n kube-system</code>
+no painel responde “nenhum recurso encontrado”, enquanto no cluster real você vê a lista acima. É uma
+limitação da simulação, não do Kubernetes — e é por isso que a transcrição está aqui, identificada como
+transcrição.</p>
+
+<h2>6. Os nós são containers</h2>
+
+<p>Essa é a ideia que faz o kind funcionar, e entender isso resolve metade das dúvidas sobre “meu cluster
+sumiu”. Cada nó é um container Docker rodando a imagem <code>kindest/node</code>. Se você pedir ao Docker a
+lista de containers, vê os nós como se fossem aplicações quaisquer:</p>
+
+<pre class="term">ana@notebook:~$ docker ps --format "{{.Names}}\t{{.Image}}\t{{.Status}}"
+guia-worker2        kindest/node:v1.37.3   Up 8 minutes
+guia-worker         kindest/node:v1.37.3   Up 8 minutes
+guia-control-plane  kindest/node:v1.37.3   Up 9 minutes</pre>
+
+<p>O primeiro da lista terminou de subir depois dos outros — daí o minuto de diferença. O
+<code>control-plane</code> é o cérebro; os <code>worker</code> são os músculos. Num cluster kind padrão,
+esse arranjo com um plano de controle e dois workers já vem montado, e é o suficiente para quase tudo o que
+você vai estudar neste guia.</p>
+
+<p>Consequência prática: quando o Docker para — você fechou o Docker Desktop, reiniciou a máquina, mandou o
+sistema suspender —, os containers param junto. O cluster não é um serviço do sistema operacional; ele é um
+conjunto de containers. Ao voltar, basta subir o Docker e, se preciso, recriar o cluster. Como tudo o que
+importa está em manifestos, recriar não é perda: é rotina.</p>
+
+<h2>7. Apagar sem medo</h2>
+
+<p>Cluster kind é descartável, e é assim que ele deve ser tratado. O comando de remoção apaga os containers
+dos nós, as redes e os volumes associados, e tira o contexto do kubeconfig. Um comando, alguns segundos, e a
+máquina volta a ter o espaço que tinha antes.</p>
+
+<div class="tryk8s" data-modo="terminal" data-get="nodes" data-goal="texto:Deleting cluster &quot;guia&quot;;;texto:Deleted nodes">
+  <p class="try-task">A primeira linha usa o plural <code>clusters</code> e o kind só entende o singular.
+  Rode para ver a mensagem e depois corrija para <code>kind delete cluster --name guia</code>.</p>
+<pre class="yaml">kind delete clusters --name guia
+kind get clusters</pre>
+<pre class="out">
+ana@notebook:~$ kind delete clusters --name guia
+kind: use get clusters, create cluster ou delete cluster
+
+ana@notebook:~$ kind get clusters
+guia
+</pre>
+<pre class="solucao">kind delete cluster --name guia
+kind get clusters</pre>
+</div>
+
+<p>As duas linhas da resposta contam a história: <code>Deleting cluster "guia"...</code> avisa que começou, e
+<code>Deleted nodes: ["guia-control-plane" "guia-worker" "guia-worker2"]</code> lista exatamente o que foi
+embora. Nada de “talvez”: o kind sabe quais containers são dele e apaga todos.</p>
+
+<p>No painel, a lista de <code>kind get clusters</code> continua mostrando <code>guia</code> depois da
+remoção, porque a simulação usa uma lista fixa de clusters. Na sua máquina, o nome sai da lista e o comando
+responde <code>No kind clusters found</code> quando não sobrar nenhum. Diferença de simulação, mais uma vez —
+o comportamento real é o da sua máquina.</p>
+
+<p>Recriar é o mesmo comando de antes. E aqui está a parte boa de ter tudo em manifesto: apagar e recriar se
+torna uma forma legítima de “limpar a bagunça”. Errou a configuração do cluster? Apaga, cria de novo, aplica
+os arquivos. É mais rápido e mais seguro do que tentar consertar peça por peça.</p>
+
+<h2>8. Quanto isso custa em memória</h2>
+
+<p>Cluster local não é de graça: cada nó é um container rodando um sistema inteiro. Um cluster kind de três
+nós fica confortável com 8 GB de RAM na máquina e sofre com 4 GB. O disco também sente: a imagem de nó ocupa
+algumas centenas de megabytes, e cada cluster usa espaço próprio para o estado do etcd e para volumes.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Comando do kind</th><th>O que faz</th><th>O que muda na máquina</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kind create cluster --name guia</code></td><td>cria o cluster com seus nós</td><td>containers novos,
+contexto novo no kubeconfig</td></tr>
+<tr><td><code>kind get clusters</code></td><td>lista os clusters locais</td><td>nada: só leitura</td></tr>
+<tr><td><code>kind delete cluster --name guia</code></td><td>apaga o cluster inteiro</td><td>containers, redes e
+volumes removidos; contexto sai do kubeconfig</td></tr>
+<tr><td><code>kubectl cluster-info</code></td><td>pergunta se a API responde</td><td>nada</td></tr>
+<tr><td><code>kubectl get nodes</code></td><td>lista os nós do cluster atual</td><td>nada</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Se a máquina estiver apertada, existe a saída de criar cluster com um nó só:
+<code>kind create cluster --name guia --config</code> apontando para um arquivo que declara um único nó. Menos
+nós significa menos memória e menos isolamento — para estudo de pod e Deployment, um nó basta. Para estudar
+como o escalonador distribui pods entre máquinas, você vai querer os três.</p>
+
+<p>Vale medir antes de reclamar. O comando <code>docker stats</code> mostra, em tempo real, quanta memória cada
+container está usando — e os três nós do kind aparecem lá com nome e sobrenome. Num cluster ocioso, o consumo
+fica na casa de algumas centenas de megabytes por nó; quando você começa a criar pods, sobe. Se a máquina
+começar a trocar memória para o disco, tudo fica lento de um jeito que parece bug do Kubernetes e não é: é
+falta de RAM. Nesse caso, apague o cluster que não está usando antes de abrir outro.</p>
+
+<p>A tabela abaixo resume o que existe dentro do cluster recém-criado e o que você pode ou não mexer. Ela
+serve como mapa para as próximas aulas: cada linha é um assunto que vai voltar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Peça</th><th>Onde fica</th><th>Você mexe?</th></tr>
+</thead>
+<tbody>
+<tr><td>seus pods e Deployments</td><td>namespace <code>default</code></td><td>sim, o tempo todo</td></tr>
+<tr><td>DNS, API, etcd, escalonador</td><td>namespace <code>kube-system</code></td><td>só para investigar</td></tr>
+<tr><td>nós do cluster</td><td>objetos <code>Node</code>, fora de namespace</td><td>não em cluster gerenciado</td></tr>
+<tr><td>contexto e credenciais</td><td><code>~/.kube/config</code></td><td>sim, com cuidado</td></tr>
+<tr><td>imagem dos nós</td><td>cache do Docker</td><td>não: o kind cuida</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o cluster que “sumiu” depois do almoço</h3>
+<p>A Ana fechou o notebook para almoçar, voltou, e <code>kubectl get nodes</code> respondeu que não conseguiu
+conectar. Ela não perdeu nada: o Docker Desktop havia parado junto com a tampa fechada, e os containers
+estavam parados. Reabriu o Docker, esperou o ícone estabilizar e os nós voltaram. Se não voltassem, seria
+recriar o cluster e reaplicar os manifestos — dois minutos, porque tudo estava escrito.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: dois clusters, um contexto</h3>
+<p>Ela criou um cluster chamado <code>teste</code> para arriscar um manifesto e esqueceu que o contexto tinha
+mudado. Rodou <code>kubectl delete deployment cardapio</code> achando que estava no cluster de estudo e
+apagou o site do cluster principal. Sorte que era local. A lição: confira o contexto antes de comando
+destrutivo, e prefira <code>--context</code> explícito quando houver mais de um cluster.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o nó que ficou NotReady</h3>
+<p>Num dia de muitas aulas, dois clusters ao mesmo tempo, a máquina ficou sem memória e o nó
+<code>guia-worker2</code> passou a <code>NotReady</code>. Os pods dele foram marcados como perdidos e
+recomeçaram em outro nó. Foi o primeiro contato dela com a cura automática de verdade — e o primeiro sinal de
+que 8 GB é o mínimo confortável para estudar com dois clusters.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Você pediu <code>kubectl get node guia</code> e recebeu
+NotFound. Por quê?</p>
+<label><input type="radio" name="c1"> porque o cluster não tem nós ainda</label>
+<label><input type="radio" name="c1"> porque o nó se chama <code>guia-control-plane</code>: o kind prefixa o
+nome do cluster</label>
+<label><input type="radio" name="c1"> porque <code>node</code> não é um recurso válido</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que <code>kubectl cluster-info</code> responde?</p>
+<label><input type="radio" name="c2"> a lista de pods de todos os namespaces</label>
+<label><input type="radio" name="c2"> o arquivo kubeconfig inteiro</label>
+<label><input type="radio" name="c2"> o endereço do plano de controle e dos serviços internos, provando que a
+API responde</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Onde nascem os seus pods quando você não informa
+namespace?</p>
+<label><input type="radio" name="c3"> no namespace <code>default</code></label>
+<label><input type="radio" name="c3"> no <code>kube-system</code>, junto do DNS</label>
+<label><input type="radio" name="c3"> num namespace criado com o seu nome</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o nome do contexto</h2>
+<p>Você criou um cluster kind chamado <code>guia</code>. O kind configurou o kubectl sozinho. Qual é o nome do
+contexto que ele gravou no kubeconfig? Complete:</p>
+<div class="ex-code">kind-<input aria-label="resposta 1" data-answer="guia" placeholder="..."></div>
+<p class="ex-dica">Dica: é o prefixo fixo do kind mais o nome do cluster. O mesmo aparece no
+<code>current-context</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Criar um cluster local é um comando: <code>kind create cluster --name guia</code>. A saída mostra seis
+etapas reais — imagem do nó, preparação, configuração, plano de controle, rede e storage — e termina apontando
+o contexto <code>kind-guia</code> para o cluster novo. Conferir é igualmente curto:
+<code>kubectl cluster-info</code> prova que a API responde e <code>kubectl get nodes</code> mostra os nós com
+<code>Ready</code>.</p>
+
+<p>Dentro do cluster você não encontra vazio: existem namespaces prontos, e no <code>kube-system</code> rodam
+as peças do próprio Kubernetes. Seus objetos ficam no <code>default</code> até você aprender a criar outros.
+E os nós não são máquinas de verdade: são containers <code>kindest/node</code> — o que explica por que o
+cluster para quando o Docker para, e por que recriar é tão barato.</p>
+
+<p>Apagar é <code>kind delete cluster --name guia</code>, sem cerimônia. Com o cluster no ar e a máquina
+entendida, falta o assunto que muda tudo no dia a dia: os comandos do <code>kubectl</code> — ver, descrever,
+aplicar e apagar. É a próxima aula.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kind create cluster --name guia</code> cria; <code>kind delete cluster</code> apaga.</li>
+  <li>Nós se chamam <code>guia-control-plane</code>, <code>guia-worker</code>, <code>guia-worker2</code>.</li>
+  <li>O contexto ganha prefixo: <code>kind-guia</code>.</li>
+  <li><code>kubectl cluster-info</code> é o teste “está no ar?”.</li>
+  <li><code>default</code> é o seu espaço; <code>kube-system</code> é do sistema.</li>
+  <li>Nós são containers: Docker parado, cluster parado.</li>
+  <li>Recriar cluster é rotina quando tudo está em manifesto.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

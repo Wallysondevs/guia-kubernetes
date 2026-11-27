@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eviction e OOMKilled | Guia Kubernetes</title>
+<meta name="description" content="Eviction e OOMKilled na prática: por que o nó despeja pods, por que o container morre com exit 137, como diferenciar as duas mortes e o que fazer para proteger o serviço.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Eviction e <span class="hl">OOMKilled</span></h1>
+<p class="intro">Duas da manhã, o nó do site da Ana ficou sem memória. Quando ela abriu o cluster, encontrou
+dois pods mortos com histórias diferentes: um tinha o status <code>Evicted</code> e nunca mais voltou
+sozinho; o outro reiniciava a cada poucos minutos com <code>OOMKilled</code> e exit code <code>137</code>.
+Os dois são “falta de memória”, mas acontecem em camadas diferentes e se consertam de jeitos diferentes.
+Nesta aula a Ana aprende a separar um do outro e a impedir que aconteçam.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>A diferença entre despejo do nó (<code>Evicted</code>) e morte do container
+  (<code>OOMKilled</code>).</li>
+  <li>Quando o kubelet começa a despejar pods e em que ordem.</li>
+  <li>Como ler <code>Exit Code: 137</code> e o bloco <code>Last State</code> no
+  <code>describe</code>.</li>
+  <li>Por que um pod grande demais deixa o vizinho sem lugar.</li>
+  <li>Como reconhecer o perfil do primeiro candidato ao despejo.</li>
+  <li>O que declarar no manifesto para o site da Ana sair da fila dos primeiros.</li>
+</ul>
+</div>
+
+<h2>1. A cena: dois mortos, duas histórias</h2>
+
+<p>O primeiro pod estava <code>Evicted</code>. O kubelet do nó viu a memória acabar, escolheu as vítimas e
+avisou o controlador: “este pod saiu daqui, não por escolha dele”. O ReplicaSet criou outro em outro nó, e
+o antigo ficou para trás como registro do que aconteceu. Um pod <code>Evicted</code> não volta: ele é um
+objeto morto que ninguém apaga, e é comum ver dezenas deles acumulados num namespace antigo.</p>
+
+<p>O segundo pod estava em <code>Running</code>, reiniciando de três em três minutos, com
+<code>RESTARTS</code> subindo. Ele não foi despejado: ele mesmo estourou o próprio limite de memória, e o
+kernel matou o processo com o sinal 9. O kubelet reiniciou o container, o programa voltou a crescer e
+morreu de novo. O <code>describe</code> mostra <code>Reason: OOMKilled</code> e
+<code>Exit Code: 137</code> — e é aí que a investigação começa.</p>
+
+<p>A confusão entre os dois é quase inevitável, porque a frase “ficou sem memória” serve para os dois casos.
+A pergunta que separa é: <em>quem ficou sem memória?</em> Se foi o nó, o kubelet despeja pods e o status é
+<code>Evicted</code>. Se foi o container, o kernel mata o processo e o status continua
+<code>Running</code>, com reinícios. Nó e container são camadas diferentes, com donos diferentes e consertos
+diferentes.</p>
+
+<h2>2. As duas mortes, por dentro</h2>
+
+<p>O Kubernetes reserva uma quantidade de memória para o próprio funcionamento e observa o que sobra. Quando
+o nó entra em pressão, o kubelet toma duas atitudes: primeiro tenta liberar memória despejando pods; se nem
+isso resolver, o kernel entra em ação e mata o maior consumidor. O despejo é uma decisão do Kubernetes; o
+<code>OOMKilled</code> é uma decisão do sistema operacional.</p>
+
+<dl class="anatomy">
+<dt>eviction</dt>
+<dd>Despejo de pods feito pelo kubelet quando o nó está sob pressão de memória, de disco ou de inodes. O pod
+recebe o status <code>Evicted</code> e não é recriado no mesmo lugar.</dd>
+<dt>MemoryPressure</dt>
+<dd>A condição que o nó anuncia quando a memória disponível passa de um limite. É a deixa para o kubelet
+começar a despejar.</dd>
+<dt>OOMKilled</dt>
+<dd>Motivo de morte quando o container passa do próprio limite de memória. Quem mata é o OOM killer do
+kernel, não o Kubernetes.</dd>
+<dt>exit code 137</dt>
+<dd>128 + 9: o processo terminou pelo sinal 9 (<code>SIGKILL</code>). É a assinatura do
+<code>OOMKilled</code>.</dd>
+<dt>ephemeral storage</dt>
+<dd>O disco local que o pod usa (logs, arquivos temporários, <code>emptyDir</code>). Também pode causar
+despejo quando o nó fica sem espaço.</dd>
+</dl>
+
+<p>Repare que o despejo não é aleatório. O kubelet ordena os candidatos por classe de QoS e por consumo
+acima do request: primeiro os <code>BestEffort</code>, depois os <code>Burstable</code> que passaram do que
+reservaram, e por último os <code>Guaranteed</code>. Dentro da mesma classe, quem está usando mais do que
+pediu sai antes. É a mesma etiqueta da aula anterior, agora decidindo quem vive.</p>
+
+<h2>3. Quem sai primeiro</h2>
+
+<p>A tabela abaixo é a ordem prática. Ela não é uma garantia matemática — o kubelet considera também
+prioridade, uso e o momento —, mas é a ordem que explica a maioria dos incidentes reais e a que você deve
+usar para raciocinar sobre o seu manifesto.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Classe</th><th>Situação no nó</th><th>O que acontece</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BestEffort</code></td><td>sem reserva nenhuma</td><td>primeiro da fila, mesmo consumindo
+pouco</td></tr>
+<tr><td><code>Burstable</code></td><td>usando acima do request</td><td>sai depois do BestEffort e antes do
+Guaranteed</td></tr>
+<tr><td><code>Burstable</code></td><td>usando abaixo do request</td><td>tende a ficar; o request é a
+proteção</td></tr>
+<tr><td><code>Guaranteed</code></td><td>reserva igual ao teto</td><td>último da fila</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas leituras dessa tabela mudam a forma de escrever manifesto. A primeira: <em>não declarar nada não é
+neutro</em> — é escolher ser o primeiro. A segunda: o request protege mais do que o limit. Um pod
+<code>Burstable</code> que consome abaixo do que reservou tem chance de sobreviver ao aperto, mesmo sem ser
+<code>Guaranteed</code>. O limit, sozinho, não protege de nada: ele só decide quando o container morre por
+conta própria.</p>
+
+<h2>4. O pod que enche o nó sozinho</h2>
+
+<p>Antes de qualquer despejo existe uma causa: alguém ocupou o nó. Um pod com pedido de memória alto não
+“causa” eviction por si — o agendador só o coloca onde ele cabe —, mas ele reduz o espaço para os outros e
+empurra o nó para perto do limite. A caixa abaixo mostra o efeito: quatro réplicas de 2500Mi num nó de 4 GiB
+deixam três rodando e uma na fila, para sempre.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="pronto:Deployment/cardapio=4;;conta:pods=4">
+  <p class="try-task">Rode e veja uma réplica sem lugar. Depois baixe o pedido de memória para
+  <code>1Gi</code> e faça as quatro subirem.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "2500Mi"</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-4h45jwhrgf-ch8bt   1/1     Running   0          1m
+cardapio-4h45jwhrgf-qpwh5   1/1     Running   0          6m
+cardapio-4h45jwhrgf-sm9hn   1/1     Running   0          2m
+cardapio-4h45jwhrgf-xxwjr   0/1     Pending   0          8m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "1Gi"</pre>
+</div>
+
+<p>Com <code>2500Mi</code>, cada nó aceita um pod e sobra pouco mais de 1,5 GiB — espaço que nenhuma quarta
+réplica consegue usar, porque ela precisa de 2500Mi inteiros. O cluster fica com 75% da capacidade útil
+presa em pedaços que não servem para nada. Com <code>1Gi</code>, cabem quatro por nó e as quatro réplicas
+sobram em dois nós.</p>
+
+<p>É esse tipo de desperdício que prepara o terreno para o despejo: um nó cheio de reservas grandes tem
+pouca folga para os picos reais. Quando o consumo de verdade sobe — a planilha do mês, o relatório da
+madrugada, o cache que cresceu —, a memória disponível despenca e o kubelet começa a escolher vítimas. A
+reserva não causa o pico, mas ela decide quem vai sofrer com ele.</p>
+
+<h2>5. OOMKilled: quando o limite é a sentença</h2>
+
+<p>O <code>OOMKilled</code> acontece dentro do container, e a causa é sempre a mesma: o processo pediu mais
+memória do que o <code>limits.memory</code> permite. O kernel não tem como “dar menos”: ou entrega a página,
+ou mata o processo. Ele mata, o container reinicia, e o ciclo se repete enquanto o programa continuar
+crescendo. O sintoma no <code>get pods</code> é <code>RESTARTS</code> subindo, com o pod em
+<code>Running</code> entre uma morte e outra.</p>
+
+<pre class="term">Containers:
+  web:
+    Image:          cardapio:1.0
+    State:          Running
+      Started:      Fri, 27 Nov 2026 15:48:09 +0000
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+      Started:      Fri, 27 Nov 2026 15:48:02 +0000
+      Finished:     Fri, 27 Nov 2026 15:48:09 +0000
+    Ready:          True
+    Restart Count:  3
+    Limits:
+      cpu:     500m
+      memory:  64Mi</pre>
+
+<p>Essa é a transcrição de um <code>kubectl describe pod</code> real de um pod com
+<code>memory: 64Mi</code>. O bloco <code>Last State</code> guarda a morte anterior — <code>State</code> é o
+agora, <code>Last State</code> é o antes. O <code>Exit Code: 137</code> é 128 + 9, o sinal de kill, e a
+combinação com <code>Reason: OOMKilled</code> fecha o diagnóstico: não foi falta de memória no nó, foi
+excesso dentro do container.</p>
+
+<p>O conserto tem duas portas, e escolher a errada custa caro. A primeira é aumentar o limite: se o programa
+precisa de 200Mi para funcionar e você deu 64Mi, o erro é seu, não dele. A segunda é investigar o
+crescimento: se o consumo sobe sem parar, há vazamento de memória, cache sem limite ou uma consulta que
+carrega a tabela inteira. Aumentar o limite sem investigar só adia a próxima morte — e, se o nó for pequeno,
+transforma o problema do container em problema do nó.</p>
+
+<h2>6. O perfil do primeiro candidato</h2>
+
+<p>Reconhecer o candidato antes do incidente é o que separa o susto do desastre. O sinal mais claro é a
+classe <code>BestEffort</code>: pod sem reserva nenhuma, que o agendador trata como zero e o kubelet trata
+como descartável. A caixa abaixo olha os pods do site da padaria, que estão exatamente nessa situação.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:QoS Class: BestEffort;;texto:Running;;texto:Created">
+  <p class="try-task">Descreva um dos pods do site e leia a classe no fim. Depois leia os eventos do
+  cluster para ver o que o controlador fez.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl get pods
+kubectl describe pod cardapio-wj4jsx2tcw-t4jwn
+kubectl get events</pre>
+</div>
+
+<p>Este é o painel da caixa, copiado do motor — repare no fim do <code>describe</code>:</p>
+
+<pre class="term">$ kubectl describe pod cardapio-wj4jsx2tcw-t4jwn
+Name:            cardapio-wj4jsx2tcw-t4jwn
+Namespace:       default
+Node:            guia-worker/192.0.2.21
+Status:          Running
+IP:              10.244.56.236
+Controlled By:   ReplicaSet/cardapio-wj4jsx2tcw
+
+Containers:
+  web:
+    Image:          cardapio:1.0
+    Port:           8080/TCP
+    State:          Running
+    Ready:          True
+    Restart Count:  0
+    Environment:    &lt;none&gt;
+    Mounts:         &lt;none&gt;
+QoS Class:                   BestEffort</pre>
+
+<p>A saída confirma o diagnóstico: <code>QoS Class: BestEffort</code> e nenhuma linha de
+<code>Limits</code> no container. Esses dois pods são os primeiros a sair se o nó apertar — e o pior é que
+eles não fizeram nada de errado: o manifesto simplesmente não declarava nada. O evento
+<code>Created</code> mostra que o Deployment os criou; nenhum evento avisa “este pod será despejado
+primeiro”, porque isso não é um evento, é uma consequência da classe.</p>
+
+<p>Vale olhar o mesmo pod com <code>-o yaml</code> para ver o que está declarado de fato. Num cluster real,
+é comum descobrir que o manifesto do repositório diz uma coisa e o objeto no cluster diz outra — por causa
+de um <code>apply</code> antigo, de um webhook ou de um container injetado. A classe é calculada sobre o
+objeto, não sobre o arquivo.</p>
+
+<h2>7. Protegendo o site da Ana</h2>
+
+<p>A proteção mais barata é dar ao pod uma reserva de memória: sair do <code>BestEffort</code> já muda a
+posição dele na fila de despejo. Para chegar ao <code>Guaranteed</code>, os quatro valores precisam ser
+iguais — CPU e memória, request e limit; só memória deixa o pod em <code>Burstable</code>, o que já é bem
+melhor do que nada. O que não dá para aceitar é o pod sem reserva nenhuma, que é o primeiro a sair mesmo
+consumindo pouco.</p>
+
+<div class="tryk8s" data-cenario="padaria" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.resources.requests.memory=256Mi;;campo:Deployment/cardapio|spec.template.spec.containers.0.resources.limits.memory=256Mi;;pronto:Deployment/cardapio=2">
+  <p class="try-task">O site tem dois pods <code>BestEffort</code>. No container <code>web</code>, declare
+  <code>256Mi</code> de memória em <code>requests</code> e em <code>limits</code> — os dois iguais.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio unchanged
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: 256Mi
+            limits:
+              memory: 256Mi</pre>
+</div>
+
+<p>O painel confere os dois valores e mostra o Deployment com duas réplicas prontas. Repare que o código
+inicial responde <code>deployment.apps/cardapio unchanged</code>: o cluster de exemplo já tem exatamente
+esse Deployment, e o <code>apply</code> é idempotente — quando nada muda, ele só confirma. É uma boa
+lembrança de que a meta desta caixa está nos campos, não na mensagem do apply.</p>
+
+<p>Num cluster real, os pods antigos seriam substituídos por pods novos com reserva de 256Mi de memória. Com
+só a memória declarada, a classe seria <code>Burstable</code> — o pod deixa de ser o primeiro da fila,
+porque agora tem um request que o protege. Acrescentar CPU com os mesmos valores nos dois lados levaria o
+pod a <code>Guaranteed</code>, o último a ser despejado.</p>
+
+<p>Existe ainda uma proteção de outro tipo, que não é sobre memória: o <code>PodDisruptionBudget</code>,
+que limita quantos pods de um serviço podem sair ao mesmo tempo em manutenções planejadas (drenar um nó,
+por exemplo). Ele não impede despejo por pressão, mas evita que uma manutenção derrube o serviço inteiro.
+São ferramentas diferentes para problemas diferentes — e as duas aparecem no nível de escala e
+disponibilidade deste guia.</p>
+
+<h2>8. Diagnosticando: o roteiro de cinco minutos</h2>
+
+<p>Um detalhe de operação que ninguém ensina: pod <code>Evicted</code> não é recriado pelo Deployment e
+também não desaparece sozinho. Ele fica no namespace ocupando espaço na listagem e confundindo o
+<code>get pods</code> de quem chega depois. A limpeza é manual — <code>kubectl delete pod</code> nos que
+estão nesse estado —, e vale automatizar num job de rotina. Já o pod que morre por <code>OOMKilled</code>
+continua sendo do ReplicaSet e volta sozinho: é por isso que o segundo caso aparece como
+<code>RESTARTS</code> e o primeiro, como linha morta na tabela.</p>
+
+<p>Quando a página cai de madrugada, o roteiro é curto e sempre na mesma ordem. Primeiro, o que existe:
+<code>kubectl get pods</code> mostra <code>Evicted</code>, <code>OOMKilled</code> (no <code>RESTARTS</code>)
+ou <code>Pending</code>. Segundo, o que aconteceu: <code>kubectl describe pod</code> mostra
+<code>Last State</code>, <code>Reason</code>, <code>Message</code> e os eventos do kubelet. Terceiro, o
+contexto: <code>kubectl get events</code> mostra o que o agendador e o controlador fizeram. Quarto, o
+manifesto: <code>kubectl get pod -o yaml</code> mostra o que está declarado de verdade.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Comando</th><th>O que procurar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Evicted</code> no <code>get pods</code></td><td><code>describe pod</code></td><td><code>Reason:
+Evicted</code> e a <code>Message</code> citando memória ou disco</td></tr>
+<tr><td><code>RESTARTS</code> subindo</td><td><code>describe pod</code></td><td><code>Last State</code> com
+<code>OOMKilled</code> e exit 137</td></tr>
+<tr><td>pod em <code>Pending</code></td><td><code>get events</code></td><td><code>FailedScheduling</code>
+com <code>Insufficient memory</code></td></tr>
+<tr><td>serviço lento, tudo verde</td><td><code>describe pod</code> e limites</td><td>limite de CPU baixo,
+sem evento nenhum</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O caso do <code>Evicted</code> merece uma olhada no status. Um pod despejado fica com
+<code>Status: Failed</code> e uma mensagem do tipo “The node was low on resource: memory”. Essa linha é a
+prova de que o problema foi o nó, não o programa — e o conserto passa por reserva, limite ou mais memória no
+cluster, não por reiniciar o pod. Reiniciar um pod despejado no mesmo nó cheio só repete o filme.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: os vinte pods Evicted que ninguém apagou</h3>
+<p>Depois de uma noite difícil, o namespace ficou com vinte pods em <code>Evicted</code>. Nenhum consumia
+recurso, mas todos apareciam no <code>get pods</code> e escondiam os pods de verdade. A limpeza é
+<code>kubectl delete pod</code> nos que estão nesse estado — e vale automatizar, porque eles voltam a cada
+incidente. O Deployment não os recria: eles não são mais parte do ReplicaSet ativo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o cache que crescia sem limite</h3>
+<p>O serviço de promoções guardava cada consulta num cache em memória. Com o limite em 256Mi, ele morria a
+cada duas horas, sempre às sextas. Aumentar para 1Gi mudou o intervalo: passou a morrer a cada três dias. A
+causa era o cache sem expiração. A correção de verdade foi de dez linhas — e o limite maior só comprou o
+tempo necessário para achar o problema.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o relatório que derrubou o site</h3>
+<p>O Job de fechamento mensal rodava no mesmo nó do site, sem limite de memória. Na virada do mês, ele
+cresceu até encher o nó, e o kubelet despejou os pods <code>BestEffort</code> — os do site. O conserto
+foi duplo: limite de memória no Job e request no site. Duas linhas de manifesto teriam evitado a noite em
+claro.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual é a diferença entre <code>Evicted</code> e
+<code>OOMKilled</code>?</p>
+<label><input type="radio" name="q1"> são sinônimos: os dois vêm do limite do container</label>
+<label><input type="radio" name="q1"> <code>Evicted</code> é o nó despejando um pod; <code>OOMKilled</code>
+é o kernel matando o processo que passou do limite</label>
+<label><input type="radio" name="q1"> <code>Evicted</code> é erro de imagem;
+<code>OOMKilled</code> é erro de configuração</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Um pod está em <code>Running</code> com
+<code>RESTARTS</code> 4 e o describe mostra <code>Exit Code: 137</code>. O que aconteceu?</p>
+<label><input type="radio" name="q2"> o pod foi despejado por falta de memória no nó</label>
+<label><input type="radio" name="q2"> o agendador não encontrou nó com espaço</label>
+<label><input type="radio" name="q2"> o container passou do próprio limite de memória e foi
+morto</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Quem é despejado primeiro quando o nó entra em
+pressão?</p>
+<label><input type="radio" name="q3"> os pods <code>BestEffort</code></label>
+<label><input type="radio" name="q3"> os pods <code>Guaranteed</code></label>
+<label><input type="radio" name="q3"> os pods mais recentes</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o limite do cache</h2>
+<p>O cache da Ana usa 180Mi em operação normal e precisa de folga para os picos. O time decidiu limitar em
+256Mi e reservar o mesmo valor, para o pod ser <code>Guaranteed</code>. Complete o bloco de
+<code>limits</code> com o valor do teto.</p>
+<div class="ex-code">limits:
+  memory: <input aria-label="resposta 1" data-answer="256Mi" placeholder="..."></div>
+<p class="ex-dica">Dica: o teto é o mesmo número do request. Se o pod passar disso, o resultado é
+<code>OOMKilled</code> com exit 137.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Duas mortes parecidas, camadas diferentes. <code>Evicted</code> é o kubelet despejando um pod porque o nó
+ficou sem memória ou sem disco — o pod fica <code>Failed</code> e não volta. <code>OOMKilled</code> é o
+kernel matando o processo que passou do <code>limits.memory</code> — o pod continua
+<code>Running</code> e reinicia, com exit code <code>137</code>.</p>
+
+<p>A ordem do despejo segue a classe de QoS: <code>BestEffort</code> primeiro, <code>Burstable</code> acima
+do request depois, <code>Guaranteed</code> por último. Declarar <code>requests</code> igual a
+<code>limits</code> de memória é a proteção mais barata que existe, e não declarar nada é escolher ser o
+primeiro. O diagnóstico é sempre <code>get pods</code>, <code>describe pod</code>,
+<code>get events</code> e <code>get -o yaml</code>.</p>
+
+<p>O painel simula a capacidade e o agendamento, mas não roda kubelet: nem despejo nem
+<code>OOMKilled</code> acontecem nele, e as cenas dessas duas mortes são transcrições identificadas. Na
+próxima aula o assunto muda de memória para disco: volumes <code>emptyDir</code>, o espaço temporário que
+nasce e morre junto com o pod.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>Evicted</code> = nó sem memória/disco; <code>OOMKilled</code> = container acima do próprio
+  limite.</li>
+  <li><code>Exit Code: 137</code> é 128 + 9: morte por <code>SIGKILL</code>.</li>
+  <li>Ordem de despejo: <code>BestEffort</code>, <code>Burstable</code> acima do request,
+  <code>Guaranteed</code>.</li>
+  <li>Request protege; limit só decide quando o container morre sozinho.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Montando a configuração | Guia Kubernetes</title>
+<meta name="description" content="Montando a configuração do site da padaria: ConfigMap para o que é público, Secret para o que é sensível, variáveis e arquivo no mesmo Deployment, nomes, ordem de apply e revisão.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Montando a <span class="hl">configuração</span></h1>
+<p class="intro">A Ana já sabe o que é um ConfigMap, como montá-lo como arquivo e como guardar uma senha num
+Secret. Agora ela precisa juntar tudo: o site da padaria tem catorze valores de configuração, três
+credenciais e um arquivo de cardápio, e todos precisam chegar ao mesmo pod, no formato certo, sem que nada
+sensível apareça no manifesto. Nesta aula a configuração é montada como se monta um móvel — peça por peça,
+com a ordem certa e uma revisão no fim.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Como decidir o destino de cada valor: ConfigMap, Secret, variável ou arquivo.</li>
+  <li>O esqueleto de um Deployment que recebe as duas famílias de variáveis.</li>
+  <li>Como conviver com um arquivo de configuração e variáveis no mesmo container.</li>
+  <li>Uma revisão de cinco minutos que pega os erros antes de chegarem ao cluster.</li>
+  <li>Convenções de nome e etiquetas que fazem a configuração ser encontrável daqui a seis meses.</li>
+  <li>A ordem de aplicar os objetos e o que acontece quando um deles falta.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a planilha da configuração</h2>
+
+<p>O site da padaria cresceu e a configuração virou uma planilha. Catorze valores: a moeda, o horário de
+funcionamento, a taxa de entrega por bairro, o tempo de forno, o endereço do banco, a porta, o usuário, a
+senha, o token do gateway, a chave do serviço de e-mail, o limite de pedidos por vez, a mensagem de
+boas-vindas, o caminho do arquivo de cardápio e o nível de log. Três deles são segredo. Um deles é um arquivo
+de quarenta linhas.</p>
+
+<p>Até aqui, cada valor foi resolvido no lugar onde doeu menos: um no manifesto do pod, outro na imagem,
+outro numa variável que ninguém sabia de onde vinha. O resultado é o clássico “funciona no meu computador e
+não funciona no cluster” — e, pior, um pod que ninguém consegue recriar sem perguntar para a Ana o que estava
+em cada lugar.</p>
+
+<p>Montar a configuração é o exercício de responder, para cada valor, três perguntas: <em>é segredo?</em>,
+<em>como o programa lê?</em> e <em>com que frequência muda?</em>. As respostas dão o objeto e o formato. É
+trabalho de meia hora que economiza meses — e é o que separa um manifesto de brinquedo de um manifesto que
+alguém consegue operar às três da manhã.</p>
+
+<h2>2. As peças da configuração</h2>
+
+<p>São poucas peças, e todas já apareceram nas aulas de
+<a href="configmap.html">ConfigMap</a> e de <a href="secret.html">Secret</a>. O que muda aqui é a combinação: um objeto
+para o que é público, um objeto para o que é sensível, um arquivo para o que é grande, e um Deployment que
+recebe tudo isso no molde do pod.</p>
+
+<dl class="anatomy">
+<dt>configuração pública</dt>
+<dd>O que pode aparecer num print sem causar dano: moeda, horário, endereço, tempo de espera. Vai num
+ConfigMap.</dd>
+<dt>credencial</dt>
+<dd>O que dá acesso a alguma coisa: senha, token, chave. Vai num Secret, um por serviço.</dd>
+<dt>arquivo</dt>
+<dd>Configuração grande e estruturada, como o JSON do cardápio. Vai numa chave de ConfigMap e é montada
+como volume.</dd>
+<dt><code>envFrom</code></dt>
+<dd>O jeito de entregar todas as chaves de um objeto como variáveis. Um bloco para o ConfigMap, outro para
+o Secret.</dd>
+<dt>template</dt>
+<dd>O molde do pod dentro do Deployment: <code>spec.template.spec</code>. Tudo o que é do pod — containers,
+volumes, variáveis — vive ali.</dd>
+</dl>
+
+<p>Repare que não existe uma peça “configuração do Deployment”. O Deployment não tem configuração própria: ele
+tem o molde de um pod, e é no molde que a configuração entra. Quem depura precisa lembrar disso — um
+<code>kubectl describe deployment</code> mostra o molde, e um <code>describe pod</code> mostra o pod que
+nasceu dele, com os valores já resolvidos.</p>
+
+<h2>3. O esqueleto: um Deployment, duas famílias</h2>
+
+<p>A primeira montagem é a mais comum de todas: o programa lê variáveis de ambiente, algumas públicas e
+outras sensíveis. A solução é um <code>envFrom</code> para cada objeto, na mesma lista, cada um apontando
+para o seu. A caixa começa com só a metade pública — e o site sobe, o que é o perigo: falta a credencial e
+o erro só aparece na primeira tentativa de login.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.envFrom.0.configMapRef.name=cardapio;;campo:Deployment/cardapio|spec.template.spec.containers.0.envFrom.1.secretRef.name=banco;;conta:pods[app=cardapio]=2;;texto:Running">
+  <p class="try-task">O Deployment só recebe as variáveis públicas. Acrescente o <code>envFrom</code> do
+  Secret <code>banco</code>, sem mexer no bloco do ConfigMap, e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  moeda: BRL
+  horario: 6h as 19h
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: banco
+type: Opaque
+data:
+  senha: czNuaDQ=
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          envFrom:
+            - configMapRef:
+                name: cardapio</pre>
+<pre class="out">
+configmap/cardapio created
+secret/banco created
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-m6p9k6cqzf-528vv   1/1     Running   0          9m
+cardapio-m6p9k6cqzf-xgk2n   1/1     Running   0          8m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  moeda: BRL
+  horario: 6h as 19h
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: banco
+type: Opaque
+data:
+  senha: czNuaDQ=
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          envFrom:
+            - configMapRef:
+                name: cardapio
+            - secretRef:
+                name: banco</pre>
+</div>
+
+<p>O painel mostra os três objetos criados e os dois pods do Deployment em <code>Running</code>. O que a meta
+confere é a ordem: o ConfigMap na posição zero, o Secret na posição um. Parece detalhe de estilo, e é
+deliberado: quem lê o manifesto vê primeiro o que é público, depois o que é sensível — e quem for revisar
+sabe onde olhar.</p>
+
+<p>Tecnicamente, a ordem não muda o resultado: o <code>envFrom</code> é uma lista de fontes, e cada chave
+entra no ambiente com o seu nome. O cuidado que vale é outro: <strong>não repita chave entre as fontes</strong>.
+Se o ConfigMap tem <code>senha</code> e o Secret também, o resultado é uma dúvida que ninguém quer ter em
+produção. Nome de chave é contrato: se está no ambiente, alguém pode estar lendo.</p>
+
+<h2>4. O arquivo no meio das variáveis</h2>
+
+<p>A segunda montagem junta os dois formatos. O cardápio é um JSON grande: continua no ConfigMap, mas como
+arquivo montado em <code>/config</code>. As variáveis trazem o resto. É a configuração completa do site —
+e a caixa começa sem o volume, com o programa procurando um arquivo que não existe.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|spec.template.spec.volumes.0.configMap.name=cardapio;;campo:Deployment/cardapio|spec.template.spec.volumes.0.configMap.items.0.path=menu.json;;campo:Deployment/cardapio|spec.template.spec.containers.0.volumeMounts.0.mountPath=/config;;texto:Running">
+  <p class="try-task">Monte a chave <code>cardapio.json</code> como o arquivo <code>menu.json</code>, em
+  <code>/config</code>, dentro do template do Deployment. Mantenha as duas réplicas de pé.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  cardapio.json: |
+    {
+      "preco": 4.5
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          env:
+            - name: MOEDA
+              value: BRL</pre>
+<pre class="out">
+configmap/cardapio created
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-74824llwrp-b7p28   1/1     Running   0          9m
+cardapio-74824llwrp-g7lqs   1/1     Running   0          5m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  cardapio.json: |
+    {
+      "preco": 4.5
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          configMap:
+            name: cardapio
+            items:
+              - key: cardapio.json
+                path: menu.json</pre>
+</div>
+
+<p>O painel mostra o ConfigMap, o Deployment e os dois pods. Repare no que <em>não</em> está lá: nenhuma
+variável do ConfigMap. O pod recebe o arquivo e a variável <code>MOEDA</code>, cada um pelo caminho que o
+programa espera — o JSON por arquivo porque é grande e estruturado, a moeda por variável porque é uma
+palavra.</p>
+
+<p>Essa mistura é o normal, não a exceção. Um mesmo ConfigMap pode ser consumido de duas maneiras: como
+volume, para a chave grande, e como <code>envFrom</code>, para as chaves curtas. O objeto é um só; as
+montagens é que mudam. E é por isso que separar por assunto compensa: se o JSON do cardápio e a moeda estão
+no mesmo ConfigMap, o volume com <code>items</code> escolhe a chave grande e deixa a pequena de fora — sem
+precisar de dois objetos.</p>
+
+<h2>5. A revisão antes de aplicar</h2>
+
+<p>Antes de entregar o manifesto ao cluster, cinco minutos de revisão. É o passo que ninguém faz e que pega
+quase todos os erros. A caixa abaixo é a revisão em forma de exercício: o Secret com a senha em texto puro e o
+Deployment buscando a senha no lugar errado — dois erros que se compensam até o dia em que não compensam.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Secret/banco|data.senha=czNuaDQ=;;campo:Pod/web|spec.containers.0.env.0.valueFrom.secretKeyRef.name=banco;;texto:Running">
+  <p class="try-task">Converta a senha para base64 e aponte a variável <code>DB_SENHA</code> para o Secret
+  <code>banco</code>, chave <code>senha</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: banco
+type: Opaque
+data:
+  senha: s3nh4
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: DB_SENHA
+          valueFrom:
+            configMapKeyRef:
+              name: banco
+              key: senha</pre>
+<pre class="out">
+secret/banco created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Secret
+metadata:
+  name: banco
+type: Opaque
+data:
+  senha: czNuaDQ=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: DB_SENHA
+          valueFrom:
+            secretKeyRef:
+              name: banco
+              key: senha</pre>
+</div>
+
+<p>O painel mostra o Secret e o pod criados — e, importante, mostra o mesmo <code>Running</code> nas duas
+versões, porque o painel não roda container. É por isso que a revisão existe: os dois erros desta caixa não
+aparecem em lugar nenhum do painel. Num cluster de verdade, a senha em texto puro faz a autenticação falhar
+com uma mensagem de “senha inválida” que parece problema de banco, e o <code>configMapKeyRef</code> apontando
+para um Secret deixa o pod preso em <code>CreateContainerConfigError</code>. Dois erros, dois sintomas que
+não apontam para a causa.</p>
+
+<p>A revisão de cinco minutos tem cinco perguntas. <em>Todo valor sensível está num Secret?</em>
+<em>Todo valor do <code>data</code> do Secret está em base64?</em> <em>Toda referência
+(<code>secretRef</code>, <code>configMapRef</code>, <code>secretKeyRef</code>) aponta para o objeto do tipo
+certo?</em> <em>Os nomes batem com o que existe no namespace?</em> <em>O que é arquivo está montado no
+caminho que o programa abre?</em> Cinco minutos, cinco perguntas, e a maior parte dos incidentes de
+configuração deixa de existir.</p>
+
+<h2>6. Nomes e etiquetas que envelhecem bem</h2>
+
+<p>Um manifesto é lido muito mais vezes do que é escrito, e quase sempre por alguém que não é você. A
+convenção de nomes é o que faz a configuração ser encontrável. Para a padaria, a Ana adotou três regras
+simples: o ConfigMap da aplicação se chama como a aplicação; o Secret se chama como o <em>serviço</em> que
+ele acessa; e o que é específico de um ambiente ganha sufixo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Objeto</th><th>Nome</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>ConfigMap da aplicação</td><td><code>cardapio</code></td><td>mesmo nome do Deployment: quem procura
+acha</td></tr>
+<tr><td>ConfigMap de um assunto</td><td><code>frete</code>, <code>mensagens</code></td><td>um objeto por
+assunto, não um gigante</td></tr>
+<tr><td>ConfigMap de outro ambiente</td><td><code>cardapio-teste</code></td><td>o sufixo diz o ambiente sem
+precisar abrir o objeto</td></tr>
+<tr><td>Secret de dependência</td><td><code>banco</code>, <code>gateway</code></td><td>a rotação de um não
+obriga a mexer no outro</td></tr>
+<tr><td>Etiqueta comum</td><td><code>app: cardapio</code></td><td>permite listar tudo o que é do site com
+<code>-l app=cardapio</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>As etiquetas merecem um parágrafo. ConfigMap e Secret aceitam <code>metadata.labels</code> como qualquer
+objeto, e vale usar a mesma etiqueta do Deployment (<code>app: cardapio</code>). Com ela, um
+<code>kubectl get configmaps -l app=cardapio</code> lista a configuração daquele site, e não a de todo mundo
+no namespace. Em cluster com muitos times, é a diferença entre achar e procurar.</p>
+
+<p>O que evitar: nome genérico (<code>config</code>, <code>settings</code>, <code>secret</code>), nome com
+ambiente embutido no Secret de produção (<code>banco-prod</code> dentro do namespace de produção é
+redundante), e nome que muda quando o conteúdo muda (<code>cardapio-v3</code>) — porque aí toda referência no
+manifesto precisa mudar junto. Nome é endereço; trate como endereço.</p>
+
+<h2>7. A ordem de aplicar e o ciclo de vida</h2>
+
+<p>Aqui está a parte que só se aprende quebrando: a ordem importa. O pod precisa do ConfigMap e do Secret no
+momento em que sobe. Se você aplicar o Deployment antes, os pods ficam presos em
+<code>CreateContainerConfigError</code> até os objetos aparecerem — e saem sozinhos quando aparecem, o que é
+uma boa notícia e um péssimo hábito de diagnóstico.</p>
+
+<p>A ordem que funciona é a das dependências: primeiro o ConfigMap, depois o Secret, por último o Deployment.
+Num arquivo único com <code>---</code> entre os documentos, essa já é a ordem natural — o <code>apply</code>
+processa na sequência em que aparecem. Em pipelines, a tentação de aplicar tudo de uma vez em paralelo é
+grande; resista, ou aceite o pod que sobe na segunda tentativa.</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe deployment cardapio
+Name:              cardapio
+Namespace:         default
+CreationTimestamp: Fri, 27 Nov 2026 15:50:21 +0000
+Labels:            app=cardapio
+Annotations:       deployment.kubernetes.io/revision: "1"
+Selector:          app=cardapio
+Pod Template:
+  Labels:  app=cardapio
+  Containers:
+   web:
+    Image:        cardapio:1.0
+    Port:         8080/TCP
+    Environment:  <none>
+    Mounts:       <none>
+Conditions:
+  Type        Status   Reason
+  Available   True     MinimumReplicasAvailable
+OldReplicaSets:  <none>
+NewReplicaSet:   cardapio-wj4jsx2tcw (2/2 replicas created)</pre>
+
+<p>A transcrição acima é a resposta do painel para o <code>describe</code> de um Deployment que não tem
+configuração nenhuma. Repare no bloco <strong>Pod Template</strong>: é ali que a configuração aparece quando
+existe — <code>Environment</code> para as variáveis, <code>Mounts</code> para os volumes. Um Deployment com a
+configuração montada mostra as duas linhas preenchidas, e é assim que se confere, no cluster, se o molde
+recebeu o que você escreveu.</p>
+
+<p>Depois do apply, a conferência do conjunto é uma tabela só. A resposta abaixo é do painel, num cluster
+de prova com o Deployment da padaria já aplicado:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m</pre>
+
+<p>Três colunas que parecem iguais e não são. <code>READY</code> é quantos pods estão prontos sobre o total
+pedido. <code>UP-TO-DATE</code> é quantos já foram atualizados para a última versão do molde.
+<code>AVAILABLE</code> é quantos estão disponíveis para atender. Num apply que acabou de mudar o molde, os
+três números ficam diferentes por alguns segundos — e é assim que se acompanha uma atualização sem abrir pod
+por pod.</p>
+
+<p>Sobre o ciclo de vida, duas verdades que valem para os dois objetos de configuração. A primeira: aplicar
+de novo o mesmo manifesto é seguro — o <code>apply</code> atualiza o que existe e cria o que falta. A
+segunda: nada reinicia sozinho. Mudar o ConfigMap não reinicia o Deployment; mudar o Secret, tampouco. Quem
+decide quando os pods nascem de novo é você, e é o assunto da
+<a href="recarregar-config.html">próxima aula</a>.</p>
+
+<h2>8. Diagnóstico: onde olhar quando falta configuração</h2>
+
+<p>Quando o pod não sobe ou o programa reclama de configuração, há uma ordem de investigação que resolve
+quase tudo em três comandos. Primeiro <code>kubectl get pods</code>, para ver o estado. Depois
+<code>kubectl describe pod</code>, para ler os eventos — é lá que aparecem <code>FailedMount</code> e
+<code>CreateContainerConfigError</code>, com o nome do objeto que faltou. Por último
+<code>kubectl logs</code>, que só existe se o container subiu: se o pod está preso antes do start, o log não
+tem nada a dizer.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Onde olhar</th><th>Causa provável</th></tr>
+</thead>
+<tbody>
+<tr><td><code>CreateContainerConfigError</code></td><td>eventos do <code>describe pod</code></td><td>referência
+a ConfigMap ou Secret que não existe, chave errada ou namespace errado</td></tr>
+<tr><td><code>FailedMount</code></td><td>eventos do <code>describe pod</code></td><td>volume apontando para
+objeto ausente, ou <code>items</code> com chave inexistente</td></tr>
+<tr><td>variável vazia no programa</td><td><code>describe pod</code>, seção
+<code>Environment</code></td><td><code>envFrom</code> com nome de chave diferente do que o código lê</td></tr>
+<tr><td>funcionava e parou após o apply</td><td><code>get configmaps</code> e
+<code>get secrets</code></td><td>objeto atualizado, pods antigos com o valor velho</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Na padaria, esse roteiro virou uma linha no runbook: “pod não sobe → describe → procurar o nome do objeto
+na mensagem”. O nome que aparece no evento é o mesmo que está no manifesto — e é por isso que a convenção de
+nomes da seção anterior não é estética: ela encurta o caminho entre o sintoma e a linha do arquivo.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a configuração que existia só na cabeça da Ana</h3>
+<p>O site rodava com três valores que a Ana ajustava direto no pod, com <code>kubectl edit</code>. Quando
+ela tirou férias, ninguém sabia quais eram. O pod foi recriado por um nó que reiniciou, e o site voltou com
+os valores do manifesto — que estavam desatualizados há meses. A configuração que mora no pod é configuração
+descartável; a que mora no repositório é a de verdade.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o mesmo manifesto em dois ambientes</h3>
+<p>Teste e produção usavam o mesmo arquivo, com nomes de objeto iguais em namespaces diferentes. Funcionou
+até alguém aplicar o manifesto no lugar errado, com a senha de teste indo para produção. A correção foi
+separar por diretório (com o nome do ambiente explícito) e passar a revisar o namespace corrente antes de
+cada apply — um <code>kubectl config current-context</code> de dois segundos.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o arquivo que ninguém sabia que era configuração</h3>
+<p>O programa lia <code>/app/seed/cardapio.json</code> — um arquivo que veio junto com a primeira versão da
+imagem e ficou. Três versões depois, ninguém lembrava que o cardápio real vinha dali, e uma atualização
+“limpa” da imagem apagou o arquivo. O site subiu com o cardápio vazio. Configuração escondida dentro da
+imagem é dívida: um dia a limpeza cobra.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Onde fica o endereço do serviço de e-mail e onde fica a
+chave de API dele?</p>
+<label><input type="radio" name="q1"> os dois no Secret, para não separar</label>
+<label><input type="radio" name="q1"> o endereço no ConfigMap, a chave no Secret</label>
+<label><input type="radio" name="q1"> os dois na imagem, com valor padrão</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual é a ordem certa de aplicar os objetos de uma
+aplicação?</p>
+<label><input type="radio" name="q2"> Deployment, depois ConfigMap, depois Secret</label>
+<label><input type="radio" name="q2"> qualquer ordem: o cluster se ajusta sozinho</label>
+<label><input type="radio" name="q2"> ConfigMap e Secret antes do Deployment</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Onde a configuração aparece no
+<code>kubectl describe deployment</code>?</p>
+<label><input type="radio" name="q3"> no bloco <code>Pod Template</code>, em
+<code>Environment</code> e <code>Mounts</code></label>
+<label><input type="radio" name="q3"> na seção <code>Conditions</code></label>
+<label><input type="radio" name="q3"> no campo <code>Annotations</code>, como texto</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a família de variáveis</h2>
+<p>Complete o bloco que entrega todas as chaves do Secret <code>banco</code> como variáveis de ambiente:</p>
+<div class="ex-code">envFrom:
+  - <input aria-label="resposta 1" data-answer="secretRef" placeholder="...">:
+      name: banco</div>
+<p class="ex-dica">Dica: <code>secretRef</code> para Secret, <code>configMapRef</code> para ConfigMap — os dois
+moram dentro de <code>envFrom</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Montar a configuração é decidir o destino de cada valor: o que é público vai no ConfigMap, o que é
+sensível vai no Secret, o que é grande e estruturado vira arquivo montado como volume. O Deployment recebe
+tudo no molde do pod — <code>envFrom</code> para as famílias de variáveis, <code>volumeMounts</code> e
+<code>volumes</code> para os arquivos — e a aplicação nunca precisa saber de onde veio cada coisa.</p>
+
+<p>Nomes e etiquetas fazem parte da montagem: um objeto por assunto, o Secret com o nome do serviço que ele
+acessa, a etiqueta <code>app</code> repetida em tudo para que o conjunto seja encontrável. E a ordem de
+aplicar segue as dependências: ConfigMap e Secret antes do Deployment, sempre.</p>
+
+<p>No fim, a revisão de cinco minutos: sensível no Secret, base64 correto, referência do tipo certo, nome que
+existe, arquivo no caminho que o programa abre. Com isso, o que sobra é a parte que muda com o tempo — e é
+exatamente por onde a próxima aula começa.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Três perguntas por valor: é segredo? como o programa lê? com que frequência muda?</li>
+  <li>Um <code>envFrom</code> por objeto, e nenhuma chave repetida entre as fontes.</li>
+  <li>Arquivo grande vai como volume; valor curto, como variável — do mesmo ConfigMap, se fizer sentido.</li>
+  <li>No Deployment, tudo é <code>spec.template.spec</code>: o molde do pod.</li>
+  <li>Ordem de apply: ConfigMap, Secret, Deployment.</li>
+  <li>Pod travado? <code>describe</code> e leia o evento: ele diz o nome do objeto que faltou.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

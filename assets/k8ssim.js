@@ -611,6 +611,22 @@
       var sel = pod.spec.nodeSelector || {};
       Object.keys(sel).forEach(function (k) { if (no.labels[k] !== sel[k]) bloqueios.push("node(s) didn't match Pod's node affinity/selector"); });
       if (pod.spec.nodeName && pod.spec.nodeName !== no.nome) bloqueios.push("node(s) didn't match Pod's node name");
+      var aff = pod.spec.affinity && pod.spec.affinity.nodeAffinity && pod.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution;
+      if (aff && (aff.nodeSelectorTerms || []).length) {
+        var casouAlgum = aff.nodeSelectorTerms.some(function (termo) {
+          var ok = (termo.matchExpressions || []).every(function (e) {
+            var v = (no.labels || {})[e.key];
+            if (e.operator === "In") return (e.values || []).indexOf(v) >= 0;
+            if (e.operator === "NotIn") return (e.values || []).indexOf(v) < 0;
+            if (e.operator === "Exists") return v != null;
+            if (e.operator === "DoesNotExist") return v == null;
+            if (e.operator === "Gt" || e.operator === "Lt") return true;
+            return false;
+          });
+          return ok;
+        });
+        if (!casouAlgum) bloqueios.push("node(s) didn't match Pod's node affinity/selector");
+      }
       var u = usadoNoNo(c, no);
       if (u.cpu + q.cpu > no.cpu) bloqueios.push("Insufficient cpu");
       if (u.memoria + q.memoria > no.memoria) bloqueios.push("Insufficient memory");
@@ -624,7 +640,13 @@
       var msg = "0/" + c.nos.length + " nodes are available: " + (detalhe || "no nodes available") + ". preemption: 0/" + c.nos.length + " nodes are available: " + c.nos.length + " Preemption is not helpful for scheduling.";
       return { erro: msg };
     }
-    candidatos.sort(function (a, b) { return a.nome < b.nome ? -1 : 1; });
+    /* espalha: o nó com menos pods primeiro; empate resolve pelo nome */
+    candidatos.sort(function (a, b) {
+      var pa = c.objs.filter(function (x) { return x.kind === "Pod" && x.status && x.status.no === a.nome; }).length;
+      var pb = c.objs.filter(function (x) { return x.kind === "Pod" && x.status && x.status.no === b.nome; }).length;
+      if (pa !== pb) return pa - pb;
+      return a.nome < b.nome ? -1 : 1;
+    });
     return { no: candidatos[0].nome };
   }
 
@@ -679,7 +701,8 @@
     var rs = listar(c, "ReplicaSet", dep.metadata.namespace).filter(function (r) {
       return r.metadata.ownerReferences && r.metadata.ownerReferences[0] && r.metadata.ownerReferences[0].name === dep.metadata.name && r.metadata.ownerReferences[0].kind === "Deployment";
     });
-    var atual = rs[rs.length - 1];
+    var nomeEsperado = dep.metadata.name + "-" + hashTemplate(dep.spec.template);
+    var atual = rs.filter(function (r) { return r.metadata.name === nomeEsperado; })[0];
     if (!atual) {
       var novo = {
         kind: "ReplicaSet", apiVersion: "apps/v1",
@@ -878,7 +901,7 @@
   }
 
   /* aplicar uma lista de documentos → linhas do kubectl apply */
-  function aplicar(c, docs) {
+  function aplicar(c, docs, criar) {
     var linhas = [], erros = [], aplicados = [];
     docs.forEach(function (bruto) {
       var kind = bruto && bruto.kind;
@@ -902,8 +925,18 @@
       }
       var obj = K.comDefaults(bruto);
       var existente = achar(c, kind, obj.metadata.namespace, obj.metadata.name);
+      if (existente && criar) {
+        erros.push('Error from server (AlreadyExists): ' + (GRUPO[kind] ? K.recursoPorNome(kind).plural + "." + GRUPO[kind] : K.recursoPorNome(kind).plural) + ' "' + obj.metadata.name + '" already exists');
+        return;
+      }
       if (existente) {
         obj.status = existente.status;
+        obj.revisoes = existente.revisoes;
+        obj.revision = existente.revision;
+        if (kind === "Deployment" && JSON.stringify(existente.spec.template) !== JSON.stringify(obj.spec.template)) {
+          obj.revisoes = (existente.revisoes || []).concat([{ template: copia(existente.spec.template), causa: "apply" }]);
+          obj.revision = (existente.revision || 1) + 1;
+        }
         var igual = JSON.stringify(obj.spec) === JSON.stringify(existente.spec);
         remover(c, existente);
         c.objs.push(obj);
@@ -920,11 +953,13 @@
     return { linhas: linhas, erros: erros, aplicados: aplicados };
   }
 
+  function criarObjeto(c, doc) { return aplicar(c, [doc], true); }
+
   function removerObjeto(c, obj) { remover(c, obj); reconciliar(c); }
 
   window.K8sCluster = {
     novo: novoCluster, achar: achar, listar: listar, aplicar: aplicar, reconciliar: reconciliar,
-    remover: removerObjeto, casarSeletor: casaSeletor, seletorDeTexto: seletorDeTexto,
+    remover: removerObjeto, criar: criarObjeto, casarSeletor: casaSeletor, seletorDeTexto: seletorDeTexto,
     nomeKubectl: nomeKubectl, podPronto: podPronto, evento: evento, GRUPO: GRUPO,
     usadoNoNo: usadoNoNo, pedidosDoPod: pedidosDoPod
   };
@@ -988,9 +1023,15 @@
   function colunaIdade(obj) { return K.idadeDo((obj.metadata.namespace || "") + obj.metadata.name); }
 
   /* --------------------------------------------------------------- get pods */
+  function listaOuObjeto(lista, opts, api, kind) {
+    if (opts.o !== "yaml" && opts.o !== "json") return null;
+    var obj = lista.length === 1 && opts.comNome ? lista[0] : { apiVersion: api, kind: "List", metadata: { resourceVersion: "" }, items: lista };
+    return opts.o === "yaml" ? paraYaml(obj.apiVersion ? obj : Object.assign({ apiVersion: api, kind: kind }, obj)) : JSON.stringify(obj, null, 4);
+  }
+
   function getPods(c, lista, opts) {
-    if (opts.o === "yaml") return paraYaml({ apiVersion: "v1", kind: "List", metadata: { resourceVersion: "" }, items: lista });
-    if (opts.o === "json") return JSON.stringify({ apiVersion: "v1", kind: "List", items: lista }, null, 4);
+    if (opts.o === "yaml") return listaOuObjeto(lista, opts, "v1", "Pod");
+    if (opts.o === "json") return listaOuObjeto(lista, opts, "v1", "Pod");
     if (opts.o === "name") return lista.map(function (p) { return "pod/" + p.metadata.name; }).join("\n");
     var cab = ["NAME", "READY", "STATUS", "RESTARTS", "AGE"];
     var wide = opts.o === "wide";
@@ -1176,6 +1217,7 @@
       else if (v.secret) out.push("    Type:      Secret (a volume populated by a Secret)\n    SecretName:  " + v.secret.secretName);
       else if (v.persistentVolumeClaim) out.push("    Type:       PersistentVolumeClaim (a reference to a PersistentVolumeClaim in the same namespace)\n    ClaimName:  " + v.persistentVolumeClaim.claimName);
       else if (v.emptyDir) out.push("    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)");
+      else if (v.hostPath) out.push("    Type:       HostPath (bare host directory volume)\n    Path:       " + v.hostPath.path + "\n    HostPathType:  " + (v.hostPath.type || ""));
       else out.push("    Type:      Projected (a volume that contains injected data from multiple sources)");
     });
     out.push("QoS Class:                   " + qosClass(p));
@@ -1266,6 +1308,42 @@
     ]));
     if (s.spec.type === "LoadBalancer") out.push("LoadBalancer Ingress:   " + ((s.status && s.status.loadBalancer && s.status.loadBalancer.ingress || [{}])[0].ip || "<pending>"));
     out.push("Events:  <none>");
+    return out.join("\n");
+  }
+
+  function describeNode(c, nome) {
+    var no = (c.nos || []).filter(function (n) { return n.nome === nome; })[0];
+    if (!no) return 'Error from server (NotFound): nodes "' + nome + '" not found';
+    var usado = C.usadoNoNo(c, no);
+    var out = [];
+    out.push(linhaKv([
+      ["Name", no.nome],
+      ["Roles", no.papel === "control-plane" ? "control-plane" : "<none>"],
+      ["Labels", Object.keys(no.labels || {}).map(function (k) { return k + "=" + no.labels[k]; }).join("\n" + new Array(24).join(" "))],
+      ["Annotations", "<none>"],
+      ["CreationTimestamp", "Fri, 27 Nov 2026 15:46:00 +0000"],
+      ["Taints", (no.taints || []).length ? no.taints.map(function (t) { return t.key + "=" + (t.value || "") + ":" + t.effect; }).join("\n" + new Array(24).join(" ")) : "<none>"]
+    ]));
+    out.push("Unschedulable:  false");
+    out.push("Conditions:");
+    var t = [["Type", "Status", "LastHeartbeatTime", "Reason", "Message"]];
+    t.push(["MemoryPressure", "False", "Fri, 27 Nov 2026 16:02:00 +0000", "KubeletHasSufficientMemory", "kubelet has sufficient memory available"]);
+    t.push(["Ready", "True", "Fri, 27 Nov 2026 16:02:00 +0000", "KubeletReady", "kubelet is posting ready status"]);
+    out.push(tabela(t).split("\n").map(function (l) { return "  " + l; }).join("\n"));
+    out.push("Capacity:");
+    out.push("  cpu:                2");
+    out.push("  memory:             " + Math.round((no.memoria || 4096) / 1024) + "Gi");
+    out.push("  pods:               110");
+    out.push("Allocatable:");
+    out.push("  cpu:                1900m");
+    out.push("  memory:             " + Math.round(((no.memoria || 4096) - 200) / 1024) + "Gi");
+    out.push("Allocated resources:");
+    out.push("  (Total limits may be over 100 percent, i.e., overcommitted.)");
+    out.push("  Resource           Requests      Limits");
+    out.push("  --------           --------      ------");
+    out.push("  cpu                " + usado.cpu + "m           0");
+    out.push("  memory             " + Math.round(usado.memoria) + "Mi           0");
+    out.push("Events:              <none>");
     return out.join("\n");
   }
 
@@ -1431,6 +1509,11 @@
     if (!rec) return 'error: the server doesn\'t have a resource type "' + alvo.split("/")[0] + '"';
     var nome = alvo.split("/")[1] || p.resto[2] || null;
     var ns = o.ns || nsAtual(ctx);
+    if (rec.kind === "Event") {
+      var evs = (c.eventos || []).slice(-12);
+      if (!evs.length) return "No resources found" + (rec.ns ? " in " + ns + " namespace." : ".");
+      return getEventos(c, null, o);
+    }
     var lista = rec.kind === "Node"
       ? c.nos.map(function (n) { return { kind: "Node", apiVersion: "v1", metadata: { name: n.nome, labels: n.labels }, papel: n.papel }; })
       : C.listar(c, rec.kind, rec.ns ? ns : null);
@@ -1464,6 +1547,7 @@
     var obj = C.achar(c, rec.kind, rec.ns ? ns : null, nome);
     if (!obj) return 'Error from server (NotFound): ' + rec.plural + ' "' + nome + '" not found';
     if (rec.kind === "Pod") return describePod(c, obj);
+    if (rec.kind === "Node") return describeNode(c, nome);
     if (rec.kind === "Deployment") return describeDeploy(c, obj);
     if (rec.kind === "Service") return describeSvc(c, obj);
     return describeGenerico(c, obj);
@@ -1520,16 +1604,16 @@
           template: { metadata: { labels: { app: nomeDep } }, spec: { containers: [{ name: nomeDep, image: imagem || "nginx", ports: [{ containerPort: 80 }] }] } }
         }
       };
-      var r = C.aplicar(c, [doc]);
+      var r = C.criar(c, doc);
       return (r.erros.length ? r.erros[0] : "deployment.apps/" + nomeDep + " created");
     }
     if (tipo === "configmap") {
-      var nomeCm = p.resto[3];
+      var nomeCm = p.resto[2];
       var literais = p.resto.filter(function (a) { return a.indexOf("--from-literal=") === 0; });
       var dados = {};
       literais.forEach(function (l) { var kv = l.replace("--from-literal=", ""); var i = kv.indexOf("="); dados[kv.slice(0, i)] = kv.slice(i + 1); });
       var docCm = { apiVersion: "v1", kind: "ConfigMap", metadata: { name: nomeCm, namespace: ns }, data: dados };
-      var rc = C.aplicar(c, [docCm]);
+      var rc = C.criar(c, docCm);
       return rc.erros.length ? rc.erros[0] : "configmap/" + nomeCm + " created";
     }
     if (tipo === "secret") {
@@ -1542,7 +1626,7 @@
         dadosSec[kv.slice(0, i)] = window.btoa(kv.slice(i + 1));
       });
       var docSec = { apiVersion: "v1", kind: "Secret", metadata: { name: nomeSec, namespace: ns }, type: "Opaque", data: dadosSec };
-      var rs = C.aplicar(c, [docSec]);
+      var rs = C.criar(c, docSec);
       return rs.erros.length ? rs.erros[0] : "secret/" + nomeSec + " created";
     }
     if (tipo === "service") {
@@ -1555,7 +1639,7 @@
         apiVersion: "batch/v1", kind: "Job", metadata: { name: nomeJob, namespace: ns },
         spec: { template: { spec: { restartPolicy: "Never", containers: [{ name: nomeJob, image: imgJob || "busybox" }] } } }
       };
-      var rj = C.aplicar(c, [docJob]);
+      var rj = C.criar(c, docJob);
       return rj.erros.length ? rj.erros[0] : "job.batch/" + nomeJob + " created";
     }
     return 'error: unknown command "create ' + tipo + '"';
@@ -1576,7 +1660,7 @@
     if (!imagem) return "error: --image is required for kubectl run";
     if (!p.resto.some(function (a) { return a.indexOf("--restart=Always") >= 0; })) {
       var doc = { apiVersion: "v1", kind: "Pod", metadata: { name: nome, namespace: ns, labels: { run: nome } }, spec: { containers: [{ name: nome, image: imagem, ports: [{ containerPort: 80 }] }] } };
-      var r = C.aplicar(c, [doc]);
+      var r = C.criar(c, doc);
       return r.erros.length ? r.erros[0] : "pod/" + nome + " created";
     }
     var docd = {
@@ -1584,7 +1668,7 @@
       metadata: { name: nome, namespace: ns, labels: { run: nome } },
       spec: { replicas: 1, selector: { matchLabels: { run: nome } }, template: { metadata: { labels: { run: nome } }, spec: { containers: [{ name: nome, image: imagem, ports: [{ containerPort: 80 }] }] } } }
     };
-    var rd = C.aplicar(c, [docd]);
+    var rd = C.criar(c, docd);
     return rd.erros.length ? rd.erros[0] : "deployment.apps/" + nome + " created";
   }
 
@@ -1647,6 +1731,7 @@
       if (ct.name === cn) { ct.image = img; feito = true; }
     });
     if (!feito) return 'error: unable to find container named "' + cn + '"';
+    obj.revisoes = (obj.revisoes || []).concat([{ template: copia(obj.spec.template), causa: "set image" }]);
     obj.revision = (obj.revision || 1) + 1;
     C.reconciliar(c);
     return C.nomeKubectl(rec.kind) + "/" + nome + " image updated";
@@ -1666,12 +1751,21 @@
     }
     if (sub === "history") {
       var linhas = [["REVISION", "CHANGE-CAUSE"]];
-      var rev = dep.revision || 1;
       linhas.push(["1", "<none>"]);
-      if (rev > 1) linhas.push([String(rev), "<none>"]);
+      (dep.revisoes || []).forEach(function (r, i) { linhas.push([String(i + 2), r.causa || "<none>"]); });
+      if (dep.revision && dep.revision > linhas.length - 1) linhas.push([String(dep.revision), "<none>"]);
       return "deployment.apps/" + nome + " \n" + tabela(linhas);
     }
-    if (sub === "undo") { C.reconciliar(c); return "deployment.apps/" + nome + " rolled back"; }
+    if (sub === "undo") {
+      var hist = dep.revisoes || [];
+      if (!hist.length) return 'deployment.apps/"' + nome + '" has no rollout history';
+      var anterior = hist.pop();
+      dep.revisoes = hist;
+      dep.spec.template = copia(anterior.template);
+      dep.revision = (dep.revision || 1) + 1;
+      C.reconciliar(c);
+      return "deployment.apps/" + nome + " rolled back";
+    }
     if (sub === "restart") {
       dep.revision = (dep.revision || 1) + 1;
       C.reconciliar(c);
@@ -1944,12 +2038,14 @@
           return { ok: false, motivo: "existem " + lista.length + " " + m[1] + (m[2] ? "[" + m[2] + "]" : "") + " (esperado " + m[3] + ")" };
         }
       } else if (nome === "pronto") {
-        var p2 = valor.split("/"), rec4 = K.recursoPorNome(p2[0]);
-        var o2 = rec4 ? C.achar(cluster, rec4.kind, cluster.nsCorrente || "default", p2[1]) : null;
-        if (!o2) return { ok: false, motivo: "não existe " + valor };
+        var igualP = valor.lastIndexOf("=");
+        var alvoN = Number(valor.slice(igualP + 1));
+        var ref = valor.slice(0, igualP).split("/");
+        var rec4 = K.recursoPorNome(ref[0]);
+        var o2 = rec4 ? C.achar(cluster, rec4.kind, cluster.nsCorrente || "default", ref[1]) : null;
+        if (!o2) return { ok: false, motivo: "não existe " + valor.slice(0, igualP) };
         var prontas = (o2.status && (o2.status.readyReplicas != null ? o2.status.readyReplicas : o2.status.ready)) || 0;
-        var alvoN = Number(String(valor).split("=").pop());
-        if (prontas !== alvoN) return { ok: false, motivo: valor.split("=")[0] + " tem " + prontas + " prontas (esperado " + alvoN + ")" };
+        if (prontas !== alvoN) return { ok: false, motivo: valor.slice(0, igualP) + " tem " + prontas + " prontas (esperado " + alvoN + ")" };
       } else {
         return { ok: false, motivo: 'passo de meta desconhecido: "' + passo + '" (use ' + Object.keys(PASSOS).join(", ") + ")" };
       }

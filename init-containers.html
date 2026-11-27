@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Init containers | Guia Kubernetes</title>
+<meta name="description" content="Init containers no Kubernetes: o passo que roda antes da aplicação, em ordem, até terminar bem. Status Init:0/1, logs por container, volumes compartilhados e erros comuns.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Init <span class="hl">containers</span></h1>
+<p class="intro">O site da Ana subia em dois segundos e caía na primeira consulta: o banco ainda estava
+começando e a tabela de preços não existia. Reiniciar o pod resolvia, até a próxima vez que o cluster
+reiniciava tudo junto. O que faltava era um passo <em>antes</em> do site — algo que esperasse o banco
+responder e só então deixasse a aplicação começar. No Kubernetes esse passo tem nome:
+<strong>init container</strong>. Nesta aula a Ana aprende a colocá-lo no manifesto, a ler o pod enquanto ele
+espera e a usar o mesmo volume para os dois lados.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um init container e por que ele roda antes dos demais.</li>
+  <li>Que eles rodam em ordem, um de cada vez, e precisam terminar com sucesso.</li>
+  <li>Como ler um pod no estado <code>Init:0/1</code> e <code>PodInitializing</code>.</li>
+  <li>Ver os logs de cada init com <code>kubectl logs -c</code>.</li>
+  <li>Preparar dados num volume <code>emptyDir</code> para a aplicação ler.</li>
+  <li>Por que o <code>READY</code> do pod não conta os init containers.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o site que chegava cedo demais</h2>
+
+<p>Todo container sobe ao mesmo tempo em que o cluster termina de agendar o pod, e o cluster não tem a menor
+ideia de que o seu programa depende de outro. Quando a Ana reiniciava o cluster inteiro de uma vez, os pods
+do banco, do cache e do site saíam do papel juntos. O site era o mais rápido: abria a porta em dois segundos
+e já recebia a primeira requisição. O banco levava quinze para aceitar conexões.</p>
+
+<p>O resultado era sempre o mesmo: o site subia, tentava consultar a tabela de preços, recebia "relation does
+not exist" e morria. O kubelet reiniciava o container (política <code>Always</code>, como você viu na aula
+anterior), e na terceira ou quarta tentativa o banco já estava de pé e tudo funcionava. Funcionava por sorte,
+não por desenho.</p>
+
+<p>Existem três jeitos de resolver isso: fazer o programa tentar de novo (bom, mas cada programa precisa
+saber fazer), usar uma sonda de prontidão (resolve o tráfego, não a inicialização) ou colocar um passo antes
+de tudo que garanta o que a aplicação precisa. O terceiro é o init container, e ele tem a vantagem de ser
+declarativo: fica escrito no manifesto que o site só começa depois do banco.</p>
+
+<h2>2. O que é um init container</h2>
+
+<p>Um init container é um container como qualquer outro — mesma imagem, mesmo <code>command</code>, mesmos
+volumes — com uma diferença de papel: ele roda <strong>antes</strong> dos containers da aplicação e precisa
+terminar com sucesso. Enquanto ele não termina, os containers da aplicação nem são iniciados. É um ensaio,
+não um ensaio geral: se o init falha, ninguém entra em cena.</p>
+
+<p>Ele fica em <code>spec.initContainers</code>, uma lista separada de <code>spec.containers</code>. Os dois
+campos convivem no mesmo <code>spec</code>, e o pod só fica pronto quando todos os inits terminaram e todos
+os containers de aplicação estão rodando. Pense numa produção de pão: o init é o forno sendo aquecido, e o
+container de aplicação é o pão que só entra depois que a temperatura está certa.</p>
+
+<dl class="anatomy">
+<dt>init container</dt>
+<dd>Container que roda antes da aplicação, em <code>spec.initContainers</code>. Precisa terminar com
+sucesso.</dd>
+<dt>ordem</dt>
+<dd>Eles executam um de cada vez, na ordem da lista. O segundo só começa quando o primeiro termina
+bem.</dd>
+<dt>Init:0/1</dt>
+<dd>O que aparece na coluna <code>STATUS</code>: nenhum init concluído de um total de um. Muda para
+<code>Init:1/2</code> conforme avançam.</dd>
+<dt>PodInitializing</dt>
+<dd>O motivo dentro do container da aplicação enquanto os inits rodam. Ele existe, mas está esperando.</dd>
+<dt>emptyDir</dt>
+<dd>Volume temporário que vive enquanto o pod viver. É o jeito clássico de passar arquivo do init para a
+aplicação.</dd>
+<dt>kubectl logs -c</dt>
+<dd>A flag que escolhe o container do qual ver o log — obrigatória para olhar o init, que tem nome
+próprio.</dd>
+</dl>
+
+<p>Uma coisa que o init <em>não</em> pode: ter <code>ports</code> útil, sonda de vida ou de prontidão. Ele não
+recebe tráfego e não é monitorado como serviço; é uma tarefa com hora para acabar. Se o seu init tem uma
+porta aberta, provavelmente ele deveria ser um sidecar — assunto da próxima aula.</p>
+
+<h2>3. O pod enquanto espera</h2>
+
+<p>Enquanto o init roda, o <code>kubectl get pods</code> não mostra <code>Running</code>. Ele mostra o
+progresso: <code>Init:0/1</code> com um init pendente, <code>Init:1/2</code> com um de dois concluídos, e
+assim por diante. Quando todos terminam, o status passa por <code>PodInitializing</code> e chega a
+<code>Running</code>.</p>
+
+<pre class="term">$ kubectl get pods
+NAME       READY   STATUS     RESTARTS   AGE
+cardapio   0/1     Init:0/1   0          25s
+
+$ kubectl describe pod cardapio | head -n 32
+Init Containers:
+  espera-banco:
+    Image:          busybox
+    Command:
+      sh
+      -c
+      until nc -z banco 5432; do sleep 2; done
+    State:          Running
+      Started:      Fri, 27 Nov 2026 15:49:10 +0000
+    Ready:          False
+    Restart Count:  0
+    Environment:    <none>
+    Mounts:         <none>
+Containers:
+  web:
+    Image:          cardapio:1.0
+    State:          Waiting
+      Reason:       PodInitializing
+    Ready:          False
+    Restart Count:  0</pre>
+
+<p>Essa é a transcrição de um cluster local com o init ainda rodando. Dois detalhes valem ouro. Primeiro: o
+<code>describe</code> ganha um bloco <strong>Init Containers</strong> acima do bloco
+<strong>Containers</strong> — é ali que você confere qual init está travado e o que ele está executando.
+Segundo: o container da aplicação aparece com <code>State: Waiting</code> e
+<code>Reason: PodInitializing</code>, o que responde de imediato "por que o site não subiu?". Não é crash: é
+espera.</p>
+
+<p>O painel do guia mostra a tabela do <code>get pods</code>, mas não simula a execução dos inits: para ele,
+o pod fica <code>Running</code> direto. É a limitação que o guia já avisou — o motor não roda container —, e
+por isso o estado de espera aparece aqui como transcrição. O que você pode provar na caixa é o manifesto: se
+o init está declarado no lugar certo, com a imagem certa e na ordem certa.</p>
+
+<h2>4. Para que servem, na prática</h2>
+
+<p>Três usos cobrem quase tudo o que se vê em produção. O primeiro é <strong>esperar</strong>: um laço que
+testa a conexão com o banco, o cache ou um serviço externo, e só sai quando a resposta chega. O comando
+clássico é <code>until nc -z banco 5432; do sleep 2; done</code> — testa, espera dois segundos, testa de
+novo.</p>
+
+<p>O segundo é <strong>preparar volume</strong>: baixar um arquivo, gerar uma configuração, ajustar permissão
+de diretório, copiar dados iniciais. Tudo isso escreve num <code>emptyDir</code> que a aplicação também
+monta, e assim o app encontra o arquivo pronto ao acordar. É o caso da Ana: o init baixa o cardápio do dia e
+o site só precisa ler.</p>
+
+<p>O terceiro é <strong>verificar pré-condição</strong>: conferir se um segredo foi montado, se uma migração
+já rodou, se a versão do banco é compatível. Se a condição não vale, o init falha — e um init que falha é
+uma forma elegante de impedir que a aplicação suba em condição errada, com o motivo visível no
+<code>describe</code>.</p>
+
+<p>Repare no que esses usos têm em comum: são passos com fim, não serviços. Nenhum deles precisa ficar
+rodando para sempre. Quando a sua necessidade é "um processo auxiliar que fica ao lado do app", você está na
+aula seguinte.</p>
+
+<h2>5. No manifesto: initContainers</h2>
+
+<p>A estrutura é idêntica à de <code>containers</code>: uma lista, cada item com <code>name</code> e
+<code>image</code> obrigatórios, e os campos opcionais que você já conhece. O cluster valida os mesmos
+campos obrigatórios e usa as mesmas mensagens de erro.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/cardapio|spec.initContainers.0.image=busybox">
+  <p class="try-task">O init container está sem imagem e o cluster recusa o pod inteiro. Ponha
+  <code>image: busybox</code> no init e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  initContainers:
+    - name: espera-banco
+      command: ["sh", "-c", "until nc -z banco 5432; do sleep 2; done"]
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.initContainers[0].image: Required value
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  initContainers:
+    - name: espera-banco
+      image: busybox
+      command: ["sh", "-c", "until nc -z banco 5432; do sleep 2; done"]
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>A mensagem é <code>spec.initContainers[0].image: Required value</code> — e note que ela derruba o pod
+inteiro: nenhum dos containers de aplicação é criado enquanto o manifesto estiver inválido. Validação é
+tudo-ou-nada. Também é comum querer <code>command</code> e <code>args</code> no init: valem exatamente as
+regras da primeira aula desta leva.</p>
+
+<p>Uma diferença que confunde: o init container <em>não</em> aceita <code>readinessProbe</code> nem
+<code>livenessProbe</code>, e o cluster recusa com
+<code>may not have lifecycle, livenessProbe, readinessProbe, or startupProbe</code>. Se você copiou um bloco
+de container comum e colou em <code>initContainers</code>, é essa a mensagem que vai aparecer.</p>
+
+<h2>6. A ordem importa — e o volume também</h2>
+
+<p>Como os inits rodam em sequência, a posição na lista é a ordem de execução. Isso é uma ferramenta, não um
+detalhe: baixar o cardápio pode vir antes de esperar o banco, ou depois, dependendo do que faz sentido. Se o
+download precisa do banco no ar, ele vem depois; se ele só precisa de rede, pode vir primeiro e economizar
+tempo.</p>
+
+<p>A caixa abaixo tem dois inits na ordem errada e a aplicação sem o volume montado. O objetivo: o download
+acontece primeiro, os dois escrevem no mesmo <code>emptyDir</code>, e o site lê de <code>/dados</code>.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cardapio|spec.initContainers.0.name=baixa-cardapio;;campo:Pod/cardapio|spec.initContainers.1.name=espera-banco;;campo:Pod/cardapio|spec.containers.0.volumeMounts.0.mountPath=/dados;;texto:Running">
+  <p class="try-task">Inverta a ordem dos dois inits (o download primeiro) e monte o volume
+  <code>dados</code> também no container <code>web</code>, em <code>/dados</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  initContainers:
+    - name: espera-banco
+      image: busybox
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+    - name: baixa-cardapio
+      image: busybox
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  containers:
+    - name: web
+      image: cardapio:1.0
+  volumes:
+    - name: dados
+      emptyDir: {}</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  initContainers:
+    - name: baixa-cardapio
+      image: busybox
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+    - name: espera-banco
+      image: busybox
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  containers:
+    - name: web
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      emptyDir: {}</pre>
+</div>
+
+<p>Repare que o cluster aceita as duas versões sem reclamar — a ordem é semântica, não sintaxe. Quem
+reclama, se você errar, é o comportamento do sistema: a migração roda antes do download e falha procurando um
+arquivo que ninguém baixou. Por isso vale conferir a lista com calma: no manifesto, a ordem de leitura é a
+ordem de execução.</p>
+
+<p>O <code>emptyDir</code> é o volume que nasce vazio junto com o pod e morre com ele, escrevível por
+qualquer container que o monte. É o par natural do init: um escreve, outro lê, e ninguém precisa de disco
+persistente para isso. Se o pod for recriado, o volume começa vazio de novo — e o init roda outra vez.</p>
+
+<h2>7. READY não conta init containers</h2>
+
+<p>Uma confusão garantida: o pod tem dois inits e um container de aplicação. Quantos aparecem no
+<code>READY</code>? A resposta é <code>1/1</code>. A coluna conta apenas os containers de
+<code>spec.containers</code> — os inits não entram na conta, porque eles já terminaram quando o pod fica
+pronto. Se aparecessem, todo pod com init ficaria eternamente incompleto.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;texto:1/1;;campo:Pod/cardapio|spec.initContainers.0.name=espera-banco">
+  <p class="try-task">Acrescente um init container <code>espera-banco</code> com a imagem
+  <code>busybox</code> e rode. O <code>READY</code> do pod continua <code>1/1</code>: init não entra na
+  conta.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  initContainers:
+    - name: espera-banco
+      image: busybox
+      command: ["sh", "-c", "until nc -z banco 5432; do sleep 2; done"]
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>Isso tem uma consequência boa para quem lê painel: <code>1/1</code> quer dizer "a aplicação está pronta",
+e pronto quer dizer "os inits terminaram". Não existe estado "meio pronto". Se você precisa saber se o pod
+está esperando ou falhando, o lugar é a coluna <code>STATUS</code>, não o <code>READY</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>No <code>get pods</code></th><th>Quer dizer</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Init:0/1</code></td><td>nenhum init concluído</td><td>ver o log do init: ele está esperando algo</td></tr>
+<tr><td><code>Init:1/2</code></td><td>um de dois concluído</td><td>o segundo é o que está rodando agora</td></tr>
+<tr><td><code>Init:Error</code></td><td>o init terminou com erro</td><td><code>logs -c</code> do init e o exit code no describe</td></tr>
+<tr><td><code>Init:CrashLoopBackOff</code></td><td>o init está falhando em repetição</td><td>o backoff do kubelet está atuando; corrija o motivo</td></tr>
+<tr><td><code>PodInitializing</code></td><td>inits terminaram, aplicação começando</td><td>normal, dura segundos</td></tr>
+<tr><td><code>Running</code> com <code>1/1</code></td><td>aplicação de pé</td><td>nada: é o estado bom</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>Init:CrashLoopBackOff</code> merece um aviso: é o mesmo backoff do container comum, com as mesmas
+esperas crescentes. Um init que sempre falha deixa o pod parado nesse estado e a aplicação nunca sobe — o que
+é o comportamento desejado, mas exige que alguém olhe. O sintoma "o site não subiu e não tem log" costuma
+terminar aqui.</p>
+
+<h2>8. Os logs do init</h2>
+
+<p>Como o init tem nome próprio, o log dele sai com <code>-c</code>:</p>
+
+<pre class="term">$ kubectl logs cardapio -c espera-banco
+aguardando o banco em banco:5432
+aguardando o banco em banco:5432
+aguardando o banco em banco:5432
+banco respondeu, seguindo
+
+$ kubectl logs cardapio -c baixa-cardapio
+curl: (6) Could not resolve host: cardapio</pre>
+
+<p>Transcrição de um pod em que o primeiro init terminou e o segundo falhou. A leitura é direta: o
+<code>espera-banco</code> fez o trabalho dele (tentou três vezes, o banco respondeu), e o
+<code>baixa-cardapio</code> não conseguiu resolver o nome do serviço — erro de rede ou de nome, não de
+Kubernetes. Sem a flag <code>-c</code>, o <code>kubectl logs</code> mostraria o log do primeiro container de
+aplicação e você ficaria olhando um log vazio, concluindo que o pod não tem nada a dizer.</p>
+
+<p>Se o pod tiver sido reiniciado e você quiser o log da tentativa anterior, existe
+<code>kubectl logs cardapio -c espera-banco --previous</code>. É a mesma ideia do <code>--previous</code> dos
+containers comuns, e vale para o init também.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>init container</th><th>container da aplicação</th></tr>
+</thead>
+<tbody>
+<tr><td>quando roda</td><td>antes de todos os outros, em ordem</td><td>depois que todos os inits terminam</td></tr>
+<tr><td>precisa terminar</td><td>sim, com código <code>0</code></td><td>não: fica rodando</td></tr>
+<tr><td>recebe tráfego</td><td>não</td><td>sim, quando o Service aponta para o pod</td></tr>
+<tr><td>sondas e lifecycle</td><td>não são permitidas</td><td>são permitidas</td></tr>
+<tr><td>se falhar</td><td>o pod repete conforme a <code>restartPolicy</code></td><td>o kubelet reinicia, com backoff</td></tr>
+<tr><td>no <code>READY</code></td><td>não conta</td><td>conta</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma novidade recente que vale saber que existe: desde as versões 1.28/1.29 o Kubernetes aceita
+<code>restartPolicy: Always</code> dentro de um init container, o que transforma o init num container que
+sobe antes da aplicação e continua rodando. É o "sidecar nativo", e é o degrau entre esta aula e a
+próxima.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a espera que nunca acabava</h3>
+<p>O init testava <code>nc -z banco 5432</code> e o pod ficava em <code>Init:0/1</code> para sempre. O log
+mostrava "aguardando o banco" a cada dois segundos. O problema não era o init: o Service do banco estava no
+namespace errado, e o nome <code>banco</code> não existia ali. O init só estava contando a verdade. Depois
+de corrigir o nome, o pod subiu em quinze segundos.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o arquivo que a aplicação não encontrava</h3>
+<p>O init baixava o cardápio em <code>/dados/cardapio.json</code>, mas o container da aplicação não montava o
+volume. O site subia e respondia "ENOENT". A solução foi acrescentar o mesmo <code>volumeMounts</code> nos
+dois lados — e a lição: volume compartilhado precisa ser declarado em todos os containers que o usam, não
+apenas no <code>spec</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o init gordo que atrasava o deploy</h3>
+<p>Um init baixava a base inteira de produtos a cada início, e cada pod levava quarenta segundos para ficar
+pronto. Durante um rollout, isso significava dois minutos de espera. A Ana moveu o download para uma imagem
+que já vinha com os dados e deixou no init só a verificação de que o arquivo existia. Init é para
+pré-condição, não para trabalho pesado.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Quando os init containers rodam?</p>
+<label><input type="radio" name="q1"> ao mesmo tempo que os containers da aplicação</label>
+<label><input type="radio" name="q1"> antes dos containers da aplicação, em ordem, até terminarem
+bem</label>
+<label><input type="radio" name="q1"> depois que a aplicação fica pronta, para limpar</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Um pod tem dois inits e um container de aplicação, e está
+em <code>Running</code>. O que mostra o <code>READY</code>?</p>
+<label><input type="radio" name="q2"> <code>3/3</code>, contando tudo</label>
+<label><input type="radio" name="q2"> <code>2/3</code>, porque os inits já terminaram</label>
+<label><input type="radio" name="q2"> <code>1/1</code>: só os containers de aplicação contam</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O pod está em <code>Init:0/1</code> há cinco minutos. Por
+onde começar?</p>
+<label><input type="radio" name="q3"> pelo log do init, com <code>kubectl logs pod -c nome-do-init</code></label>
+<label><input type="radio" name="q3"> apagar o pod e aumentar o limite de CPU</label>
+<label><input type="radio" name="q3"> olhar o log do container da aplicação, que ainda não existe</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: esperar o banco antes do site</h2>
+<p>Complete o manifesto do pod <code>cardapio</code> para que um init container espere o banco responder
+antes de o site começar.</p>
+<div class="ex-code">spec:
+  <input aria-label="resposta 1" data-answer="initContainers" placeholder="...">:
+    - name: espera-banco
+      image: busybox
+      command: ["sh", "-c", "until nc -z banco 5432; do sleep 2; done"]
+  containers:
+    - name: web
+      image: cardapio:1.0</div>
+<p class="ex-dica">Dica: é uma lista irmã de <code>containers</code>, dentro do mesmo <code>spec</code>. Se
+você colocar o init como um item de <code>containers</code>, ele passa a ser um container comum — e a
+aplicação sobe junto com ele.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Init containers são containers que rodam antes da aplicação, um de cada vez, na ordem da lista, e precisam
+terminar com sucesso. Eles moram em <code>spec.initContainers</code>, aceitam <code>image</code>,
+<code>command</code>, <code>args</code> e volumes, e recusam sondas e ciclo de vida. Servem para esperar
+dependência, preparar volume e conferir pré-condição — nunca para atender tráfego.</p>
+
+<p>Enquanto rodam, o pod mostra <code>Init:0/1</code> (ou <code>1/2</code>, conforme avança) e o container da
+aplicação fica em <code>PodInitializing</code>. Falha leva a <code>Init:Error</code> ou
+<code>Init:CrashLoopBackOff</code>, com o mesmo backoff do container comum. Para ver o que o init disse, é
+<code>kubectl logs pod -c nome</code>; sem a flag, você olha o container errado.</p>
+
+<p>O <code>READY</code> continua contando só a aplicação: <code>1/1</code> com dois inits é normal. E o
+<code>emptyDir</code> é a ponte entre o init que escreve e o app que lê, desde que o volume seja montado nos
+dois. Na próxima aula o container auxiliar não termina — ele fica ao lado do app: é o sidecar, e ele muda o
+jeito de pensar o pod.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Init roda antes, em ordem, e precisa sair com <code>0</code> para o próximo começar.</li>
+  <li>Fica em <code>spec.initContainers</code>, lista irmã de <code>spec.containers</code>.</li>
+  <li><code>Init:0/1</code> é espera, não erro; <code>Init:Error</code> é falha.</li>
+  <li><code>kubectl logs pod -c nome-do-init</code> — sem <code>-c</code> você lê o container errado.</li>
+  <li><code>READY 1/1</code> com dois inits está certo: init não entra na conta.</li>
+  <li>Volume compartilhado precisa de <code>volumeMounts</code> em cada container que o usa.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Namespaces | Guia Kubernetes</title>
+<meta name="description" content="Namespaces no Kubernetes: a divisão lógica do cluster, os que já existem, como criar um, o mesmo nome em dois lugares e o que é do cluster, não do namespace.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Namespaces</span></h1>
+<p class="intro">A Ana tem dois cardápios: o de verdade, que o cliente vê, e um de teste, onde ela experimenta
+preço novo e imagem nova antes de publicar. Os dois se chamam <code>cardapio</code>. No cluster, isso seria
+briga — dois objetos com o mesmo nome no mesmo lugar não cabem. A solução não é inventar
+<code>cardapio-teste-v2</code>: é separar os dois em pastas. Essas pastas existem, têm nome, e a Ana já usou
+uma delas em quase toda aula sem perceber. São os namespaces.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um namespace e o que ele realmente separa.</li>
+  <li>Quais namespaces já existem em todo cluster e para que serve cada um.</li>
+  <li>Como criar um namespace, por comando e por manifesto.</li>
+  <li>Por que criar um objeto em namespace inexistente dá erro.</li>
+  <li>O mesmo nome em dois namespaces: o que muda e o que não muda.</li>
+  <li>O que é do namespace e o que é do cluster inteiro.</li>
+  <li>Quando vale criar namespace e quando ele só atrapalha.</li>
+</ul>
+</div>
+
+<h2>1. A cena: dois cardápios, um nome só</h2>
+
+<p>A Ana aplicou o manifesto do cardápio de teste no cluster e o site saiu do ar por alguns minutos. O
+Deployment de teste tinha o mesmo nome do de produção, e o <code>apply</code> não criou um segundo: ele
+<em>atualizou</em> o que já existia. A imagem de teste entrou no lugar da imagem boa, as réplicas foram
+trocadas e o cliente viu a versão que ela estava experimentando.</p>
+
+<p>O susto tem três lições embutidas. A primeira: nome é único dentro de um namespace, e o
+<code>apply</code> procura por nome. A segunda: “atualizar” é o comportamento correto do <code>apply</code> —
+ele existe para isso. A terceira: o cluster tem uma forma de separar dois mundos que não depende de inventar
+nomes, e é ela que a Ana vai usar dali em diante. Em vez de <code>cardapio</code> e
+<code>cardapio-teste</code>, ela passa a ter <code>cardapio</code> em <code>producao</code> e
+<code>cardapio</code> em <code>teste</code>.</p>
+
+<p>Se o cluster é uma pasta cheia de arquivos, como dizia a aula de <code>get</code>, o namespace é uma
+subpasta. Você continua com um cluster só, um kubectl só, um nó só — e cada grupo de objetos mora na sua
+subpasta, com nomes independentes.</p>
+
+<h2>2. O que um namespace separa</h2>
+
+<p>A separação mais visível é de nomes: dois pods chamados <code>cardapio</code> convivem sem problema desde
+que estejam em namespaces diferentes, exatamente como dois arquivos <code>index.html</code> em pastas
+diferentes. Comandos como <code>get</code>, <code>describe</code>, <code>logs</code>, <code>exec</code> e
+<code>delete</code> obedecem a esse recorte: sem <code>-n</code>, olham o <code>default</code>.</p>
+
+<p>A segunda separação é de permissão e de cota. Em cluster de time, cada namespace pode ter suas próprias
+regras de quem pode fazer o quê, e um limite de quanta CPU e memória o conjunto pode pedir. É isso que impede
+o ambiente de teste de derrubar produção: mesmo com regras separadas, o nó é o mesmo, e a cota é o que
+garante a fatia de cada um.</p>
+
+<p>O que o namespace <strong>não</strong> separa é rede. Por padrão, um pod do namespace <code>teste</code>
+alcança um pod do <code>producao</code> pelo nome do serviço, sem pedir licença. Isolar tráfego é trabalho de
+<code>NetworkPolicy</code>, assunto mais adiante. Confundir as duas coisas é o erro conceitual mais comum do
+tema: namespace organiza e limita, mas não é firewall.</p>
+
+<dl class="anatomy">
+<dt>namespace</dt>
+<dd>Divisão lógica de nomes dentro do cluster. Todo objeto de namespace precisa morar em um.</dd>
+<dt>default</dt>
+<dd>O namespace usado quando você não diz nada. É onde a maioria dos testes acaba morando.</dd>
+<dt>kube-system</dt>
+<dd>Onde o próprio Kubernetes roda: DNS, controladores, proxies. Não é lugar para o seu site.</dd>
+<dt>escopo</dt>
+<dd>Se o objeto vive dentro de um namespace (<em>namespaced</em>) ou é do cluster inteiro, como nó e
+namespace.</dd>
+<dt>quota</dt>
+<dd>O limite de recursos somados que um namespace pode pedir. Separar por namespace é o que torna a cota
+possível.</dd>
+</dl>
+
+<h2>3. Os namespaces que já existem</h2>
+
+<p>Todo cluster nasce com pelo menos dois. O primeiro é o <code>default</code>, onde tudo cai quando você não
+escolhe nada — é onde os pods das aulas anteriores moraram. O segundo é o <code>kube-system</code>, onde o
+próprio Kubernetes vive: o DNS que resolve nomes de serviço, os controladores, o proxy de rede. Mexer nele é
+mexer no encanamento do prédio.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:kube-system;;texto:default">
+  <p class="try-task">A caixa só lista pods. Liste os namespaces para ver o <code>default</code> e o
+  <code>kube-system</code> — o comando é <code>kubectl get namespaces</code>.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+No resources found in default namespace.
+</pre>
+<pre class="solucao">kubectl get namespaces</pre>
+</div>
+
+<p>A tabela tem duas colunas: <code>NAME</code> e <code>AGE</code>. O <code>AGE</code> maior costuma ser do
+<code>default</code> e do <code>kube-system</code>, porque nasceram com o cluster. Os outros, criados depois,
+mostram a idade da criação — e essa é uma informação útil: namespace com idade de três minutos é alguém
+testando alguma coisa agora.</p>
+
+<p>Em clusters de nuvem aparecem também <code>kube-public</code> e <code>kube-node-lease</code>. O primeiro
+guarda informação que pode ser lida por qualquer um, o segundo guarda os batimentos dos nós. Nos dois casos, a
+regra prática é a mesma do <code>kube-system</code>: olhe, entenda, não mexa. O lugar do site da padaria é um
+namespace seu, com nome que diga o que é.</p>
+
+<h2>4. Criar um namespace</h2>
+
+<p>Criar é uma linha: <code>kubectl create namespace padaria</code>. A resposta é
+<code>namespace/padaria created</code>, no mesmo formato de sempre. Se já existir, o cluster recusa com
+<code>AlreadyExists</code> — e isso é bom, porque o comando não sobrescreve nada por acidente.</p>
+
+<p>O erro que aparece logo depois é o mais instrutivo do tema: criar um objeto num namespace que não existe.
+O cluster não cria o namespace por você; ele recusa o objeto inteiro.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:pod/cardapio created;;texto:Running">
+  <p class="try-task">O comando tenta criar um pod no namespace <code>teste</code>, que ainda não existe.
+  Primeiro crie o namespace e depois rode o pod de novo, terminando com a listagem no namespace certo.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0 -n teste</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0 -n teste
+Error from server (NotFound): error when creating "STDIN": namespaces "teste" not found
+</pre>
+<pre class="solucao">kubectl create namespace teste
+kubectl run cardapio --image=cardapio:1.0 -n teste
+kubectl get pods -n teste</pre>
+</div>
+
+<p>A mensagem do erro merece ser lida devagar: <code>error when creating "STDIN": namespaces "teste" not
+found</code>. O <code>STDIN</code> aparece porque o objeto veio de um comando, não de um arquivo — no dia em
+que você usar <code>apply -f</code>, ali vai estar o nome do arquivo. O resto é direto: o namespace
+<code>teste</code> não foi encontrado, e nada foi criado. Nenhum pod ficou pela metade.</p>
+
+<p>O mesmo namespace também pode nascer de um manifesto, e é o que você faz quando quer guardar tudo no
+repositório:</p>
+
+<pre class="file" data-file="namespace.yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria</pre>
+
+<p>Vale conhecer a validação, porque ela aparece em qualquer objeto: nome de namespace segue a mesma regra de
+nome de pod — minúsculas, números e hífen, começando e terminando por letra ou número. Um manifesto com
+<code>name: Padaria</code> é recusado com a frase comprida que você já viu na aula de erro de nome: “a
+lowercase RFC 1123 label must consist of lower case alphanumeric characters or '-'…”. O conserto é trocar uma
+letra.</p>
+
+<h2>5. O mesmo nome em dois namespaces</h2>
+
+<p>Aqui está o motivo de o tema existir. Dois pods com o mesmo nome, em namespaces diferentes, convivem sem
+conflito — e cada comando enxerga só o seu. A transcrição abaixo é de uma sessão real no cluster de teste,
+com os dois “cardápios” lado a lado:</p>
+
+<pre class="term">ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0 -n padaria
+pod/cardapio created
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0 -n teste
+pod/cardapio created
+ana@notebook:~$ kubectl get pods -n padaria
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          3m
+ana@notebook:~$ kubectl get pods -n teste
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          1m</pre>
+
+<p>Repare que o <code>pod/cardapio created</code> apareceu duas vezes, sem erro de duplicidade. Se os dois
+estivessem no mesmo namespace, o segundo seria recusado com <code>AlreadyExists</code>. E repare também na
+consequência para o <code>delete</code>: apagar <code>cardapio</code> em <code>teste</code> não toca no
+<code>cardapio</code> de <code>padaria</code>. O nome é o mesmo; o objeto não.</p>
+
+<p>Para o Service, o namespace muda até o endereço. Um serviço chamado <code>cardapio</code> no namespace
+<code>padaria</code> tem o nome completo <code>cardapio.padaria.svc.cluster.local</code>, e é assim que ele é
+achado de fora do namespace. De dentro do mesmo namespace, basta <code>cardapio</code>. Essa diferença é a
+origem de metade dos “funciona local e não funciona entre serviços”: a URL estava com o nome curto e o
+chamador morava em outro namespace.</p>
+
+<h2>6. O namespace corrente</h2>
+
+<p>Todo comando que fala de objeto por namespace aceita <code>-n nome</code> ou
+<code>--namespace=nome</code>. Existe ainda um terceiro caminho, que é mudar o padrão do contexto:
+<code>kubectl config set-context --current --namespace=padaria</code>. A partir daí, todo comando sem
+<code>-n</code> olha o <code>padaria</code>. É prático e traiçoeiro: o mesmo comando passa a significar outra
+coisa, e quem lê o histórico não sabe em qual pasta você estava.</p>
+
+<p>A caixa abaixo percorre o caminho inteiro com a flag explícita: dois namespaces, um <code>cardapio</code>
+em cada, e uma listagem por vez. Repare que o <code>-n</code> aparece em todas as linhas — é ele que escolhe a
+pasta, e é por isso que o comando funciona igual para quem lê e para quem escreveu.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:pod/cardapio created;;texto:Running">
+  <p class="try-task">A caixa começa listando o namespace <code>teste</code>, que ainda não existe. Crie os
+  dois namespaces, suba um <code>cardapio</code> em cada um e liste os dois para ver o mesmo nome convivendo
+  sem conflito.</p>
+<pre class="yaml">kubectl get pods -n teste</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods -n teste
+No resources found in teste namespace.
+</pre>
+<pre class="solucao">kubectl create namespace teste
+kubectl create namespace padaria
+kubectl run cardapio --image=cardapio:1.0 -n teste
+kubectl run cardapio --image=cardapio:1.0 -n padaria
+kubectl get pods -n teste
+kubectl get pods -n padaria</pre>
+</div>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Objeto</th><th>Vive em namespace?</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pod</code>, <code>deployment</code>, <code>service</code></td><td>sim</td><td>são a carga de trabalho e o acesso a ela</td></tr>
+<tr><td><code>configmap</code>, <code>secret</code></td><td>sim</td><td>configuração pertence ao que a consome</td></tr>
+<tr><td><code>persistentvolumeclaim</code></td><td>sim</td><td>o pedido de disco é feito pelo time que usa</td></tr>
+<tr><td><code>namespace</code></td><td>não</td><td>ele <em>é</em> a divisão: não caberia dentro de si mesmo</td></tr>
+<tr><td><code>node</code></td><td>não</td><td>máquina é infraestrutura, compartilhada por todos</td></tr>
+<tr><td><code>persistentvolume</code></td><td>não</td><td>o disco existe antes de alguém pedir</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa tabela explica metade dos comandos que “não funcionam”. <code>kubectl get nodes</code> não aceita
+<code>-n</code> porque nó não mora em namespace; <code>kubectl get pods</code> sem <code>-n</code> mostra só
+o <code>default</code> porque pod mora. Quando a resposta é <code>No resources found</code>, a primeira
+pergunta é sempre “em qual namespace eu estou olhando?”.</p>
+
+<h2>7. Quando criar um namespace</h2>
+
+<p>A divisão mais comum é por ambiente: <code>producao</code>, <code>homolog</code>, <code>teste</code>. Ela
+resolve o problema da Ana da seção 1 e é o que permite aplicar o mesmo manifesto em lugares diferentes sem
+editar nome. A segunda é por time ou por projeto, num cluster compartilhado: cada time com sua cota, suas
+permissões, seu espaço para experimentar sem pisar no vizinho.</p>
+
+<p>Existe também a divisão por cliente, comum em produto que atende várias empresas com a mesma aplicação.
+Funciona, e tem custo: cada namespace novo é mais um lugar para configurar, monitorar e limpar. Namespace é
+uma ferramenta de organização, não um botão de “isolar tudo”. Se a separação for de rede, o caminho é
+<code>NetworkPolicy</code>; se for de máquina, é nó separado; se for de cluster, é outro cluster.</p>
+
+<p>Uma regra prática que evita o exagero: crie namespace quando existir uma fronteira de
+<em>responsabilidade</em> — quem pode mexer, quanto pode gastar, o que pode apagar sem levar outra coisa
+junto. Se a única diferença for o nome do objeto, talvez baste uma etiqueta. Etiqueta separa listas;
+namespace separa mundos.</p>
+
+<p>O teste mais rápido é fazer a pergunta ao contrário: “se eu apagar este namespace inteiro agora, quem
+chora?”. Se a resposta for “ninguém, é tudo descartável”, ele é um bom namespace de teste. Se a resposta
+incluir o banco de dados de outra pessoa, o desenho está errado — ou o namespace é grande demais, ou objetos
+de gente diferente moraram juntos. A tabela abaixo resume as fronteiras que costumam valer a pena e as que
+costumam virar bagunça.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Fronteira</th><th>Criar namespace?</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>produção × homologação × teste</td><td>sim</td><td>o mesmo nome de objeto, com risco e cota diferentes</td></tr>
+<tr><td>um time × outro time</td><td>sim</td><td>permissões e cota separadas num cluster compartilhado</td></tr>
+<tr><td>um cliente × outro cliente</td><td>sim, com critério</td><td>isola dados e nomes, mas multiplica o que manter</td></tr>
+<tr><td>um microsserviço × outro</td><td>não</td><td>o nome já distingue; a fronteira não é de responsabilidade</td></tr>
+<tr><td>uma pessoa × outra</td><td>não</td><td>etiqueta com o dono resolve e não cria mais um lugar para limpar</td></tr>
+<tr><td>um experimento de dez minutos</td><td>não</td><td>use <code>-n teste</code> e apague os objetos no fim</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare na linha do microsserviço. É tentador dar um namespace a cada serviço — <code>cardapio</code>,
+<code>precos</code>, <code>pedidos</code> — porque parece organizado. Na prática, os três falam entre si o
+tempo todo, compartilham o mesmo ConfigMap de ambiente e sobem juntos numa versão. Você ganha nomes curtos e
+perde a visão de conjunto: um <code>kubectl get pods</code> sem <code>-n</code> passa a mostrar um terço do
+sistema, e cada investigação começa com uma caçada ao namespace certo.</p>
+
+<h2>8. As armadilhas do dia a dia</h2>
+
+<p>Quatro coisas mordem quem começa com namespaces. A primeira é esquecer o <code>-n</code> na metade dos
+comandos: cria num, lista em outro, apaga num terceiro. A cura é colar a flag nos três e, em script, guardar
+o namespace numa variável. A segunda é criar objeto em namespace inexistente e ler o erro como se fosse do
+objeto — <code>namespaces "teste" not found</code> é sobre o namespace, não sobre o pod.</p>
+
+<p>A terceira é apagar um namespace sem olhar o que tem dentro. Ele leva tudo: pods, deployments, services,
+configmaps, secrets, e o disco dos <code>PersistentVolumeClaim</code> que estiverem lá. Não há confirmação
+nem lista de filhos — o comando responde <code>namespace/teste deleted</code> e o estrago já aconteceu. A
+quarta é usar o <code>kube-system</code> como se fosse o <code>default</code>: qualquer coisa que você
+quebrar ali pode levar o DNS do cluster junto, e aí nada resolve nada.</p>
+
+<pre class="term">ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0 -n teste
+Error from server (NotFound): error when creating "STDIN": namespaces "teste" not found</pre>
+
+<p>Essa frase é a companheira de quem trabalha com namespace. Ela diz três coisas ao mesmo tempo: o objeto
+não foi criado, o motivo é o namespace, e o nome exato que faltou está entre aspas no fim. Na dúvida, o
+comando seguinte é <code>kubectl get namespaces</code> — se o nome não estiver na lista, é isso.</p>
+
+<p>Em script, a defesa é não repetir o nome em cada linha. Guarde o namespace numa variável e passe sempre
+ela: <code>NS=padaria</code> e depois <code>kubectl get pods -n "$NS"</code>,
+<code>kubectl logs cardapio -n "$NS"</code>, <code>kubectl delete pod cardapio -n "$NS"</code>. Quando o
+script roda em outro ambiente, muda uma linha e o resto acompanha. A variável também serve de aviso para quem
+lê: aquele comando tem um alvo explícito, não está à mercê do contexto de quem o executou. É a diferença
+entre “apaguei o pod errado” e “apaguei o pod do namespace que o script mandou”.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o site que caiu com um apply de teste</h3>
+<p>O Deployment de teste tinha o mesmo nome do de produção, e o <code>apply</code> atualizou o objeto
+existente. O conserto foi criar o namespace <code>teste</code>, mudar o <code>metadata.namespace</code> do
+manifesto de teste e aplicar de novo. Desde então existe um <code>cardapio</code> em <code>producao</code> e um
+<code>cardapio</code> em <code>teste</code>, e o pior que um teste pode fazer é derrubar o próprio
+namespace.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o serviço que não achava o outro</h3>
+<p>O site chamava <code>http://precos/api</code> e recebia erro de nome não resolvido. O serviço
+<code>precos</code> existia — em outro namespace. De dentro do mesmo namespace, o nome curto funciona; de
+fora, é preciso o nome completo <code>precos.producao.svc.cluster.local</code>. O erro não era de rede nem de
+Service: era de endereço relativo, como um arquivo que você procura na pasta errada.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a limpeza que levou o banco</h3>
+<p>Num cluster de homologação, alguém apagou o namespace <code>teste</code> para começar do zero. Levou junto
+o banco de dados que o time usava para ensaiar migração — porque o banco estava lá dentro. A regra que ficou
+escrita no README: antes de apagar um namespace, listar o que existe nele, tipo por tipo, e conferir se
+alguma coisa dali não é descartável.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Dois pods com o nome <code>cardapio</code> convivem no
+mesmo cluster se:</p>
+<label><input type="radio" name="q1"> tiverem etiquetas diferentes</label>
+<label><input type="radio" name="q1"> estiverem em namespaces diferentes</label>
+<label><input type="radio" name="q1"> um deles usar imagem diferente</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Onde o Kubernetes instala o próprio DNS e os
+controladores?</p>
+<label><input type="radio" name="q2"> no namespace <code>default</code></label>
+<label><input type="radio" name="q2"> no namespace do projeto</label>
+<label><input type="radio" name="q2"> no namespace <code>kube-system</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual destes objetos <strong>não</strong> vive em
+namespace?</p>
+<label><input type="radio" name="q3"> <code>node</code></label>
+<label><input type="radio" name="q3"> <code>pod</code></label>
+<label><input type="radio" name="q3"> <code>configmap</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: criar a pasta do cluster</h2>
+
+<p>Complete o comando que cria um namespace chamado <code>padaria</code>:</p>
+
+<div class="ex-code">kubectl create <input aria-label="resposta 1" data-answer="namespace" placeholder="..."> padaria</div>
+
+<p class="ex-dica">Dica: o subcomando do <code>create</code> tem o mesmo nome do objeto. A resposta esperada
+é <code>namespace/padaria created</code>; se o nome já existir, vem <code>AlreadyExists</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Namespace é a divisão lógica do cluster: um lugar com nome onde objetos de mesmo nome convivem sem
+conflito. Todo cluster nasce com <code>default</code> e <code>kube-system</code>; o primeiro é onde os testes
+caem quando você não escolhe, o segundo é onde o próprio Kubernetes mora. Criar é
+<code>kubectl create namespace nome</code>, e criar objeto em namespace inexistente dá
+<code>namespaces "x" not found</code>.</p>
+
+<p>Comandos de objeto aceitam <code>-n</code>; o <code>default</code> vale quando você não diz nada. O nome
+do serviço muda conforme quem pergunta: curto dentro do namespace, completo
+(<code>servico.namespace.svc.cluster.local</code>) fora dele. E nem tudo vive em namespace: nó, volume
+persistente e o próprio namespace são do cluster inteiro. Namespace organiza nomes, permissões e cotas — não
+isola rede, e não substitui pensar antes de apagar.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Namespace = subpasta do cluster; nomes iguais convivem em namespaces diferentes.</li>
+  <li><code>default</code> é o padrão; <code>kube-system</code> é do Kubernetes — não mexa.</li>
+  <li><code>kubectl create namespace padaria</code> cria; repetir dá <code>AlreadyExists</code>.</li>
+  <li>Objeto em namespace inexistente: <code>namespaces "teste" not found</code>, nada é criado.</li>
+  <li><code>-n</code> escolhe o namespace; sem ele, é sempre <code>default</code>.</li>
+  <li>Nó, volume persistente e namespace são do cluster, não do namespace.</li>
+  <li>Apagar namespace leva tudo o que está dentro — sem confirmação.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

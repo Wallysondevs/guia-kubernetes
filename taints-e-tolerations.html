@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Taints e tolerations | Guia Kubernetes</title>
+<meta name="description" content="Taints e tolerations na prática: reservar um nó para o forno da padaria da Ana, ler o evento untolerated taint e escrever a toleration no lugar certo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Taints e <span class="hl">tolerations</span></h1>
+<p class="intro">A Ana comprou o forno novo — na verdade, alugou uma máquina com mais memória para assar
+os relatórios do mês — e quer que ela seja usada só por ele. O site do cardápio não pode ocupar esse nó
+por acidente e deixar a fornada esperando. Reservar um nó no Kubernetes não se faz com senha nem com
+pasta: faz-se com uma marca no nó, a <strong>taint</strong>, e uma permissão no pod, a
+<strong>toleration</strong>. Nesta aula a Ana fecha a porta dos três nós, vê o pod ficar em
+<code>Pending</code>, aprende a ler o evento que explica o motivo e abre a porta do jeito certo.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é uma taint, onde ela mora e por que ela existe.</li>
+  <li>Os três efeitos: <code>NoSchedule</code>, <code>PreferNoSchedule</code> e <code>NoExecute</code>.</li>
+  <li>A sintaxe do <code>kubectl taint</code> para pôr e tirar a marca.</li>
+  <li>Como escrever a toleration no manifesto e o que cada campo significa.</li>
+  <li>Por que toleration <em>não</em> atrai o pod — e o que usar junto para atrair.</li>
+  <li>Ler o evento <code>untolerated taint</code> e o <code>Taints:</code> do
+  <code>kubectl describe node</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: um nó só para o forno</h2>
+
+<p>O cluster da Ana tem três nós: o <code>guia-control-plane</code> e os workers <code>guia-worker</code>
+e <code>guia-worker2</code>. O forno é um Job pesado, que precisa de 2 GB de memória e roda por quarenta
+minutos. Os workers têm 4 GB cada; o site do cardápio usa boa parte disso. Se o forno cair no mesmo nó do
+site, os dois brigam por memória e algum pod morre.</p>
+
+<p>A ideia dela é simples: marcar o <code>guia-worker2</code> como “reservado ao forno” e garantir que só
+o forno entre ali. Repare que são duas coisas diferentes: <em>impedir</em> que os outros entrem e
+<em>permitir</em> que o forno entre. O Kubernetes separa as duas de propósito, com objetos diferentes, e
+essa separação é a fonte de quase toda a confusão do assunto.</p>
+
+<p>A marca no nó se chama <strong>taint</strong> — “mancha”, em inglês. A permissão no pod se chama
+<strong>toleration</strong> — “tolerância”. O nome é desagradável, mas a metáfora é clara: o nó está
+manchado de “só o forno”, e só um pod que tolera aquela mancha pode ser agendado ali. Todo pod que não
+tolera fica de fora, sem discussão.</p>
+
+<h2>2. Taint no nó, toleration no pod</h2>
+
+<p>Uma taint tem três partes: uma chave, um valor opcional e um efeito. No comando ela aparece como
+<code>forno=true:NoSchedule</code>. A chave é <code>forno</code>, o valor é <code>true</code> e o efeito é
+<code>NoSchedule</code> — “não agende aqui quem não tolerar”. Quem tolera precisa declarar, no manifesto
+do pod, uma toleration que case com essa chave e esse efeito.</p>
+
+<p>Duas consequências que valem o preço da aula. A primeira: a taint é do nó, não do pod nem do
+namespace. Ela vale para todo mundo que tenta agendar ali, inclusive para o Deployment do site, para o
+Job do forno e para os pods do sistema. A segunda: a taint não escolhe <em>quem</em> entra; ela só
+repele quem não tem a permissão. Se dois pods toleram a mancha, os dois podem entrar — a taint não
+reserva vaga para ninguém.</p>
+
+<p>É por isso que taint e toleration quase nunca aparecem sozinhas. Para reservar um nó de verdade, você
+combina as duas coisas: a taint expulsa os indesejados e o pod do forno leva, além da toleration, um
+<code>nodeSelector</code> ou uma afinidade que o <em>puxa</em> para aquele nó. Sem o empurrão, o forno
+pode ser agendado em qualquer nó livre — inclusive longe do que você reservou. O assunto da <a href="node-selector-affinity.html">próxima aula</a>
+entra aqui de propósito: taint repele, seletor atrai.</p>
+
+<h2>3. <code>kubectl taint</code>: pôr, ver e tirar</h2>
+
+<p>A marca se põe por comando, não por manifesto. Não existe “arquivo de taints”: a taint é um atributo do
+nó, como a etiqueta, e o nó é um objeto que você raramente descreve em YAML. O comando é
+<code>kubectl taint nodes &lt;nó&gt; chave=valor:efeito</code>. Para ver o que está marcado,
+<code>kubectl describe node</code> tem uma linha <code>Taints:</code>. Para tirar, o mesmo comando com um
+<code>-</code> no fim.</p>
+
+<pre class="term">$ kubectl taint nodes guia-worker2 forno=true:NoSchedule
+node/guia-worker2 tainted
+
+$ kubectl describe node guia-worker2 | grep Taints
+Taints:             forno=true:NoSchedule
+
+$ kubectl taint nodes guia-worker2 forno=true:NoSchedule-
+node/guia-worker2 untainted</pre>
+
+<p>Repare que a remoção repete a marca inteira e só acrescenta o hífen. É um comando chato de digitar e
+fácil de errar; se o <code>kubectl</code> responder <code>node/guia-worker2 untainted</code> mas a linha
+<code>Taints:</code> continuar mostrando a marca, o texto não casou — normalmente por causa do valor ou do
+efeito. Vale conferir com <code>describe</code> em vez de confiar na resposta do comando.</p>
+
+<p>Uma taint não mexe nos pods que já estão rodando. Se um pod está no nó e você marca o nó, o pod
+continua lá, feliz, até morrer por outro motivo. A exceção é o efeito <code>NoExecute</code>, que
+<em>expulsa</em> os pods que não toleram — mas isso é o terceiro efeito, e ele tem regras próprias. Para
+tirar um pod do nó agora, o caminho é <code>kubectl drain</code>, não <code>taint</code>.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:tainted;;erro:untolerated taint;;texto:Pending" data-get="pods">
+  <p class="try-task">Marque os três nós com <code>forno=true:NoSchedule</code>, crie o pod
+  <code>forno</code> e descreva-o. O painel tem de mostrar o pod em <code>Pending</code> e o evento com
+  <code>untolerated taint</code>.</p>
+<pre class="yaml">kubectl run forno --image=forno:1.0
+kubectl get pods
+kubectl describe pod forno</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run forno --image=forno:1.0
+pod/forno created
+
+ana@notebook:~$ kubectl get pods
+NAME    READY   STATUS    RESTARTS   AGE
+forno   1/1     Running   0          5m
+
+ana@notebook:~$ kubectl describe pod forno
+Name:            forno
+Namespace:       default
+Priority:        0
+Service Account: default
+Node:            guia-control-plane/192.0.2.28
+Start Time:      Fri, 27 Nov 2026 15:50:25 +0000
+Labels:          run=forno
+Annotations:     &lt;none&gt;
+Status:          Running
+IP:              10.244.144.245
+IPs:             IP:  10.244.144.245
+Controlled By:   &lt;none&gt;
+
+Containers:
+  forno:
+    Image:          forno:1.0
+    Port:           80/TCP
+    State:          Running
+      Started:      Fri, 27 Nov 2026 15:50:25 +0000
+    Ready:          True
+    Restart Count:  0
+    Environment:    &lt;none&gt;
+    Mounts:         &lt;none&gt;
+Conditions:
+  Type              Status
+  PodScheduled      True
+  Initialized       True
+  Ready             True
+  ContainersReady   True
+Volumes:
+  kube-api-access-lb2nn:
+    Type:      Projected (a volume that contains injected data from multiple sources)
+QoS Class:                   BestEffort
+Node-Selectors:              &lt;none&gt;
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason    Age   From                Message
+  Normal   Created   20s   default-scheduler   created by ana
+</pre>
+<pre class="solucao">kubectl taint nodes guia-control-plane forno=true:NoSchedule
+kubectl taint nodes guia-worker forno=true:NoSchedule
+kubectl taint nodes guia-worker2 forno=true:NoSchedule
+kubectl run forno --image=forno:1.0
+kubectl get pods
+kubectl describe pod forno</pre>
+</div>
+
+<p>Sem a taint, o pod do forno encontra um nó livre e sobe em segundos; é o que o código inicial mostra.
+Com os três nós marcados, não há para onde ir e o pod fica em <code>Pending</code> — e o
+<code>describe</code> entrega a frase exata, com a contagem de nós que recusaram. É a mesma leitura que
+você fez na aula de pod em Pending, só que agora o motivo tem nome próprio.</p>
+
+<h2>4. Os três efeitos</h2>
+
+<p>O efeito decide o que a taint faz com quem não tolera. São três, e a diferença entre eles é o que
+separa “não entre” de “saia agora”.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Efeito</th><th>O que faz</th><th>Pods que já estavam no nó</th><th>Uso típico</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NoSchedule</code></td><td>não agenda pod novo que não tolere</td><td>ficam onde estão</td>
+<td>reservar nó para uma carga</td></tr>
+<tr><td><code>PreferNoSchedule</code></td><td>evita, mas não proíbe</td><td>ficam onde estão</td><td>preferência
+leve, sem risco de pod preso</td></tr>
+<tr><td><code>NoExecute</code></td><td>não agenda e ainda <em>expulsa</em> quem não tolere</td><td>são
+removidos</td><td>nó que vai sair de serviço, drenagem</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><code>NoSchedule</code> é o efeito do dia a dia e o que a Ana usa: só vale para agendamentos novos, e
+nenhum pod é jogado para fora. <code>PreferNoSchedule</code> é um empurrãozinho: o agendador tenta evitar
+aquele nó, mas se não houver alternativa ele agenda ali mesmo. E <code>NoExecute</code> é o mais
+agressivo: além de barrar pod novo, ele expulsa os pods em execução que não toleram a marca, com uma
+carência que se declara no próprio pod (<code>tolerationSeconds</code>).</p>
+
+<p>O <code>NoExecute</code> é o que o cluster usa sozinho quando um nó fica mudo. O kubelet marca o nó com
+<code>node.kubernetes.io/unreachable:NoExecute</code> e os pods que não toleram são removidos depois de
+300 segundos; é por isso que, num cluster saudável, os pods de Deployment não ficam presos num nó morto.
+Essas taints automáticas são a razão de existir a toleration padrão que você já viu no
+<code>describe pod</code>: <code>node.kubernetes.io/not-ready:NoExecute op=Exists for 300s</code>.</p>
+
+<h2>5. A toleration no manifesto</h2>
+
+<p>Do lado do pod, a toleration é uma lista chamada <code>tolerations</code>, dentro de
+<code>spec</code>. Cada item tem quatro campos e a regra de casamento é simples: a toleration precisa
+casar com a chave e o efeito da taint. Com <code>operator: Equal</code> (o padrão), o valor também
+precisa casar; com <code>operator: Exists</code>, qualquer valor serve, desde que a chave exista.</p>
+
+<dl class="anatomy">
+<dt>key</dt>
+<dd>A chave da taint que o pod aceita, por exemplo <code>forno</code>. Vazio com
+<code>operator: Exists</code> significa “tolero qualquer taint”.</dd>
+<dt>operator</dt>
+<dd><code>Equal</code> (padrão): valor tem de ser igual. <code>Exists</code>: basta a chave existir, e o
+campo <code>value</code> é ignorado.</dd>
+<dt>value</dt>
+<dd>O valor da taint, por exemplo <code>"true"</code>. Só é comparado quando o operador é
+<code>Equal</code>.</dd>
+<dt>effect</dt>
+<dd><code>NoSchedule</code>, <code>PreferNoSchedule</code> ou <code>NoExecute</code>. Vazio casa com os
+três — funciona, mas é mais permissivo do que você normalmente quer.</dd>
+<dt>tolerationSeconds</dt>
+<dd>Só para <code>NoExecute</code>: quanto tempo o pod pode ficar no nó depois da marca antes de ser
+removido. Sem ele, sai na hora.</dd>
+</dl>
+
+<div class="tryk8s" data-goal="campo:Pod/forno|spec.tolerations.0.key=forno;;campo:Pod/forno|spec.tolerations.0.effect=NoSchedule;;texto:Running">
+  <p class="try-task">Complete a toleration do pod <code>forno</code>: ele tolera a taint
+  <code>forno=true:NoSchedule</code>, então a lista precisa da chave e do efeito certos. Rode e confira o
+  campo que ficou gravado.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  tolerations:
+    - key: forno
+      operator: Equal
+      value: "true"
+  containers:
+    - name: forno
+      image: forno:1.0</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   1/1     Running   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  tolerations:
+    - key: forno
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: forno
+      image: forno:1.0</pre>
+</div>
+
+<p>Este é o ponto em que a caixa pode enganar se você não ler com atenção: o painel começa com um cluster
+sem taints, então o pod sobe nos dois casos — não há mancha para tolerar. O que a meta confere é o campo
+gravado no objeto: <code>spec.tolerations[0].key</code> igual a <code>forno</code> e
+<code>spec.tolerations[0].effect</code> igual a <code>NoSchedule</code>. Numa taint de verdade, a
+toleration sem <code>effect</code> também funcionaria (casa com os três efeitos), mas seria mais ampla do
+que o necessário: o pod passaria a tolerar <code>NoExecute</code> naquele nó sem você ter pedido.</p>
+
+<p>O erro clássico é o oposto: escrever <code>tolerations</code> em <code>spec</code> do container, ou
+como um mapa em vez de lista. A API recusa o mapa (<code>tolerations</code> é uma lista de objetos) e o
+campo no lugar errado é ignorado — o pod sobe e depois fica em <code>Pending</code> no nó reservado, sem
+que ninguém entenda por quê. Quando um pod não entra num nó que você marcou, o primeiro lugar a olhar é o
+<code>describe pod</code>: se a lista de tolerations não aparece lá, o manifesto não foi lido como você
+pensou.</p>
+
+<h2>6. As taints que o cluster já tem</h2>
+
+<p>A Ana não é a única a marcar nós. O Kubernetes marca vários, sozinho, e por bons motivos. O
+control-plane nasce com <code>node-role.kubernetes.io/control-plane:NoSchedule</code>; nós com pouca
+memória, pouco disco ou muitos processos ganham <code>memory-pressure</code>,
+<code>disk-pressure</code> e <code>pid-pressure</code> com efeito <code>NoSchedule</code>; nós que o
+kubelet não consegue alcançar ganham <code>unreachable:NoExecute</code>. Você não escreveu nada disso e
+convive com tudo.</p>
+
+<pre class="term">$ kubectl describe node guia-control-plane | grep Taints
+Taints:             node-role.kubernetes.io/control-plane:NoSchedule
+
+$ kubectl describe pod forno
+...
+Events:
+  Type     Reason            Age   From               Message
+  Warning  FailedScheduling  16s   default-scheduler  0/3 nodes are available: 1 node(s) had
+  untolerated taint {node-role.kubernetes.io/control-plane: }, 2 Insufficient cpu. preemption: 0/3 nodes
+  are available: 3 Preemption is not helpful for scheduling.</pre>
+
+<p>Essa é a explicação de um mistério da aula de DaemonSet: por que o coletor nunca aparecia no
+control-plane. O nó está marcado, o pod não tolera, e o agendador nem considera. Os DaemonSets do
+<code>kube-system</code> — o plugin de rede, o <code>kube-proxy</code> — aparecem lá porque os manifestos
+deles trazem a toleration escrita. É uma decisão de quem escreveu o manifesto, não um privilégio
+especial.</p>
+
+<div class="tryk8s" data-goal="conta:pods[app=coletor]=3;;campo:DaemonSet/coletor|spec.template.spec.tolerations.0.key=node-role.kubernetes.io/control-plane" data-get="pods -o wide">
+  <p class="try-task">O DaemonSet <code>coletor</code> cobre os dois workers e deixa o control-plane de
+  fora. Acrescente no template a toleration da taint do control-plane para que ele também receba um pod —
+  e confira na coluna <code>NODE</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coletor
+  labels:
+    app: coletor
+spec:
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      containers:
+        - name: coletor
+          image: coletor:1.0</pre>
+<pre class="out">
+daemonset.apps/coletor created
+
+NAME            READY   STATUS    RESTARTS   AGE   IP              NODE           NOMINATED NODE   READINESS GATES
+coletor-l965k   1/1     Running   0          3m    10.244.102.46   guia-worker2   &lt;none&gt;           &lt;none&gt;
+coletor-vnk2n   1/1     Running   0          7m    10.244.1.229    guia-worker    &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coletor
+  labels:
+    app: coletor
+spec:
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: coletor
+          image: coletor:1.0</pre>
+</div>
+
+<p>Aqui a toleration muda o resultado de verdade: o DaemonSet passa de dois para três pods e o terceiro
+aparece no <code>guia-control-plane</code>. Use <code>operator: Exists</code> quando só a chave importa —
+é o que os manifestos do <code>kube-system</code> fazem, porque o valor da taint do control-plane costuma
+ser vazio. Com <code>Equal</code> e um valor errado, a toleration não casa e o pod continua de fora.</p>
+
+<h2>7. Taint ou seletor? Escolhendo a ferramenta</h2>
+
+<p>Chegou a hora de separar as duas ideias que vivem se misturando. <code>nodeSelector</code> e afinidade
+são escolhas do <em>pod</em>: “quero rodar naquele nó”. Taint e toleration são regras do <em>nó</em>:
+“não quero você aqui”. As duas olham para etiquetas e nomes, mas o ponto de vista é oposto, e é por isso
+que a resposta certa quase sempre usa as duas juntas.</p>
+
+<p>Se a Ana só escrever a toleration no forno, ele <em>pode</em> entrar no nó reservado, mas nada o
+obriga: o agendador pode colocá-lo em qualquer nó que tenha espaço. Se ela só marcar o nó com a taint, o
+forno fica de fora como todo mundo. Para reservar de verdade: taint no nó, toleration no forno e um
+<code>nodeSelector</code> (ou afinidade) que case com uma etiqueta do nó reservado. A taint protege o nó
+dos outros; o seletor garante que o forno vá para lá.</p>
+
+<p>Também vale saber o que <em>não</em> é taint. <code>kubectl cordon</code> marca o nó como
+“não agendável” e serve para manutenção; <code>kubectl drain</code> tira os pods de um nó antes de
+desligá-lo, e não é a mesma coisa que marcar uma taint permanente. Reserva de longo prazo é taint;
+manutenção de meia hora é cordon e drain.</p>
+
+<h2>8. Os erros que mais aparecem</h2>
+
+<p><strong>Toleration que não casa.</strong> O pod tem <code>key: forno</code> e o nó tem
+<code>forno=true:NoSchedule</code>, mas a toleration diz <code>value: "sim"</code>. Com
+<code>operator: Equal</code>, valor diferente não casa e o pod fica em <code>Pending</code>. A mensagem do
+evento mostra a taint inteira — compare letra por letra, inclusive o efeito.</p>
+
+<p><strong>Toleration no lugar errado.</strong> Escrita em <code>spec</code> do Pod, ou em
+<code>spec</code> do DaemonSet em vez de <code>spec.template.spec</code>. A API aceita campo desconhecido
+em alguns níveis e o efeito é silencioso: o pod nasce sem toleration e ninguém vê erro nenhum até o
+<code>Pending</code> aparecer.</p>
+
+<p><strong>Taint em todos os nós.</strong> É o que a caixa 1 faz de propósito para mostrar o
+<code>Pending</code>. Num cluster de verdade, marcar todos os nós com <code>NoSchedule</code> sem ter
+tolerações escritas derruba o agendamento inteiro — inclusive dos pods do sistema que ainda não estão
+rodando. Antes de marcar, pergunte quem precisa continuar entrando.</p>
+
+<p><strong>Achar que taint puxa.</strong> O erro conceitual mais caro. Taint não atrai, não prioriza e não
+reserva vaga: ela só fecha a porta para quem não tem a chave. Se você quer o pod num nó específico, o
+trabalho de atrair é do <code>nodeSelector</code> ou da afinidade.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a reserva que parou o cluster</h3>
+<p>A Ana marcou os dois workers com <code>NoSchedule</code> para o forno e foi almoçar. Quando voltou, o
+site estava fora do ar: os pods do Deployment não tinham onde nascer e o rollout da versão nova ficou
+parado. A taint não derrubou os pods que já rodavam — derrubou os <em>novos</em>, e um rollout precisa de
+pods novos. Antes de reservar um nó, conte quantos nós sobram para o resto.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod que insiste em cair no nó errado</h3>
+<p>Ela escreveu a toleration no forno e ele foi agendado no <code>guia-worker</code>, longe do nó
+reservado. Não é bug: toleration é permissão, não atração. O conserto é acrescentar o seletor que casa com
+a etiqueta do nó reservado. Sem o seletor, o agendador escolhe pelo espaço livre, e o espaço livre é
+justamente o nó que ninguém está usando.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o nó que ficou mudo</h3>
+<p>O <code>guia-worker2</code> perdeu rede por dez minutos. O kubelet parou de mandar sinal de vida e o
+controlador marcou o nó com <code>unreachable:NoExecute</code>. Os pods que estavam ali foram removidos
+depois de 300 segundos e recriados nos outros nós — o site continuou no ar. Quando o nó voltou, as taints
+automáticas sumiram e os pods novos foram se acomodando. Ninguém precisou digitar nada.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<p>Três perguntas para separar “fechar a porta” de “abrir a porta”.</p>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O nó tem <code>forno=true:NoSchedule</code>. O pod tem
+<code>tolerations: [{key: forno, operator: Exists}]</code>, sem <code>effect</code>. Ele entra no nó?</p>
+<label><input type="radio" name="q1"> não: falta o campo <code>effect</code></label>
+<label><input type="radio" name="q1"> não: <code>operator: Exists</code> nunca casa com
+<code>value</code></label>
+<label><input type="radio" name="q1"> sim: sem <code>effect</code> a toleration vale para os três
+efeitos</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Um pod com a toleration certa é sempre agendado no nó
+marcado?</p>
+<label><input type="radio" name="q2"> não: a toleration só permite; quem atrai é o seletor ou a
+afinidade</label>
+<label><input type="radio" name="q2"> sim: a toleration funciona como reserva de vaga</label>
+<label><input type="radio" name="q2"> sim, desde que o pod peça pouca memória</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Qual efeito expulsa pods que já estão rodando no
+nó?</p>
+<label><input type="radio" name="q3"> <code>NoSchedule</code></label>
+<label><input type="radio" name="q3"> <code>NoExecute</code></label>
+<label><input type="radio" name="q3"> <code>PreferNoSchedule</code></label>
+</div>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que você quer</th><th>Ferramenta</th><th>Onde se escreve</th></tr>
+</thead>
+<tbody>
+<tr><td>reservar um nó para uma carga</td><td>taint + toleration (+ seletor)</td><td>nó por comando;
+pod no manifesto</td></tr>
+<tr><td>levar o pod para um nó específico</td><td><code>nodeSelector</code> ou afinidade</td><td>no pod,
+em <code>spec</code></td></tr>
+<tr><td>tirar pods de um nó para manutenção</td><td><code>kubectl drain</code></td><td>comando, no
+nó</td></tr>
+<tr><td>só evitar um nó, sem risco</td><td><code>PreferNoSchedule</code></td><td>taint no nó</td></tr>
+<tr><td>cobrir também o control-plane</td><td>toleration no template do DaemonSet</td><td>no
+manifesto</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Exercício: o forno tolerante</h2>
+
+<p>Escreva o pod <code>forno</code>, imagem <code>forno:1.0</code>, que tolera qualquer taint com a chave
+<code>forno</code>, independentemente do valor, e apenas para <code>NoSchedule</code>. Depois responda:
+qual é o efeito que <em>não</em> expulsa pods que já estão no nó?</p>
+
+<div class="exercise">
+<div class="ex-code">spec.tolerations[0].<input aria-label="resposta 1" data-answer="operator" placeholder="...">: Exists</div>
+<p class="ex-dica">Dica: <code>Exists</code> ignora o valor e casa só pela chave; para limitar o efeito,
+acrescente <code>effect: NoSchedule</code> ao mesmo item.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Taint é uma marca no nó; toleration é a permissão no pod. A taint tem chave, valor opcional e efeito —
+<code>NoSchedule</code> barra pod novo, <code>PreferNoSchedule</code> evita sem proibir e
+<code>NoExecute</code> barra e expulsa. Ela se põe com <code>kubectl taint nodes</code> e se lê no
+<code>Taints:</code> do <code>describe node</code>; tira-se com o mesmo comando e um hífen no fim.</p>
+
+<p>Do lado do pod, <code>spec.tolerations</code> é uma lista de objetos com <code>key</code>,
+<code>operator</code>, <code>value</code> e <code>effect</code>. Tolerar não é escolher: a toleration só
+permite que o pod entre, e quem o atrai é o <code>nodeSelector</code> ou a afinidade. Sem esse empurrão,
+o pod pode ser agendado em qualquer nó livre — inclusive longe do que você reservou. E quando o pod não
+entra, o evento <code>FailedScheduling</code> diz o motivo em voz alta: <code>untolerated taint</code>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Taint no nó, toleration no pod. Uma fecha a porta, a outra entrega a chave.</li>
+  <li><code>NoSchedule</code> barra o novo; <code>NoExecute</code> também tira o que já está lá.</li>
+  <li><code>kubectl taint nodes X chave=valor:NoSchedule</code>; para tirar, o mesmo com
+  <code>-</code> no fim.</li>
+  <li>Toleration não atrai: use <code>nodeSelector</code> ou afinidade junto.</li>
+  <li>Control-plane tem <code>node-role.kubernetes.io/control-plane:NoSchedule</code>; só entra quem
+  tolera.</li>
+  <li><code>cordon</code> e <code>drain</code> são manutenção; reserva é taint.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kustomize | Guia Kubernetes</title>
+<meta name="description" content="Kustomize na prática: base e overlays, o kustomization.yaml campo por campo, kubectl apply -k, namePrefix, labels e patches — sem copiar manifesto entre ambientes.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Kustomize</span></h1>
+<p class="intro">A Ana tem três ambientes — <code>homolog</code>, <code>producao</code> e o cluster de
+teste — e três cópias quase iguais do mesmo manifesto. Toda mudança vira três edições, e toda pressa vira uma
+divergência: a imagem nova entrou em dois lugares e esqueceu o terceiro. Nesta aula ela conhece o Kustomize, a
+ferramenta que já vem dentro do kubectl e monta o manifesto de cada ambiente a partir de uma base única. Sem
+template, sem variável mágica: sobreposição.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O problema que o Kustomize resolve e o que ele <em>não</em> é.</li>
+  <li>A estrutura de pastas: <code>base</code> e <code>overlays</code>.</li>
+  <li>O <code>kustomization.yaml</code> campo por campo.</li>
+  <li><code>kubectl kustomize</code> e <code>kubectl apply -k</code>: ver antes de aplicar.</li>
+  <li><code>namePrefix</code>, <code>labels</code>, <code>images</code> e <code>patches</code>.</li>
+  <li>A armadilha do rótulo que entra no seletor e deixou o Service sem endpoint.</li>
+</ul>
+</div>
+
+<h2>1. A cena: três manifestos, dois iguais e um esquecido</h2>
+
+<p>O Deployment do cardápio precisava de uma linha diferente em cada ambiente: em <code>homolog</code> a
+imagem é <code>cardapio:1.0</code> e uma réplica; em <code>producao</code> é <code>cardapio:1.1</code> e três
+réplicas; no cluster de teste, duas réplicas e a imagem que estiver na moda. A Ana resolveu isso do jeito
+natural: copiou o arquivo três vezes e editou cada cópia.</p>
+
+<p>Funcionou por um mês. Depois vieram as divergências. Uma etiqueta nova entrou em dois arquivos e não no
+terceiro, e o Service de um ambiente ficou sem endpoint. Uma porta foi corrigida em produção e continuou
+errada em homolog, e o bug “só acontece em homolog” custou dois dias. E o pior: ninguém conseguia comparar
+os três arquivos sem abrir os três lado a lado.</p>
+
+<p>O Kustomize ataca exatamente isso. Em vez de três manifestos completos, você tem <strong>um</strong>
+manifesto base e, para cada ambiente, um arquivo pequeno dizendo só o que muda: “aqui o nome ganha o prefixo
+<code>producao-</code>, a imagem é a 1.1, são três réplicas e todo objeto leva a etiqueta
+<code>ambiente: producao</code>”. O kubectl junta base e diferença, gera o manifesto final e aplica. Uma
+mudança na base vale para os três; uma mudança de ambiente mora num arquivo só.</p>
+
+<h2>2. O que é o Kustomize, na prática</h2>
+
+<p>Não é um programa separado que você instala: desde a versão 1.14 ele vem embutido no kubectl como
+<code>kubectl kustomize</code> e como a flag <code>-k</code> do <code>apply</code>. E não é template: não há
+laço, condicional nem variável de ambiente. O que existe é uma pilha de arquivos que se sobrepõem na ordem.
+O vocabulário:</p>
+
+<dl class="anatomy">
+<dt>kustomization.yaml</dt>
+<dd>O arquivo que diz o que compor: quais recursos entram, que transformações aplicar e de onde vem o
+resto. É o único arquivo com nome fixo.</dd>
+<dt>base</dt>
+<dd>A pasta com o manifesto genérico — o Deployment e o Service como seriam em qualquer lugar. Não tem
+nada de ambiente.</dd>
+<dt>overlay</dt>
+<dd>A pasta que parte da base e aplica as diferenças de um ambiente. Cada ambiente tem o seu.</dd>
+<dt>patch</dt>
+<dd>Um trecho de manifesto que altera um recurso da base: só as chaves que mudam. É o mesmo formato de
+patch que o kubectl aceita.</dd>
+<dt>transformador</dt>
+<dd>O passo que o Kustomize aplica em todos os recursos de uma vez: <code>namePrefix</code>,
+<code>labels</code>, <code>images</code>, <code>namespace</code>.</dd>
+</dl>
+
+<p>Guarde a diferença em relação a Helm, que aparece mais adiante no guia: Helm é template com variáveis e
+pacotes versionados; Kustomize é sobreposição de arquivos. Os dois resolvem “o mesmo app em vários ambientes”
+e é comum usar os dois juntos. Para quem está começando e quer o mínimo de conceitos novos, Kustomize ganha:
+o que você escreve é YAML comum. Nada do que está na pasta precisa ser aprendido de novo — é o mesmo
+manifesto das aulas anteriores, com um arquivo de índice ao lado e uma pasta de diferenças por ambiente.</p>
+
+<h2>3. A estrutura de pastas</h2>
+
+<p>Um projeto Kustomize é uma árvore de diretórios. A convenção que a maioria dos times usa separa a base
+dos ambientes:</p>
+
+<pre class="file" data-file="kustomize/cardapio/">kustomize/cardapio/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   └── service.yaml
+└── overlays/
+    ├── homolog/
+    │   ├── kustomization.yaml
+    │   └── patch-replicas.yaml
+    └── producao/
+        ├── kustomization.yaml
+        └── patch-replicas.yaml</pre>
+
+<p>Nada nessa árvore é invenção do Kustomize: são pastas e arquivos. O que o liga tudo é o
+<code>kustomization.yaml</code> de cada nível. O da base lista os manifestos que ela contém. O do overlay
+aponta para a base com <code>../../base</code> e acrescenta as diferenças. O kubectl entra por um dos
+overlays e sobe a árvore sozinho.</p>
+
+<p>Repare no que a organização permite: o <code>deployment.yaml</code> da base é o único lugar onde a
+estrutura do Deployment é escrita. Se amanhã o time adicionar um <code>readinessProbe</code>, ele entra ali e
+aparece nos três ambientes na próxima aplicação. Se o número de réplicas de produção mudar, muda no overlay
+de produção — e em nenhum outro lugar.</p>
+
+<h2>4. O <code>kustomization.yaml</code> campo por campo</h2>
+
+<p>O arquivo é pequeno e tem poucos campos de verdade. A tabela reúne os que aparecem no primeiro dia:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>O que faz</th><th>Exemplo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>resources</code></td><td>lista os arquivos ou pastas que entram na composição</td><td><code>../../base</code></td></tr>
+<tr><td><code>namePrefix</code></td><td>acrescenta um prefixo ao nome de todos os objetos</td><td><code>producao-</code></td></tr>
+<tr><td><code>labels</code></td><td>acrescenta etiquetas a todos os objetos (com <code>includeSelectors</code>, também ao seletor)</td><td><code>pairs: {ambiente: producao}</code></td></tr>
+<tr><td><code>images</code></td><td>troca imagem e tag de qualquer container que use aquela imagem</td><td><code>name: cardapio</code>, <code>newTag: "1.1"</code></td></tr>
+<tr><td><code>patches</code></td><td>aplica um trecho de manifesto sobre um recurso já existente</td><td><code>path: patch-replicas.yaml</code></td></tr>
+<tr><td><code>namespace</code></td><td>põe todos os objetos no namespace indicado</td><td><code>padaria-producao</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um overlay de produção completo cabe em vinte linhas:</p>
+
+<pre class="file" data-file="overlays/producao/kustomization.yaml">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+namePrefix: producao-
+namespace: padaria-producao
+labels:
+  - pairs:
+      ambiente: producao
+    includeSelectors: true
+images:
+  - name: cardapio
+    newTag: "1.1"
+patches:
+  - path: patch-replicas.yaml</pre>
+
+<p>O <code>apiVersion</code> e o <code>kind</code> são sempre esses dois valores. O resto é o que muda entre
+ambientes. E o patch citado no fim é minúsculo — ele só diz o que quer mudar:</p>
+
+<pre class="file" data-file="overlays/producao/patch-replicas.yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3</pre>
+
+<p>Duas sutilezas que economizam horas de depuração. O <code>metadata.name</code> do patch é o nome
+<em>antes</em> do prefixo — <code>cardapio</code>, não <code>producao-cardapio</code>, porque o patch é
+aplicado antes das transformações de nome. E o <code>newTag</code> é texto entre aspas: sem aspas, o YAML
+entrega o número <code>1.1</code> e o resultado pode sair como <code>cardapio:1.1</code> só por sorte — com
+tag <code>1.10</code> a diferença aparece de verdade.</p>
+
+<h2>5. Ver antes de aplicar</h2>
+
+<p>O Kustomize tem uma vantagem enorme sobre template: o resultado é só YAML, e você pode imprimi-lo antes
+de tocar no cluster. O comando <code>kubectl kustomize</code> faz exatamente isso — não aplica nada, só
+mostra o que o <code>apply -k</code> aplicaria. É o <code>--dry-run</code> do mundo dos manifestos
+compostos, e é o hábito que evita aplicar três réplicas em produção por acidente.</p>
+
+<pre class="term">ana@notebook:~$ kubectl apply -k overlays/producao
+deployment.apps/producao-cardapio created
+service/producao-cardapio created
+
+ana@notebook:~$ kubectl apply -k overlays/homolog
+deployment.apps/homolog-cardapio created
+service/homolog-cardapio created</pre>
+
+<p>Repare nos nomes: o prefixo do overlay apareceu nos dois objetos, sem ninguém editar o
+<code>deployment.yaml</code>. Repare também em como o comando é curto: <code>-k</code> no lugar de
+<code>-f</code>, apontando para a <em>pasta</em>, não para um arquivo. O kubectl procura o
+<code>kustomization.yaml</code> ali dentro e compõe tudo. Se você esquecer e passar um arquivo com
+<code>-k</code>, ele reclama que não achou o <code>kustomization.yaml</code>.</p>
+
+<p>E vale saber o que o Kustomize <em>não</em> faz: ele não aplica, não faz rollout, não guarda estado e não
+sabe o que está no cluster. Quem aplica é o kubectl; quem compara com o que existe é o <code>apply</code>.
+Isso mantém a ferramenta simples e previsível — e é também o motivo de o resultado poder ser lido como
+qualquer outro manifesto.</p>
+
+<p>Existe ainda um terceiro comando, o <code>kubectl diff -k overlays/producao</code>, que mostra a diferença
+entre o que o overlay renderiza e o que está no cluster. É o irmão cuidadoso do <code>apply</code>: em vez de
+aplicar e torcer, ele imprime o que mudaria. Em pipeline de produção, o hábito que os times consolidam é
+<code>diff</code> antes, <code>apply</code> depois — e nenhum dos dois sem o <code>kubectl kustomize</code>
+ter sido lido por alguém pelo menos uma vez na vida do projeto.</p>
+
+<h2>6. O resultado do overlay, no cluster</h2>
+
+<p>O painel deste guia não executa o Kustomize: ele aplica manifestos. Então a caixa abaixo aplica o
+<strong>resultado renderizado</strong> do overlay de produção — o mesmo YAML que <code>kubectl kustomize
+overlays/producao</code> imprimiria. As três diferenças em relação à base são o prefixo do nome, a etiqueta
+<code>ambiente</code> e a imagem.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/producao-cardapio|metadata.labels.ambiente=producao;;campo:Deployment/producao-cardapio|spec.replicas=3;;campo:Deployment/producao-cardapio|spec.template.spec.containers.0.image=cardapio:1.1;;texto:producao-cardapio created">
+  <p class="try-task">Este é o manifesto que o overlay de produção gera. Complete as três diferenças: o nome
+  já está prefixado, faltam a etiqueta <code>ambiente: producao</code> no <code>metadata</code>, a imagem
+  <code>cardapio:1.1</code> e três réplicas.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producao-cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/producao-cardapio created
+
+NAME                READY   UP-TO-DATE   AVAILABLE   AGE
+producao-cardapio   1/1     1            1           9m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producao-cardapio
+  labels:
+    app: cardapio
+    ambiente: producao
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.1
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Compare com o que a base diria: <code>cardapio</code>, uma réplica, imagem <code>1.0</code>, sem etiqueta
+de ambiente. O overlay não reescreveu o arquivo — ele acrescentou o que faltava. E é por isso que o
+<code>selector</code> continua com <code>app: cardapio</code>: o <code>includeSelectors</code> não foi ligado
+nesse exemplo, então a etiqueta <code>ambiente</code> entrou nos objetos mas não nos seletores. Guarde esse
+detalhe, porque ele é o assunto da seção 8.</p>
+
+<h2>7. Uma base, dois ambientes, lado a lado</h2>
+
+<p>A prova de que a base é uma só está em aplicar dois overlays e olhar os dois objetos convivendo. O nome
+diferente é o que permite isso: sem prefixo, o segundo <code>apply</code> atualizaria o primeiro objeto em vez
+de criar outro. A caixa aplica o stream de documentos que o Kustomize geraria para os dois ambientes.</p>
+
+<div class="tryk8s" data-goal="conta:deployments=2;;campo:Deployment/producao-cardapio|spec.replicas=3;;campo:Deployment/homolog-cardapio|spec.replicas=1">
+  <p class="try-task">O manifesto tem só o ambiente de produção. Acrescente o segundo documento (separado por
+  <code>---</code>) com o Deployment de homologação: nome <code>homolog-cardapio</code>, uma réplica, imagem
+  <code>cardapio:1.0</code> e etiqueta <code>ambiente: homolog</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producao-cardapio
+  labels:
+    app: cardapio
+    ambiente: producao
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.1</pre>
+<pre class="out">
+deployment.apps/producao-cardapio created
+
+NAME                READY   UP-TO-DATE   AVAILABLE   AGE
+producao-cardapio   3/3     3            3           9m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producao-cardapio
+  labels:
+    app: cardapio
+    ambiente: producao
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: homolog-cardapio
+  labels:
+    app: cardapio
+    ambiente: homolog
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>O resultado é o retrato de um projeto Kustomize bem-feito: dois objetos, um arquivo base que ninguém
+duplicou e dois overlays de poucas linhas. A tabela abaixo mostra o antes e o depois de cada transformação,
+do jeito que você vai conferir no <code>kubectl kustomize</code>:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Base</th><th>Overlay de homolog</th><th>Overlay de produção</th></tr>
+</thead>
+<tbody>
+<tr><td>nome do Deployment</td><td><code>cardapio</code></td><td><code>homolog-cardapio</code></td><td><code>producao-cardapio</code></td></tr>
+<tr><td>réplicas</td><td><code>1</code></td><td><code>1</code></td><td><code>3</code></td></tr>
+<tr><td>imagem</td><td><code>cardapio:1.0</code></td><td><code>cardapio:1.0</code></td><td><code>cardapio:1.1</code></td></tr>
+<tr><td>etiqueta de ambiente</td><td>nenhuma</td><td><code>ambiente: homolog</code></td><td><code>ambiente: producao</code></td></tr>
+<tr><td>namespace</td><td>o do comando</td><td><code>padaria-homolog</code></td><td><code>padaria-producao</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa tabela é o documento que faltava no tempo do copiar-colar. Quando alguém pergunta “o que muda entre
+homolog e produção?”, a resposta é uma tabela de cinco linhas — e não uma sessão de <code>diff</code> entre
+três arquivos de duzentas linhas.</p>
+
+<h2>8. A armadilha do rótulo que entra no seletor</h2>
+
+<p>Aqui está o erro que mais custa caro em quem começa. Quando você manda o Kustomize acrescentar uma
+etiqueta com <code>includeSelectors: true</code> — ou usa o antigo <code>commonLabels</code>, que fazia isso
+sempre —, a etiqueta entra nos objetos <em>e nos seletores</em>. Isso é ótimo para o Deployment: o seletor e o
+molde continuam casando automaticamente. E é péssimo se o seu Service escrito à mão tem um seletor que não
+foi atualizado junto: ele deixa de achar os pods, e o site fica sem endpoint sem nenhum erro vermelho.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="campo:Deployment/cardapio|spec.template.metadata.labels.ambiente=producao;;texto:10.244">
+  <p class="try-task">O Service seleciona por <code>app: cardapio</code> e <code>ambiente: producao</code>,
+  mas o molde do Deployment só tem <code>app</code>. Acrescente <code>ambiente: producao</code> às etiquetas
+  do <code>template</code> e veja o endpoint aparecer.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.1
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+    ambiente: producao
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME       ENDPOINTS   AGE
+cardapio   &lt;none&gt;      2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        ambiente: producao
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.1
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+    ambiente: producao
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>Antes do conserto, a listagem de endpoints mostra <code>&lt;none&gt;</code> — o Service existe, o pod
+existe, e não se falam. Depois, aparecem os IPs dos dois pods. Nenhuma mensagem de erro em nenhum dos dois
+casos: é o silêncio que faz desse erro um clássico. O <code>kubectl get endpoints</code> é o comando que
+responde “o Service está ligado em alguém?” sem precisar abrir manifesto.</p>
+
+<p>E tem o aviso que denuncia o campo antigo. Quem ainda usa <code>commonLabels</code> vê isto na primeira
+aplicação:</p>
+
+<pre class="term">ana@notebook:~$ kubectl apply -k overlays/producao
+# Warning: 'commonLabels' is deprecated. Please use 'labels' instead. See https://kubectl.docs.kubernetes.io for more information.
+deployment.apps/producao-cardapio created
+service/producao-cardapio created</pre>
+
+<p>O aviso não impede a aplicação, e é por isso que ele passa despercebido por meses. O caminho novo é
+<code>labels:</code> com <code>pairs</code>, e a decisão explícita sobre o seletor fica no
+<code>includeSelectors</code>. Quando você vê o aviso num pipeline, ele está dizendo que aquele arquivo vai
+quebrar numa versão futura do kustomize.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o bug que só existia em homolog</h3>
+<p>A imagem de produção tinha a correção da porta, homolog não — porque a troca foi feita no arquivo de
+produção, à mão, num domingo. Com Kustomize, a porta vive na base e a única diferença entre os ambientes é o
+que está escrito no overlay. O bug “só em homolog” deixa de ser possível por construção.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Service sem endpoint depois do <code>commonLabels</code></h3>
+<p>O time adicionou <code>commonLabels: {ambiente: producao}</code> no overlay e o site caiu. O Deployment
+ajustou seletor e molde sozinho; o Service, escrito à mão com o seletor antigo, parou de casar. O conserto foi
+incluir <code>ambiente</code> no seletor do Service. O diagnóstico veio de
+<code>kubectl get endpoints</code>, que mostrou <code>&lt;none&gt;</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o patch que não aplicava</h3>
+<p>Um patch de réplicas citava <code>name: producao-cardapio</code> — o nome depois do prefixo. O Kustomize
+não encontrou o alvo, e a aplicação seguiu sem o patch, com uma réplica em produção. A regra: no patch, use o
+nome da base, porque o prefixo entra depois. E confira sempre com <code>kubectl kustomize</code> antes de
+aplicar.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que o Kustomize faz?</p>
+<label><input type="radio" name="q1"> instala e atualiza o cluster, como um operador</label>
+<label><input type="radio" name="q1"> substitui variáveis dentro de um template</label>
+<label><input type="radio" name="q1"> compõe o manifesto final sobrepondo base e overlay</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">2. Qual comando mostra o YAML final sem aplicar nada?</p>
+<label><input type="radio" name="q2"> <code>kubectl apply -k overlays/producao</code></label>
+<label><input type="radio" name="q2"> <code>kubectl kustomize overlays/producao</code></label>
+<label><input type="radio" name="q2"> <code>kubectl get -f overlays/producao</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que o patch de réplicas usa <code>name:
+cardapio</code> e não <code>producao-cardapio</code>?</p>
+<label><input type="radio" name="q3"> porque o patch é aplicado antes do <code>namePrefix</code></label>
+<label><input type="radio" name="q3"> porque prefixo não vale para patch</label>
+<label><input type="radio" name="q3"> porque o nome do patch é ignorado</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o que muda em produção</h2>
+<p>No overlay de produção, a imagem da base (<code>cardapio:1.0</code>) precisa virar <code>1.1</code> sem
+editar o <code>deployment.yaml</code> da base. Complete o campo do <code>kustomization.yaml</code> que faz
+essa troca em todos os containers que usam a imagem:</p>
+<div class="ex-code">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+<input aria-label="resposta 1" data-answer="images" placeholder="...">:
+  - name: cardapio
+    newTag: "1.1"</div>
+<p class="ex-dica">Dica: <code>namePrefix</code> mexe em nome, <code>labels</code> em etiqueta,
+<code>patches</code> em campo do manifesto. Quem troca a tag de uma imagem em todo o projeto é o transformador
+de imagens — e o valor da tag vai entre aspas.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Kustomize é sobreposição: uma <code>base</code> com o manifesto genérico e um <code>overlay</code> por
+ambiente com só o que muda. O arquivo que liga tudo é o <code>kustomization.yaml</code>, com
+<code>resources</code>, <code>namePrefix</code>, <code>labels</code>, <code>images</code> e
+<code>patches</code>. Ele vem embutido no kubectl: <code>kubectl kustomize pasta</code> imprime o resultado e
+<code>kubectl apply -k pasta</code> aplica.</p>
+
+<p>As três transformações do primeiro dia são <code>namePrefix</code> (para os objetos de ambientes
+diferentes conviverem), <code>images</code> (para a tag variar sem editar a base) e <code>labels</code> (para
+agrupar e para o Service achar). Patches entram quando a mudança não tem transformador próprio, e usam o nome
+da base — o prefixo vem depois.</p>
+
+<p>E o cuidado que fecha: se o rótulo entra no seletor, todo Service escrito à mão precisa acompanhar. Service
+sem endpoint não dá erro; dá silêncio, e o <code>kubectl get endpoints</code> é quem quebra o silêncio. Na
+próxima parte do guia a Ana volta ao cluster: os primeiros problemas, começando pelo
+<a href="pod-pending.html">pod que não sobe</a>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+<li><code>base/</code> tem o manifesto genérico; <code>overlays/&lt;ambiente&gt;/</code> tem as diferenças.</li>
+<li><code>kustomization.yaml</code>: <code>resources</code>, <code>namePrefix</code>, <code>labels</code>,
+<code>images</code>, <code>patches</code>, <code>namespace</code>.</li>
+<li><code>kubectl kustomize pasta</code> mostra; <code>kubectl apply -k pasta</code> aplica.</li>
+<li>No patch, o nome é o da base: o prefixo é aplicado depois.</li>
+<li><code>commonLabels</code> está depreciado: use <code>labels</code> com <code>pairs</code> e decida o
+<code>includeSelectors</code>.</li>
+<li>Rótulo no seletor exige Service atualizado; confira com <code>kubectl get endpoints</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

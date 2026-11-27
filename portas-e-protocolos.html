@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portas e protocolos | Guia Kubernetes</title>
+<meta name="description" content="Portas e protocolos no Kubernetes: containerPort, port, targetPort e nodePort, a faixa 30000-32767, TCP, UDP e SCTP, e portas com nome ligando Service, Ingress e container.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Portas e <span class="hl">protocolos</span></h1>
+<p class="intro">O Service da Ana existia, os pods estavam prontos, os endpoints apareciam — e o site não abria.
+Depois de duas horas, ela descobriu o óbvio: o Service apontava para a porta 80 e o programa escutava na 8080.
+Em Kubernetes existem quatro números de porta diferentes, cada um com um dono, e trocar dois deles é o erro
+mais comum de rede do começo da vida. Nesta aula você aprende quem é quem, qual faixa cada um aceita, o que
+TCP, UDP e SCTP mudam e por que dar nome às portas vale a pena.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Quais são as quatro portas do caminho e quem usa cada uma.</li>
+  <li>Por que <code>port</code> e <code>targetPort</code> não são a mesma coisa.</li>
+  <li>A faixa obrigatória do <code>nodePort</code> e o que fazer quando ela é violada.</li>
+  <li>Como declarar porta com nome e por que isso deixa o manifesto mais resistente.</li>
+  <li>O que muda entre TCP, UDP e SCTP no manifesto.</li>
+  <li>Como ler as portas no <code>get</code>, no <code>describe</code> e nos endpoints.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o Service certo apontando para a porta errada</h2>
+
+<p>O Service estava perfeito à vista: seletor casando, endpoints com dois IPs, clusterIP atribuído. O pod
+também: <code>Running</code>, log dizendo “servindo na porta 8080”. Ainda assim, o navegador esperava e
+desistia. O erro estava numa linha do manifesto do Service, <code>targetPort: 80</code>, quando o container
+escutava em 8080.</p>
+
+<p>Esse tipo de erro é tão comum porque a palavra “porta” aparece quatro vezes no caminho, com significados
+diferentes. Cada uma responde a uma pergunta distinta, e cada uma pertence a um objeto diferente: uma ao
+container, duas ao Service, uma ao nó. Quem decora os nomes sem entender o caminho troca os números na
+primeira oportunidade.</p>
+
+<p>A boa notícia é que o caminho é curto e sempre o mesmo. Do cliente até o programa, a requisição passa por
+no máximo quatro números, e cada salto tem um dono. Entender esses quatro é o que transforma “a rede não
+funciona” em “o targetPort está errado”.</p>
+
+<h2>2. Quatro portas, quatro donos</h2>
+
+<p>Comece pelo fim do caminho, que é onde o programa está. O container escuta numa porta — no caso da padaria,
+8080. Essa é a <code>containerPort</code>, e ela é uma informação do pod, não uma ordem: o Kubernetes não abre
+nada, só registra o que o programa faz. Depois vem o Service, com duas portas: a que ele oferece
+(<code>port</code>) e a que ele usa para chegar no pod (<code>targetPort</code>). Por último, se o Service for
+do tipo NodePort, o número que cada nó abre (<code>nodePort</code>).</p>
+
+<dl class="anatomy">
+<dt>containerPort</dt>
+<dd>A porta em que o processo escuta dentro do pod. Informativa: não abre nem fecha nada, mas é o alvo do
+<code>targetPort</code>.</dd>
+<dt>port</dt>
+<dd>A porta que o Service oferece para quem está dentro do cluster. É o número que aparece no DNS interno:
+<code>cardapio:80</code>.</dd>
+<dt>targetPort</dt>
+<dd>A porta do pod para onde o Service encaminha. Pode ser um número ou o nome de uma porta declarada no
+container.</dd>
+<dt>nodePort</dt>
+<dd>A porta que cada nó abre para fora, no tipo NodePort. Fica na faixa 30000–32767.</dd>
+<dt>protocol</dt>
+<dd>O protocolo da porta: <code>TCP</code> (padrão), <code>UDP</code> ou <code>SCTP</code>. Muda o tráfego, não
+o número.</dd>
+<dt>porta com nome</dt>
+<dd>Um apelido dado no <code>containerPort</code> (<code>name: http</code>) que pode ser usado no
+<code>targetPort</code> e no backend do Ingress.</dd>
+<dt>hostPort</dt>
+<dd>Abre a porta do nó direto pelo pod, sem Service. Raramente é o que você quer.</dd>
+<dt>Endpoints</dt>
+<dd>A lista que o Service mantém com IP e porta de cada pod pronto. É a prova de que a ligação
+funcionou.</dd>
+</dl>
+
+<p>Repare que só o <code>nodePort</code> tem faixa obrigatória. <code>containerPort</code>,
+<code>port</code> e <code>targetPort</code> aceitam de 1 a 65535, e nada impede que sejam iguais — na verdade,
+o mais comum é <code>port: 80</code> e <code>targetPort: 8080</code>, para o cliente ver a porta bonita e o
+programa ficar com a porta que ele já usava.</p>
+
+<h2>3. O caminho completo, salto por salto</h2>
+
+<p>Vale acompanhar uma requisição do cliente até o programa. Ela entra pela porta do nó (ou pelo Ingress), é
+traduzida para a porta do Service, é traduzida de novo para a porta do pod e chega no processo. Cada tradução
+é uma linha do manifesto, e errar qualquer uma quebra o caminho em silêncio.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Salto</th><th>Porta</th><th>Quem declara</th><th>Faixa ou regra</th></tr>
+</thead>
+<tbody>
+<tr><td>nó → cluster</td><td><code>nodePort</code></td><td>Service (tipo NodePort)</td><td>30000–32767; se
+omitida, o cluster sorteia</td></tr>
+<tr><td>Service → Service</td><td><code>port</code></td><td>Service</td><td>1–65535; é o número do DNS
+interno</td></tr>
+<tr><td>Service → pod</td><td><code>targetPort</code></td><td>Service</td><td>1–65535 ou nome de porta do
+container</td></tr>
+<tr><td>dentro do pod</td><td><code>containerPort</code></td><td>Pod</td><td>1–65535; informativa</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A linha mais traiçoeira é a do <code>targetPort</code>, porque ela não é validada contra o pod. O Service
+aceita <code>targetPort: 80</code> mesmo que nenhum pod escute em 80. O erro só aparece quando alguém tenta
+conectar: a conexão é encaminhada para o pod, na porta errada, e o pod responde com recusa. O sintoma é
+“conexão recusada”, e não “serviço inexistente” — detalhe que já ajuda no diagnóstico.</p>
+
+<p>Já a <code>containerPort</code> é puramente informativa. Você pode remover a linha do pod e o Service
+continua funcionando, desde que o <code>targetPort</code> aponte para a porta certa. A linha serve para
+documentar, para o <code>describe</code> mostrar e para permitir porta com nome — que é o assunto da seção 6.</p>
+
+<p>Existe um quinto número que não faz parte do caminho normal: o <code>hostPort</code>. Ele abre a porta
+direto no nó onde o pod está, sem Service no meio. Funciona, e é tentador para quem vem de servidor comum, mas
+tem dois problemas sérios: o pod fica preso àquele nó, e dois pods com o mesmo <code>hostPort</code> não podem
+cair na mesma máquina. Em cluster com mais de um nó, o cliente precisa saber em qual deles o pod está. Para
+expor uma porta, use Service; para desenvolvimento local, <code>port-forward</code>.</p>
+
+<h2>4. A caixa: duas portas sem nome</h2>
+
+<p>Quando um Service declara mais de uma porta, cada uma precisa de um nome. A regra existe porque o
+Kubernetes precisa distinguir as entradas: sem nome, não há como o Ingress ou outro objeto dizer “use a porta
+https”. A caixa tem um Service com HTTP e HTTPS sem nome.</p>
+
+<div class="tryk8s" data-get="service" data-goal="texto:created;;campo:Service/cardapio|spec.ports.1.name=https">
+  <p class="try-task">Dê nome às duas portas (<code>http</code> e <code>https</code>) e rode. O erro diz
+  exatamente quais itens da lista estão sem nome.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+    - port: 443
+      targetPort: 8443</pre>
+<pre class="out">
+The Service "cardapio" is invalid: spec.ports[0].name: Required value: must be specified when there are multiple ports; spec.ports[1].name: Required value: must be specified when there are multiple ports
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: https
+      port: 443
+      targetPort: 8443</pre>
+</div>
+
+<p>A resposta lista os dois itens: <code>spec.ports[0].name: Required value: must be specified when there are
+multiple ports; spec.ports[1].name: Required value</code>. A mensagem é repetitiva de propósito — ela mostra
+todos os problemas de uma vez, em vez de um por vez.</p>
+
+<p>Com os nomes, o Service passa a ter duas entradas distintas, e a tabela mostra <code>80/TCP,443/TCP</code>.
+O nome não muda o tráfego; muda a possibilidade de referenciar cada porta sem ambiguidade. Guarde essa ideia,
+porque ela volta na seção 6.</p>
+
+<h2>5. A caixa: o protocolo escrito errado</h2>
+
+<p>Porta não é só número: é número mais protocolo. O padrão é <code>TCP</code>, e é por isso que quase ninguém
+pensa nisso até precisar de DNS, métricas ou jogos, que usam <code>UDP</code>. A caixa tem um pod declarando um
+protocolo que não existe.</p>
+
+<div class="tryk8s" data-goal="texto:created;;campo:Pod/dns-padaria|spec.containers.0.ports.0.protocol=UDP">
+  <p class="try-task">O protocolo está como <code>UDPX</code>. Rode, leia os valores aceitos e corrija para
+  <code>UDP</code> — o protocolo de uma consulta DNS.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: dns-padaria
+  labels:
+    app: dns
+spec:
+  containers:
+    - name: dns
+      image: coredns:1.11
+      ports:
+        - containerPort: 53
+          protocol: UDPX</pre>
+<pre class="out">
+The Pod "dns-padaria" is invalid: spec.containers[0].ports[0].protocol: Unsupported value: "UDPX": supported values: "SCTP", "TCP", "UDP"
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: dns-padaria
+  labels:
+    app: dns
+spec:
+  containers:
+    - name: dns
+      image: coredns:1.11
+      ports:
+        - containerPort: 53
+          protocol: UDP</pre>
+</div>
+
+<p>O erro é <code>spec.containers[0].ports[0].protocol: Unsupported value: "UDPX": supported values: "SCTP",
+"TCP", "UDP"</code>. São só três, e cada um tem seu lugar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Protocolo</th><th>Para que serve</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>TCP</code></td><td>HTTP, banco de dados, a maioria das APIs</td><td>é o padrão; omitir equivale a
+TCP</td></tr>
+<tr><td><code>UDP</code></td><td>DNS, métricas, streaming, jogos</td><td>não tem conexão: “recusa” vira
+timeout, e o diagnóstico é mais difícil</td></tr>
+<tr><td><code>SCTP</code></td><td>telefonia e sinalização</td><td>depende de suporte no nó e no plugin de
+rede</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O protocolo precisa bater nas duas pontas: no <code>containerPort</code> do pod, na <code>port</code> do
+Service e, se houver, no Ingress. Um Service TCP para um pod UDP não “erra” na validação — ele simplesmente não
+conversa. E o sintoma de UDP é sempre pior de diagnosticar, porque não existe recusa: o pacote sai e ninguém
+responde.</p>
+
+<p>Para o DNS, a combinação certa é declarar as duas portas, <code>UDP</code> e <code>TCP</code>, com nomes
+diferentes (<code>dns</code> e <code>dns-tcp</code>). É o que o próprio CoreDNS faz no cluster: consultas
+pequenas por UDP, respostas grandes e transferência por TCP.</p>
+
+<h2>6. A caixa: o nodePort fora da faixa</h2>
+
+<p>O <code>nodePort</code> é a porta que o nó abre para o mundo. Para não brigar com as portas do sistema
+operacional e dos outros programas da máquina, o Kubernetes reserva uma faixa: de 30000 a 32767. Escrever
+8080 ali é erro de validação, e a mensagem é bem específica.</p>
+
+<div class="tryk8s" data-get="service" data-goal="texto:created;;campo:Service/cardapio|spec.ports.0.nodePort=30080">
+  <p class="try-task">O <code>nodePort</code> está em 8080, fora da faixa. Troque por <code>30080</code> e
+  rode: a tabela do Service passa a mostrar <code>80:30080/TCP</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: NodePort
+  selector:
+    app: cardapio
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      nodePort: 8080</pre>
+<pre class="out">
+The Service "cardapio" is invalid: spec.ports[0].nodePort: Invalid value: 8080: provided port is not in the valid range. The range of valid ports is 30000-32767
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: NodePort
+  selector:
+    app: cardapio
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      nodePort: 30080</pre>
+</div>
+
+<p>A mensagem é <code>spec.ports[0].nodePort: Invalid value: 8080: provided port is not in the valid range. The
+range of valid ports is 30000-32767</code>. Com o valor certo, a coluna <code>PORT(S)</code> mostra
+<code>80:30080/TCP</code> — a leitura é “porta 80 do Service, exposta na 30080 de cada nó”.</p>
+
+<p>Você não é obrigado a escolher o <code>nodePort</code>. Se omitir, o cluster sorteia um número livre na
+faixa e o mostra na tabela. Escolher à mão serve para documentar, para casar com um firewall ou para manter
+um link antigo funcionando — mas aumenta a chance de conflito quando dois Services pedem o mesmo número, e aí
+o segundo fica sem ser criado com a mensagem <code>provided port is already allocated</code>.</p>
+
+<p>Uma armadilha comum: o <code>nodePort</code> é do cluster inteiro, não do namespace. Dois Services em
+namespaces diferentes não podem usar o mesmo número. Já o <code>port</code> é por Service, e dois Services
+podem usar 80 à vontade — cada um tem o seu clusterIP.</p>
+
+<h2>7. Porta com nome: o número que não precisa ser repetido</h2>
+
+<p>Aqui está o motivo de dar nome a uma porta. Se o <code>containerPort</code> se chama <code>http</code>, o
+Service pode usar <code>targetPort: http</code> em vez de <code>8080</code>. O efeito prático: no dia em que o
+time trocar a porta do programa de 8080 para 3000, basta mudar o pod. O Service continua apontando para
+“http”, e nada mais quebra.</p>
+
+<pre class="file" data-file="servico-com-porta-nomeada.yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - name: http
+      port: 80
+      targetPort: http</pre>
+
+<p>O Ingress usa a mesma ideia, do outro lado: no <code>backend</code>, o campo <code>port.name</code> aponta
+para o nome da porta do Service, em vez de <code>port.number</code>. A corrente fica nomeada de ponta a ponta:
+Ingress usa <code>http</code>, Service usa <code>http</code>, container declara <code>http</code>. Trocar o
+número passa a ser um detalhe local.</p>
+
+<p>A contrapartida é que nome errado falha em silêncio. Se o Service diz <code>targetPort: web</code> e o
+container declara <code>http</code>, o Service é aceito, os endpoints aparecem com a porta <em>nomeada</em> ou
+sem porta, e a conexão não chega. Não há erro de validação: para a API, o nome pode ser qualquer coisa. A
+conferência é no <code>describe</code> do Service e nos endpoints.</p>
+
+<h2>8. Onde ver as portas</h2>
+
+<p>Três comandos mostram as portas, cada um com um recorte. O <code>get service</code> mostra a coluna
+<code>PORT(S)</code> no formato que já apareceu aqui; o <code>describe service</code> abre cada porta e o
+alvo; e o <code>get endpoints</code> mostra o IP e a porta final de cada pod. Esta é uma transcrição de um
+cluster real, com um Service NodePort de duas portas:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get service cardapio
+NAME       TYPE       CLUSTER-IP     EXTERNAL-IP   PORT(S)                 AGE
+cardapio   NodePort   10.96.147.79   none          80:30080/TCP,443:30443/TCP   6m
+
+ana@notebook:~$ kubectl describe service cardapio
+Name:                     cardapio
+Namespace:                default
+Selector:                 app=cardapio
+Type:                     NodePort
+IP:                       10.96.147.79
+Port:                     http  80/TCP
+TargetPort:               8080/TCP
+NodePort:                 http  30080/TCP
+Endpoints:                10.244.111.241:8080,10.244.56.236:8080
+Port:                     https  443/TCP
+TargetPort:               8443/TCP
+NodePort:                 https  30443/TCP
+Endpoints:                10.244.111.241:8443,10.244.56.236:8443
+Session Affinity:         None</pre>
+
+<p>A leitura é por bloco: cada porta do Service tem <code>Port</code>, <code>TargetPort</code>,
+<code>NodePort</code> e <code>Endpoints</code> próprios. Se o <code>TargetPort</code> diz 8080 mas os endpoints
+mostram 8443, há um desencontro; se os endpoints estiverem vazios, o problema é de seletor ou de prontidão, não
+de porta.</p>
+
+<p>Num cluster com CNI diferente, o <code>get endpoints</code> é a confirmação final. Esta é outra transcrição,
+do mesmo Service, mostrando o que o controlador gravou:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                             AGE
+cardapio   10.244.111.241:8080,10.244.56.236:8080   6m</pre>
+
+<p>Repare que a porta dos endpoints é a do <code>targetPort</code> — 8080 —, e não a <code>port</code> do
+Service (80) nem a <code>nodePort</code> (30080). É a prova de que o Service traduziu corretamente. Quando o
+targetPort aponta para uma porta em que ninguém escuta, o endpoint é o mesmo e a conexão é recusada pelo pod:
+por isso “endpoints certos + conexão recusada” é o par que aponta para o programa, não para o Service.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o site que só funcionava de dentro do cluster</h3>
+<p>Do pod de teste, <code>curl cardapio:80</code> respondia. Do notebook, não. O Service era ClusterIP — só
+acessível de dentro. A Ana achou que era porta, mexeu no <code>targetPort</code> e piorou. O conserto era outro:
+trocar o tipo para NodePort e abrir a 30080, ou colocar um Ingress na frente. Porta certa no tipo errado não
+abre nada.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o DNS que respondia a metade das consultas</h3>
+<p>O serviço interno de nomes estava com uma única porta UDP declarada no Service. Consultas pequenas iam bem;
+as grandes, que caem para TCP, falhavam de forma intermitente. A correção foi declarar as duas portas, com
+nomes distintos, e apontar o <code>targetPort</code> de cada uma para a porta certa no pod.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o 30080 que já era de outro</h3>
+<p>Depois de fixar o <code>nodePort</code> em 30080 para o cardápio, a Ana tentou usar o mesmo número no painel,
+em outro namespace. O segundo Service não foi criado: <code>provided port is already allocated</code>. O
+<code>nodePort</code> é do cluster, não do namespace — e o conserto foi deixar o cluster sortear o segundo e
+guardar o número só para o que precisa de link fixo.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Onde o <code>targetPort</code> é declarado e para onde ele
+aponta?</p>
+<label><input type="radio" name="q1"> no pod, apontando para a porta do Service</label>
+<label><input type="radio" name="q1"> no Service, apontando para a porta do container</label>
+<label><input type="radio" name="q1"> no Ingress, apontando para o nodePort</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual é a faixa válida de <code>nodePort</code>?</p>
+<label><input type="radio" name="q2"> 1 a 1024</label>
+<label><input type="radio" name="q2"> 1024 a 65535</label>
+<label><input type="radio" name="q2"> 30000 a 32767</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que usar <code>targetPort: http</code> em vez de
+<code>targetPort: 8080</code>?</p>
+<label><input type="radio" name="q3"> para o Service continuar certo se a porta do container mudar</label>
+<label><input type="radio" name="q3"> para o tráfego sair cifrado</label>
+<label><input type="radio" name="q3"> para dispensar o seletor do Service</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a porta que o cliente vê</h2>
+<p>Complete a porta que o Service oferece dentro do cluster, com o programa escutando em 8080.</p>
+<div class="ex-code">ports:
+  - name: http
+    <input aria-label="resposta 1" data-answer="port" placeholder="...">: 80
+    targetPort: 8080</div>
+<p class="ex-dica">Dica: são duas portas — a que o Service oferece e a que ele usa para chegar no pod. A
+primeira é a do DNS interno.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>São quatro portas no caminho, cada uma com um dono: <code>nodePort</code> no nó, <code>port</code> e
+<code>targetPort</code> no Service, <code>containerPort</code> no pod. Só a primeira tem faixa obrigatória
+(30000–32767); as outras aceitam 1–65535. E só a do pod é informativa: o resto precisa estar coerente, e o
+erro de coerência não aparece no <code>apply</code>, só na conexão.</p>
+
+<p>Porta é número mais protocolo. <code>TCP</code> é o padrão; <code>UDP</code> aparece em DNS, métricas e
+streaming, e erra de um jeito mais silencioso porque não tem recusa; <code>SCTP</code> é nicho e depende do nó.
+Serviço com mais de uma porta exige nome, e o nome serve para referenciar sem repetir números — do
+<code>containerPort</code> ao <code>targetPort</code> e ao backend do Ingress.</p>
+
+<p>Na próxima aula o assunto vira saúde: como o cluster descobre se um container está vivo, com a liveness
+probe, e o que acontece quando ela falha — reinício, em loop, e um efeito colateral que já derrubou muita
+produção.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>containerPort</code> é informativa; <code>targetPort</code> é quem manda o tráfego.</li>
+  <li><code>port</code> é o número do DNS interno: <code>cardapio:80</code>.</li>
+  <li><code>nodePort</code> só existe de 30000 a 32767 e é único no cluster.</li>
+  <li>Mais de uma porta no Service exige <code>name</code> em cada uma.</li>
+  <li>Protocolo tem de bater nas duas pontas; UDP falha com timeout, não com recusa.</li>
+  <li>Porta com nome (<code>http</code>) sobrevive à troca de número no container.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

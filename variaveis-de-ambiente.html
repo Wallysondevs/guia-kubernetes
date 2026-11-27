@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Variáveis de ambiente | Guia Kubernetes</title>
+<meta name="description" content="Variáveis de ambiente no pod: env como lista de name e value, envFrom com ConfigMap, valueFrom com Secret e fieldRef, e por que base64 não é criptografia.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Variáveis de <span class="hl">ambiente</span></h1>
+<p class="intro">O site da Ana funciona no teste e precisa apontar para o banco de produção. A solução que ela
+conhece é reconstruir a imagem com outro endereço dentro — e é a solução errada, porque a imagem é a mesma e
+o endereço é que muda. Nesta aula ela aprende a dar configuração ao container por fora: a lista
+<code>env</code>, o <code>envFrom</code> com ConfigMap, o <code>valueFrom</code> com Secret e a diferença
+entre guardar uma senha e escondê-la. É a aula que separa a imagem do ambiente.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que configuração não deve entrar na imagem.</li>
+  <li>Como escrever <code>env</code> como lista de <code>name</code> e <code>value</code>.</li>
+  <li>O que é um ConfigMap e o que é um Secret, na prática.</li>
+  <li>Como importar todas as chaves de uma vez com <code>envFrom</code>.</li>
+  <li>Como pegar uma chave só com <code>configMapKeyRef</code> e <code>secretKeyRef</code>.</li>
+  <li>Como dar à aplicação dados do próprio pod com <code>fieldRef</code>.</li>
+  <li>Por que base64 em Secret não é criptografia e o que fazer com segredo de verdade.</li>
+  <li>Quando a variável passa a valer — e por que mudar o ConfigMap não muda o container.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a mesma imagem, dois endereços</h2>
+
+<p>O site da padaria conversa com um banco de dados. No cluster de teste, o banco está em
+<code>db-teste.loja.test</code>; em produção, em <code>db.loja.test</code>. O endereço estava escrito no código
+da aplicação, dentro da imagem. Para publicar, a Ana reconstruía a imagem com o outro endereço — duas imagens
+diferentes para o mesmo programa, e a garantia de que um dia ela ia publicar a de teste.</p>
+
+<p>O problema não é o endereço: é o lugar dele. O programa é o mesmo nos dois ambientes; o que muda é a
+configuração. Guardar configuração dentro da imagem é como escrever o endereço da entrega na receita do pão:
+mudou o cliente, você reescreve a receita. O certo é a receita ficar igual e a etiqueta da encomenda dizer
+para onde vai.</p>
+
+<p>Variável de ambiente é essa etiqueta. O container recebe pares de nome e valor no momento em que começa a
+rodar, e o programa lê dali em vez de ter o dado no código. A mesma imagem, com variáveis diferentes, aponta
+para bancos diferentes, liga ou desliga recurso, escolhe o nível de log. Uma imagem, vários ambientes.</p>
+
+<p>No Kubernetes há três lugares de onde a variável pode vir: escrita no manifesto, de um ConfigMap, ou de um
+Secret. Cada um tem o seu papel, e a diferença entre eles é o que a aula desenrola.</p>
+
+<h2>2. O que é uma variável de ambiente num container</h2>
+
+<p>Todo processo em Linux nasce com um conjunto de variáveis de ambiente herdadas de quem o iniciou. O
+container não é exceção: o kubelet monta esse conjunto e passa para o processo principal. A aplicação lê com o
+que já usa na linguagem — <code>process.env.PORTA</code> em Node, <code>os.environ["PORTA"]</code> em Python,
+<code>System.getenv("PORTA")</code> em Java.</p>
+
+<p>A consequência que mais confunde: <strong>a variável é lida uma vez, no início do processo</strong>. Mudar
+o valor depois não muda nada para quem já está rodando. Se a aplicação lê a configuração no boot, o container
+precisa ser recriado para enxergar o valor novo. É por isso que “atualizei o ConfigMap e o site não mudou” é
+uma pergunta frequente — e a resposta é reiniciar o pod, não esperar.</p>
+
+<p>Outra consequência: <strong>o valor é sempre texto</strong>, mesmo quando parece número. Não existe
+booleano, lista ou objeto em variável de ambiente. Quem precisa de número converte (<code>Number()</code>,
+<code>parseInt()</code>), e quem precisa de lista usa um separador combinado com o código — vírgula, dois
+pontos. O manifesto não tem como dizer “isto é inteiro”; ele diz “isto é a string 8080”.</p>
+
+<p>E há um detalhe de segurança que vale desde já: a variável aparece no <code>describe</code> do pod, no
+ambiente do processo e em qualquer diagnóstico que liste o objeto. Ela não é lugar de segredo — para isso
+existe o Secret, e mesmo ele tem limites, como você vai ver na seção 7.</p>
+
+<h2>3. <code>env</code>: uma lista de nome e valor</h2>
+
+<p>No manifesto, <code>env</code> fica dentro do container e é uma <strong>lista</strong> de mapas com
+<code>name</code> e <code>value</code>. Lista, com hífen em cada item — não é mapa como
+<code>labels</code>:</p>
+
+<pre class="file" data-file="cardapio.yaml">spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: PORTA
+          value: "8080"
+        - name: MODO
+          value: producao</pre>
+
+<p>A forma é estranha à primeira vista, e a razão é histórica: a lista permite que cada variável venha de um
+lugar diferente (literal, ConfigMap, Secret, campo do pod), e um mapa não permitiria. Você paga o preço de
+duas linhas por variável e ganha a flexibilidade.</p>
+
+<p>Escrever <code>env</code> como mapa — <code>env: {PORTA: "8080"}</code> — é o erro mais comum de quem
+conhece <code>labels</code>, e o cluster recusa com uma mensagem curta:
+<code>spec.containers[0].env: Invalid value: must be a list</code>. A caixa abaixo tem esse erro. Conserte
+transformando em lista e veja o pod subir.</p>
+
+<div class="tryk8s" data-goal="texto:pod/cardapio created;;campo:Pod/cardapio|spec.containers.0.env.1.name=MODO">
+  <p class="try-task">As variáveis estão escritas como mapa. Transforme em lista — cada variável com
+  <code>name</code> e <code>value</code> — e acrescente <code>MODO=producao</code> como segundo item.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        PORTA: "8080"</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.containers[0].env: Invalid value: must be a list
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: PORTA
+          value: "8080"
+        - name: MODO
+          value: producao</pre>
+</div>
+
+<p>Repare em duas coisas depois do conserto. A primeira: <code>PORTA</code> está entre aspas e
+<code>MODO</code> não. As aspas em <code>"8080"</code> são uma proteção, não uma obrigação — sem elas o YAML
+leria número e o campo pede texto, o que dá erro. A segunda: <code>producao</code> não precisa de aspas porque
+é texto por natureza. A regra prática é pôr aspas em tudo o que parece número ou booleano.</p>
+
+<p>O nome da variável tem regra: letras, números e sublinhado, começando por letra ou sublinhado. Nada de
+hífen, nada de acento, nada de espaço. <code>MINHA-VARIAVEL</code> não é aceita pelo processo; o padrão é
+<code>MAIUSCULAS_COM_SUBLINHADO</code>, e a convenção existe para o valor não se confundir com o nome.</p>
+
+<h2>4. Onde guardar a configuração</h2>
+
+<p>Escrever variável direto no pod funciona e não escala: o mesmo valor aparece em três manifestos, e mudar
+exige editar os três. Para configuração que vários pods compartilham existem dois objetos próprios, e a
+diferença entre eles é o nível de cuidado com o conteúdo.</p>
+
+<dl class="anatomy">
+<dt>variável de ambiente</dt>
+<dd>Um par de nome e valor entregue ao processo quando ele começa. Sempre texto, lida uma vez no boot.</dd>
+<dt>ConfigMap</dt>
+<dd>Objeto que guarda configuração não secreta em pares de chave e valor. Um ConfigMap pode servir vários
+pods.</dd>
+<dt>Secret</dt>
+<dd>Objeto para dados sensíveis. Guarda os valores em base64, o que evita olhar por acidente, mas não
+criptografa.</dd>
+<dt>envFrom</dt>
+<dd>A forma de importar todas as chaves de um ConfigMap ou Secret de uma vez, sem listar nome por nome.</dd>
+<dt>valueFrom</dt>
+<dd>A forma de apontar de onde vem o valor de uma variável específica: uma chave de ConfigMap, uma chave de
+Secret ou um campo do próprio pod.</dd>
+</dl>
+
+<p>O ConfigMap é simples: <code>data</code> com pares de chave e valor, tudo texto. Ele não é montado como
+variável por mágica — alguém precisa referenciá-lo no pod, e é isso que as duas seções seguintes fazem. O
+mesmo objeto pode ser montado como arquivo dentro do container (assunto de outra aula), o que explica por que
+ele é útil mesmo para configuração grande.</p>
+
+<p>O Secret tem a mesma forma, com <code>data</code> em base64, e um <code>type</code> que diz que tipo de
+credencial é (<code>Opaque</code> para o genérico, <code>kubernetes.io/tls</code> para certificado,
+<code>kubernetes.io/dockerconfigjson</code> para registro privado). Base64 é só uma codificação: qualquer
+pessoa com acesso ao namespace lê o valor. Ele serve para não deixar a senha escrita em texto puro em
+<code>kubectl get</code>, não para proteger de quem tem permissão.</p>
+
+<h2>5. <code>envFrom</code>: todas as chaves de uma vez</h2>
+
+<p>Quando um ConfigMap tem cinco chaves e você quer as cinco como variáveis, listar uma por uma é trabalho
+repetido e uma chance a mais de errar o nome. O <code>envFrom</code> resolve: ele recebe a referência ao
+ConfigMap inteiro e o cluster cria uma variável para cada chave de <code>data</code>.</p>
+
+<pre class="file" data-file="cardapio.yaml">      envFrom:
+        - configMapRef:
+            name: config-cardapio</pre>
+
+<p>É lista, com hífen, porque um container pode importar de vários ConfigMaps e Secrets ao mesmo tempo. A
+ordem importa: o que vem depois sobrescreve o que veio antes, e o <code>env</code> explícito sempre vence o
+<code>envFrom</code>. Se duas fontes têm a mesma chave, a que está por último ganha — e isso é uma fonte
+silenciosa de bug, porque ninguém vê a colisão olhando o manifesto.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>env</code></th><th><code>envFrom</code></th></tr>
+</thead>
+<tbody>
+<tr><td>o que faz</td><td>declara variável por variável</td><td>importa todas as chaves de um objeto</td></tr>
+<tr><td>de onde vem</td><td>valor fixo, ConfigMap, Secret ou campo do pod</td><td>ConfigMap ou Secret
+inteiro</td></tr>
+<tr><td>quando usar</td><td>poucas variáveis, ou valor vindo de outra fonte</td><td>configuração que já está
+agrupada</td></tr>
+<tr><td>se a fonte faltar</td><td>o container não sobe, salvo <code>optional: true</code></td><td>o container
+não sobe, salvo <code>optional: true</code></td></tr>
+<tr><td>quem vence</td><td>o <code>env</code>, sobre o <code>envFrom</code></td><td>o último da lista, sobre os
+anteriores</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A caixa abaixo tem o ConfigMap e o pod no mesmo arquivo, mas o pod ainda usa uma variável escrita à mão.
+Troque pelo <code>envFrom</code> apontando para <code>config-cardapio</code> e rode.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cardapio|spec.containers.0.envFrom.0.configMapRef.name=config-cardapio;;texto:pod/cardapio created" data-get="pods">
+  <p class="try-task">O ConfigMap já existe no arquivo, mas o pod repete a variável à mão. Apague o
+  <code>env</code> e use <code>envFrom</code> com <code>configMapRef</code> apontando para
+  <code>config-cardapio</code>.</p>
+<pre class="yaml" data-file="site.yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-cardapio
+data:
+  PORTA: "8080"
+  MODO: producao
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: PORTA
+          value: "8080"</pre>
+<pre class="out">
+configmap/config-cardapio created
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-cardapio
+data:
+  PORTA: "8080"
+  MODO: producao
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      envFrom:
+        - configMapRef:
+            name: config-cardapio</pre>
+</div>
+
+<p>O painel mostra os dois objetos criados, o ConfigMap primeiro e o pod depois — a ordem dos documentos no
+arquivo é a ordem de aplicação, e isso importa aqui: o pod referencia um ConfigMap que precisa existir. Se o
+ConfigMap não existisse, o pod seria criado e o container não subiria, com
+<code>CreateContainerConfigError</code> no estado e o motivo no <code>describe</code>. O painel deste guia não
+roda container, então esse estado aparece nas aulas de diagnóstico como transcrição; o que ele faz é guardar a
+referência no objeto, que é o que a missão confere.</p>
+
+<p>Existe o <code>optional: true</code> para o caso de a fonte poder faltar: com ele, a ausência do ConfigMap
+não impede o container de subir. Use com consciência — a maioria dos “o pod subiu e a configuração não veio”
+começa com um <code>optional</code> que alguém colocou para fazer o erro sumir.</p>
+
+<h2>6. <code>valueFrom</code>: uma chave só</h2>
+
+<p>O contrário do <code>envFrom</code> é o <code>valueFrom</code>: a variável tem nome escolhido por você e o
+valor vem de uma fonte específica. Três fontes interessam:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Fonte</th><th>Como se escreve</th><th>Serve para</th></tr>
+</thead>
+<tbody>
+<tr><td>literal</td><td><code>value: "8080"</code></td><td>valor fixo, sem segredo</td></tr>
+<tr><td>ConfigMap</td><td><code>configMapKeyRef</code> com <code>name</code> e <code>key</code></td><td>uma
+chave de configuração</td></tr>
+<tr><td>Secret</td><td><code>secretKeyRef</code> com <code>name</code> e <code>key</code></td><td>senha, token,
+credencial</td></tr>
+<tr><td>campo do pod</td><td><code>fieldRef</code> com <code>fieldPath</code></td><td>nome do pod, namespace,
+IP, nome do nó</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>fieldRef</code> é o menos conhecido e o mais útil para log e monitoramento. Com
+<code>fieldPath: metadata.name</code>, a aplicação recebe o próprio nome do pod e pode incluí-lo em cada linha
+de log — o que resolve o clássico “não sei de qual réplica veio este erro”. Também dá para pedir
+<code>status.podIP</code>, <code>spec.nodeName</code> e <code>metadata.namespace</code>.</p>
+
+<p>A caixa abaixo tem a senha escrita à mão no manifesto. Isso é pior do que parece: ela fica no arquivo, no
+histórico do repositório e em qualquer <code>describe</code>. A missão é tirá-la de lá e apontar para o
+Secret <code>cardapio-db</code>, na chave <code>senha</code>.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cardapio|spec.containers.0.env.0.valueFrom.secretKeyRef.key=senha;;objeto:Secret/cardapio-db" data-get="pods">
+  <p class="try-task">Troque <code>value: pao-quente</code> por um <code>valueFrom</code> com
+  <code>secretKeyRef</code>, apontando para o Secret <code>cardapio-db</code> e a chave
+  <code>senha</code>.</p>
+<pre class="yaml" data-file="site.yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: cardapio-db
+data:
+  senha: cGFvLXF1ZW50ZQ==
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: SENHA_BANCO
+          value: pao-quente</pre>
+<pre class="out">
+secret/cardapio-db created
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Secret
+metadata:
+  name: cardapio-db
+data:
+  senha: cGFvLXF1ZW50ZQ==
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: SENHA_BANCO
+          valueFrom:
+            secretKeyRef:
+              name: cardapio-db
+              key: senha</pre>
+</div>
+
+<p>Note que o nome da variável continua sendo escolha sua (<code>SENHA_BANCO</code>) e o
+<code>key: senha</code> aponta a chave dentro do Secret. São dois nomes diferentes, e trocar um não troca o
+outro. O <code>describe</code> do pod mostra a variável sem o valor, como referência:
+<code>SENHA_BANCO</code> vindo de <code>secretKeyRef</code> — o que é melhor do que mostrar a senha, e é
+motivo suficiente para preferir Secret a <code>value</code> mesmo quando o valor é pequeno.</p>
+
+<p>Uma armadilha de digitação: o campo é <code>secretKeyRef</code>, com “secret” e “Key” e “Ref” grudados
+assim. Escrever <code>secretKeyReference</code> ou <code>secretRef</code> faz o campo ser ignorado e a
+variável chegar vazia — sem erro de validação em versões mais antigas. Se a aplicação reclama de variável
+ausente e o manifesto parece certo, confira a grafia do bloco.</p>
+
+<h2>7. Segredo não é o que parece</h2>
+
+<p>O nome “Secret” engana. O valor é guardado em base64, que é uma codificação reversível sem senha: qualquer
+pessoa com permissão de leitura no namespace lê o conteúdo. O base64 serve para não exibir a senha por
+acidente num <code>kubectl get</code>, não para proteger de quem tem acesso. O objeto em si tem aula própria
+mais adiante; aqui basta entender por que a variável aponta para ele em vez de carregar o valor.</p>
+
+<pre class="term">$ kubectl create secret generic cardapio-db --from-literal=senha=pao-quente
+secret/cardapio-db created
+
+$ kubectl get secrets
+NAME          DATA   AGE
+cardapio-db   1      9m</pre>
+
+<p>A coluna <code>DATA</code> conta quantas chaves o Secret tem, e é tudo o que a tabela mostra — o valor fica
+escondido. Mas escondido não é criptografado, e o comando que prova isso é o mesmo que qualquer pessoa com
+permissão roda:</p>
+
+<pre class="term">$ kubectl get secret cardapio-db -o yaml
+data:
+  senha: cGFvLXF1ZW50ZQ==
+type: Opaque</pre>
+
+<p><code>cGFvLXF1ZW50ZQ==</code> é base64 de <code>pao-quente</code>. Um <code>echo</code> com
+<code>base64 -d</code> devolve o texto. Por isso a regra é: Secret protege contra olhar por acidente e
+contra versionar senha em texto puro no Git, e nada mais. Quem tem <code>get secret</code> no namespace vê
+tudo.</p>
+
+<p>O que fazer, então? Três práticas que já valem no começo. Primeira: nunca escreva senha em
+<code>value</code> no manifesto; use <code>secretKeyRef</code>. Segunda: no repositório, guarde só o modelo do
+Secret (o nome e as chaves, com valor vazio) e injete o valor na hora de aplicar, por ferramenta de segredo ou
+por variável do pipeline. Terceira: limite quem pode ler Secret com RBAC — se todo mundo no namespace pode
+<code>get secrets</code>, o Secret é decoração.</p>
+
+<p>E existe o nível acima, para quando a exigência é real: criptografia em repouso no etcd, Secrets externos
+sincronizados por operador e cofres de senha. O que importa agora é não confundir a embalagem com o
+cofre.</p>
+
+<h2>8. Ordem, expansão e o reinício</h2>
+
+<p>Três detalhes fecham o funcionamento e explicam a maioria dos bugs de configuração. O primeiro é a ordem
+de precedência: <code>env</code> vence <code>envFrom</code>, e dentro de cada um, o que vem depois vence o que
+veio antes. Duas fontes com a mesma chave não dão erro — a última ganha, silenciosamente.</p>
+
+<p>O segundo é a expansão de referência. Dentro de <code>env</code>, você pode usar <code>$(NOME)</code> para
+montar um valor a partir de outra variável já declarada: <code>DATABASE_URL</code> pode ser
+<code>postgres://db:5432/$(BANCO)</code>. A expansão só enxerga variáveis declaradas antes dela na lista e as
+que vieram do <code>envFrom</code>, então a ordem das linhas passa a importar de verdade. Se a variável
+referenciada não existir, o valor fica com o texto <code>$(NOME)</code> literal — sem erro, e o problema
+aparece só quando a aplicação tenta usar a URL.</p>
+
+<p>O terceiro é o mais importante: <strong>mudar a configuração não muda o container em execução</strong>. O
+processo leu as variáveis quando nasceu. Editar o ConfigMap e aplicar não reinicia pod nenhum, e a aplicação
+continua com o valor antigo até alguém recriar o container — <code>kubectl delete pod</code> (o Deployment
+recria), <code>kubectl rollout restart</code> no caso de Deployment, ou uma mudança no próprio pod que force a
+recriação. É a causa número um de “mudei a configuração e não pegou”.</p>
+
+<p>Existe também o caminho de montar o ConfigMap como arquivo, em vez de variável. Aí o arquivo é atualizado
+no disco do container em algum tempo, e quem relê o arquivo pega o valor novo — mas a aplicação precisa reler,
+o que nem sempre acontece. Variável é mais simples e mais rígida; arquivo é mais flexível e mais sutil. A
+próxima aula sobre ConfigMap mostra o arquivo em detalhe.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: “mudei o ConfigMap e o site não mudou”</h3>
+<p>A Ana trocou o preço no ConfigMap, aplicou, conferiu com <code>kubectl get configmap</code> e o site
+continuou com o valor velho. O container tinha lido a variável no boot. O conserto foi reiniciar o pod. O
+hábito que ficou: quando a mudança é de configuração, o apply do ConfigMap é só metade do trabalho — a outra
+metade é reiniciar quem lê.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a variável que veio vazia</h3>
+<p>O pod subiu, a aplicação reclamou de configuração ausente, e o manifesto parecia perfeito. O problema era
+o nome da chave: o ConfigMap tinha <code>porta</code> em minúscula e o manifesto pedia <code>PORTA</code>.
+Chave de ConfigMap é sensível a maiúscula, e o cluster não avisa — ele simplesmente não acha. O diagnóstico
+foi <code>kubectl get configmap config-cardapio -o yaml</code> e comparar letra por letra.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a senha no histórico do repositório</h3>
+<p>Ela colou a senha do banco em <code>value</code> para “resolver rápido” e subiu o commit. Três semanas
+depois, a senha apareceu num relatório de exposição. Trocar a senha no banco resolveu o presente; apagar o
+commit não resolveu o passado, porque o histórico já tinha sido copiado. Desde então, senha só em Secret
+criado fora do repositório.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o <code>envFrom</code> faz?</p>
+<label><input type="radio" name="q1"> cria uma variável para cada container do pod</label>
+<label><input type="radio" name="q1"> importa todas as chaves de um ConfigMap ou Secret como
+variáveis</label>
+<label><input type="radio" name="q1"> monta o ConfigMap como arquivo dentro do container</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o base64 de um Secret garante?</p>
+<label><input type="radio" name="q2"> que o valor está criptografado e ninguém consegue ler</label>
+<label><input type="radio" name="q2"> que o valor só pode ser lido pelo pod que o usa</label>
+<label><input type="radio" name="q2"> apenas que o valor não aparece em texto puro numa listagem</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Você mudou uma variável no ConfigMap e o container continua
+com o valor antigo. Por quê?</p>
+<label><input type="radio" name="q3"> porque o processo leu a variável no início e precisa ser
+recriado</label>
+<label><input type="radio" name="q3"> porque o ConfigMap precisa ser aplicado duas vezes</label>
+<label><input type="radio" name="q3"> porque variável de ambiente não aceita texto com número</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: importar tudo de uma vez</h2>
+<p>Você quer que todas as chaves do ConfigMap <code>config-cardapio</code> virem variáveis de ambiente.
+Complete o bloco:</p>
+<div class="ex-code">envFrom:
+  - <input aria-label="resposta 1" data-answer="configMapRef" placeholder="...">:
+      name: config-cardapio</div>
+<p class="ex-dica">Dica: é o par do <code>secretKeyRef</code> para ConfigMap — a referência ao objeto inteiro,
+uma palavra com “config”, “Map” e “Ref”.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Configuração não entra na imagem. O container recebe variáveis de ambiente no boot, e o programa lê dali: a
+mesma imagem roda em teste e em produção com valores diferentes. No manifesto, <code>env</code> é uma
+<strong>lista</strong> de <code>name</code> e <code>value</code>, e o valor é sempre texto — número e booleano
+precisam de conversão no código.</p>
+
+<p>Para valores compartilhados existem dois objetos: ConfigMap, para configuração comum, e Secret, para dados
+sensíveis. O <code>envFrom</code> importa todas as chaves de um deles; o <code>valueFrom</code> pega uma chave
+específica (<code>configMapKeyRef</code>, <code>secretKeyRef</code>) ou um dado do próprio pod
+(<code>fieldRef</code>). Quando duas fontes têm a mesma chave, a última vence, e o <code>env</code> explícito
+vence o <code>envFrom</code>.</p>
+
+<p>Secret guarda em base64, o que não é criptografia: quem pode ler, lê. Senha nunca vai em
+<code>value</code> no manifesto, e o valor de verdade é injetado fora do repositório. E, acima de tudo: mudar
+a configuração não muda o container em execução — é preciso recriar. Com isso, a Ana consegue levar o mesmo
+site para qualquer ambiente sem reconstruir imagem, e o manifesto continua contando a verdade sobre o que
+roda.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>env</code> é lista de <code>name</code> e <code>value</code>; mapa dá
+  <code>must be a list</code>.</li>
+  <li>Valor é sempre texto: aspas em número, conversão no código.</li>
+  <li><code>envFrom</code> importa todas as chaves; <code>valueFrom</code> pega uma.</li>
+  <li><code>secretKeyRef</code> e <code>configMapKeyRef</code> levam <code>name</code> e
+  <code>key</code>.</li>
+  <li><code>fieldRef</code> traz <code>metadata.name</code>, <code>status.podIP</code> e o nome do nó.</li>
+  <li>Secret em base64 não é segredo protegido: é segredo não exibido.</li>
+  <li>Mudou a variável? O container precisa ser recriado para ler o valor novo.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

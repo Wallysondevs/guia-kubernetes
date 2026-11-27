@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>O que é Kubernetes | Guia Kubernetes</title>
+<meta name="description" content="O que é Kubernetes sem jargão: o problema que ele resolve, a ideia de descrever o estado desejado, as partes de um cluster e o primeiro manifesto rodando no painel.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>O que é <span class="hl">Kubernetes</span></h1>
+<p class="intro">A Ana tem um site de padaria que roda num programa só, aberto no terminal do notebook
+dela. Já aconteceu de o notebook reiniciar de madrugada e o site ficar fora do ar até as sete da manhã,
+quando ela abriu a janela de novo. Kubernetes existe para resolver exatamente esse tipo de problema — mas
+antes de decorar comandos, vale entender <em>que problema é esse</em>. Nesta primeira aula a Ana vê a
+ideia central (descrever o que quer, em vez de mandar o que fazer), conhece as peças de um cluster e
+aplica o primeiro manifesto no painel do guia.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Que problema o Kubernetes resolve — e qual ele não resolve.</li>
+  <li>A diferença entre mandar comandos e descrever o estado desejado.</li>
+  <li>O que é um cluster, um nó, um pod e um manifesto.</li>
+  <li>O papel do <em>control plane</em> e do kubelet, sem decoreba.</li>
+  <li>Como aplicar um manifesto no painel deste guia e ler a resposta.</li>
+  <li>Por que quase tudo em Kubernetes é um arquivo de texto.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o site que cai de madrugada</h2>
+
+<p>O site da padaria é um programa pequeno: quando alguém abre o endereço, ele responde com o cardápio, os
+preços e o horário. A Ana sobe esse programa à mão, com <code>node servidor.js</code>, e deixa a janela do
+terminal aberta. Enquanto a janela estiver ali, funciona. Se o notebook reiniciar, se o terminal fechar, se
+o programa travar às três da manhã, o site sai do ar e ninguém fica sabendo até o primeiro cliente
+reclamar.</p>
+
+<p>Ela já tentou resolver com boa vontade: uma anotação colada no monitor dizendo “abrir o terminal e rodar
+o comando”. Funciona quando ela está acordada. O problema não é o comando estar difícil — é que a
+responsabilidade de <em>ficar de olho</em> está na cabeça de uma pessoa. E pessoa dorme.</p>
+
+<p>Kubernetes é um programa que assume esse papel de vigia. Você instala num computador (ou num conjunto de
+computadores) e passa a <strong>entregar pedidos</strong> para ele: “quero este programa rodando, nesta
+imagem, nesta quantidade”. De tempos em tempos, ele compara o que você pediu com o que está de fato
+acontecendo e corrige a diferença: liga o que faltou, recoloca no ar o que caiu, tira o que sobrou. Isso
+tem um nome — <em>reconciliação</em> — e é a alma do negócio.</p>
+
+<h2>2. A ideia central: descrever, em vez de mandar</h2>
+
+<p>Existem dois jeitos de pedir uma pizza. O primeiro é ligar e ditar cada passo: “corta a cebola agora,
+põe no forno, tira em quinze minutos”. O segundo é dizer “quero uma pizza de muçarela” e deixar a cozinha
+se virar. O primeiro é imperativo, o segundo é declarativo. A maior parte dos comandos que você conhece é
+imperativa; Kubernetes trabalha declarativamente.</p>
+
+<p>Você não manda o Kubernetes “subir um container”. Você <em>descreve</em> o estado final: “quero um pod
+com a imagem <code>cardapio:1.0</code>”. É essa descrição que fica guardada. O cluster compara
+continuamente o que está escrito com o que está rodando e age para que os dois coincidam. Se o programa
+morre, a descrição continua lá, então o cluster liga de novo. Se alguém apaga o pod por engano, a
+descrição continua lá, e o cluster cria outro.</p>
+
+<p>A consequência prática é grande: você guarda as descrições num arquivo de texto, coloca no repositório
+do projeto e pode recriar o site inteiro em qualquer lugar, do mesmo jeito, quantas vezes quiser. É a
+diferença entre “está rodando porque eu digitei um comando” e “está rodando porque este arquivo diz que
+deve estar”.</p>
+
+<dl class="anatomy">
+<dt>estado desejado</dt>
+<dd>O que você pediu que existisse. Fica guardado no cluster, mesmo que o programa esteja fora do ar
+naquele instante.</dd>
+<dt>estado atual</dt>
+<dd>O que está de fato rodando: quantos pods existem, onde estão, prontos ou não.</dd>
+<dt>reconciliação</dt>
+<dd>O laço que compara os dois estados e age para fechar a diferença. Roda para sempre, em silêncio.</dd>
+<dt>manifesto</dt>
+<dd>O arquivo de texto que descreve um ou mais objetos. É o que você entrega ao cluster.</dd>
+<dt>objeto</dt>
+<dd>Uma coisa guardada no cluster: um pod, um service, um deployment. Tem nome, tipo e campos.</dd>
+<dt>cluster</dt>
+<dd>O conjunto de máquinas que roda tudo isso: o cérebro (control plane) e os nós de trabalho.</dd>
+</dl>
+
+<h2>3. O que Kubernetes é — e o que ele não é</h2>
+
+<p>Kubernetes é open source, feito pelo Google e mantido por uma comunidade enorme, hoje sob o guarda-chuva
+da CNCF. A versão que este guia usa é a 1.37. O nome tem origem grega, quer dizer timoneiro, e o apelido
+dele é <strong>k8s</strong> — o 8 está no lugar das oito letras entre o k e o s. Você vai ver as duas
+formas por aí; são a mesma coisa.</p>
+
+<p>Ele também não é um programa que você abre numa janela. Kubernetes vem em pedaços: um conjunto de
+programas que rodam em servidores e conversam entre si por rede. Quem fala com tudo isso é um cliente de
+linha de comando, o <code>kubectl</code> — o “cubo-controle”. Você digita <code>kubectl</code> no terminal,
+ele manda um pedido por HTTP para o cluster e mostra a resposta.</p>
+
+<p>Agora a parte importante do “não é”. Kubernetes <strong>não</strong> compila o seu site, não cuida do
+banco de dados por você, não substitui o Docker (ele usa containers, que é outra tecnologia) e
+<strong>não</strong> adivinha o que o seu programa precisa. Ele é um gerente de infraestrutura: recebe
+descrições, arranja lugar para elas e mantém de pé. Programe, teste e empacote o site continua sendo
+trabalho seu.</p>
+
+<h2>4. As partes de um cluster</h2>
+
+<p>Um cluster tem, por baixo, máquinas — físicas ou virtuais. Cada máquina que participa do cluster é um
+<strong>nó</strong> (<em>node</em>). Num nó comum roda o seu site; no nó especial que comanda o resto roda o
+<em>control plane</em>, o cérebro. Num cluster de estudo, é comum o mesmo computador fazer os dois papéis:
+você tem um “nó de controle” e um ou dois “nós de trabalho”, todos desenhados por software na sua
+máquina.</p>
+
+<p>O cérebro tem quatro peças que você vai ouvir por nome cedo ou tarde. O <strong>API server</strong> é a
+porta de entrada: tudo passa por ele, inclusive o seu <code>kubectl</code>. O <strong>etcd</strong> é o
+caderno onde o estado desejado fica anotado. O <strong>scheduler</strong> decide em qual nó cada pod vai
+cair. E o <strong>controller manager</strong> fica comparando o que está escrito com o que existe, ligando
+os controladores que corrigem a diferença.</p>
+
+<p>Do outro lado, em cada nó de trabalho, roda o <strong>kubelet</strong>: um agente que conversa com o
+cérebro e cuida dos containers daquela máquina, usando um <em>runtime</em> de containers (o mais comum é o
+<code>containerd</code>). Se o kubelet percebe que um container do seu pod parou, ele reinicia. Se o nó
+inteiro cai, o cérebro percebe que os pods de lá sumiram e cria substitutos em outro lugar.</p>
+
+<h2>5. O vocabulário mínimo</h2>
+
+<p>Cinco palavras aparecem em toda aula daqui para a frente, e vale fixar cada uma com uma imagem mental.
+Elas não são sinônimos: cada uma responde uma pergunta diferente.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Palavra</th><th>O que é</th><th>Pergunta que responde</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>cluster</strong></td><td>o conjunto todo: cérebro mais nós</td><td>onde as coisas rodam?</td></tr>
+<tr><td><strong>nó</strong> (<em>node</em>)</td><td>uma máquina do cluster</td><td>em qual computador?</td></tr>
+<tr><td><strong>pod</strong></td><td>a menor unidade que o cluster agenda: um ou mais containers juntos,
+com o mesmo endereço de rede</td><td>o que está rodando?</td></tr>
+<tr><td><strong>objeto</strong></td><td>um registro no cluster: pod, service, deployment, configmap</td>
+<td>o que eu pedi?</td></tr>
+<tr><td><strong>manifesto</strong></td><td>o arquivo YAML que descreve objetos</td><td>como eu peço?</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O pod merece um parágrafo à parte, porque é a peça que confunde. Ele não é o seu programa e não é o
+container: é o <em>pacote</em> que o cluster liga. Dentro dele pode haver um container (o caso comum) ou
+vários, que compartilham rede e ciclo de vida — se um cai, o pacote inteiro é considerado problemático. O
+cluster não agenda “containers”; ele agenda pods.</p>
+
+<p>Além dos nós, o cluster guarda <em>namespaces</em>: gavetas onde os objetos moram. Todo cluster nasce
+com duas, e ver isso é um bom primeiro sinal de vida. A transcrição abaixo é de um cluster local recém
+criado:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get ns
+NAME          AGE
+default       8m
+kube-system   9m</pre>
+
+<p><code>default</code> é onde o seu pedido cai quando você não escolhe outro lugar. <code>kube-system</code>
+é onde moram os programas do próprio Kubernetes — o DNS do cluster, o controlador de rede e por aí. Você não
+vai mexer nessa gaveta no começo, e é bom que ela exista: é o que faz o cluster funcionar antes de você pedir
+qualquer coisa.</p>
+
+<h2>6. Vendo o cluster responder</h2>
+
+<p>Chega de teoria por um minuto. A caixa abaixo é um terminal: cada linha é um comando que a Ana
+digitaria, e o painel mostra a resposta do cluster. O primeiro comando pergunta a versão do
+<code>kubectl</code> instalado no notebook. O segundo lista os nós — as máquinas que formam o cluster.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Client Version;;texto:guia-control-plane;;texto:Ready">
+  <p class="try-task">Só falta ver as máquinas. Acrescente a linha <code>kubectl get nodes</code> embaixo do
+  primeiro comando e rode.</p>
+<pre class="yaml">kubectl version --client</pre>
+<pre class="out">
+ana@notebook:~$ kubectl version --client
+Client Version: v1.37.3
+Kustomize Version: v5.8.1
+</pre>
+<pre class="solucao">kubectl version --client
+kubectl get nodes</pre>
+</div>
+
+<p>A primeira resposta tem duas linhas: <code>Client Version: v1.37.3</code> e a versão do
+<code>kustomize</code> que vem embutida. A segunda é uma tabela com três nós: <code>guia-control-plane</code>
+(o cérebro), <code>guia-worker</code> e <code>guia-worker2</code> (os trabalhadores). A coluna
+<code>STATUS</code> em <code>Ready</code> quer dizer que o cérebro consegue falar com o nó e considera que
+ele está saudável. Nó <code>NotReady</code> é nó com problema — e, quando isso acontece, os pods dele são
+recriados em outro lugar.</p>
+
+<p>Repare no nome: <code>guia</code> é o nome do cluster de estudo, e o kind (a ferramenta que cria clusters
+de teste, que você instala na aula 4) batiza os nós com esse prefixo. Num cluster de nuvem, os nomes são
+compridos e feios, tipo <code>ip-10-0-1-23</code>; a lógica é a mesma.</p>
+
+<h2>7. O pedido escrito em YAML</h2>
+
+<p>Ver o cluster responder é bom; pedir alguma coisa é melhor. Todo pedido em Kubernetes tem a mesma
+estrutura de três andares: <code>apiVersion</code> (a versão da API que você está usando),
+<code>kind</code> (o tipo do objeto) e <code>metadata</code> (a identidade: nome, etiquetas). Depois vem
+<code>spec</code>, que é o conteúdo do pedido. A caixa abaixo tem um manifesto de pod faltando um desses
+andares. Rode e leia o erro antes de consertar.</p>
+
+<div class="tryk8s" data-goal="objeto:Pod/cardapio;;texto:Running">
+  <p class="try-task">Falta dizer <em>que tipo</em> de objeto é. Acrescente a linha <code>kind: Pod</code>
+  embaixo do <code>apiVersion</code> e rode de novo.</p>
+<pre class="yaml">apiVersion: v1
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+error: unable to decode "STDIN": Object 'Kind' is missing
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>A mensagem do erro é curta e direta: <code>error: unable to decode "STDIN": Object 'Kind' is missing</code>.
+Traduzindo: “não consegui ler, o objeto não tem <code>kind</code>”. O kubectl leu o texto, tentou descobrir
+de que tipo era e não achou; sem tipo, ele não sabe nem qual validação aplicar. Com a linha
+<code>kind: Pod</code>, o pod é criado e aparece <code>Running</code>.</p>
+
+<p>O <code>spec</code> desse manifesto tem uma lista de containers, com nome e imagem. Note que o nome
+aparece duas vezes: <code>metadata.name</code> é o nome do pod (<code>cardapio</code>), e o
+<code>name</code> dentro de <code>containers</code> é o nome do container (<code>web</code>). São coisas
+diferentes: um pod pode ter vários containers, cada um com seu nome.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Obrigatório?</th><th>O que vai ali</th></tr>
+</thead>
+<tbody>
+<tr><td><code>apiVersion</code></td><td>sim</td><td>a versão da API: <code>v1</code> para Pod,
+<code>apps/v1</code> para Deployment</td></tr>
+<tr><td><code>kind</code></td><td>sim</td><td>o tipo do objeto: <code>Pod</code>,
+<code>Service</code>, <code>Deployment</code></td></tr>
+<tr><td><code>metadata.name</code></td><td>sim</td><td>o nome, em minúsculas e com hífen</td></tr>
+<tr><td><code>metadata.labels</code></td><td>não</td><td>etiquetas para agrupar e filtrar</td></tr>
+<tr><td><code>spec</code></td><td>sim</td><td>o conteúdo do pedido, diferente para cada tipo</td></tr>
+<tr><td><code>status</code></td><td>não</td><td>preenchido pelo cluster; você não escreve</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. Um pedido, dois pods</h2>
+
+<p>O pod é a unidade, mas pedir um pod sozinho é frágil: se ele morrer, ninguém recria. Por isso o jeito
+normal de pedir é um <strong>Deployment</strong>, que diz “quero esta imagem, com esta quantidade de
+cópias”. O Deployment é um controlador: ele cria os pods, vigia cada um e repõe o que faltar. A caixa
+abaixo pede uma cópia; a missão é pedir duas, sem criar o segundo pod na mão.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/cardapio|spec.replicas=2;;conta:pods=2">
+  <p class="try-task">Troque <code>replicas: 1</code> por <code>replicas: 2</code> e rode. O cluster tem de
+  criar o segundo pod sozinho.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   1/1     1            1           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>A tabela do Deployment mostra <code>READY 2/2</code>: duas cópias prontas de duas pedidas. Se você
+rodasse <code>kubectl get pods</code> na sequência (o comando da aula de kubectl), veria dois pods de nome
+comprido, do tipo <code>cardapio-xxxxx-yyyyy</code>. Esses nomes são inventados
+pelo controlador, e é por isso que eles têm essa cara: cada pod é descartável, o nome dele não importa. O
+que importa é o Deployment <code>cardapio</code>, esse sim com nome fixo.</p>
+
+<p>Para ver os pods por trás do Deployment, o comando é <code>kubectl get pods</code>. A transcrição
+abaixo é do mesmo cluster local, com o Deployment pedindo duas cópias:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-pvx6crj8rr-64bgk   1/1     Running   0          3m
+cardapio-pvx6crj8rr-w5m2v   1/1     Running   0          1m</pre>
+
+<p>Repare que os dois nomes começam igual — <code>cardapio-pvx6crj8rr</code> — e terminam com um sufixo
+aleatório. A parte do meio é o ReplicaSet, o objeto que o Deployment criou para cuidar das cópias; o sufixo é
+o nome único de cada pod. É por isso que você nunca escreve o nome de um pod num script: ele muda a cada
+recriação.</p>
+
+<p>O bloco <code>template</code> é o molde do pod: tudo o que está ali dentro vira cada uma das cópias. E o
+<code>selector</code> é como o Deployment reconhece os pods que são dele — ele procura pods com a etiqueta
+<code>app: cardapio</code>, a mesma que o molde coloca. Se as duas não casarem, o controlador cria pods e
+não os enxerga como seus, num vaivém infinito. É um erro clássico, e a aula de labels e selectors volta
+nele.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: “mas eu já tinha subido o site”</h3>
+<p>A Ana achou que o cluster estava “rodando o site” do mesmo jeito que o terminal rodava. Não é: o cluster
+roda o que está <em>descrito</em>. Quando ela apagou o arquivo do projeto e pensou que o site continuaria,
+descobriu que o manifesto, não o programa, é a fonte da verdade. Quem descreve, manda; o que roda é
+consequência.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o cluster não é um servidor mágico</h3>
+<p>Ela tentou “subir” uma pasta do notebook com o site e o comando não fez sentido nenhum: Kubernetes não
+copia código para dentro do cluster. O que viaja é a imagem — o pacote do programa, construído antes, num
+registro. Todo o resto é descrição. Se a imagem não existe no registro, o pod não sobe, e o motivo aparece
+no <code>describe</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o manifesto que ninguém sabe ler</h3>
+<p>Ela copiou um YAML de um blog e o cluster recusou com uma mensagem sobre <code>apiVersion</code>. O
+arquivo era de uma versão antiga de outro tipo de objeto. Manifesto não é texto sagrado: é um pedido com
+três andares (versão, tipo, identidade) e um conteúdo. Quando algo falha, o primeiro passo é olhar esses
+andares antes de qualquer outra coisa.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o Kubernetes faz, em uma frase?</p>
+<label><input type="radio" name="q1"> compila o seu site e publica na internet</label>
+<label><input type="radio" name="q1"> guarda o estado desejado e age para que ele coincida com o real</label>
+<label><input type="radio" name="q1"> substitui o Docker, criando imagens por você</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual é a menor unidade que o cluster agenda?</p>
+<label><input type="radio" name="q2"> o container</label>
+<label><input type="radio" name="q2"> o nó</label>
+<label><input type="radio" name="q2"> o pod</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Quais campos todo manifesto precisa ter?</p>
+<label><input type="radio" name="q3"> <code>apiVersion</code>, <code>kind</code>,
+<code>metadata.name</code> e <code>spec</code></label>
+<label><input type="radio" name="q3"> <code>status</code>, <code>kind</code> e <code>spec</code></label>
+<label><input type="radio" name="q3"> só <code>spec</code>: o resto é opcional</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o tipo do objeto</h2>
+<p>O manifesto abaixo descreve um pod, mas está sem a linha que diz o tipo. Complete:</p>
+<div class="ex-code"><input aria-label="resposta 1" data-answer="kind" placeholder="...">: Pod</div>
+<p class="ex-dica">Dica: é o campo que responde “que tipo de objeto é este?”. Sem ele, o kubectl responde
+<em>Object 'Kind' is missing</em>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Kubernetes é um gerente de infraestrutura declarativo: você descreve o estado desejado num manifesto, o
+cluster guarda essa descrição e reconcilia — liga o que falta, repõe o que caiu, tira o que sobra. Não é
+linguagem, não é nuvem, não constrói imagem: ele usa containers e cuida de mantê-los vivos no lugar
+certo.</p>
+
+<p>As peças têm nomes: <strong>cluster</strong> é o conjunto, <strong>nó</strong> é a máquina,
+<strong>control plane</strong> é o cérebro (API server, etcd, scheduler, controller manager) e
+<strong>kubelet</strong> é o agente que trabalha em cada nó. A unidade que o cluster agenda é o
+<strong>pod</strong>, e o <strong>Deployment</strong> é quem pede pods em quantidade e os vigia.</p>
+
+<p>Todo manifesto tem os mesmos andares: <code>apiVersion</code>, <code>kind</code>, <code>metadata</code> e
+<code>spec</code> — e é o <code>kind</code> que falta que produz o erro mais comum de quem está começando.
+Na próxima aula a Ana olha para dentro dessa hierarquia: o que é um cluster, o que é um nó e o que é um pod,
+com os comandos que mostram cada um.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Kubernetes guarda o <em>estado desejado</em> e reconcilia com o real, sem parar.</li>
+  <li>Cluster = cérebro (control plane) + nós de trabalho.</li>
+  <li>Pod é a unidade que o cluster agenda; container é o que está dentro.</li>
+  <li>Manifesto tem <code>apiVersion</code>, <code>kind</code>, <code>metadata</code> e
+  <code>spec</code>.</li>
+  <li><code>kubectl</code> é o cliente que fala com o cluster.</li>
+  <li>Deployment pede cópias e repõe as que caem; pod solto não volta.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

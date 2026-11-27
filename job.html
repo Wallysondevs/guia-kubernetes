@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job | Guia Kubernetes</title>
+<meta name="description" content="Job no Kubernetes: o workload que roda até terminar. restartPolicy obrigatória, pods Succeeded, backoffLimit, activeDeadlineSeconds, ttlSecondsAfterFinished e kubectl create job.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Job</span></h1>
+<p class="intro">Todo mês a Ana fecha o caixa da padaria e precisa de um relatório: somar as vendas do mês,
+gerar um PDF, mandar por e-mail para a contabilidade. Isso é uma tarefa, não um serviço. Ela tem começo, tem
+fim e, quando termina, não faz sentido nenhum ficar rodando. É para isso que existe o <strong>Job</strong> — o
+workload do Kubernetes que promete “rodar até completar”, em vez de “ficar no ar para sempre”.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que um Job promete e por que ele não é um Deployment pequeno.</li>
+  <li>As seis linhas do manifesto que realmente importam.</li>
+  <li>Por que <code>restartPolicy: Always</code> é proibido num Job e o que usar no lugar.</li>
+  <li>Como ler o <code>Succeeded</code> no lugar de <code>Running</code>.</li>
+  <li><code>backoffLimit</code>, <code>activeDeadlineSeconds</code> e <code>ttlSecondsAfterFinished</code>:
+  quantas tentativas, quanto tempo, e quem apaga o quê.</li>
+  <li>A diferença entre <code>kubectl run</code> e <code>kubectl create job</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o relatório que precisa terminar</h2>
+
+<p>Na primeira versão da padaria, o relatório era um container rodando dentro de um Deployment com uma réplica.
+Funcionava até alguém olhar a fatura: o script gerava o PDF em dois minutos e passava o resto do mês dormindo —
+mas o pod continuava lá, ocupando um lugar no nó, sendo reiniciado de vez em quando, e o log enchia de
+“relatório já gerado”. Pior: quando o processo terminava com sucesso, o Deployment entendia aquilo como
+<em>falha</em> e subia de novo.</p>
+
+<p>O erro de raciocínio é tratar uma tarefa como um serviço. Um Deployment existe para manter um número de
+réplicas vivas: se o processo morre, ele ressuscita. Um Job existe para levar um trabalho até o fim: se o
+processo termina bem, ele <em>para</em>, e isso é o resultado esperado. São promessas opostas, e o Kubernetes
+tem objetos diferentes para cada uma.</p>
+
+<p>Na padaria, a lista de tarefas é grande: gerar o relatório mensal, exportar o catálogo para o site, fazer o
+backup do banco, reorganizar as fotos dos produtos, treinar o modelo que sugere recheio. Nenhuma delas
+precisa estar no ar às três da manhã. Todas precisam de alguém que saiba dizer “terminou” ou “falhou depois de
+tantas tentativas” — e é exatamente o que o Job faz.</p>
+
+<h2>2. Anatomia de um Job</h2>
+
+<p>Um Job é um objeto pequeno: um molde de pod (igual ao do Deployment) e um punhado de campos que dizem
+<em>quantas</em> vezes rodar, <em>quantas</em> ao mesmo tempo, <em>quanto</em> insistir e <em>por quanto
+tempo</em> guardar o resultado. Estes são os que você vai usar:</p>
+
+<dl class="anatomy">
+<dt>spec.template</dt>
+<dd>O molde do pod, com <code>containers</code>, <code>image</code>, <code>command</code>. É praticamente o
+mesmo bloco que você já escreve num Deployment.</dd>
+<dt>spec.template.spec.restartPolicy</dt>
+<dd>Obrigatória, e só aceita <code>OnFailure</code> ou <code>Never</code>. Sem ela, o Job é recusado na hora
+do <code>apply</code>.</dd>
+<dt>spec.completions</dt>
+<dd>Quantos pods precisam terminar com sucesso para o Job ser considerado completo. Padrão 1.</dd>
+<dt>spec.parallelism</dt>
+<dd>Quantos pods rodam ao mesmo tempo. Padrão 1.</dd>
+<dt>spec.backoffLimit</dt>
+<dd>Quantas vezes o Job aceita falhar antes de desistir. Padrão 6.</dd>
+<dt>spec.activeDeadlineSeconds</dt>
+<dd>Prazo de parede para o Job inteiro. Estourado o prazo, ele é encerrado, mesmo que ainda esteja
+tentando.</dd>
+<dt>spec.ttlSecondsAfterFinished</dt>
+<dd>Quanto tempo o Job (e os pods dele) fica no cluster depois de terminar, antes de ser apagado
+sozinho.</dd>
+</dl>
+
+<p>Repare no que <em>não</em> existe aqui: não há <code>replicas</code>, não há <code>strategy</code>, não há
+probe de liveness. Não faz sentido perguntar se uma tarefa que já terminou está saudável. E note também que
+<code>completions</code> e <code>parallelism</code> são o assunto de uma aula inteira —
+<a href="job-paralelo.html">Job paralelo</a> — então aqui eles ficam no padrão 1 e 1.</p>
+
+<h2>3. A linha que o Kubernetes exige: restartPolicy</h2>
+
+<p>Todo pod tem uma política de reinício, e num Job ela não pode ser <code>Always</code>. O motivo é
+filosófico antes de ser técnico: se o container reiniciasse para sempre, o Job nunca chegaria a “terminou”, e
+o controlador não teria como contar sucesso. Quer dizer, o Job depende de o pod <em>parar</em> — e
+<code>Always</code> é justamente a política que impede isso.</p>
+
+<p>O erro aparece cedo, no <code>apply</code>, e a mensagem é bem específica:</p>
+
+<pre class="term">$ kubectl apply -f relatorio.yaml
+The Job "relatorio" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"</pre>
+
+<p>Essa é a mensagem de um Job <em>sem</em> política nenhuma. Se você escrever <code>Always</code> por hábito,
+o servidor responde com <code>Unsupported value: "Always"</code> e as mesmas duas opções. A caixa começa
+exatamente nesse estado: um Job sem a linha. A missão é fazer o manifesto ser aceito e o pod terminar.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Job/relatorio|spec.template.spec.restartPolicy=Never;;campo:Job/relatorio|status.succeeded=1;;texto:Succeeded">
+  <p class="try-task">O manifesto abaixo é recusado porque falta a política de reinício. Acrescente
+  <code>restartPolicy: Never</code> dentro de <code>spec.template.spec</code> e rode até o pod aparecer em
+  <code>Succeeded</code>.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: relatorio
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: relatorio
+    spec:
+      containers:
+        - name: relatorio
+          image: relatorio:1.0
+          command: ["python", "gerar.py"]</pre>
+<pre class="out">
+The Job "relatorio" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+</pre>
+  <pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: relatorio
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: relatorio
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: relatorio
+          image: relatorio:1.0
+          command: ["python", "gerar.py"]</pre>
+</div>
+
+<p>Qual das duas escolher? <code>Never</code> cria um pod novo a cada tentativa: você vê o histórico completo
+no <code>get pods</code> e cada tentativa tem log próprio. <code>OnFailure</code> reinicia o container dentro
+do mesmo pod: menos objetos, mas o log mistura as tentativas. Para tarefa curta e de diagnóstico fácil,
+<code>Never</code>; para trabalho que pode ser repetido no mesmo lugar sem sujar nada, <code>OnFailure</code>.
+As duas valem, e o assunto foi detalhado em <a href="restart-policy.html">Restart Policy</a>.</p>
+
+<h2>4. O pod que termina: Succeeded no lugar de Running</h2>
+
+<p>O que muda no painel quando o Job funciona? O status do pod. Um Deployment vive em <code>Running</code>;
+o pod de um Job passa por <code>Running</code> e chega em <code>Succeeded</code>. A coluna <code>READY</code>
+fica em <code>0/1</code> — e isso não é erro: o container já não está lá para aceitar tráfego.</p>
+
+<pre class="term">$ kubectl get pods
+NAME              READY   STATUS      RESTARTS   AGE
+relatorio-bzfhv   0/1     Succeeded   0          2m
+
+$ kubectl get jobs
+NAME        COMPLETIONS   DURATION   AGE
+relatorio   1/1           41s        2m</pre>
+
+<p>A primeira saída é do painel do guia, com o motor real. A segunda é a transcrição de um cluster de prova:
+num cluster de verdade o <code>get jobs</code> mostra <code>COMPLETIONS</code> e <code>DURATION</code>, e é
+essa a linha que você olha para saber se a tarefa fechou. O <code>1/1</code> quer dizer “um pod precisava
+terminar, um terminou”.</p>
+
+<p>E, num cluster real, o status do pod aparece como <code>Completed</code> em vez de <code>Succeeded</code>
+na listagem — é o mesmo estado, com nome comercial diferente. O importante é o significado: o processo saiu
+com zero. Qualquer código diferente de zero é <code>Failed</code> e, dependendo do <code>backoffLimit</code>,
+o Job tenta de novo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Status do pod</th><th>O que significa num Job</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Succeeded</code></td><td>terminou com código zero; conta para <code>completions</code></td><td>nada,
+era o objetivo</td></tr>
+<tr><td><code>Failed</code></td><td>saiu com erro; consome uma tentativa do <code>backoffLimit</code></td><td>ler
+o log daquela tentativa antes que o Job desista</td></tr>
+<tr><td><code>Running</code></td><td>ainda executando</td><td>esperar; se demorar demais, é caso de
+<code>activeDeadlineSeconds</code></td></tr>
+<tr><td><code>Pending</code></td><td>o agendador não achou lugar (recurso, taint, seletor)</td><td>o Job não tem
+culpa: o problema é de agendamento</td></tr>
+<tr><td><code>ContainerCreating</code></td><td>baixando imagem ou montando volume</td><td>erro de imagem aparece
+como <code>ImagePullBackOff</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um detalhe que confunde muita gente: o Job também tem status próprio, em
+<code>status.succeeded</code> e <code>status.conditions</code>. É ele que o Kubernetes usa para dizer
+“Complete” ou “Failed”; o status do pod é o retrato de uma tentativa. Quando os dois discordam — Job
+<code>Complete</code> com pods <code>Failed</code> no histórico —, está tudo certo: as tentativas que falharam
+ficaram para trás, e a que deu certo fechou a conta.</p>
+
+<h2>5. backoffLimit: quantas vezes insistir</h2>
+
+<p>Se a tarefa falhar, o Job tenta de novo. <code>backoffLimit</code> é o orçamento de falhas, e o padrão é
+6. As tentativas não saem em rajada: o controlador espera um tempo crescente entre elas (na casa de dez
+segundos, dobrando até um teto de alguns minutos). Quando o orçamento acaba, o Job ganha a condição
+<code>Failed</code> com motivo <code>BackoffLimitExceeded</code> — e para de criar pods.</p>
+
+<p>Escolher o número é escolher entre “insistir” e “avisar logo”. Um backup que falha por rede merece
+<code>backoffLimit: 3</code> e uma noite de tentativas. Um script de migração que falhou por bug de SQL vai
+falhar seis vezes do mesmo jeito, e cada tentativa pode sujar o banco: nesse caso, <code>backoffLimit: 0</code>
+é a resposta — uma tentativa, falhou, me chama. O valor não é sobre resiliência genérica; é sobre quanto dano
+uma repetição pode causar.</p>
+
+<p>Vale saber onde olhar quando o Job desiste: <code>kubectl describe job relatorio</code> mostra os eventos
+com <code>BackoffLimitExceeded</code> e o número de pods falhos; o log de cada tentativa está no pod
+correspondente. Não existe “log do Job” — existe log do pod, que é por tentativa. Um Job que já apagou os pods
+(por TTL, por exemplo) perdeu a evidência junto.</p>
+
+<h2>6. activeDeadlineSeconds: o prazo de parede</h2>
+
+<p><code>backoffLimit</code> conta tentativas; <code>activeDeadlineSeconds</code> conta <em>tempo</em>. Os dois
+resolvem problemas diferentes. Se o script trava esperando um lock que nunca vem, ele não falha — ele fica
+parado, e o contador de falhas não anda. O prazo é o que salva: passados os segundos configurados, o
+controlador encerra o Job com motivo <code>DeadlineExceeded</code>.</p>
+
+<p>Há um uso secundário que vale conhecer: prazo também serve de freio para Job mal configurado. Se você
+escreveu <code>completions: 3</code> mas só existe um pod que consegue rodar, o Job fica tentando para sempre e
+o <code>get jobs</code> mostra <code>1/3</code> eternamente. Com prazo, ele desiste e o painel diz por quê.
+Nunca deixe um Job sem prazo só porque “a tarefa costuma ser rápida”: o dia em que não for, você vai descobrir
+pelo nó cheio, não por um alerta.</p>
+
+<p>O relógio começa quando o Job começa a rodar, não a cada pod. Com três tentativas em fila e
+<code>activeDeadlineSeconds: 900</code>, o Job tem quinze minutos <em>no total</em>, não quinze por tentativa.
+É a diferença entre “quanto tempo cada tentativa pode levar” e “até quando eu estou disposto a esperar por
+esse resultado”, e a segunda pergunta é a que a operação faz.</p>
+
+<p>Um valor bem escolhido vem da medição, não do chute: rode a tarefa algumas vezes, veja a duração típica no
+<code>get jobs</code>, e ponha o prazo em algo como três vezes esse valor. Prazo curto demais transforma
+tarefa saudável em falha; prazo longo demais não protege de nada. E, se a tarefa for longa de verdade, prefira
+dividi-la em pedaços com <code>completions</code> — o que é assunto da aula de <a href="job-paralelo.html">Job
+paralelo</a>.</p>
+
+<h2>7. Limpando o rastro: ttlSecondsAfterFinished</h2>
+
+<p>Job terminado não some. Ele fica no cluster, com o pod <code>Succeeded</code> ao lado, e isso é bom: é o
+registro de que o relatório foi gerado, com data e status. O problema é o acúmulo — um Job por hora, durante
+um ano, são quase nove mil objetos no <code>get jobs</code>, e o <code>etcd</code> não acha graça.</p>
+
+<p><code>ttlSecondsAfterFinished</code> resolve com uma linha: passados os segundos, o controlador apaga o Job
+e, em cascata, os pods dele. <code>0</code> apaga assim que terminar (bom para tarefa de altíssima frequência
+cujo resultado é lido em outro lugar); <code>600</code> dá dez minutos para você olhar; e não declarar o campo
+significa “fica para sempre”, que é o padrão e a origem de quase todo entulho de cluster.</p>
+
+<p>O preço é a evidência. Se o Job foi apagado, o log da tentativa foi com ele. Por isso a combinação
+recomendada é: TTL curto para tarefas frequentes e descartáveis, TTL longo (ou nenhum) para o relatório
+mensal que a contabilidade pode pedir para conferir. A caixa abaixo põe prazo e TTL no mesmo Job de backup,
+que começa sem nenhum dos dois.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Job/backup|spec.activeDeadlineSeconds=300;;campo:Job/backup|spec.ttlSecondsAfterFinished=600;;campo:Job/backup|status.succeeded=1">
+  <p class="try-task">O backup da padaria roda sem prazo e fica para sempre no cluster. Acrescente
+  <code>activeDeadlineSeconds: 300</code> e <code>ttlSecondsAfterFinished: 600</code> em
+  <code>spec</code> (fora do <code>template</code>). Rode e confira o Job concluído.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backup
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backup
+          image: backup:2.0</pre>
+<pre class="out">
+job.batch/backup created
+
+NAME           READY   STATUS      RESTARTS   AGE
+backup-dtcmk   0/1     Succeeded   0          37s
+</pre>
+  <pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backup
+spec:
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backup
+          image: backup:2.0</pre>
+</div>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Se você não puser</th><th>Se puser</th></tr>
+</thead>
+<tbody>
+<tr><td><code>backoffLimit</code></td><td>seis tentativas por padrão</td><td>você escolhe quanto insistir</td></tr>
+<tr><td><code>activeDeadlineSeconds</code></td><td>o Job pode ficar preso indefinidamente</td><td>prazo total,
+depois encerra com <code>DeadlineExceeded</code></td></tr>
+<tr><td><code>ttlSecondsAfterFinished</code></td><td>Job e pods ficam para sempre</td><td>apaga sozinho depois de
+N segundos</td></tr>
+<tr><td><code>restartPolicy</code></td><td>manifesto recusado no <code>apply</code></td><td>aceito com
+<code>Never</code> ou <code>OnFailure</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma nota honesta sobre o painel: ele guarda os campos e mostra o Job concluído, mas não existe um
+controlador de TTL rodando ali para apagar o objeto depois do tempo. Num cluster real, o <code>get jobs</code>
+simplesmente deixaria de listar o Job. O que o painel prova é que o manifesto está correto — e é isso que você
+leva para o cluster.</p>
+
+<h2>8. Job na mão: kubectl run não cria Job</h2>
+
+<p>Existe um atalho que engana muita gente. <code>kubectl run</code> cria um <em>pod</em> solto, não um Job.
+Ele aceita <code>--restart=Never</code>, e o pod até se comporta parecido, mas ninguém conta as tentativas,
+ninguém registra “terminou”, e ninguém recria nada. Se o nó for reiniciado, o pod solto simplesmente some.</p>
+
+<p>Para criar um Job sem escrever YAML, o comando é outro:</p>
+
+<pre class="term">$ kubectl create job faxina --image=limpeza:1.0
+job.batch/faxina created</pre>
+
+<p>A caixa usa isso. O estado inicial é o comando errado, com <code>kubectl run</code>: o painel mostra um pod
+vivo e nenhum Job. A missão é trocar pelo comando que cria o Job de verdade, com a mesma imagem.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="campo:Job/faxina|spec.template.spec.restartPolicy=Never;;conta:pods=1;;texto:Succeeded">
+  <p class="try-task">Troque o <code>kubectl run</code> por <code>kubectl create job faxina
+  --image=limpeza:1.0</code> e rode. O painel tem de mostrar o Job criado e o pod em
+  <code>Succeeded</code>.</p>
+<pre class="yaml">kubectl run faxina --image=limpeza:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run faxina --image=limpeza:1.0
+pod/faxina created
+
+ana@notebook:~$ kubectl get pods
+NAME     READY   STATUS    RESTARTS   AGE
+faxina   1/1     Running   0          3m
+</pre>
+  <pre class="solucao">kubectl create job faxina --image=limpeza:1.0
+kubectl get pods</pre>
+</div>
+
+<p>Repare no que o comando gerou: um Job com <code>restartPolicy: Never</code>, <code>backoffLimit: 6</code>,
+<code>completions: 1</code> e <code>parallelism: 1</code> — os padrões. Para ver o YAML e guardar no
+repositório, o caminho é o de sempre:</p>
+
+<pre class="term">$ kubectl create job faxina --image=limpeza:1.0 --dry-run=client -o yaml</pre>
+
+<p>Isso imprime o manifesto sem enviar nada ao cluster. É o jeito mais rápido de sair do comando para o
+arquivo versionado, e vale para qualquer recurso. Para criar um Job a partir de um CronJob já existente existe
+<code>--from=cronjob/nome</code>, que é assunto da <a href="cronjob.html">próxima aula</a>. E, em qualquer
+caso, comandos imperativos são bons para rascunho e ruins para produção: o arquivo no repositório é o que
+sobrevive ao próximo <code>apply</code>.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o relatório de fim de mês</h3>
+<p>Job com <code>completions: 1</code>, <code>backoffLimit: 2</code> e <code>activeDeadlineSeconds: 1800</code>.
+Terminou em dois minutos e ficou lá, com o pod <code>Succeeded</code> ao lado, servindo de comprovante. No mês
+seguinte, o time acrescentou <code>ttlSecondsAfterFinished: 604800</code>: sete dias de evidência, e depois a
+limpeza automática, sem ninguém precisar lembrar.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a migração que não podia repetir</h3>
+<p>Um script alterava a tabela de pedidos. Falhou no meio, e o padrão de seis tentativas executou o mesmo
+comando seis vezes, deixando o schema pela metade. A correção foi <code>backoffLimit: 0</code> — uma tentativa,
+uma falha, um humano. Tarefa que não é idempotente não ganha retentativa de graça; ela ganha um alarme.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o pod solto que ninguém viu terminar</h3>
+<p>Alguém rodou <code>kubectl run exportacao --image=pandas:2.2</code> para exportar o catálogo. Funcionou. Na
+semana seguinte, o nó foi drenado e o pod foi embora — sem Job, não havia registro de que a exportação tinha
+terminado, nem quando, nem com que resultado. Refeito como Job com <code>ttlSecondsAfterFinished: 3600</code>,
+o histórico passou a existir por uma hora, o suficiente para conferir.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que um Job garante que um Deployment não garante?</p>
+<label><input type="radio" name="q1"> que o container nunca reinicia</label>
+<label><input type="radio" name="q1"> que a tarefa roda até terminar, com sucesso, e para</label>
+<label><input type="radio" name="q1"> que o pod usa menos CPU</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Quais valores <code>restartPolicy</code> um Job aceita?</p>
+<label><input type="radio" name="q2"> <code>Always</code> e <code>OnFailure</code></label>
+<label><input type="radio" name="q2"> qualquer um dos três</label>
+<label><input type="radio" name="q2"> <code>OnFailure</code> e <code>Never</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual campo apaga o Job sozinho depois que ele termina?</p>
+<label><input type="radio" name="q3"> <code>ttlSecondsAfterFinished</code></label>
+<label><input type="radio" name="q3"> <code>activeDeadlineSeconds</code></label>
+<label><input type="radio" name="q3"> <code>backoffLimit</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: limpeza automática</h2>
+<p>Complete o campo que faz o Job ser apagado dez minutos depois de terminar:</p>
+<div class="ex-code">spec:
+  <input aria-label="resposta 1" data-answer="ttlSecondsAfterFinished" placeholder="...">: 600</div>
+<p class="ex-dica">Dica: não é <code>activeDeadlineSeconds</code>, que conta o tempo <em>rodando</em> — este conta
+o tempo <em>depois de terminar</em>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Job é o workload de “uma vez só, até o fim”. Ele exige <code>restartPolicy</code>
+(<code>Never</code> ou <code>OnFailure</code>), conta sucessos em <code>status.succeeded</code> e transforma o
+pod em <code>Succeeded</code> — <code>Completed</code>, na vida real — quando o processo sai com zero. Ler esse
+status é a diferença entre achar que está tudo bem e saber que está.</p>
+
+<p>Os três botões de operação são: <code>backoffLimit</code> (quantas tentativas), <code>activeDeadlineSeconds</code>
+(quanto tempo no total) e <code>ttlSecondsAfterFinished</code> (quanto tempo de lembrança). Sem eles, o Job
+insiste demais, trava para sempre ou enche o cluster de objetos. Com eles, você decide — e a decisão muda
+conforme a tarefa pode ou não ser repetida.</p>
+
+<p>Por fim, o comando: <code>kubectl run</code> cria pod, <code>kubectl create job</code> cria Job. Parece
+detalhe, mas é a diferença entre um resultado que ninguém registrou e um histórico que você pode conferir
+depois. Na próxima aula o mesmo raciocínio ganha um relógio: o CronJob, que cria Jobs sozinho no horário
+marcado.</p>
+
+<div class="note">
+<h3>Para lembrar</h3>
+<ul>
+<li>Job roda até completar; Deployment mantém no ar.</li>
+<li><code>restartPolicy</code> é obrigatória e só aceita <code>Never</code> ou <code>OnFailure</code>.</li>
+<li>Pod de Job termina em <code>Succeeded</code>; num cluster real, aparece como <code>Completed</code>.</li>
+<li><code>backoffLimit</code> conta falhas; padrão 6; motiva <code>BackoffLimitExceeded</code>.</li>
+<li><code>activeDeadlineSeconds</code> conta tempo total; motiva <code>DeadlineExceeded</code>.</li>
+<li><code>ttlSecondsAfterFinished</code> apaga o Job e os pods depois do fim.</li>
+<li><code>kubectl run</code> é pod solto; <code>kubectl create job</code> é Job.</li>
+<li><code>--dry-run=client -o yaml</code> transforma comando em manifesto.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>O básico do kubectl | Guia Kubernetes</title>
+<meta name="description" content="A gramática do kubectl: verbo, recurso, nome e flags. Os verbos que bastam, os apelidos dos recursos, como mudar a saída e como se virar sem decorar comando.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>O básico do <span class="hl">kubectl</span></h1>
+<p class="intro">A Ana tinha uma lista de quarenta comandos colada no monitor e esquecia todos. Até o dia em
+que percebeu que não precisa decorar: existe uma gramática de quatro peças — verbo, recurso, nome e flag — e
+quase todo comando é uma combinação delas. Nesta aula ela aprende a gramática, descobre os seis verbos que
+resolvem o dia a dia, aprende os apelidos dos recursos, entende como mudar a forma da resposta e vê por que
+<code>kubectl get pods,deployments</code> não funciona. Com o cluster no ar da aula anterior, tudo isso é
+testado no painel.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>A forma <code>kubectl &lt;verbo&gt; &lt;recurso&gt; [nome] [flags]</code>.</li>
+  <li>Os seis verbos que cobrem o dia a dia.</li>
+  <li>Plural, singular, apelido: como nomear o recurso.</li>
+  <li>Quando o comando precisa do nome e quando não precisa.</li>
+  <li><code>-n</code>, <code>-o</code> e <code>-l</code>: as três flags que mudam tudo.</li>
+  <li>Como descobrir sozinho o que existe no cluster.</li>
+</ul>
+</div>
+
+<h2>1. A cena: quarenta comandos e nenhum na cabeça</h2>
+
+<p>O caderno da Ana tinha quatro páginas de comandos: criar deployment, ver pods, ver logs, escalar, apagar,
+escrever YAML na tela, filtrar por etiqueta. Ela decorava um, esquecia dois. No dia em que precisou ver os
+pods de outro namespace, travou — não tinha anotado aquele.</p>
+
+<p>O que destravou foi entender que o <code>kubectl</code> não é uma coleção de comandos soltos: é uma
+linguagem pequena e regular. Todo comando tem a mesma espinha: um <strong>verbo</strong> (o que fazer), um
+<strong>recurso</strong> (com o que), às vezes um <strong>nome</strong> (qual deles) e, no fim,
+<strong>flags</strong> (como fazer ou como mostrar). Aprender a espinha vale mais que decorar quarenta linhas,
+porque com ela você monta a linha que falta.</p>
+
+<p>Além disso, o próprio <code>kubectl</code> responde perguntas. Ele sabe listar os tipos de recurso do
+cluster, sabe descrever o que cada tipo significa e sabe explicar o esquema de um objeto. Quem sabe perguntar
+não precisa decorar: precisa saber onde está a resposta.</p>
+
+<h2>2. A gramática de uma linha</h2>
+
+<p>Leia a forma geral com calma, porque ela explica quase todos os erros de iniciante:</p>
+
+<p><code>kubectl VERBO RECURSO [NOME] [FLAGS]</code></p>
+
+<p>O verbo vem primeiro, sempre. O recurso vem em segundo. O nome, quando existe, é um só e vem depois do
+recurso. As flags vêm no fim, com dois hífens quando são palavras e um hífen quando são letras. Trocar a
+ordem produz mensagens estranhas: <code>kubectl --version</code> reclama de comando desconhecido, porque o
+<code>kubectl</code> espera um verbo naquela posição — e <code>--version</code> não é verbo.</p>
+
+<dl class="anatomy">
+<dt>verbo</dt>
+<dd>A ação: <code>get</code>, <code>describe</code>, <code>create</code>, <code>apply</code>,
+<code>delete</code>, <code>scale</code>. Vem logo depois de <code>kubectl</code>.</dd>
+<dt>recurso</dt>
+<dd>O tipo de objeto: <code>pods</code>, <code>deployments</code>, <code>nodes</code>. Aceita plural,
+singular e apelido.</dd>
+<dt>nome</dt>
+<dd>Qual objeto, quando o comando é sobre um só: <code>kubectl get pod forno</code>.</dd>
+<dt>flag</dt>
+<dd>Opção no fim do comando: <code>-n</code> (namespace), <code>-o</code> (formato), <code>-l</code>
+(seletor).</dd>
+<dt>namespace</dt>
+<dd>Divisória lógica dos objetos. Sem <code>-n</code>, o kubectl usa o namespace do contexto, quase sempre
+<code>default</code>.</dd>
+<dt>seletor</dt>
+<dd>Filtro por etiqueta: <code>-l app=cardapio</code> mostra só o que tem aquela etiqueta.</dd>
+<dt>shortname</dt>
+<dd>Apelido do recurso: <code>po</code> para pods, <code>deploy</code> para deployments, <code>no</code>
+para nodes.</dd>
+</dl>
+
+<p>Uma consequência prática dessa gramática: o <code>kubectl</code> não adivinha. Se você escrever um
+recurso que o cluster não conhece, a resposta é <code>error: the server doesn't have a resource type</code>
+seguida do que você escreveu. Não é falha de digitação do programa: é o servidor dizendo “eu não tenho esse
+tipo”. E o jeito de saber quais tipos existem é perguntar — o que nos leva ao verbo seguinte.</p>
+
+<h2>3. Os seis verbos que bastam</h2>
+
+<p>Existem dezenas de verbos no <code>kubectl</code>, mas seis cobrem a rotina inteira de quem está começando.
+Se você só souber esses seis e as flags básicas, resolve praticamente tudo neste guia.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Verbo</th><th>O que faz</th><th>Exemplo</th><th>Precisa de nome?</th></tr>
+</thead>
+<tbody>
+<tr><td><code>get</code></td><td>lista ou mostra objetos</td><td><code>kubectl get pods</code></td><td>não; com nome, mostra um só</td></tr>
+<tr><td><code>describe</code></td><td>mostra o detalhe e os eventos</td><td><code>kubectl describe pod forno</code></td><td>sim</td></tr>
+<tr><td><code>create</code></td><td>cria a partir de parâmetros ou arquivo</td><td><code>kubectl create deployment cardapio --image=cardapio:1.0</code></td><td>depende do verbo</td></tr>
+<tr><td><code>apply</code></td><td>aplica um manifesto (cria ou atualiza)</td><td><code>kubectl apply -f cardapio.yaml</code></td><td>não: o nome está no arquivo</td></tr>
+<tr><td><code>delete</code></td><td>remove objetos</td><td><code>kubectl delete deployment cardapio</code></td><td>sim</td></tr>
+<tr><td><code>scale</code></td><td>muda a quantidade de réplicas</td><td><code>kubectl scale deployment/cardapio --replicas=3</code></td><td>sim</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare em duas diferenças que confundem. <code>create</code> e <code>apply</code> parecem a mesma coisa e
+não são: <code>create</code> com flags monta o objeto na hora e reclama se ele já existe;
+<code>apply</code> lê um arquivo e ajusta o que estiver lá, criando ou atualizando sem drama. No dia a dia
+com manifesto, quase tudo é <code>apply</code>.</p>
+
+<p>E <code>get</code> contra <code>describe</code>: o primeiro é a foto da tabela, o segundo é o dossiê. Quando
+um pod não sobe, a resposta está no fim do <code>describe</code>, na seção de eventos — não no
+<code>get</code>. Guardar essa dupla economiza horas.</p>
+
+<h2>4. Os recursos: plural, singular e apelido</h2>
+
+<p>O <code>kubectl</code> aceita o nome do recurso no plural, no singular e por apelido. <code>get pods</code>,
+<code>get pod</code> e <code>get po</code> dão o mesmo resultado. Isso não é generosidade: é a mesma tabela de
+tipos que o servidor publica, consultada por nomes alternativos. Quem quer ver a tabela inteira pergunta com
+<code>kubectl api-resources</code>, e a resposta é longa e útil.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:SHORTNAMES;;texto:apps/v1;;texto:Deployment">
+  <p class="try-task">As duas primeiras linhas tentam explicar um campo interno com ponto, e o painel só
+  conhece o tipo inteiro. Troque pelas linhas que funcionam: <code>kubectl api-resources</code>,
+  <code>kubectl explain pod</code> e <code>kubectl explain deployment</code>.</p>
+<pre class="yaml">kubectl explain deployment.spec.replicas
+kubectl explain pod.spec.containers</pre>
+<pre class="out">
+ana@notebook:~$ kubectl explain deployment.spec.replicas
+error: field "deployment.spec.replicas" does not exist
+
+ana@notebook:~$ kubectl explain pod.spec.containers
+error: field "pod.spec.containers" does not exist
+</pre>
+<pre class="solucao">kubectl api-resources
+kubectl explain pod
+kubectl explain deployment</pre>
+</div>
+
+<p>A tabela de <code>api-resources</code> tem cinco colunas que valem leitura: <code>NAME</code> (o nome
+completo), <code>SHORTNAMES</code> (os apelidos), <code>APIVERSION</code> (o grupo e a versão da API),
+<code>NAMESPACED</code> (se o objeto vive dentro de namespace) e <code>KIND</code> (o nome do tipo como
+aparece no <code>kind:</code> do YAML). A coluna <code>NAMESPACED</code> explica um erro clássico: pedir
+<code>-n</code> para <code>nodes</code> ou <code>namespaces</code>, que não vivem em namespace nenhum.</p>
+
+<p>Já o <code>explain</code> é a documentação embutida. <code>kubectl explain pod</code> responde com
+<code>KIND: Pod</code>, <code>VERSION: v1</code> e uma descrição curta; <code>explain deployment</code> mostra
+<code>VERSION: apps/v1</code>. É o comando para consultar quando você está escrevendo YAML e não lembra se o
+campo é <code>replicas</code> ou <code>replicaCount</code>.</p>
+
+<p>Uma limitação honesta do painel: ele responde o tipo inteiro, mas não desce até o campo com ponto —
+<code>explain pod.spec.containers</code> responde <code>field "pod.spec.containers" does not exist</code>. No
+<code>kubectl</code> de verdade esse caminho funciona e mostra o esquema do campo. Use o painel para o tipo;
+use a sua máquina para o campo.</p>
+
+<p>Existe ainda um terceiro jeito de perguntar, que é o mais subestimado: deixar o kubectl completar o comando
+com a tecla <code>Tab</code>. Com o preenchimento automático instalado no shell (o próprio
+<code>kubectl</code> imprime a instrução no manual), você digita <code>kubectl get po</code>, aperta
+<code>Tab</code> e vê os nomes dos pods; digita <code>kubectl get pod</code> e <code>Tab</code> de novo para
+completar o nome do primeiro. Não é enfeite: evita erro de digitação em nome comprido, que é a causa de
+metade dos <code>NotFound</code> que aparecem no começo.</p>
+
+<h2>5. O nome: quando o comando precisa dele</h2>
+
+<p>Existe uma regra simples: verbo que age sobre <em>um</em> objeto precisa do nome; verbo que lista não
+precisa. <code>delete</code>, <code>describe</code> e <code>scale</code> precisam. <code>get</code> é o
+híbrido: sem nome lista tudo, com nome mostra um.</p>
+
+<p>E existe uma segunda forma de escrever o nome que confunde muita gente: juntar recurso e nome com uma
+barra. <code>kubectl scale deployment/cardapio --replicas=3</code> é o mesmo que
+<code>kubectl scale deployment cardapio --replicas=3</code>. A barra é atalho, e ela é obrigatória em alguns
+contextos — dentro de comandos aninhados, em <code>kubectl wait</code> e, no painel deste guia, no
+<code>scale</code>.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:deployment.apps/cardapio scaled;;texto:DESIRED;;conta:pods=3">
+  <p class="try-task">A primeira linha cria o Deployment. A segunda esquece de dizer <em>qual tipo</em> de
+  objeto é <code>cardapio</code> e o painel responde com a forma correta. Corrija para
+  <code>kubectl scale deployment/cardapio --replicas=3</code> e confira o ReplicaSet.</p>
+<pre class="yaml">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl scale cardapio --replicas=3
+kubectl get replicasets</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create deployment cardapio --image=cardapio:1.0
+deployment.apps/cardapio created
+
+ana@notebook:~$ kubectl scale cardapio --replicas=3
+error: use: kubectl scale deployment/&lt;nome&gt; --replicas=3
+
+ana@notebook:~$ kubectl get replicasets
+NAME                  DESIRED   CURRENT   READY   AGE
+cardapio-pvx6crj8rr   1         1         1       2m
+</pre>
+<pre class="solucao">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl scale deployment/cardapio --replicas=3
+kubectl get replicasets</pre>
+</div>
+
+<p>A mensagem <code>error: use: kubectl scale deployment/&lt;nome&gt; --replicas=3</code> é uma das raras em
+que o Kubernetes ensina o comando certo. Ela existe porque <code>scale</code> precisa saber o tipo: existem
+objetos com o mesmo nome em tipos diferentes, e <code>cardapio</code> sozinho é ambíguo. O painel exige a
+forma com barra; o <code>kubectl</code> real aceita as duas.</p>
+
+<p>Depois do conserto, o <code>get replicasets</code> mostra a coluna <code>DESIRED</code> com 3. É a prova de
+que o número chegou ao controlador — e, alguns segundos depois, a lista de pods terá três linhas. Um comando,
+três objetos, nenhum YAML.</p>
+
+<h2>6. As flags que mudam a resposta</h2>
+
+<p>Flag é a parte que diz “como”. Três delas mudam o dia a dia de verdade: <code>-n</code> escolhe o
+namespace, <code>-o</code> escolhe o formato da saída e <code>-l</code> filtra por etiqueta. Há também as
+formas longas, como <code>--namespace</code> e <code>--output</code>, equivalentes.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Flag</th><th>Para que serve</th><th>Exemplo</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-n</code></td><td>escolher o namespace</td><td><code>kubectl get pods -n kube-system</code></td><td>nome errado dá “namespace not found”</td></tr>
+<tr><td><code>-o wide</code></td><td>mais colunas: IP, nó, imagem</td><td><code>kubectl get pods -o wide</code></td><td>a tabela fica larga no terminal</td></tr>
+<tr><td><code>-o yaml</code></td><td>o objeto inteiro, como manifesto</td><td><code>kubectl get deploy cardapio -o yaml</code></td><td>saída enorme: use com <code>--dry-run</code> para estudar</td></tr>
+<tr><td><code>-o name</code></td><td>só os nomes, um por linha</td><td><code>kubectl get pods -o name</code></td><td>útil para compor scripts</td></tr>
+<tr><td><code>-l</code></td><td>filtrar por etiqueta</td><td><code>kubectl get pods -l app=cardapio</code></td><td>etiqueta errada devolve lista vazia, não erro</td></tr>
+<tr><td><code>-A</code></td><td>todos os namespaces</td><td><code>kubectl get pods -A</code></td><td>barulhento em cluster cheio</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Antes dela, a mais usada no dia a dia é <code>-o wide</code>: a mesma tabela do <code>get</code>, com
+colunas a mais. Em pods, aparecem o IP do pod e o nó onde ele está rodando; em nodes, aparecem o IP interno e
+a versão do runtime. É a primeira flag que se aprende porque responde à pergunta seguinte de quem está
+investigando: “este pod está em qual máquina?”. Sem ela, essa resposta exige um <code>describe</code>.</p>
+
+<p>A flag <code>-o yaml</code> merece um parágrafo: é o comando que transforma um objeto em manifesto. Você
+cria algo com <code>create</code>, olha com <code>-o yaml</code>, copia o resultado para um arquivo, limpa os
+campos de status e ganha a receita exata daquele objeto — inclusive os valores padrão que você não digitou.
+Transcrição de um cluster real, com as partes centrais do resultado:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get deployment cardapio -o yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - image: cardapio:1.0
+          imagePullPolicy: IfNotPresent
+          name: cardapio
+          ports:
+            - containerPort: 80
+              protocol: TCP</pre>
+
+<p>Repare no que apareceu sem você pedir: <code>strategy</code> com <code>maxSurge</code> e
+<code>maxUnavailable</code>, <code>imagePullPolicy</code>, <code>restartPolicy</code>. São os padrões que o
+cluster aplica quando o campo não vem no manifesto. É por isso que “o meu YAML” e “o YAML do cluster” nunca
+são idênticos — e por isso que ler a saída é uma aula de graça.</p>
+
+<h2>7. O que o kubectl não faz</h2>
+
+<p>Três coisas que quase todo iniciante tenta e o <code>kubectl</code> recusa. A primeira é separar recursos
+por vírgula no mesmo comando: <code>kubectl get pods,deployments</code> parece razoável e responde
+<code>error: the server doesn't have a resource type "pods,deployments"</code> — o kubectl trata a lista
+inteira como um único nome de tipo. A segunda é usar <code>all</code> como se fosse o recurso “tudo”; o painel
+responde o mesmo tipo de erro. A terceira é esperar que ele conserte erros de digitação.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:deployment.apps/cardapio created;;texto:Running;;conta:pods=1">
+  <p class="try-task">As duas primeiras linhas tentam listar dois tipos de uma vez e usar <code>all</code>, e
+  o servidor recusa. Substitua pelas duas listagens separadas, criando antes o Deployment para haver o que
+  mostrar.</p>
+<pre class="yaml">kubectl get pods,deployments
+kubectl get all</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods,deployments
+error: the server doesn't have a resource type "pods,deployments"
+
+ana@notebook:~$ kubectl get all
+error: the server doesn't have a resource type "all"
+</pre>
+<pre class="solucao">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl get deployments
+kubectl get pods</pre>
+</div>
+
+<p>Sobre o <code>all</code>, uma diferença entre painel e mundo real que vale saber: no <code>kubectl</code>
+de verdade, <code>get all</code> funciona como um apelido para alguns tipos (pods, services, deployments,
+replicasets, statefulsets) — mas deixa de fora ConfigMap, Secret, volume persistente e mais um punhado de
+coisas. Ou seja: mesmo quando funciona, não é “tudo”. Quem quer ver tudo de verdade combina
+<code>kubectl get</code> com os tipos certos, um por um.</p>
+
+<p>A terceira recusa é a mais útil de todas: quando o objeto não existe, o <code>kubectl</code> diz isso na
+cara, com o verbo certo e o nome entre aspas. Apagar algo que já foi apagado não é sucesso silencioso nem
+tragédia — é <code>NotFound</code>, e você segue em frente.</p>
+
+<h2>8. Criar, apagar e o NotFound</h2>
+
+<p>Essa sequência aparece tanto no dia a dia que vale ver uma vez, com a saída completa. É também a
+demonstração de que o <code>kubectl</code> é honesto: cada comando responde o que fez ou não fez.</p>
+
+<pre class="term">ana@notebook:~$ kubectl create deployment cardapio --image=cardapio:1.0
+deployment.apps/cardapio created
+
+ana@notebook:~$ kubectl delete deployment cardapio
+deployment.apps/cardapio deleted
+
+ana@notebook:~$ kubectl delete deployment cardapio
+Error from server (NotFound): deployments "cardapio" not found
+
+ana@notebook:~$ kubectl get deployments
+No resources found in default namespace.</pre>
+
+<p>Três respostas diferentes para três situações: <code>created</code> quando criou, <code>deleted</code>
+quando apagou, <code>NotFound</code> quando você pediu o que não existe. A última linha,
+<code>No resources found in default namespace</code>, é o “lista vazia” — não é erro, é resposta: o namespace
+existe e não tem nada daquele tipo ali.</p>
+
+<p>Note que <code>delete</code> não pede confirmação. Em cluster de estudo, tudo bem. Em produção, é o motivo
+pelo qual se usa <code>--dry-run=client</code> antes de aplicar algo novo e se confere o contexto antes de
+qualquer comando destrutivo. E note também que apagar um Deployment apaga os pods dele — em cascata, pelo
+controlador, não pelo comando.</p>
+
+<p>O <code>--dry-run=client</code> merece um lugar na sua memória: ele monta o objeto, valida o seu YAML e
+imprime o resultado <em>sem</em> mandar nada para o cluster. É o ensaio antes da apresentação — o comando
+responde <code>created (dry run)</code> e nada muda no cluster. Junte com <code>-o yaml</code> e você tem o
+gerador de manifesto mais rápido que existe: <code>kubectl create deployment cardapio --image=cardapio:1.0
+--dry-run=client -o yaml</code> imprime um YAML completo para você editar em vez de digitar do zero. É
+permitido errar no ensaio.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o pod que não estava no namespace default</h3>
+<p>A Ana jurou que o pod tinha desaparecido: <code>get pods</code> vazio. Estava lá, em outro namespace, criado
+por um colega. O conserto foi <code>-A</code> para ver tudo e depois <code>-n</code> para o namespace certo.
+Atalho que ela adotou: começar a investigação com <code>kubectl get pods -A</code> e só então refinar. Uma
+linha a mais, e nunca mais “sumiu”.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a etiqueta que não casava</h3>
+<p>Ela rodou <code>kubectl get pods -l app=cardapio</code> e recebeu lista vazia. Não era bug: os pods tinham
+<code>app: vitrine</code>. Filtro por etiqueta não avisa que a etiqueta está errada — devolve vazio, como se
+nada existisse. Para descobrir a etiqueta real, <code>kubectl get pods --show-labels</code> mostra todas numa
+coluna extra. A partir daí o filtro passa a ser confiável.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o YAML da preguiça</h3>
+<p>Precisava de um manifesto de Service igual ao de produção, e ela não lembrava dos campos. Rodou
+<code>kubectl get service vitrine -o yaml</code>, copiou, apagou o bloco <code>status</code>, trocou o nome e
+aplicou. Funcionou na primeira. É o jeito mais rápido de aprender a forma de um objeto: ver um objeto pronto,
+gerado pelo próprio cluster.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="1"><p class="mc-q">1. Qual é a ordem correta das peças de um comando?</p>
+<label><input type="radio" name="b1"> <code>kubectl verbo recurso [nome] [flags]</code></label>
+<label><input type="radio" name="b1"> <code>kubectl recurso verbo [flags] [nome]</code></label>
+<label><input type="radio" name="b1"> <code>kubectl flags verbo [nome] recurso</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Por que <code>kubectl get pods,deployments</code> falha?</p>
+<label><input type="radio" name="b2"> porque falta <code>-n default</code></label>
+<label><input type="radio" name="b2"> porque o plural é obrigatório nos dois nomes</label>
+<label><input type="radio" name="b2"> porque o kubectl trata a lista como um único nome de tipo, e o servidor
+não tem esse tipo</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Qual comando mostra <em>detalhes e eventos</em> de um
+pod?</p>
+<label><input type="radio" name="b3"> <code>kubectl get pod forno</code></label>
+<label><input type="radio" name="b3"> <code>kubectl describe pod forno</code></label>
+<label><input type="radio" name="b3"> <code>kubectl explain pod</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o apelido do recurso</h2>
+<p>Você quer listar os nós com o apelido mais curto que o <code>kubectl</code> aceita. Complete o comando:</p>
+<div class="ex-code">kubectl get <input aria-label="resposta 1" data-answer="no" placeholder="..."></div>
+<p class="ex-dica">Dica: são as duas primeiras letras de <em>node</em>, como aparecem na coluna
+<code>SHORTNAMES</code> de <code>kubectl api-resources</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O <code>kubectl</code> tem gramática: verbo, recurso, nome opcional e flags no fim. Com seis verbos
+(<code>get</code>, <code>describe</code>, <code>create</code>, <code>apply</code>, <code>delete</code>,
+<code>scale</code>) e três flags (<code>-n</code>, <code>-o</code>, <code>-l</code>) você resolve a rotina
+inteira — e monta de cabeça o comando que não decorou.</p>
+
+<p>O recurso aceita plural, singular e apelido; o nome só aparece quando o comando age sobre um objeto; a
+barra (<code>deployment/cardapio</code>) é atalho que alguns comandos exigem. E o cluster responde perguntas:
+<code>api-resources</code> lista os tipos com apelidos e versões, <code>explain</code> descreve cada tipo,
+<code>-o yaml</code> devolve o objeto inteiro como manifesto.</p>
+
+<p>O que ele não faz: separar recursos por vírgula, adivinhar tipo desconhecido, perdoar falta de nome. E o
+que ele sempre faz: dizer a verdade — <code>created</code>, <code>deleted</code>, <code>NotFound</code>,
+<code>No resources found</code>. Saber ler essas quatro respostas é metade do trabalho de operar um cluster. A
+outra metade começa na próxima aula, com os objetos que você vai usar todos os dias.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl VERBO RECURSO [NOME] [FLAGS]</code> — nesta ordem.</li>
+  <li><code>get</code> lista; <code>describe</code> conta a história; <code>apply -f</code> aplica arquivo.</li>
+  <li><code>po</code>, <code>deploy</code>, <code>no</code>, <code>svc</code> são apelidos válidos.</li>
+  <li><code>-n</code> muda namespace; <code>-o yaml</code> mostra o objeto inteiro.</li>
+  <li>Sem vírgula e sem <code>all</code>: um tipo por comando.</li>
+  <li>Lista vazia não é erro; <code>NotFound</code> é resposta, não tragédia.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

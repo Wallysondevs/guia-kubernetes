@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StatefulSet | Guia Kubernetes</title>
+<meta name="description" content="StatefulSet na prática: nomes previsíveis web-0, web-1 e web-2, serviceName obrigatório, um PersistentVolumeClaim por pod e o que sobrevive ao escalar.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">StatefulSet</span></h1>
+<p class="intro">O banco de dados da padaria da Ana roda em três cópias, e cada cópia precisa saber quem é: a
+primeira é a líder, a segunda e a terceira são seguidoras, e cada uma tem o seu próprio disco. Com Deployment
+isso não dá — os pods têm nomes sorteados, sobem todos de uma vez e compartilham (ou não têm) o mesmo volume.
+Nesta aula a Ana conhece o <strong>StatefulSet</strong>, o workload que troca anonimato por identidade: pods
+numerados, cada um com o seu nome estável, o seu DNS e o seu pedido de disco.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que alguns programas precisam de identidade, e não só de réplicas.</li>
+  <li>O que é o índice ordinal e por que os pods se chamam <code>web-0</code>, <code>web-1</code>,
+  <code>web-2</code>.</li>
+  <li>Por que <code>serviceName</code> é obrigatório e o que ele liga.</li>
+  <li>Como declarar um disco por pod com <code>volumeClaimTemplates</code>.</li>
+  <li>O que a política <code>OrderedReady</code> garante na subida e na descida.</li>
+  <li>O que acontece com os claims quando você escala para baixo.</li>
+  <li>Comparar StatefulSet e Deployment sem achismo.</li>
+  <li>Onde o painel para: o que é ordem de verdade e o que é só o campo.</li>
+</ul>
+</div>
+
+<h2>1. A cena: três cópias e nenhuma sabe quem é</h2>
+
+<p>O banco da padaria é um cluster de três nós: um eleito líder, dois seguidores. O programa que roda dentro
+dele precisa saber disso — quem é o nó 0 vira líder, quem é o nó 1 e 2 replicam. E precisa de um nome estável:
+os outros dois se conectam ao líder por endereço, e se o endereço muda a cada reinício, a replicação quebra.</p>
+
+<p>Um Deployment não oferece nada disso. Ele cria pods com nomes sorteados
+(<code>banco-6d8f89b786-88dn9</code>), recria em outro lugar quando um morre, e trata todos como
+intercambiáveis — o que é ótimo para um site que só responde requisições e péssimo para um programa que
+guarda posição. Trocar um pod por outro igual funciona para o site; para o banco, é como trocar o goleiro no
+meio do pênalti.</p>
+
+<p>O StatefulSet existe para esse caso. Ele mantém a mesma ideia de réplicas, mas dá a cada pod uma
+<strong>identidade</strong>: um número, um nome derivado dele, um DNS próprio e um volume que acompanha aquele
+número para sempre. O pod pode morrer e renascer; o número, o nome e o disco continuam os mesmos. É a
+diferença entre “mais um atendente” e “o gerente da loja”.</p>
+
+<h2>2. Identidade, em quatro peças</h2>
+
+<p>StatefulSet parece um Deployment com nomes bonitos, e a semelhança engana. São quatro peças que trabalham
+juntas: o índice, o nome derivado, o serviço que dá DNS e o pedido de disco por pod. Tirar uma delas quebra a
+promessa, e é por isso que o manifesto tem campos que o Deployment não tem.</p>
+
+<dl class="anatomy">
+<dt>StatefulSet</dt>
+<dd>O controlador de pods com identidade. A API é <code>apps/v1</code>, como o Deployment, e os campos são
+parecidos — mas o comportamento não.</dd>
+<dt>ordinal</dt>
+<dd>O número do pod: 0, 1, 2… Ele vem de <code>replicas</code> e nunca muda enquanto o pod existir. É a
+identidade de verdade.</dd>
+<dt>nome estável</dt>
+<dd><code>&lt;nome do set&gt;-&lt;ordinal&gt;</code>: <code>web-0</code>, <code>web-1</code>. Ao contrário do
+Deployment, o nome não tem sufixo sorteado.</dd>
+<dt>serviceName</dt>
+<dd>O nome do Service (em geral headless) que dá a cada pod um DNS
+<code>web-0.web.default.svc.cluster.local</code>. Campo obrigatório.</dd>
+<dt>volumeClaimTemplates</dt>
+<dd>Um molde de PVC. Para cada pod, o controlador cria um claim com o nome
+<code>&lt;molde&gt;-&lt;pod&gt;</code> — <code>dados-web-0</code>, <code>dados-web-1</code>.</dd>
+<dt>podManagementPolicy</dt>
+<dd><code>OrderedReady</code> (padrão): sobe e desce um por vez, na ordem. <code>Parallel</code>: todos de uma
+vez, sem esperar.</dd>
+</dl>
+
+<p>A consequência mais visível é que o StatefulSet não é anônimo nem descartável: cada réplica tem um lugar
+próprio na hierarquia. Isso resolve banco, fila particionada, cache com shard e qualquer programa que eleja
+líder. E cobra um preço: operar um StatefulSet é mais difícil do que operar um Deployment, porque não dá para
+simplesmente apagar e recriar tudo — o disco de <code>web-1</code> é o disco de <code>web-1</code>, e apagar o
+set não apaga os claims.</p>
+
+<h2>3. O manifesto, com o campo que todo mundo esquece</h2>
+
+<p>Vamos ao manifesto. Ele tem o mesmo esqueleto do Deployment — <code>selector</code>, <code>template</code>,
+containers — e dois campos a mais: <code>serviceName</code> e, quando há disco, o molde de claim. A caixa
+começa sem <code>serviceName</code> e com uma réplica só. Rode como está: o servidor recusa.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:StatefulSet/web|spec.serviceName=web;;campo:StatefulSet/web|spec.replicas=3;;conta:pods=3;;texto:web-0;;texto:web-2">
+  <p class="try-task">Acrescente <code>serviceName: web</code> e mude <code>replicas</code> para
+  <code>3</code>. Rode e confira os três pods numerados.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  clusterIP: None
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+service/web created
+The StatefulSet "web" is invalid: spec.serviceName: Required value
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  clusterIP: None
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>A resposta do painel antes do conserto é curta e específica:</p>
+
+<pre class="term">The StatefulSet "web" is invalid: spec.serviceName: Required value</pre>
+
+<p>Guarde essa mensagem, porque ela é a primeira coisa que aparece para quem copia um Deployment e troca o
+<code>kind</code>. O <code>serviceName</code> não é decoração: é ele que amarra o pod ao Service que fornece o
+DNS estável. Sem esse serviço, o pod <code>web-1</code> existiria, mas ninguém conseguiria encontrá-lo por
+nome — e a identidade pela metade não serve para nada.</p>
+
+<p>O Service do exemplo tem <code>clusterIP: None</code>. Isso o torna <em>headless</em>: em vez de um IP
+virtual único, o DNS devolve os IPs dos pods. É o que permite ao cliente escolher a réplica, em vez de cair
+num balanceador que sorteia. Num banco, é exatamente o que se quer: o cliente precisa falar com o líder, não
+com “um dos três”.</p>
+
+<h2>4. Nomes que não mudam</h2>
+
+<p>Com o manifesto consertado, a tabela do <code>get pods</code> mostra a assinatura do StatefulSet. Nada de
+sufixo sorteado: os nomes terminam em <code>-0</code>, <code>-1</code>, <code>-2</code>, e o número é a
+posição do pod. Se o <code>web-1</code> morrer, o substituto também se chamará <code>web-1</code>, no mesmo
+DNS, com o mesmo disco.</p>
+
+<p>Essa estabilidade é o que permite configurar os membros do cluster de banco por posição: “o
+<code>web-0</code> é o líder”, “os outros apontam para <code>web-0.web</code>”. Num Deployment, a lista de
+membros mudaria a cada reinício e o arquivo de configuração teria de ser reescrito — ou, pior, o programa
+teria de descobrir sozinho quem é quem, e é aí que eleição de líder vira dor de cabeça.</p>
+
+<p>A ordem dos números também aparece no <code>describe</code>, que mostra o dono do pod com o índice embutido
+no nome. E a label <code>statefulset.kubernetes.io/pod-name</code> vem preenchida com o nome do pod, o que
+permite criar Services seletivos por posição — um Service só para o líder, outro para as leituras. Isso é
+assunto de uma aula adiante; aqui basta saber que a informação está lá, porque o pod tem identidade.</p>
+
+<h2>5. Um disco por pod</h2>
+
+<p>Identidade sem disco não resolve o problema do banco: cada réplica precisa do seu próprio arquivo de dados,
+e ninguém pode escrever no disco do vizinho. O StatefulSet resolve isso com um <em>molde</em> de claim. Você
+declara <code>volumeClaimTemplates</code> uma vez, e o controlador cria um PVC por pod, com o nome do molde
+mais o nome do pod.</p>
+
+<div class="tryk8s" data-get="pvc" data-goal="campo:StatefulSet/web|spec.volumeClaimTemplates.0.metadata.name=dados;;conta:pvc=3;;texto:dados-web-0;;texto:dados-web-2">
+  <p class="try-task">Acrescente o molde <code>volumeClaimTemplates</code> chamado <code>dados</code> pedindo
+  <code>1Gi</code>, monte esse volume em <code>/dados</code> no container e rode. Cada pod tem de ganhar o seu
+  claim.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: dados
+              mountPath: /dados</pre>
+<pre class="out">
+statefulset.apps/web created
+
+No resources found in default namespace.
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: dados
+              mountPath: /dados
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi</pre>
+</div>
+
+<p>A tabela do <code>get pvc</code> mostra três claims, um por pod, todos <code>Bound</code>. Repare no nome:
+<code>dados-web-0</code>, <code>dados-web-1</code>, <code>dados-web-2</code>. O molde se chama
+<code>dados</code>; o claim ganha o nome do molde e o nome do pod. Não é um claim compartilhado — são três
+volumes independentes, e é por isso que a réplica 1 não vê o arquivo da réplica 0.</p>
+
+<p>O <code>volumeMounts</code> do container aponta para o molde pelo nome (<code>dados</code>), do mesmo jeito
+que apontaria para qualquer volume. A diferença é que o volume não é declarado em
+<code>spec.volumes</code>: quem o fornece é o molde, um por pod. Se você declarar os dois, o do pod ganha e o
+claim do molde fica sem uso — um jeito silencioso de achar que tem disco quando não tem.</p>
+
+<p>É o único workload nativo do Kubernetes que cria PVCs por conta própria. E é bom saber o que ele <em>não</em> faz: apagar o StatefulSet não apaga os claims. Os três volumes
+continuam lá, com os dados, esperando alguém decidir. É a proteção mais importante do conjunto — e a origem de
+metade das faturas de nuvem inesperadas.</p>
+
+<h2>6. A ordem: um por vez</h2>
+
+<p>O campo <code>podManagementPolicy</code> decide como os pods nascem e morrem. O padrão,
+<code>OrderedReady</code>, sobe o <code>web-0</code>, espera ele ficar pronto, sobe o <code>web-1</code>,
+espera, sobe o <code>web-2</code>. Na descida, o contrário: sai o 2, depois o 1, depois o 0. Com
+<code>Parallel</code>, todos sobem juntos, sem espera.</p>
+
+<p>A ordem existe porque os programas que precisam de StatefulSet costumam precisar de ordem: o segundo nó do
+banco só consegue entrar no cluster quando o primeiro está de pé para aceitar a réplica. Subir os três ao
+mesmo tempo faria os três se procurarem e nenhum encontrar. Com <code>Parallel</code>, você assume a
+responsabilidade de que o programa aguenta — bom para cache, ruim para banco.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>OrderedReady</code></th><th><code>Parallel</code></th></tr>
+</thead>
+<tbody>
+<tr><td>subida</td><td><code>web-0</code>, espera ficar pronto, depois <code>web-1</code>, depois
+<code>web-2</code></td><td>todos ao mesmo tempo</td></tr>
+<tr><td>descida</td><td>do maior para o menor, um por vez</td><td>todos ao mesmo tempo</td></tr>
+<tr><td>se o <code>web-0</code> não ficar pronto</td><td>o resto nem é criado</td><td>os outros sobem
+normalmente</td></tr>
+<tr><td>serve para</td><td>banco, fila, qualquer coisa que forma cluster</td><td>cache, worker, réplicas que
+não conversam entre si</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Honestidade sobre o painel: ele cria os pods do StatefulSet de uma vez e mostra todos em
+<code>Running</code>, porque não existe kubelet esperando prontidão de verdade. O campo
+<code>podManagementPolicy</code> aparece no objeto e vale como configuração, mas a <em>espera</em> é
+comportamento do controlador num cluster real. Se você rodar o mesmo manifesto num cluster de verdade com
+<code>OrderedReady</code>, verá o <code>web-1</code> demorar até o <code>web-0</code> ficar
+<code>Ready</code>.</p>
+
+<h2>7. Escalar: cada número tem o seu disco</h2>
+
+<p>Escalar um StatefulSet é mudar <code>replicas</code>. Para cima, entram pods com os próximos números — e,
+com eles, claims novos, um para cada. Para baixo, saem os pods de número maior, mas os claims
+<strong>não</strong> saem: a réplica 2 desaparece, o <code>dados-web-2</code> continua lá, com os dados. Essa
+assimetria é deliberada e é o detalhe que separa quem entendeu de quem decorou.</p>
+
+<p>O raciocínio é simples: escalar para baixo pode ser temporário, e apagar o disco junto seria destruir dado
+por causa de uma linha no YAML. O preço é que o volume continua ocupando espaço e, se você nunca voltar ao
+número 2, ele fica órfão. A limpeza é manual — apagar o PVC. Vale a mesma regra da aula de PV: quem apaga
+decide, e o Kubernetes não decide por você.</p>
+
+<div class="tryk8s" data-get="pvc" data-goal="campo:StatefulSet/web|spec.replicas=3;;conta:pods=3;;conta:pvc=3;;texto:dados-web-2">
+  <p class="try-task">O set está com <code>2</code> réplicas. Suba para <code>3</code> e rode: o pod
+  <code>web-2</code> aparece e, com ele, o claim <code>dados-web-2</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: dados
+              mountPath: /dados
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi</pre>
+<pre class="out">
+statefulset.apps/web created
+
+NAME          STATUS   VOLUME         CAPACITY   ACCESS MODES   STORAGECLASS   AGE   VOLUMEMODE
+dados-web-0   Bound    pvc-2lp75ps2   1Gi        RWO                           5m    Filesystem
+dados-web-1   Bound    pvc-92ppdcnm   1Gi        RWO                           1m    Filesystem
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: dados
+              mountPath: /dados
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi</pre>
+</div>
+
+<p>Depois de rodar, os três claims aparecem na tabela, todos <code>Bound</code>, cada um no tamanho pedido pelo
+molde:</p>
+
+<pre class="term">NAME          STATUS   VOLUME         CAPACITY   ACCESS MODES   STORAGECLASS   AGE   VOLUMEMODE
+dados-web-0   Bound    pvc-2lp75ps2   1Gi        RWO                           5m    Filesystem
+dados-web-1   Bound    pvc-92ppdcnm   1Gi        RWO                           1m    Filesystem
+dados-web-2   Bound    pvc-qpz76z5l   1Gi        RWO                           7m    Filesystem</pre>
+
+<p>Existe uma consequência prática gostosa nisso: dá para escalar para baixo, subir de novo e encontrar os
+dados no lugar. A réplica 2 volta com o mesmo <code>dados-web-2</code>, com o conteúdo de antes. É esse ida e
+volta que permite reiniciar um cluster de banco sem perder o estado — e é o motivo de o StatefulSet ser o
+escolhido para programas que guardam posição.</p>
+
+<p>Uma nota sobre o painel, porque ele mostra o estado depois de um único <code>apply</code>: aqui a subida é de
+2 para 3 e o número de claims bate com o número de pods. Num cluster real, o caminho de 3 para 2 deixaria o
+terceiro claim para trás, como descrito acima. O motor simula um cluster recém-criado a cada execução, então
+não há histórico de escala para mostrar — mas a regra que você precisa levar é a mesma.</p>
+
+<h2>8. StatefulSet ou Deployment?</h2>
+
+<p>A pergunta não é “qual é melhor”, é “o meu programa precisa de identidade?”. Se a resposta for não, o
+Deployment é mais simples, mais barato de operar e faz rolling update sem cerimônia. Se for sim, o StatefulSet
+é o único que entrega nomes estáveis, disco por réplica e ordem — e cobra o preço em complexidade.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>Deployment</th><th>StatefulSet</th></tr>
+</thead>
+<tbody>
+<tr><td>nome do pod</td><td>sorteado: <code>web-6d8f89b786-88dn9</code></td><td>numerado: <code>web-0</code>,
+<code>web-1</code></td></tr>
+<tr><td>disco</td><td>um PVC compartilhado, se houver</td><td>um PVC por pod, criado pelo molde</td></tr>
+<tr><td>troca de pods</td><td>todos equivalentes, troca livre</td><td>identidade preservada por posição</td></tr>
+<tr><td>ordem de subida</td><td>simultânea, controlada por maxSurge/maxUnavailable</td><td>um por vez com
+<code>OrderedReady</code></td></tr>
+<tr><td>DNS estável por pod</td><td>não existe</td><td><code>web-0.web</code>, via headless Service</td></tr>
+<tr><td>serve para</td><td>site, API, worker sem estado</td><td>banco, fila particionada, cache com shard</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um erro comum é usar StatefulSet “porque é mais robusto”. Não é: é mais <em>específico</em>. Um site que
+não guarda estado em StatefulSet perde tempo de subida (pods um por vez), ganha um serviço headless que não
+precisa e dificulta o rolling update. A regra é chata e funciona: comece com Deployment; mude para StatefulSet
+quando o programa exigir identidade, e só então.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o cluster de banco que perdeu o líder</h3>
+<p>O <code>web-0</code>, que era líder, foi reiniciado por causa de uma atualização do nó. O pod voltou com o
+mesmo nome, o mesmo DNS e o mesmo disco — e o programa, ao subir, encontrou os dados e reassumiu a liderança
+sem configuração nova. Num Deployment, o substituto teria outro nome e o arquivo de configuração dos seguidores
+estaria errado. É a diferença que se paga na primeira madrugada.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o disco que sobrou do número 2</h3>
+<p>A Ana escalou de 3 para 2 no domingo e esqueceu. Três semanas depois, o disco de
+<code>dados-web-2</code> ainda ocupava 100Gi e ninguém sabia para quê. O conserto foi listar os claims,
+conferir quais não têm pod correspondente e apagar os que não fazem sentido. Um bom runbook tem esse passo:
+depois de escalar para baixo, decidir explicitamente o destino de cada claim órfão.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a subida que parou no primeiro</h3>
+<p>Num cluster real, o StatefulSet parou de subir no <code>web-1</code>, sem erro no <code>get sts</code>.
+Com <code>OrderedReady</code>, o controlador espera o <code>web-0</code> ficar <code>Ready</code> antes de
+criar o próximo — e o <code>web-0</code> estava com a sonda de prontidão falhando por causa de uma variável de
+ambiente que ninguém tinha visto. O problema estava no primeiro pod, não no segundo.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Como se chamam os pods de um StatefulSet <code>web</code> com
+três réplicas?</p>
+<label><input type="radio" name="q1"> <code>web-6d8f89b786-88dn9</code> e outros dois sorteados</label>
+<label><input type="radio" name="q1"> <code>web-0</code>, <code>web-1</code>, <code>web-2</code></label>
+<label><input type="radio" name="q1"> <code>web-a</code>, <code>web-b</code>, <code>web-c</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o <code>volumeClaimTemplates</code> cria?</p>
+<label><input type="radio" name="q2"> um PVC único, compartilhado por todos os pods</label>
+<label><input type="radio" name="q2"> um PV por nó do cluster</label>
+<label><input type="radio" name="q2"> um PVC por pod, com o nome do molde mais o nome do pod</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que acontece com os claims quando o StatefulSet é escalado
+de 3 para 2 réplicas?</p>
+<label><input type="radio" name="q3"> o pod <code>web-2</code> sai e o claim <code>dados-web-2</code>
+permanece</label>
+<label><input type="radio" name="q3"> o pod e o claim do <code>web-2</code> são apagados juntos</label>
+<label><input type="radio" name="q3"> os três claims são apagados e recriados na próxima subida</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o campo obrigatório</h2>
+<p>Complete o StatefulSet com o campo que liga o pod ao Service headless e permite o DNS
+<code>web-0.web</code>:</p>
+<div class="ex-code">apiVersion: apps/v1<br>
+kind: StatefulSet<br>
+metadata:<br>
+&nbsp;&nbsp;name: web<br>
+spec:<br>
+&nbsp;&nbsp;<input aria-label="resposta 1" data-answer="serviceName" placeholder="...">: web<br>
+&nbsp;&nbsp;replicas: 3</div>
+<p class="ex-dica">Dica: o valor é o nome do Service, não o nome do StatefulSet — no exemplo os dois coincidem,
+mas o campo se refere ao serviço. Sem ele, o servidor recusa com <code>Required value</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>StatefulSet é o workload das identidades: pods numerados de <code>0</code> a <code>n-1</code>, nome estável
+que sobrevive à recriação, DNS próprio via <code>serviceName</code> e um PVC por pod criado por
+<code>volumeClaimTemplates</code>. É o que bancos, filas particionadas e caches com shard precisam — e é o que
+o Deployment não oferece, porque o Deployment troca identidade por liberdade de troca.</p>
+
+<p>O manifesto tem três campos que o Deployment não tem ou não usa assim: <code>serviceName</code>
+(obrigatório), <code>volumeClaimTemplates</code> e <code>podManagementPolicy</code>. O primeiro é a ligação com
+o DNS; o segundo é o molde do disco; o terceiro decide se os pods sobem um por vez ou todos juntos. Sem o
+primeiro o servidor recusa; sem o segundo o dado mora no container e some; com o terceiro errado o banco não
+forma cluster.</p>
+
+<p>E guarde a parte que ninguém conta: o StatefulSet não apaga os claims quando você escala para baixo nem
+quando apaga o set. Isso protege o dado e cria a obrigação de cuidar dele. Antes de escalar, saiba o que vai
+acontecer com os discos dos números que vão sair. Na próxima aula a Ana vai além do básico — ordem de
+atualização, partição e o que fazer quando o pod precisa entrar em modo de manutenção.</p>
+
+<div class="note">
+<h3>Para lembrar</h3>
+<ul>
+<li>StatefulSet = pods com identidade: <code>web-0</code>, <code>web-1</code>, <code>web-2</code>.</li>
+<li><code>serviceName</code> é obrigatório e liga o pod ao Service headless.</li>
+<li>Headless é <code>clusterIP: None</code>: o DNS devolve os IPs dos pods.</li>
+<li><code>volumeClaimTemplates</code> cria um PVC por pod, chamado <code>molde-pod</code>.</li>
+<li>Apagar o StatefulSet não apaga os claims; escalar para baixo também não.</li>
+<li><code>OrderedReady</code> sobe e desce um por vez; <code>Parallel</code> não espera.</li>
+<li>Pod que volta mantém nome, DNS e disco — é isso que eleição de líder precisa.</li>
+<li>Sem estado? Use Deployment. StatefulSet é mais específico, não “mais robusto”.</li>
+<li>No painel os pods nascem juntos: a espera do <code>OrderedReady</code> é do cluster real.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

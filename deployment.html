@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deployment | Guia Kubernetes</title>
+<meta name="description" content="O Deployment na prática: por que ele substitui o pod solto, o manifesto com replicas, selector e template, o ReplicaSet por baixo e a auto-cura quando um pod morre.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Deployment</span></h1>
+<p class="intro">A Ana criou o pod do site com um manifesto bonito e foi dormir. Às três da manhã o
+container saiu sozinho — talvez memória, talvez um erro bobo no programa — e o pod morreu. Ninguém
+recriou nada: pod solto não tem dono. De manhã o site estava fora do ar e o <code>kubectl get pods</code>
+mostrava uma lista vazia. Nesta aula ela conhece o objeto que resolve exatamente isso: o
+<strong>Deployment</strong>, que descreve “quero duas cópias desse site, sempre” e passa o resto da
+madrugada vigiando para que a frase continue verdadeira.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que um Deployment existe quando já existe o pod.</li>
+  <li>Escrever o manifesto com <code>replicas</code>, <code>selector</code> e <code>template</code>.</li>
+  <li>Entender o ReplicaSet, o filho que o Deployment cria para contar pods.</li>
+  <li>Ler as colunas <code>READY</code>, <code>UP-TO-DATE</code> e <code>AVAILABLE</code> do
+  <code>get deployments</code>.</li>
+  <li>Ver a auto-cura acontecendo: apagar um pod e o Deployment repor.</li>
+  <li>Reconhecer os dois tropeços clássicos: <code>selector</code> que não casa com as etiquetas e
+  <code>apiVersion</code> errada.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o pod que ninguém repôs</h2>
+
+<p>Um pod solto é como um padeiro contratado sem contrato: se ele faltar, a padaria fica sem pão e
+ninguém é obrigado a mandar outro. O Kubernetes trata o pod exatamente assim — você pediu <em>um</em>,
+ele entregou <em>um</em>, e quando aquele um acaba, o assunto está encerrado. O objeto existe até alguém
+ou alguma coisa apagá-lo, e ninguém é essa alguma coisa.</p>
+
+<p>A Ana não quer um pod. Ela quer o site funcionando. A diferença parece filosofia de corredor, mas é a
+diferença entre “criei um pod” e “o site tem de estar no ar”. A primeira frase descreve um <em>evento</em>;
+a segunda descreve um <em>estado</em>. O Kubernetes é um sistema que persegue estados: você escreve como
+as coisas devem ser, ele compara com o que existe e trabalha para fechar a diferença. Um pod não serve
+para isso, porque pod não tem quem o persiga. Um Deployment tem.</p>
+
+<p>O nome é ruim de propósito para quem está começando — parece “implantação”, um verbo, e não um objeto.
+Pense num Deployment como uma <em>ordem de serviço permanente</em> pregada na parede da cozinha: “manter
+duas cópias do site da padaria no ar, com esta imagem e esta porta”. O gerente da cozinha lê essa ordem
+toda hora, conta quantas cópias estão de pé e manda fazer outra quando alguma desaparece. Ele não pergunta
+por quê; ele só mantém o número.</p>
+
+<h2>2. O que é um Deployment, na prática</h2>
+
+<p>Na prática, um Deployment é um objeto como o pod: tem <code>metadata</code>, tem <code>spec</code>, tem
+<code>status</code>. A diferença está no que o <code>spec</code> descreve. Em vez de containers, ele
+descreve um <em>modelo</em> de pod (o <code>template</code>) e quantas cópias desse modelo devem existir
+(<code>replicas</code>). O controlador do Deployment, um programa que roda no plano de controle, compara
+o número desejado com o número real e age.</p>
+
+<p>Essa comparação acontece o tempo todo, não só quando você aplica o arquivo. Se um pod morre, o número
+real cai e o controlador cria outro. Se você muda o número desejado, ele cria ou apaga pods. Se alguém
+apaga o pod “na mão”, ele cria outro. É um vigia barato e incansável, e é por isso que em produção quase
+ninguém cria pods soltos: cria-se Deployment, e o pod vira consequência.</p>
+
+<dl class="anatomy">
+<dt>Deployment</dt>
+<dd>O objeto que declara “N cópias deste modelo de pod devem existir”. Ele cria e vigia o ReplicaSet, e
+guarda o histórico de mudanças do modelo.</dd>
+<dt>ReplicaSet</dt>
+<dd>O filho do Deployment. A única tarefa dele é contar pods: criar quando falta, apagar quando sobra. O
+nome dele é o nome do Deployment mais um sufixo calculado a partir do modelo.</dd>
+<dt>template</dt>
+<dd>O modelo de pod dentro do Deployment: <code>spec.template</code> tem o mesmo formato do manifesto de
+um pod, com <code>metadata</code> e <code>spec</code> próprios.</dd>
+<dt>selector</dt>
+<dd>O filtro de etiquetas que diz <em>quais</em> pods são deste Deployment. Tem de casar com as etiquetas
+do <code>template</code>, senão o cluster recusa o objeto.</dd>
+<dt>réplica</dt>
+<dd>Cada cópia do pod. Duas réplicas é o mesmo que dizer “dois pods iguais, em nós diferentes se
+possível”.</dd>
+</dl>
+
+<p>Repare que o Deployment não fala com o container. Ele fala com o ReplicaSet, que fala com os pods, que
+são agendados nos nós. Cada camada tem uma responsabilidade pequena o bastante para caber na cabeça: o
+Deployment cuida do <em>modelo</em>, o ReplicaSet cuida da <em>contagem</em>, o kubelet cuida do
+<em>processo</em>. Quando algo dá errado, saber em qual camada olhar é metade do diagnóstico.</p>
+
+<h2>3. O manifesto do Deployment, linha por linha</h2>
+
+<p>O manifesto começa igual ao do pod, com <code>apiVersion</code> e <code>kind</code> — mas o
+<code>apiVersion</code> agora é <code>apps/v1</code>, porque Deployment pertence ao grupo
+<code>apps</code>. Depois vêm <code>metadata.name</code> e o <code>spec</code>, que tem três partes:
+<code>replicas</code>, <code>selector</code> e <code>template</code>. A caixa abaixo tem um erro de
+propósito: o seletor procura <code>app: cardapio</code> e o modelo marca os pods como
+<code>app: vitrine</code>. Rode do jeito que está e leia a resposta.</p>
+
+<div class="tryk8s" data-goal="conta:pods=2;;campo:Deployment/cardapio|status.readyReplicas=2">
+  <p class="try-task">Alinhe a etiqueta do <code>template</code> com o <code>selector</code> (as duas com
+  <code>app: cardapio</code>), rode e veja os dois pods nascerem.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: vitrine
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value: {"app":"vitrine"}: `selector` does not match template `labels`
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>O erro é comprido, mas tem uma frase no meio que resolve tudo:
+<code>`selector` does not match template `labels`</code> — “o seletor não casa com as etiquetas do
+modelo”. O cluster nem cria o objeto. Isso é uma gentileza: se ele aceitasse, o Deployment ficaria
+eternamente tentando contar pods que ele mesmo nunca reconheceria como seus, e você veria
+<code>READY 0/2</code> sem nenhum erro na tela.</p>
+
+<p>Depois de alinhar as duas etiquetas, a primeira linha do painel muda para
+<code>deployment.apps/cardapio created</code> e a tabela do <code>get deployments</code> aparece com
+<code>2/2</code>. Repare no plural do nome do recurso: <code>deployments</code>. Você pode escrever
+<code>kubectl get deploy</code>, que é o apelido, e <code>kubectl get deployment</code>, no singular — o
+kubectl aceita os três. O que ele não aceita é esquecer o <code>selector</code>: em <code>apps/v1</code>
+ele é obrigatório, diferente das versões antigas em que o Kubernetes adivinhava o seletor a partir das
+etiquetas do modelo.</p>
+
+<h2>4. O ReplicaSet, o filho que faz o trabalho</h2>
+
+<p>Se você pedir <code>kubectl get replicasets</code> depois de criar o Deployment, aparece uma linha com
+um nome esquisito: <code>cardapio-wj4jsx2tcw</code>. Esse sufixo não é aleatório; é um resumo do modelo
+de pod. Mude a imagem e o sufixo muda — e é assim que o Deployment distingue “o modelo antigo” de “o
+modelo novo” quando faz uma atualização. O nome do pod, por sua vez, é o nome do ReplicaSet mais cinco
+caracteres: <code>cardapio-wj4jsx2tcw-t4jwn</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Objeto</th><th>Quem cria</th><th>O que ele garante</th><th>Nome típico</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Deployment</code></td><td>você, com <code>apply</code></td><td>o modelo e o número de
+cópias</td><td><code>cardapio</code></td></tr>
+<tr><td><code>ReplicaSet</code></td><td>o controlador do Deployment</td><td>a contagem exata de pods
+daquele modelo</td><td><code>cardapio-wj4jsx2tcw</code></td></tr>
+<tr><td><code>Pod</code></td><td>o controlador do ReplicaSet</td><td>o container rodando</td>
+<td><code>cardapio-wj4jsx2tcw-t4jwn</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa corrente de nomes é o primeiro mapa de diagnóstico do Kubernetes. Se o pod tem o sufixo do
+ReplicaSet atual, ele é da versão que você acabou de publicar. Se tem um sufixo que não aparece em
+<code>get rs</code>, é pod solto de algum teste antigo. E se o Deployment existe mas o ReplicaSet não, o
+controlador não conseguiu nem começar — normalmente por causa de permissão ou de um campo inválido que
+passou batido.</p>
+
+<h2>5. Lendo o kubectl get deployments</h2>
+
+<p>A tabela do <code>get deployments</code> tem cinco colunas, e três delas contam histórias diferentes
+sobre o mesmo número. <strong>READY</strong> é “prontas / desejadas”: <code>2/2</code> é tudo certo,
+<code>1/2</code> é uma faltando. <strong>UP-TO-DATE</strong> é quantos pods já estão com o modelo mais
+recente — depois de uma atualização, esse número começa baixo e sobe. <strong>AVAILABLE</strong> é
+quantos estão prontos para receber tráfego, o que costuma empatar com READY, mas não sempre: um pod pode
+estar rodando e ainda não estar pronto para atender.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Coluna</th><th>O que mostra</th><th>Quando assusta</th></tr>
+</thead>
+<tbody>
+<tr><td><code>READY</code></td><td>pods prontos / pods desejados</td><td><code>1/2</code> parado por
+muito tempo: um pod não sobe</td></tr>
+<tr><td><code>UP-TO-DATE</code></td><td>pods com o modelo mais novo</td><td>menor que READY logo depois
+de um deploy: a atualização não terminou</td></tr>
+<tr><td><code>AVAILABLE</code></td><td>pods disponíveis para uso</td><td><code>0</code> com READY
+positivo: os pods existem, mas não estão prontos</td></tr>
+<tr><td><code>AGE</code></td><td>idade do Deployment</td><td>idade de segundos toda vez que você olha:
+algo está recriando o objeto</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma leitura útil é comparar as três colunas com o número que você pediu. Se você escreveu
+<code>replicas: 2</code> e a tabela mostra <code>2/2 2 2</code>, o cluster está em paz. Se mostra
+<code>1/2 2 1</code>, existe um pod novo que não fica pronto — e a explicação está no
+<code>describe</code> desse pod, não no Deployment. Guarde essa divisão: o Deployment diz
+<em>quantos</em>; o pod diz <em>por quê</em>.</p>
+
+<p>O <code>kubectl describe deployment</code> abre o objeto inteiro e é o complemento natural da tabela.
+Ele mostra o seletor, o modelo de pod com a imagem e a porta, as condições e — no fim — os nomes dos
+ReplicaSets antigos e do atual. Esta é a saída que o painel devolve para o Deployment da padaria:</p>
+
+<pre class="term">$ kubectl describe deployment cardapio
+Name:              cardapio
+Namespace:         default
+CreationTimestamp: Fri, 27 Nov 2026 15:50:21 +0000
+Labels:            app=cardapio
+Annotations:       deployment.kubernetes.io/revision: "1"
+Selector:          app=cardapio
+Pod Template:
+  Labels:  app=cardapio
+  Containers:
+   web:
+    Image:        cardapio:1.0
+    Port:         8080/TCP
+    Environment:  &lt;none&gt;
+    Mounts:       &lt;none&gt;
+Conditions:
+  Type        Status   Reason
+  Available   True     MinimumReplicasAvailable
+OldReplicaSets:  &lt;none&gt;
+NewReplicaSet:   cardapio-wj4jsx2tcw (2/2 replicas created)
+Events:
+  Type     Reason              Age   From                    Message
+  Normal   Created             20s   deployment-controller   created by ana
+  Normal   ScalingReplicaSet   26s   deployment-controller   Scaled up replica set cardapio-wj4jsx2tcw to 2</pre>
+
+<p>Três linhas desse bloco merecem atenção. <code>Annotations</code> traz a revisão atual do Deployment —
+o número que a aula de revisões vai perseguir. <code>Conditions</code> resume a saúde:
+<code>Available</code> com <code>MinimumReplicasAvailable</code> quer dizer “tem pod suficiente de pé”.
+E <code>NewReplicaSet</code> mostra quantas réplicas o ReplicaSet atual criou. Quando existir uma versão
+antiga convivendo, ela aparece em <code>OldReplicaSets</code>.</p>
+
+<h2>6. Auto-cura: apague um pod e veja o que acontece</h2>
+
+<p>Chegou a parte gostosa. A caixa abaixo começa com o cluster da padaria já montado: um Deployment
+<code>cardapio</code> com duas réplicas e um Service. A tarefa é apagar um dos pods — exatamente o que a
+madrugada fez com o pod solto da introdução — e conferir a tabela depois.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:deleted;;texto:2/2">
+  <p class="try-task">Apague o pod <code>cardapio-wj4jsx2tcw-t4jwn</code> e rode os dois
+  <code>get</code> seguintes. O Deployment tem de continuar em <code>2/2</code>.</p>
+<pre class="yaml">kubectl get pods
+kubectl get deployments</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">kubectl get pods
+kubectl delete pod cardapio-wj4jsx2tcw-t4jwn
+kubectl get pods
+kubectl get deployments</pre>
+</div>
+
+<p>A resposta tem duas partes. Primeiro o kubectl confirma o apagão:
+<code>pod/cardapio-wj4jsx2tcw-t4jwn deleted</code>. Depois, sem você pedir nada, a tabela do
+<code>get pods</code> volta a mostrar dois pods e o Deployment continua em <code>2/2</code>. Quem repôs
+foi o ReplicaSet: ele contou um pod a menos, comparou com o número desejado e criou outro. Você não viu
+o pedido porque o pedido não foi seu — foi do controlador.</p>
+
+<p>Uma honestidade sobre o painel: os nomes dos pods são calculados por posição, então o pod reposto
+reaparece com o mesmo nome do que você apagou. Num cluster de verdade o nome seria outro, porque o
+sufixo final é aleatório. O importante é o que não muda: a contagem volta ao desejado sem intervenção
+humana. É essa diferença entre pod solto e Deployment que a Ana precisava às três da manhã.</p>
+
+<pre class="term">$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+
+$ kubectl delete pod cardapio-wj4jsx2tcw-t4jwn
+pod/cardapio-wj4jsx2tcw-t4jwn deleted
+
+$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m</pre>
+
+<p>Essa é a saída que a caixa devolve, copiada do painel. Repare no <code>AGE</code> diferente entre os
+dois pods: um nasceu um minuto antes do outro. Num cluster real essa diferença seria ainda mais visível,
+porque o pod novo teria nome, IP e nó novos. A lição vale para os dois casos: o Deployment não impede
+que um pod morra; ele garante que a morte não vire falta de capacidade.</p>
+
+<h2>7. apps/v1: o erro de copiar e colar</h2>
+
+<p>Agora o tropeço mais comum de todos, e ele não tem nada a ver com a lógica do manifesto. Muita gente
+copia um Deployment antigo da internet e mantém <code>apiVersion: v1</code>. O cluster responde com uma
+mensagem que parece falar de outra coisa: <code>no matches for kind "Deployment" in version "v1"</code>.
+Traduzindo: “não conheço Deployment na versão v1; ele mora em outro grupo da API”.</p>
+
+<div class="tryk8s" data-goal="objeto:Deployment/cardapio;;conta:pods=1">
+  <p class="try-task">Rode e leia o erro. Depois troque o <code>apiVersion</code> para
+  <code>apps/v1</code>, rode de novo e confira o pod criado.</p>
+<pre class="yaml">apiVersion: v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no matches for kind "Deployment" in version "v1"
+ensure CRDs are installed first
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>Cada grupo da API tem a sua versão: Pod é <code>v1</code>, Deployment e ReplicaSet são
+<code>apps/v1</code>, Job é <code>batch/v1</code>, Ingress é <code>networking.k8s.io/v1</code>. O
+<code>apiVersion</code> é o endereço do tipo, não uma etiqueta de idade — não existe “v1 é mais novo”.
+Se o erro falar de <em>kind</em> e <em>version</em> juntos, quase sempre é isso: o tipo existe, mas não
+naquele grupo.</p>
+
+<p>Vale guardar o segundo tropeço da mesma família: <code>spec.replicas</code> com texto. Escrever
+<code>replicas: "2"</code> ou <code>replicas: duas</code> produz
+<code>spec.replicas: Invalid value: "2": must be an integer</code> — YAML aceita aspas, o Kubernetes não
+aceita texto onde espera número. É o tipo de detalhe que passa despercebido às duas da manhã.</p>
+
+<h2>8. Quando dá errado: três sintomas e onde olhar</h2>
+
+<p>O primeiro sintoma é <code>READY 0/2</code> eterno. O Deployment existe, o ReplicaSet existe, e nenhum
+pod fica pronto. Quase sempre é a imagem: nome errado, tag que não existe, registro privado sem
+credencial. O <code>describe pod</code> mostra o motivo no fim, na seção de eventos, com palavras como
+<code>ErrImagePull</code>. O painel não simula esse estado — ele não roda container —, mas num cluster
+real é a primeira coisa a conferir.</p>
+
+<p>O segundo sintoma é o pod em <code>Pending</code> com <code>READY 1/2</code> no Deployment. Aqui a
+imagem está boa; o pod é que não achou lugar. O evento <code>FailedScheduling</code> diz se falta CPU,
+memória ou se alguma restrição de nó barrou o agendamento. Aumentar <code>replicas</code> sem ter
+capacidade produz exatamente isso: você pede cinco, o cluster entrega três, e a tabela mostra
+<code>3/5</code>.</p>
+
+<p>O terceiro sintoma é o mais confuso: <code>kubectl get pods</code> mostra pods que o
+<code>kubectl get deployments</code> não reconhece. Aí a pergunta é de etiqueta. O Deployment só considera
+seus os pods que casam com <code>spec.selector.matchLabels</code>. Se alguém mudou a etiqueta de um pod
+na mão, ele sai da conta, o Deployment cria outro e você fica com um pod órfão passeando pelo namespace.
+O <code>describe</code> do pod mostra <code>Controlled By</code>; se estiver vazio, ninguém manda nele.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o site tem de sobreviver ao deploy</h3>
+<p>A Ana vai publicar a versão 2.0 do cardápio. Se ela apagasse o pod e criasse outro, o site ficaria
+alguns segundos fora do ar. Com Deployment, ela muda o modelo e o controlador troca os pods um a um,
+mantendo o serviço atendendo. O assunto tem aula própria — é o rolling update —, mas a base é esta: o
+Deployment guarda o modelo, e mudar o modelo não é apagar tudo e começar de novo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a réplica que some por causa de um nó</h3>
+<p>Um dos nós do cluster reinicia. Os pods daquele nó morrem de uma vez, e o ReplicaSet vê a contagem
+cair. Ele cria pods novos, e o agendador os coloca nos nós que sobraram. A Ana percebe só pelo
+<code>AGE</code> das linhas no <code>get pods</code>. É por isso que duas réplicas não é exagero de
+arquitetura: é o mínimo para um nó poder cair sem o site sumir.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o Deployment que ninguém sabe de onde veio</h3>
+<p>Num time maior, alguém aplica um Deployment chamado <code>cardapio</code> com uma imagem diferente da
+que está no repositório. O <code>apply</code> seguinte, do arquivo versionado, sobrescreve o que estava
+lá — e a mudança some sem aviso. É por isso que o manifesto precisa estar no repositório e o cluster não
+é lugar de editar à mão. Quando algo parece “voltar sozinho”, quase sempre é um <code>apply</code>
+automático reafirmando o que está no arquivo.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Para que serve um Deployment?</p>
+<label><input type="radio" name="q1"> para rodar o container sem precisar de imagem</label>
+<label><input type="radio" name="q1"> para declarar quantas cópias de um modelo de pod devem existir e
+mantê-las assim</label>
+<label><input type="radio" name="q1"> para expor o site na internet</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Quem cria os pods de um Deployment?</p>
+<label><input type="radio" name="q2"> o kubelet, direto no nó</label>
+<label><input type="radio" name="q2"> o kubectl, a cada comando que você digita</label>
+<label><input type="radio" name="q2"> o ReplicaSet, que o próprio Deployment criou</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que significa <code>selector</code> que não casa com
+<code>template.metadata.labels</code>?</p>
+<label><input type="radio" name="q3"> o cluster recusa o Deployment na hora, com a mensagem
+<code>`selector` does not match template `labels`</code></label>
+<label><input type="radio" name="q3"> o Deployment é criado e os pods ficam em <code>Pending</code></label>
+<label><input type="radio" name="q3"> nada: o Kubernetes corrige as etiquetas sozinho</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o Deployment da vitrine</h2>
+<p>Escreva o manifesto de um Deployment chamado <code>vitrine</code>, com três réplicas, que selecione
+pods pela etiqueta <code>app: vitrine</code> e rode a imagem <code>cardapio:1.0</code> na porta 8080.
+Depois responda: qual campo do manifesto guarda o modelo de pod?</p>
+<div class="ex-code">spec.<input aria-label="resposta 1" data-answer="template" placeholder="...">: o
+modelo que o ReplicaSet vai copiar</div>
+<p class="ex-dica">Dica: <code>replicas</code> é o número, <code>selector</code> é o filtro e o terceiro
+campo do <code>spec</code> é o modelo — o mesmo formato do manifesto de um pod.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Pod é a peça que roda; Deployment é a ordem que mantém a peça no lugar. O manifesto tem
+<code>replicas</code>, <code>selector</code> e <code>template</code>, e a etiqueta do modelo tem de casar
+com o seletor, senão o cluster recusa o objeto com <code>`selector` does not match template `labels`</code>.
+O <code>apiVersion</code> é <code>apps/v1</code>, não <code>v1</code>.</p>
+
+<p>Por baixo, o Deployment cria um ReplicaSet, e o ReplicaSet cria os pods. Os nomes contam essa
+hierarquia: <code>cardapio</code>, <code>cardapio-wj4jsx2tcw</code>,
+<code>cardapio-wj4jsx2tcw-t4jwn</code>. A tabela do <code>get deployments</code> mostra
+<code>READY</code> (prontas/desejadas), <code>UP-TO-DATE</code> (com o modelo novo) e
+<code>AVAILABLE</code> (prontas para uso); o <code>get pods</code> diz o porquê de cada pod.</p>
+
+<p>E o mais importante: apagar um pod não derruba o site. O ReplicaSet conta, vê que falta um, e cria
+outro. A Ana não precisa mais acordar às três da manhã — mas precisa saber olhar as três colunas e o
+<code>describe</code> quando o número não fecha. Na próxima aula ela aprende a mexer nesse número:
+réplicas e escala, do <code>scale</code> ao <code>replicas: 0</code>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Deployment = quantas cópias de qual modelo devem existir, sempre.</li>
+  <li><code>apiVersion: apps/v1</code>, e o <code>selector</code> tem de casar com
+  <code>template.metadata.labels</code>.</li>
+  <li>Deployment cria ReplicaSet; ReplicaSet cria pod. O nome conta essa história.</li>
+  <li><code>READY</code> baixo é pergunta para o pod; <code>UP-TO-DATE</code> baixo é deploy em
+  andamento.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

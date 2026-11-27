@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kubectl describe | Guia Kubernetes</title>
+<meta name="description" content="O kubectl describe por dentro: as seções da saída, as Conditions, a tabela de Events e como descobrir por que um pod ficou em Pending lendo o motivo certo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>kubectl <span class="hl">describe</span></h1>
+<p class="intro">Na aula passada a Ana aprendeu a ver <em>o que</em> existe no cluster. Agora ela precisa
+saber <em>por que</em> uma coisa não funciona: o <code>get</code> disse <code>Pending</code> e parou ali,
+sem dizer nada. É o momento do <code>kubectl describe</code> — o comando que abre o objeto por dentro e,
+no fim, mostra a parte que resolve a maior parte dos problemas: a lista de eventos, com as frases que o
+próprio cluster escreveu.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o <code>describe</code> mostra que o <code>get</code> não mostra.</li>
+  <li>As seções da saída: cabeçalho, <code>Containers</code>, <code>Conditions</code>,
+  <code>Volumes</code> e <code>Events</code>.</li>
+  <li>O que cada <em>condition</em> quer dizer e qual delas explica o <code>Pending</code>.</li>
+  <li>Como ler a tabela de eventos: <code>Type</code>, <code>Reason</code>, <code>Age</code>,
+  <code>From</code> e <code>Message</code>.</li>
+  <li>Descrever Deployment e Service, não só pod.</li>
+  <li>Os tropeços de quem lê o <code>describe</code> com pressa.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o pod que ficou em Pending</h2>
+
+<p>O <code>get pods</code> da Ana mostrou uma linha seca: <code>forno 0/1 Pending 0 5m</code>. Cinco minutos
+em <code>Pending</code> e nenhuma explicação. Ela tentou <code>get pods -o wide</code> e a coluna
+<code>NODE</code> veio vazia. Tentou <code>get events</code> e a lista veio vazia também — o evento existe,
+mas está ligado ao pod e não aparece na listagem por namespace do jeito que ela esperava.</p>
+
+<p>O que ela queria era uma frase em português dizendo “não coloquei esse pod em nó nenhum porque falta
+CPU”. Essa frase existe, o cluster a escreveu, e o comando que a mostra é o <code>describe</code>. Ele lê
+o objeto inteiro no servidor e monta um relatório legível: identidade, containers, condições, volumes e os
+eventos mais recentes.</p>
+
+<p>Vale guardar a diferença em uma linha: o <code>get</code> responde “existe e em que estado”; o
+<code>describe</code> responde “por que está nesse estado”. Quem começa costuma pular direto para o
+<code>describe</code> e se perder no meio da saída longa — por isso a ordem boa é sempre
+<code>get</code> primeiro, <code>describe</code> depois, e só então mexer em alguma coisa.</p>
+
+<p>Como o <code>get</code>, o <code>describe</code> é só leitura: ele não reinicia, não recria e não muda
+nada. Isso importa mais do que parece, porque o momento em que você mais precisa dele é justamente o
+momento em que está com pressa e com o site fora do ar. Poder bisbilhotar à vontade, várias vezes, sem
+medo de piorar a situação, é o que permite investigar com calma em vez de chutar um <code>delete</code>.
+O defeito não some porque você olhou; ele só fica visível.</p>
+
+<h2>2. Get e describe: resumo e raio-x</h2>
+
+<p>Os dois comandos leem o mesmo objeto. A diferença é o recorte. O <code>get</code> mostra as cinco
+colunas que interessam para saber se está tudo de pé. O <code>describe</code> mostra tudo o que o servidor
+sabe, incluindo o que você não pediu — e é justamente aí que mora o motivo do problema.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>kubectl get</code></th><th><code>kubectl describe</code></th></tr>
+</thead>
+<tbody>
+<tr><td>formato</td><td>tabela de uma linha por objeto</td><td>relatório de várias seções</td></tr>
+<tr><td>serve para</td><td>saber o que existe e em que estado</td><td>descobrir o motivo do estado</td></tr>
+<tr><td>mostra eventos?</td><td>não</td><td>sim, no fim</td></tr>
+<tr><td>mostra imagem, porta e restart?</td><td>não</td><td>sim, em <code>Containers</code></td></tr>
+<tr><td>cabe na tela?</td><td>sim, quase sempre</td><td>não: role ou use <code>| less</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma consequência prática: o <code>describe</code> de um pod grande pode ter oitenta linhas, e o
+terminal rola. No cluster de verdade, o hábito é <code>kubectl describe pod forno | less</code> para
+navegar, ou <code>| tail -20</code> quando você só quer os eventos. No painel desta página a saída aparece
+inteira, então vale procurar pela seção: <code>Events</code> é a última.</p>
+
+<h2>3. As seções da saída</h2>
+
+<p>A saída do <code>describe</code> é sempre na mesma ordem, e saber onde olhar economiza minutos. O
+cabeçalho traz <code>Name</code>, <code>Namespace</code>, <code>Node</code>, <code>Start Time</code>,
+<code>Labels</code>, <code>Status</code> e <code>IP</code>. Depois vem <code>Containers</code>, com imagem,
+porta, estado e contagem de reinícios. Em seguida <code>Conditions</code>, <code>Volumes</code>,
+<code>QoS Class</code> e, por último, <code>Events</code>.</p>
+
+<dl class="anatomy">
+<dt>describe</dt>
+<dd>Comando que monta um relatório legível de um objeto do cluster, juntando o objeto e os eventos
+ligados a ele.</dd>
+<dt>condition</dt>
+<dd>Cada uma das verificações que o cluster faz sobre o pod: agendado, inicializado, pronto. Tem
+<code>Type</code> e <code>Status</code>.</dd>
+<dt>evento</dt>
+<dd>A linha do tempo do que o cluster tentou fazer. Tem tipo (<code>Normal</code> ou
+<code>Warning</code>), motivo, idade, quem gerou e uma mensagem.</dd>
+<dt>QoS Class</dt>
+<dd>A classe de qualidade do pod, calculada a partir de requests e limits: <code>BestEffort</code>,
+<code>Burstable</code> ou <code>Guaranteed</code>.</dd>
+<dt>Node</dt>
+<dd>O nó onde o pod caiu. Quando aparece <code>&lt;none&gt;</code>, ninguém agendou o pod — e é a pista do
+<code>Pending</code>.</dd>
+</dl>
+
+<p>A seção <code>Volumes</code> merece uma frase porque aparece em todo pod, mesmo nos simples. O volume
+<code>kube-api-access-...</code> é injetado pelo cluster em todo pod e não é problema nem configuração sua.
+Os outros volumes — de ConfigMap, Secret, <code>emptyDir</code> — aparecem com o tipo entre parênteses e o
+nome da origem. Quando o programa reclama de arquivo que não existe, é aqui que se confere se ele foi
+montado e em que caminho, e a seção <code>Mounts</code> dentro de <code>Containers</code> mostra o ponto de
+montagem.</p>
+
+<p>Antes de decorar seção, decore a ordem de leitura para problema: <code>Status</code> no topo,
+<code>Node</code> logo abaixo, <code>Containers</code> para ver se o container está
+<code>Waiting</code> e, por fim, <code>Events</code>. Nessa ordem você descarta as causas grandes — não
+agendado, não iniciado, não pronto — antes de entrar nos detalhes.</p>
+
+<h2>4. Descrevendo um pod que está rodando</h2>
+
+<p>A primeira vez serve para aprender a ler a saída com um caso fácil, sem erro nenhum no meio. A caixa
+cria o pod do cardápio e depois o descreve.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Containers:;;texto:Image:">
+  <p class="try-task">Crie o pod e descreva-o. O <code>get</code> só mostra a tabela: troque a segunda linha
+  por <code>kubectl describe pod cardapio</code> para aparecerem as seções <code>Containers:</code> e
+  <code>Image:</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl get pod cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pod cardapio
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl describe pod cardapio</pre>
+</div>
+
+<p>Repare no par <code>Status: Running</code> e <code>Ready: True</code> dentro de
+<code>Containers</code>. São coisas diferentes: <code>Status</code> é a fase do pod;
+<code>Ready</code> é se ele já pode receber tráfego. Um pod pode estar <code>Running</code> e
+<code>Ready: False</code> — nesse caso o Service não manda visitas para ele, mesmo com o container vivo.
+Essa distinção aparece também no <code>get</code>, na coluna <code>READY</code>, como
+<code>0/1</code>.</p>
+
+<p>O <code>QoS Class</code> chama atenção de quem nunca viu: <code>BestEffort</code> significa que o pod
+não declarou requests nem limits de CPU e memória. É o padrão de um <code>kubectl run</code> sem flags, e
+é o caso mais frágil — se o nó ficar sem recurso, os pods <code>BestEffort</code> são os primeiros
+candidatos a sair. Não é urgente para aprender, mas vale reconhecer o nome quando aparecer.</p>
+
+<h2>5. Conditions: as quatro verificações</h2>
+
+<p>A seção <code>Conditions</code> é a mais mal-entendida da saída. Ela não descreve o programa; descreve o
+caminho do pod até ficar pronto. São quatro verificações, sempre nesta ordem de produção:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Condition</th><th>O que significa</th><th>Quando fica <code>False</code></th></tr>
+</thead>
+<tbody>
+<tr><td><code>PodScheduled</code></td><td>o agendador escolheu um nó</td><td>nenhum nó serve: falta CPU, memória, etiqueta ou sobra taint</td></tr>
+<tr><td><code>Initialized</code></td><td>os init containers terminaram</td><td>um init container falhou ou ainda está rodando</td></tr>
+<tr><td><code>Ready</code></td><td>o pod pode receber tráfego</td><td>o container ainda não respondeu à verificação de prontidão</td></tr>
+<tr><td><code>ContainersReady</code></td><td>todos os containers do pod estão prontos</td><td>algum container está reiniciando ou não responde</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A leitura útil é da primeira para a última: se <code>PodScheduled</code> está <code>False</code>, nada
+mais importa — não adianta investigar imagem, variável de ambiente ou código, porque o pod nunca chegou a
+um nó. Se <code>PodScheduled</code> é <code>True</code> e <code>Ready</code> é <code>False</code>, o
+problema é dentro do container. Essa é a decisão que separa os dois grandes grupos de defeito, e ela se
+toma olhando duas linhas.</p>
+
+<p>Um cuidado com a palavra “Ready”: ela oscila. Um pod que está pronto há uma hora pode ficar
+<code>Ready: False</code> por dez segundos se a verificação de prontidão falhar uma vez, e voltar sozinho
+depois. Por isso o <code>describe</code> mostra a condição com a idade do último evento ao lado, e não um
+histórico de tudo que já aconteceu. Se você olhar uma vez e ver <code>False</code>, olhe de novo em alguns
+segundos antes de concluir qualquer coisa — condição que muda sozinha raramente é defeito de
+configuração.</p>
+
+<h2>6. Lendo o motivo: pod em Pending</h2>
+
+<p>Agora o caso que interessa. A caixa começa com um cluster que já tem um pod chamado
+<code>forno</code>, que pediu mais CPU do que qualquer nó do teste tem. Ele existe, aparece no
+<code>get</code> e nunca sai do lugar.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="pod-pendente" data-goal="texto:FailedScheduling;;texto:Insufficient cpu">
+  <p class="try-task">O <code>get</code> mostra <code>Pending</code> e não diz o motivo. Troque a linha por
+  <code>kubectl describe pod forno</code> e encontre o evento com <code>FailedScheduling</code> e
+  <code>Insufficient cpu</code>.</p>
+<pre class="yaml">kubectl get pod forno</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pod forno
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">kubectl describe pod forno</pre>
+</div>
+
+<p>A seção <code>Events</code> é a resposta: um evento do tipo <code>Warning</code>, motivo
+<code>FailedScheduling</code>, mensagem começando com <code>0/3 nodes are available</code>. Traduzindo:
+“avaliei os três nós, nenhum tinha o que o pod pediu”. O número antes da frase é quantos nós falharam
+por aquele motivo — <code>3 Insufficient cpu</code> quer dizer três nós sem CPU sobrando. Quando há
+motivos diferentes, a linha lista cada um com sua contagem.</p>
+
+<p>O mesmo formato de mensagem aparece para outros bloqueios, e reconhecer o começo economiza tradução.
+<code>Insufficient memory</code> é memória; <code>node(s) didn&#39;t match Pod&#39;s node affinity/selector</code>
+é etiqueta de nó que não casa com o que o manifesto pediu; <code>node(s) had untolerated taint</code> é o
+nó marcado para não receber aquele pod. Em todos os casos a estrutura é igual: quantos nós falharam, por
+qual motivo. Você não precisa decorar as frases — precisa saber que a primeira delas é a resposta.</p>
+
+<p>Repare também no <code>Node: &lt;none&gt;</code> no topo e no <code>State: Waiting</code> com
+<code>Reason: FailedScheduling</code> dentro de <code>Containers</code>. A mesma informação aparece em
+três lugares, o que é bom: você pode começar a leitura por qualquer um deles e chegar ao evento. O que não
+dá é concluir “a imagem está errada” — imagem só se discute depois que o pod foi agendado.</p>
+
+<h2>7. A tabela de eventos, coluna por coluna</h2>
+
+<p>Cinco colunas, e cada uma responde uma pergunta diferente. <code>Type</code> diz se é
+<code>Normal</code> (aconteceu o esperado) ou <code>Warning</code> (algo não deu certo) — comece pelos
+<code>Warning</code>. <code>Reason</code> é o código curto do motivo, em CamelCase:
+<code>FailedScheduling</code>, <code>Created</code>, <code>Pulled</code>. <code>Age</code> é há quanto
+tempo aconteceu; eventos antigos costumam ser história, não problema.</p>
+
+<p><code>From</code> diz quem escreveu: <code>default-scheduler</code> é o agendador,
+<code>deployment-controller</code> é o controlador do Deployment. E <code>Message</code> é a frase em
+inglês que você vai traduzir. Uma leitura que funciona: pegue o último <code>Warning</code>, olhe a
+mensagem, e traduza só ela. Eventos <code>Normal</code> servem para saber o que deu certo, não para achar o
+defeito.</p>
+
+<p>Uma limitação do formato que ajuda a interpretar: o <code>describe</code> não mostra a lista completa de
+eventos, e sim os mais recentes. Um pod que existe há três dias tem muito mais história do que as poucas
+linhas ali — o resto já foi compactado pelo cluster para economizar espaço. Por isso “não tem evento” quase
+sempre significa “não aconteceu nada de novo”, e não “o cluster esqueceu”. Quando precisa da história
+inteira, o comando é <code>kubectl get events</code>, que lista tudo do namespace.</p>
+
+<pre class="term">Events:
+  Type      Reason             Age   From                Message
+  Normal    Created            20s   default-scheduler   created by ana
+  Warning   FailedScheduling   23s   default-scheduler   0/3 nodes are available: 3 Insufficient cpu. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.</pre>
+
+<p>A segunda metade da mensagem, sobre <em>preemption</em>, quer dizer que o cluster também considerou
+despejar algum pod para abrir espaço e desistiu. É informação de segunda ordem: para quem está começando,
+a parte útil é sempre a primeira, <code>0/3 nodes are available: 3 Insufficient cpu</code>. E quando o
+objeto não existe, o <code>describe</code> responde com o mesmo erro do <code>get</code> — outra frase para
+reconhecer de longe:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe pod brioche
+Error from server (NotFound): pods "brioche" not found</pre>
+
+<p>Duas linhas e dois aprendizados: a mensagem é a mesma do <code>get</code>, porque quem responde é o
+servidor; e o <code>describe</code> não inventa um relatório vazio para objeto inexistente. Se aparecer
+<code>NotFound</code>, o problema é nome ou namespace antes de ser qualquer outra coisa.</p>
+
+<h2>8. Descrevendo Deployment e Service</h2>
+
+<p>O <code>describe</code> não é só de pod. Cada tipo de objeto tem um relatório próprio, com as seções que
+fazem sentido para ele. O Deployment, por exemplo, mostra o <code>Selector</code>, o
+<code>Pod Template</code> com a imagem e as portas do modelo, as <code>Conditions</code> e dois campos que
+não existem em pod: <code>OldReplicaSets</code> e <code>NewReplicaSet</code>.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:Pod Template:;;texto:NewReplicaSet:">
+  <p class="try-task">O cluster já tem o Deployment <code>cardapio</code> com duas réplicas. Troque a linha
+  por <code>kubectl describe deployment cardapio</code> para aparecerem o <code>Pod Template:</code> e o
+  <code>NewReplicaSet:</code> que o <code>get</code> não mostra.</p>
+<pre class="yaml">kubectl get deployments</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">kubectl describe deployment cardapio</pre>
+</div>
+
+<p>Esses dois campos contam a mecânica do Deployment sem precisar de aula nova. O
+<code>NewReplicaSet</code> é o ReplicaSet da versão atual, com a contagem de réplicas que ele criou. O
+<code>OldReplicaSets</code> guarda os anteriores, com zero réplicas — é o histórico que permite voltar
+atrás. Quando você muda a imagem no manifesto, o Deployment cria um ReplicaSet novo, enche ele e esvazia o
+antigo, um passo de cada vez.</p>
+
+<p>Já o <code>describe service</code> responde uma pergunta diferente: <em>quem</em> está atrás do Service.
+Ele mostra o <code>Selector</code>, o <code>Port</code> e o <code>TargetPort</code> e, principalmente, a
+linha <code>Endpoints</code> com os IPs dos pods que casaram com o seletor. Se
+<code>Endpoints: &lt;none&gt;</code>, o Service existe mas não tem ninguém para entregar — quase sempre
+porque a etiqueta do pod não bate com o seletor. É a mesma investigação da aula de <code>get</code>, agora
+com a resposta na tela.</p>
+
+<p>O cabeçalho do relatório também responde perguntas rápidas que passam batido. <code>Start Time</code>
+diz quando o pod nasceu — diferente de <code>Age</code>, que conta desde a criação e fica no
+<code>get</code>. <code>Labels</code> mostra as etiquetas que o pod carrega, o que é meio caminho para
+descobrir se um Service vai encontrá-lo. E <code>Controlled By</code> diz quem é o dono: em pod criado por
+Deployment, aparece o ReplicaSet; em pod solto, <code>&lt;none&gt;</code>. É essa linha que explica por que
+alguns pods voltam sozinhos depois de apagados — eles têm dono.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o pedido de CPU grande demais</h3>
+<p>O pod <code>forno</code> tinha <code>requests.cpu: "8"</code> — oito núcleos. O cluster de teste tem três
+nós pequenos e nenhum com isso sobrando. O <code>get</code> mostrou <code>Pending</code> por vinte minutos
+enquanto a Ana procurava erro na imagem; o <code>describe</code> disse <code>Insufficient cpu</code> em
+duas linhas. O conserto foi reduzir o pedido para <code>500m</code>, e o pod subiu no mesmo minuto.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Service sem ninguém atrás</h3>
+<p>O site respondia 503. O <code>get pods</code> mostrava os dois pods <code>Running</code> e
+<code>1/1</code>, o que parecia ótimo. O <code>describe service cardapio</code> mostrou
+<code>Endpoints: &lt;none&gt;</code>: o seletor pedia <code>app=cardapio</code> e os pods tinham
+<code>run=cardapio</code>. O defeito não estava no pod nem no Service, mas no encontro dos dois — e o
+relatório do Service é o único lugar onde esse encontro aparece.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o pod pronto que não recebia visita</h3>
+<p>Um pod estava <code>Running</code> mas com <code>READY 0/1</code>. O <code>describe</code> mostrou
+<code>Ready: False</code> na condição <code>Ready</code>, com a verificação de prontidão falhando na porta
+8080. O programa estava de pé, mas respondendo na 3000 — a porta do manifesto estava errada. Sem a seção
+<code>Conditions</code>, a tentação seria reiniciar o pod e esperar mágica.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Para que serve o <code>kubectl describe</code>?</p>
+<label><input type="radio" name="q1"> para apagar o objeto e recriá-lo limpo</label>
+<label><input type="radio" name="q1"> para ver o objeto inteiro e os eventos que explicam o estado dele</label>
+<label><input type="radio" name="q1"> para abrir um terminal dentro do container</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O pod está em <code>Pending</code> e
+<code>PodScheduled</code> é <code>False</code>. Onde está o motivo?</p>
+<label><input type="radio" name="q2"> na imagem do container</label>
+<label><input type="radio" name="q2"> nas variáveis de ambiente do pod</label>
+<label><input type="radio" name="q2"> no evento <code>FailedScheduling</code>, na seção
+<code>Events</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. <code>Endpoints: &lt;none&gt;</code> no
+<code>describe service</code> quer dizer:</p>
+<label><input type="radio" name="q3"> nenhum pod casou com o seletor do Service</label>
+<label><input type="radio" name="q3"> o Service está desligado pelo cluster</label>
+<label><input type="radio" name="q3"> todos os pods estão prontos, mas em outro nó</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o comando do raio-x</h2>
+
+<p>O <code>get</code> mostrou o estado. Para ver as seções e os eventos do pod <code>forno</code>, complete o
+comando:</p>
+
+<div class="ex-code">kubectl <input aria-label="resposta 1" data-answer="describe" placeholder="..."> pod forno</div>
+
+<p class="ex-dica">Dica: o verbo é o mesmo nome do relatório — em inglês, “descrever”. Ele funciona com pod,
+deployment, service e com quase todo tipo de objeto do cluster.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O <code>get</code> mostra o estado; o <code>describe</code> mostra o motivo. A saída tem sempre a mesma
+ordem — cabeçalho, <code>Containers</code>, <code>Conditions</code>, <code>Volumes</code>, QoS e
+<code>Events</code> — e a leitura para problema é sempre do topo para baixo: <code>Status</code>,
+<code>Node</code>, estado do container e eventos.</p>
+
+<p>Em <code>Conditions</code>, comece por <code>PodScheduled</code>: se ele é <code>False</code>, o pod não
+chegou a nó nenhum e o problema é de agendamento (CPU, memória, etiqueta, taint). Se é <code>True</code> e
+<code>Ready</code> é <code>False</code>, o problema está dentro do container. Nos eventos, procure o último
+<code>Warning</code> e traduza a mensagem — o resto costuma ser história ou detalhe de segunda ordem.</p>
+
+<p>E o <code>describe</code> não é só de pod: no Deployment ele mostra o <code>Pod Template</code> e os
+ReplicaSets; no Service, mostra os <code>Endpoints</code>, que são a prova de que o seletor encontrou
+alguém. Na próxima aula a Ana vai ler o que o programa escreve — o <code>kubectl logs</code> —, fechando o
+trio de leitura do cluster.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl describe pod nome</code> abre o objeto inteiro; <code>Events</code> é a última
+  seção.</li>
+  <li><code>PodScheduled False</code> = não achou nó; <code>Ready False</code> = achou e não está
+  pronto.</li>
+  <li>Evento útil é o último <code>Warning</code>; a mensagem costuma bastar.</li>
+  <li><code>0/3 nodes are available: 3 Insufficient cpu</code> = falta CPU em três nós.</li>
+  <li><code>Endpoints: &lt;none&gt;</code> no Service = seletor não casou com etiqueta nenhuma.</li>
+  <li><code>NotFound</code> no describe = nome ou namespace errado.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

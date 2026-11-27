@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kubectl logs | Guia Kubernetes</title>
+<meta name="description" content="O kubectl logs na prática: ler o que o programa escreveu, escolher o container com -c, buscar no namespace certo e separar log de evento do cluster.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>kubectl <span class="hl">logs</span></h1>
+<p class="intro">O cliente da Ana viu “erro 500” na tela do cardápio. O <code>get</code> mostrou o pod
+<code>Running</code>, o <code>describe</code> mostrou tudo pronto e nenhum evento de aviso. Só que o defeito
+não está no cluster: está no programa, e quem sabe o que aconteceu é o próprio programa, na mensagem que
+escreveu na saída. Nesta aula a Ana aprende a abrir essa saída com <code>kubectl logs</code> — e a separar
+o que é problema de infraestrutura do que é problema de código.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um log de container e por que ele não é a mesma coisa que evento.</li>
+  <li>Ler os logs de um pod com <code>kubectl logs nome</code>.</li>
+  <li>Como procurar no log: o começo, o fim e a última mensagem de erro.</li>
+  <li>Escolher o container quando o pod tem mais de um, com <code>-c</code>.</li>
+  <li>Buscar o log no namespace certo, com <code>-n</code>.</li>
+  <li>Quais filtros do kubectl existem e por que o painel desta página não os aplica.</li>
+  <li>Quando o log está vazio e o que isso quer dizer.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o 500 que o cluster não explica</h2>
+
+<p>A Ana já sabe que o <code>get</code> mostra estado e o <code>describe</code> mostra motivo. Nos dois, ela
+chegou à mesma conclusão: o pod está de pé, pronto, sem reinício, sem evento de aviso. Para o cluster, está
+tudo certo. E, para o cluster, está mesmo: ele não sabe se o programa está respondendo bem, só se o processo
+está vivo.</p>
+
+<p>O “erro 500” que o cliente viu é uma resposta do programa, não do Kubernetes. O programa é que decidiu
+responder com erro — porque faltou um arquivo, porque a consulta ao banco demorou demais, porque o preço
+chegou vazio. E, quando isso acontece, o programa quase sempre escreve uma linha explicando. Essa linha está
+no log do container, e o comando que a traz é <code>kubectl logs</code>.</p>
+
+<p>A analogia mais próxima: se o pod fosse uma pessoa trabalhando, o <code>get</code> diria se ela está na
+mesa, o <code>describe</code> diria se a mesa está montada, e o <code>logs</code> seria o que ela falou
+enquanto trabalhava. Problema de mesa se resolve com o cluster; problema de trabalho se resolve com o que a
+pessoa disse.</p>
+
+<p>Vale antecipar o que costuma travar a primeira leitura: o log não é bonito. Cada programa escreve do
+jeito que o time dele decidiu, sem padrão comum, e o do cardápio é mentira descarada — a Ana nunca escreveu
+essa aplicação pensando em observabilidade. É assim mesmo na vida: você vai encontrar log com data em uma
+linha e sem data na outra, texto sem acento, mensagem em inglês e rastreamento de erro com vinte linhas de
+pilha. O trabalho é achar a linha que muda a história, e não ler tudo com atenção igual.</p>
+
+<h2>2. Log é a boca do programa</h2>
+
+<p>Todo container tem duas saídas de texto: a padrão (<em>stdout</em>) e a de erro (<em>stderr</em>). O
+kubectl junta as duas e mostra em ordem de chegada. Quem escreve ali é o seu programa, do jeito que ele
+quiser: uma linha por requisição, uma mensagem quando começa, um aviso quando algo demora. O cluster não
+interpreta nada disso — ele só guarda e entrega quando você pede.</p>
+
+<p>Disso decorrem três consequências que valem mais do que decorar comando. Primeira: <strong>o formato é do
+seu programa</strong>, então cada pod tem um log com cara diferente. Segunda: <strong>o log é do
+container</strong>, não do pod nem do Deployment — quem perde o container perde o log dele. Terceira:
+<strong>log é passado</strong>: ele conta o que já aconteceu, e não o estado atual. Quem conta o estado é o
+<code>get</code>.</p>
+
+<dl class="anatomy">
+<dt>stdout</dt>
+<dd>A saída padrão do programa. É para cá que a maioria das aplicações escreve o que quer contar.</dd>
+<dt>stderr</dt>
+<dd>A saída de erro. No <code>kubectl logs</code> aparece junto com a padrão, na mesma lista.</dd>
+<dt>container</dt>
+<dd>O processo que produz o log. Um pod com dois containers tem dois logs separados, e a opção
+<code>-c</code> escolhe qual.</dd>
+<dt>evento</dt>
+<dd>O que o cluster fez com o objeto. Fica no <code>describe</code>, não no log — são fontes
+diferentes.</dd>
+<dt>seguir</dt>
+<dd>Deixar o comando aberto mostrando linhas novas conforme aparecem (<code>-f</code>), como acompanhar
+um vídeo ao vivo.</dd>
+</dl>
+
+<h2>3. Os logs do pod</h2>
+
+<p>O comando é simples: <code>kubectl logs</code> mais o nome do pod. O que costuma confundir é que ele não
+aceita deploy, service nem namespace no lugar do nome — precisa do pod, daquele nome comprido que muda. A
+caixa abaixo cria o pod do cardápio e lê o que ele escreveu.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Servindo o cardapio na porta 8080">
+  <p class="try-task">A caixa só lista o pod. Troque a segunda linha por <code>kubectl logs cardapio</code>
+  para ver o que o programa escreveu — a primeira linha do log é o aviso de que ele está servindo na porta
+  8080.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl logs cardapio</pre>
+</div>
+
+<p>O que aparece é o que o programa do cardápio escreveu desde que subiu. Note que não há data nem hora em
+cada linha: o kubectl só prefixa horário quando você pede (com <code>--timestamps</code>), e muitas
+aplicações escrevem o próprio horário dentro da mensagem. Se o log que você recebeu tem
+<code>2026-11-27T15:50:21Z</code> no começo de cada linha, é o programa que colocou.</p>
+
+<p>Um hábito que separa quem depura rápido de quem se perde: peça o log <em>depois</em> de saber qual pod
+te interessa. Num Deployment com duas réplicas, metade das requisições vai para cada pod, e o defeito pode
+aparecer em uma só. Nesse caso, o <code>get pods -o wide</code> mostra os dois IPs, a linha do log mostra o
+caminho e o código de resposta, e a comparação entre os dois logs diz se o problema é do código (os dois
+iguais) ou do ambiente daquele pod (um diferente do outro).</p>
+
+<p>Repare também no que <em>não</em> está ali: nenhuma linha dizendo “pod criado” ou “imagem baixada”. Isso é
+assunto de evento, não de log. A separação é a mesma da seção 2, e é a confusão número um de quem está
+começando: procurar no log um problema que só o <code>describe</code> conta, ou procurar no
+<code>describe</code> um erro que só o programa escreveu.</p>
+
+<h2>4. Como ler um log em dez segundos</h2>
+
+<pre class="term">Servindo o cardapio na porta 8080
+Precos carregados de /config/cardapio.json
+conexao com o banco: ok
+pedido entregue em 132 ms
+GET /cardapio 200 12ms
+GET /saude 200 1ms</pre>
+
+<p>O log que a caixa mostra tem seis linhas e ensina o roteiro. A primeira linha
+(<code>Servindo o cardapio na porta 8080</code>) responde “o programa chegou a iniciar?”. Se ela não
+existir, o processo morreu antes de começar a servir — e aí o problema é configuração, não código. As linhas
+do meio (<code>conexao com o banco: ok</code>) contam o que deu certo; servem para saber até onde ele
+chegou.</p>
+
+<p>As últimas linhas são as mais importantes, porque são as mais recentes: cada requisição atendida aparece
+como <code>GET /cardapio 200 12ms</code>, com o caminho, o código de resposta e o tempo. Um
+<code>500</code> no fim dessa linha é a assinatura do erro que o cliente viu. E, quando o programa escreve
+um rastreamento de erro, ele vem logo depois da linha que falhou — não no começo do arquivo.</p>
+
+<p>Por isso a leitura padrão é de baixo para cima: comece pelo fim, procure a primeira coisa que não é rotina
+(um <code>500</code>, um <code>Error</code>, uma palavra em maiúsculas), e suba a partir dali. O começo do
+log serve para confirmar que o processo iniciou; o fim, para saber onde ele parou de dar certo.</p>
+
+<h2>5. Mais de um container no pod: <code>-c</code></h2>
+
+<p>Quando o pod tem dois containers — um site e um proxy, por exemplo —, existem dois logs separados, e o
+kubectl precisa saber qual você quer. Sem a opção <code>-c</code>, ele mostra o primeiro container do
+manifesto; com ela, mostra o que você nomeou. Se o nome não existir, a resposta é um erro curto e
+específico:</p>
+
+<pre class="term">ana@notebook:~$ kubectl logs cardapio -c proxy
+error: container proxy is not valid for pod cardapio</pre>
+
+<p>Traduzindo: “o container <code>proxy</code> não existe neste pod”. A mensagem não lista os nomes válidos,
+o que é uma chatice — o jeito de descobrir é o <code>describe</code>, na seção <code>Containers</code>, onde
+cada container aparece com seu nome. Ler essa lista antes de pedir o log economiza a tentativa e erro.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:conexao com o banco: ok">
+  <p class="try-task">O pod <code>cardapio</code> tem um container chamado <code>cardapio</code>, e o comando
+  abaixo pede o log de um container <code>proxy</code> que não existe. Corrija o nome do container e leia o
+  log — a linha <code>conexao com o banco: ok</code> tem de aparecer.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl logs cardapio -c proxy</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl logs cardapio -c proxy
+error: container proxy is not valid for pod cardapio
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl logs cardapio -c cardapio</pre>
+</div>
+
+<p>Aqui a Ana aprendeu duas coisas ao mesmo tempo: o nome do container é o que o <code>describe</code>
+mostra na seção <code>Containers</code> (não o nome do pod, não o nome da imagem), e o log de cada container
+é independente. Num pod com site e proxy, o log do proxy conta quem entrou; o log do site conta o que
+aconteceu depois. Misturar os dois é o mesmo que ler a correspondência do vizinho.</p>
+
+<h2>6. Log e evento: duas fontes, duas perguntas</h2>
+
+<p>A tabela que resolve a dúvida mais comum de quem está começando a investigar. À esquerda, a pergunta que
+você tem; à direita, onde a resposta mora:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sua pergunta</th><th>Onde está a resposta</th></tr>
+</thead>
+<tbody>
+<tr><td>o programa subiu?</td><td><code>kubectl get pods</code> (coluna <code>STATUS</code>) e a primeira linha do log</td></tr>
+<tr><td>o cluster conseguiu agendar o pod?</td><td><code>kubectl describe pod</code>, seção <code>Events</code></td></tr>
+<tr><td>por que a requisição deu 500?</td><td><code>kubectl logs</code></td></tr>
+<tr><td>por que o pod reiniciou?</td><td><code>describe</code> (restart count e eventos) + log da tentativa anterior</td></tr>
+<tr><td>por que o Service não acha o pod?</td><td><code>describe service</code>, seção <code>Endpoints</code></td></tr>
+<tr><td>o programa está lento?</td><td>log com tempo por requisição (o <code>12ms</code> no fim da linha)</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma leitura que ajuda: evento é o que o <em>cluster</em> fez com o objeto; log é o que o <em>programa</em>
+fez com a vida dele. Agendar, baixar imagem, montar volume e reiniciar são atos do cluster. Processar
+requisição, conectar no banco e calcular preço são atos do programa. Quando a investigação troca de fonte,
+ela também troca de comando — e não existe comando que mostre as duas coisas juntas.</p>
+
+<h2>7. Filtros, histórico e o que o painel não faz</h2>
+
+<p>O kubectl tem filtros que economizam tela: <code>--tail=100</code> mostra as cem últimas linhas (bom para
+log que já tem milhares), <code>--since=1h</code> mostra só a última hora, <code>--timestamps</code> põe
+data e hora em cada linha, e <code>-f</code> deixa o comando aberto acompanhando linhas novas. São opções do
+cliente: o servidor manda o log e o kubectl recorta.</p>
+
+<p>É importante ser honesto sobre o painel desta página: ele mostra o log inteiro e não recorta. Se você
+digitar <code>--tail=2</code>, a saída continua com todas as linhas. Isso não é erro do seu comando — é uma
+limitação do motor do guia, que não implementa os filtros do cliente. No cluster de verdade os quatro
+funcionam, e valem o hábito: <code>--tail</code> antes de <code>-f</code>, sempre, para não começar a leitura
+por dez mil linhas antigas.</p>
+
+<p>Outra honestidade necessária: o log que o kubectl entrega é o do container que existe agora. Se o pod
+foi recriado — porque o Deployment trocou a imagem, porque o nó caiu, porque alguém apagou —, o log anterior
+foi embora junto com o container. É por isso que produção de verdade manda log para um lugar centralizado,
+fora do cluster. Enquanto o time da Ana não faz isso, o <code>--previous</code> é a única janela para o
+passado, e ela só abre uma vez.</p>
+
+<p>Existe um caso em que o log normal não serve: o container que morreu. Quando o programa quebra e o cluster
+reinicia o container, o log do container atual é o da tentativa nova — a anterior se foi. Para lê-la, o
+comando é <code>kubectl logs nome --previous</code>. É a única forma de ver a mensagem de um programa que
+morreu no boot, e é o primeiro comando depois de um <code>CrashLoopBackOff</code>. Como o painel não roda
+container, ele não simula esse estado: aqui o log de um pod que não está rodando simplesmente vem vazio.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Opção</th><th>O que faz</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-c nome</code></td><td>escolhe o container do pod</td><td>pod com mais de um container</td></tr>
+<tr><td><code>--tail=N</code></td><td>só as N últimas linhas</td><td>primeira olhada num log grande</td></tr>
+<tr><td><code>--since=1h</code></td><td>linhas da última hora</td><td>investigar um incidente recente</td></tr>
+<tr><td><code>-f</code></td><td>acompanha linhas novas</td><td>reproduzir o erro enquanto ele acontece</td></tr>
+<tr><td><code>--previous</code></td><td>log da tentativa anterior</td><td>container que morreu e reiniciou</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. O log do namespace certo</h2>
+
+<p>O <code>logs</code> também obedece ao namespace. Sem <code>-n</code>, ele procura o pod no
+<code>default</code> e, se não achar, responde com o mesmo <code>NotFound</code> do <code>get</code>. E aqui
+está a pegadinha que mais custa tempo: um pod em outro namespace responde “não achei” como se nunca tivesse
+existido.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Servindo o cardapio na porta 8080">
+  <p class="try-task">O pod foi criado no namespace <code>padaria</code> e o comando de log procura no
+  <code>default</code>, por isso responde que não achou. Acrescente <code>-n padaria</code> na última linha
+  para ler o log.</p>
+<pre class="yaml">kubectl create namespace padaria
+kubectl run cardapio --image=cardapio:1.0 -n padaria
+kubectl logs cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create namespace padaria
+namespace/padaria created
+
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0 -n padaria
+pod/cardapio created
+
+ana@notebook:~$ kubectl logs cardapio
+Error from server (NotFound): pods "cardapio" not found
+</pre>
+<pre class="solucao">kubectl create namespace padaria
+kubectl run cardapio --image=cardapio:1.0 -n padaria
+kubectl logs cardapio -n padaria</pre>
+</div>
+
+<p>Duas leituras rápidas sobre o erro: <code>Error from server (NotFound): pods "cardapio" not found</code>
+diz que o <em>pod</em> não foi encontrado no namespace consultado — não que o comando esteja errado. E a
+mesma frase aparece quando o nome está errado, quando o pod já foi apagado e quando ele está em outro
+namespace. A ordem de conferência é sempre a mesma: nome, depois namespace, depois existência.</p>
+
+<p>Um detalhe que só aparece com Deployment: o <code>logs</code> quer o nome do <strong>pod</strong>. Se você
+digitar o nome do Deployment (<code>kubectl logs cardapio</code> quando o dono dos pods se chama
+<code>cardapio</code>), a resposta é <code>NotFound</code>, porque não existe pod com esse nome — os pods têm
+o nome do Deployment mais um sufixo gerado. O jeito de pegar o nome certo é
+<code>kubectl get pods -o name</code>, que imprime exatamente o formato que o <code>logs</code> aceita.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o 500 do cardápio</h3>
+<p>O cliente viu “erro 500” e o cluster não mostrava nada. No fim do log do pod, a linha
+<code>GET /cardapio 500 12ms</code> apareceu três vezes seguidas, e as mensagens acima dela diziam que o
+arquivo <code>/config/cardapio.json</code> não existia. O defeito era um volume que não tinha sido montado —
+o log contou em duas linhas o que o <code>describe</code> não teria motivo para mostrar.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: os dois containers, dois logs</h3>
+<p>O pod tinha um proxy na frente e o site atrás. A Ana leu o log do proxy e viu só códigos 502, e concluiu
+que o site estava fora do ar. O log do site dizia que ele estava servindo normalmente. O problema era a porta
+configurada no proxy: ele mandava para a 8080 e o site escutava na 3000. Ler o log do container certo teria
+economizado a tarde.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o log que reiniciava sozinho</h3>
+<p>O pod subia, escrevia duas linhas e reiniciava. A cada vez o log parecia “ter apagado” — e era isso mesmo:
+o container novo começa um log novo. O comando que mostrou o motivo foi
+<code>kubectl logs cardapio --previous</code>, com o erro de faltar a variável <code>PORTA</code> no fim da
+tentativa anterior. Sem o <code>--previous</code>, a Ana teria ficado olhando um log que nunca passava da
+segunda linha.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o <code>kubectl logs</code> mostra?</p>
+<label><input type="radio" name="q1"> os eventos do pod, como no <code>describe</code></label>
+<label><input type="radio" name="q1"> o que o programa escreveu na saída padrão e na saída de erro</label>
+<label><input type="radio" name="q1"> o histórico de imagens usadas pelo pod</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O pod tem dois containers. O que fazer para ler o log do
+segundo?</p>
+<label><input type="radio" name="q2"> rodar <code>logs</code> duas vezes, ele mostra os dois em ordem</label>
+<label><input type="radio" name="q2"> usar o nome do Deployment no lugar do nome do pod</label>
+<label><input type="radio" name="q2"> acrescentar <code>-c nome-do-container</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O log do pod está vazio, mas o pod consta como
+<code>Running</code>. Qual é a explicação mais provável?</p>
+<label><input type="radio" name="q3"> o programa não escreveu nada desde que subiu</label>
+<label><input type="radio" name="q3"> o kubectl perdeu o log do cluster</label>
+<label><input type="radio" name="q3"> o pod está no namespace errado</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o log de um container específico</h2>
+
+<p>O pod <code>cardapio</code> tem dois containers: <code>web</code> e <code>proxy</code>. Complete o comando
+para ler o log do <code>web</code>:</p>
+
+<div class="ex-code">kubectl logs cardapio <input aria-label="resposta 1" data-answer="-c" placeholder="..."> web</div>
+
+<p class="ex-dica">Dica: a opção é a inicial de <em>container</em>. Sem ela, o kubectl mostra o primeiro
+container do manifesto — que pode não ser o que você quer ler.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Log é o que o programa escreveu: a saída padrão e a de erro do container, entregues pelo kubectl em ordem.
+<code>kubectl logs nome-do-pod</code> mostra tudo; <code>-c</code> escolhe o container quando há mais de um;
+<code>-n</code> escolhe o namespace. O log é do container, não do pod: container novo, log novo.</p>
+
+<p>Para ler, comece pelo fim: as últimas linhas são as mais recentes e é lá que o erro aparece. Guarde a
+separação que organiza a investigação — evento é o que o cluster fez (está no <code>describe</code>), log é
+o que o programa fez (está no <code>logs</code>). E lembre dos filtros que o painel não aplica mas o cluster
+real sim: <code>--tail</code>, <code>--since</code>, <code>-f</code> e <code>--previous</code>. Na próxima
+aula a Ana deixa de só ler e passa a agir dentro do container, com o <code>kubectl exec</code>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl logs pod</code> mostra a saída do programa; não mostra eventos.</li>
+  <li>Leia de baixo para cima: o fim do log é o agora.</li>
+  <li><code>-c nome</code> escolhe o container; o nome está no <code>describe</code>.</li>
+  <li><code>-n</code> é obrigatório quando o pod está em outro namespace.</li>
+  <li><code>logs</code> aceita nome de pod, não de Deployment.</li>
+  <li><code>--previous</code> mostra a tentativa que morreu; <code>--tail</code> corta o excesso.</li>
+  <li>Log vazio com pod <code>Running</code> = programa calado, não log perdido.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

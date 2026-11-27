@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Requests e limits | Guia Kubernetes</title>
+<meta name="description" content="Requests e limits do lado do nó: a conta que o agendador faz, por que doze réplicas viram seis pods, somas de containers e o que fazer quando a conta não fecha.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Requests e <span class="hl">limits</span></h1>
+<p class="intro">A Ana pediu doze réplicas do site para o domingo e recebeu seis funcionando e seis paradas
+em <code>Pending</code>. O cluster “tinha espaço” — três nós de dois núcleos cada —, mas o agendador não
+soma o cluster inteiro: ele olha nó por nó, e cada nó já tinha a sua cota tomada. Nesta aula ela aprende a
+fazer a mesma conta que o agendador faz, a ler onde cada pod caiu e a decidir os dois números que mudam
+tudo: <code>requests</code> e <code>limits</code>.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>A conta do agendador: por nó, não pelo cluster inteiro.</li>
+  <li>Por que doze réplicas de 700m viram seis pods e como consertar isso.</li>
+  <li>Ler <code>-o wide</code> e <code>get events</code> para saber onde e por que cada pod caiu.</li>
+  <li>O que muda entre o espaço reservado e o teto permitido, em CPU e em memória.</li>
+  <li>Somar containers dentro do mesmo pod antes de escolher os números.</li>
+  <li>O que fazer quando a soma não fecha: baixar, redistribuir ou aumentar o cluster.</li>
+</ul>
+</div>
+
+<h2>1. A cena: doze pedidos, seis pods</h2>
+
+<p>No sábado à noite a Ana rodou <code>kubectl scale deployment/vitrine --replicas=12</code>, confiante.
+Três nós, dois núcleos em cada, seis núcleos no total; doze pods de <code>700m</code> pedem 8400m, mais que
+o cluster tem — mas ela não fez essa conta, e mesmo que tivesse feito, a conclusão estaria errada pela
+metade: sobrava espaço, só não do jeito que o agendador enxerga.</p>
+
+<p>Na manhã seguinte, <code>kubectl get pods</code> mostrava seis <code>Running</code> e seis
+<code>Pending</code>. O <code>get deployments</code> mostrava <code>6/12</code>. Nenhum evento de erro de
+imagem, nenhum container morrendo: seis pods simplesmente nunca saíram da fila. O evento que explicava tudo
+estava no <code>describe</code>, com a frase que já virou rotina nesta altura do guia:
+<code>0/3 nodes are available: 3 Insufficient cpu</code>.</p>
+
+<p>O detalhe que faz a diferença: o agendador coloca cada pod inteiro num nó. Não existe “meio pod aqui,
+meio pod ali”, nem “o cluster tem 6000m, então cabem oito pods de 700m”. Ele olha um nó por vez, desconta o
+que já está reservado ali e decide se o pod novo cabe <em>naquele</em> nó. É uma conta de capacidade local,
+repetida três vezes — e é essa repetição que produz os seis <code>Pending</code>.</p>
+
+<h2>2. As duas contas: reserva e teto</h2>
+
+<p>Pense na cota de farinha da padaria. O <strong>request</strong> é o que o fornecedor separa para você na
+segunda-feira: está reservado, ninguém mais pode usar, mesmo que você não asse nada até quinta. O
+<strong>limit</strong> é o quanto o padeiro pode pegar do estoque num dia de produção: se ele tentar passar
+disso, o sistema corta. Um é promessa de disponibilidade; o outro é proibição de excesso.</p>
+
+<dl class="anatomy">
+<dt>requests</dt>
+<dd>O que o pod reserva em cada nó. É lido pelo agendador na hora de decidir onde o pod cabe; ninguém mais
+usa esse pedaço.</dd>
+<dt>limits</dt>
+<dd>O teto que o container pode consumir. Lido pelo kubelet e pelo runtime, já com o pod rodando.</dd>
+<dt>allocatable</dt>
+<dd>A parte da capacidade do nó que sobra para pods depois do que o próprio Kubernetes reserva. Um nó de
+2 núcleos anuncia menos que isso como utilizável.</dd>
+<dt>overcommit</dt>
+<dd>A soma dos <code>limits</code> ser maior que a capacidade do nó. É permitido e comum — os picos não
+acontecem todos ao mesmo tempo.</dd>
+<dt>Pending</dt>
+<dd>A fila. O pod existe, está válido, mas nenhum nó tem a soma de requests necessária para recebê-lo.</dd>
+</dl>
+
+<p>Repare que os dois números respondem a perguntas diferentes e são lidos por programas diferentes. Isso
+explica por que um pod pode ficar em <code>Pending</code> mesmo com o nó “vazio” de consumo real: o
+agendador não sabe quanto o seu programa vai usar, só sabe quanto você declarou que ele precisa. E explica
+também por que um pod pode ficar lentíssimo com o nó “com espaço”: o teto de CPU está baixo e o kernel
+corta o tempo de processamento.</p>
+
+<h2>3. A conta por nó, na prática</h2>
+
+<p>Vamos reproduzir o sábado da Ana. A caixa abaixo cria a vitrine com doze réplicas de <code>700m</code>.
+Cada nó de 2000m aceita dois pods (1400m) e recusa o terceiro (2100m), então o cluster inteiro comporta
+seis e os outros seis ficam na fila. A tarefa é achar o número que faz os doze caberem.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="pronto:Deployment/vitrine=12;;conta:pods=12">
+  <p class="try-task">Rode e veja seis pods em <code>Pending</code>. Depois baixe o pedido de CPU para
+  <code>300m</code> e rode de novo: os doze precisam ficar prontos.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vitrine
+spec:
+  replicas: 12
+  selector:
+    matchLabels:
+      app: vitrine
+  template:
+    metadata:
+      labels:
+        app: vitrine
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "700m"</pre>
+<pre class="out">
+deployment.apps/vitrine created
+
+NAME                       READY   STATUS    RESTARTS   AGE
+vitrine-6lhcl4k78p-6t75h   1/1     Running   0          7m
+vitrine-6lhcl4k78p-9jl6x   0/1     Pending   0          1m
+vitrine-6lhcl4k78p-fgrwq   0/1     Pending   0          49s
+vitrine-6lhcl4k78p-fwjzb   0/1     Pending   0          1m
+vitrine-6lhcl4k78p-k6qmj   0/1     Pending   0          5m
+vitrine-6lhcl4k78p-mrmj8   1/1     Running   0          9m
+vitrine-6lhcl4k78p-qfq9w   1/1     Running   0          8m
+vitrine-6lhcl4k78p-qlt7z   0/1     Pending   0          3m
+vitrine-6lhcl4k78p-rzttm   1/1     Running   0          10m
+vitrine-6lhcl4k78p-tlkd5   1/1     Running   0          2m
+vitrine-6lhcl4k78p-vpt6x   1/1     Running   0          47s
+vitrine-6lhcl4k78p-z7hnq   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vitrine
+spec:
+  replicas: 12
+  selector:
+    matchLabels:
+      app: vitrine
+  template:
+    metadata:
+      labels:
+        app: vitrine
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "300m"</pre>
+</div>
+
+<p>Antes de rodar, é isto que a caixa devolve — a metade que subiu e a metade que ficou na fila,
+copiada do painel:</p>
+
+<pre class="term">NAME                       READY   STATUS    RESTARTS   AGE
+vitrine-6lhcl4k78p-6t75h   1/1     Running   0          7m
+vitrine-6lhcl4k78p-9jl6x   0/1     Pending   0          1m
+vitrine-6lhcl4k78p-fgrwq   0/1     Pending   0          49s
+vitrine-6lhcl4k78p-fwjzb   0/1     Pending   0          1m
+vitrine-6lhcl4k78p-k6qmj   0/1     Pending   0          5m
+vitrine-6lhcl4k78p-mrmj8   1/1     Running   0          9m
+vitrine-6lhcl4k78p-qfq9w   1/1     Running   0          8m
+vitrine-6lhcl4k78p-qlt7z   0/1     Pending   0          3m
+vitrine-6lhcl4k78p-rzttm   1/1     Running   0          10m
+vitrine-6lhcl4k78p-tlkd5   1/1     Running   0          2m
+vitrine-6lhcl4k78p-vpt6x   1/1     Running   0          47s
+vitrine-6lhcl4k78p-z7hnq   0/1     Pending   0          5m</pre>
+
+<p>Com <code>300m</code>, cada nó aceita seis pods (1800m de 2000m) e os doze cabem com folga. A conta que
+você precisa saber fazer de cabeça é esta: <em>quantos pods deste tamanho cabem num nó?</em> Divida a
+capacidade do nó pelo request, arredonde para baixo e multiplique pelo número de nós. Com 2000m por nó:
+700m dá 2, 500m dá 4, 300m dá 6, 100m dá 20. O tamanho do pod é o que decide a densidade — e densidade é
+dinheiro.</p>
+
+<p>Há um detalhe que o número esconde: o agendador também reserva o que o próprio cluster usa. Um nó de
+2000m não oferece 2000m; oferece o <code>allocatable</code>, que é um pouco menos. Por isso a conta de
+guarda-chuva funciona para entender e falha por pouco na hora de encher o nó até a borda. Em produção, os
+números redondos do tipo “cabem exatamente 6” costumam virar 5 no primeiro nó ocupado.</p>
+
+<h2>4. Onde cada pod caiu</h2>
+
+<p>Saber <em>por que</em> um pod está em <code>Pending</code> é metade do trabalho; a outra metade é saber
+<em>onde</em> os que subiram foram parar. O <code>kubectl get pods -o wide</code> acrescenta a coluna
+<code>NODE</code>, e o <code>kubectl get events</code> mostra o que o controlador e o agendador tentaram
+fazer, em ordem. As duas leituras juntas respondem “o cluster está distribuindo ou empilhando?”.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:guia-worker;;texto:ScalingReplicaSet">
+  <p class="try-task">Veja em quais nós os dois pods do site caíram e depois leia os eventos do cluster.
+  Acrescente <code>get pods -o wide</code> e <code>get events</code> ao roteiro.</p>
+<pre class="yaml">kubectl get deployments
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl get deployments
+kubectl get pods -o wide
+kubectl get events</pre>
+</div>
+
+<p>É esta a resposta que a caixa devolve para o roteiro completo — repare na coluna
+<code>NODE</code>:</p>
+
+<pre class="term">$ kubectl get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE   IP               NODE                 NOMINATED NODE   READINESS GATES
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m    10.244.111.241   guia-control-plane   &lt;none&gt;           &lt;none&gt;
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m   10.244.56.236    guia-worker          &lt;none&gt;           &lt;none&gt;
+
+$ kubectl get events
+LAST SEEN   TYPE     REASON              OBJECT                MESSAGE
+20s         Normal   Created             Deployment/cardapio   created by ana
+23s         Normal   Created             Service/cardapio      created by ana
+26s         Normal   ScalingReplicaSet   Deployment/cardapio   Scaled up replica set cardapio-wj4jsx2tcw to 2</pre>
+
+<p>A saída mostra um pod no <code>guia-control-plane</code> e outro no <code>guia-worker</code>: o
+agendador escolhe primeiro o nó com menos pods e, no empate, o de nome que vem antes. Com duas réplicas,
+isso significa dois nós diferentes — o que é bom. Com doze réplicas de um pod pequeno, os três nós ficam
+com quatro cada, e o site sobrevive à queda de um nó inteiro. O balanceamento é por contagem, não por
+consumo: um pod gigante e um pod minúsculo contam igual na hora de escolher o próximo nó.</p>
+
+<p>Os eventos contam a outra metade. <code>ScalingReplicaSet</code> mostra o Deployment pedindo pods ao
+ReplicaSet; <code>Scheduled</code> mostra o agendador escolhendo o nó; <code>FailedScheduling</code> mostra
+a recusa, com o motivo. Numa página cheia de eventos, procure primeiro as linhas <code>Warning</code>:
+elas são poucas e são sempre o começo da história.</p>
+
+<h2>5. O espaço entre request e limit</h2>
+
+<p>Quando request e limit são diferentes, o pod tem uma faixa de respiro: garante o mínimo e pode usar até o
+teto. O comportamento nessa faixa depende do recurso, e é aqui que muita gente se machuca. CPU é elástica:
+passar do limite faz o processo esperar, sem erro e sem reinício. Memória não é: passar do limite faz o
+processo morrer, com <code>OOMKilled</code> e exit code 137.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Recurso</th><th>Request menor que limit</th><th>Se passar do limit</th><th>Sintoma</th></tr>
+</thead>
+<tbody>
+<tr><td>CPU</td><td>o pod pode usar o núcleo ocioso do vizinho</td><td>o kernel corta o tempo
+(<em>throttling</em>)</td><td>lentidão, sem evento e sem reinício</td></tr>
+<tr><td>Memória</td><td>o pod pode crescer até o teto</td><td>o processo é morto
+(<code>OOMKilled</code>)</td><td><code>RESTARTS</code> subindo e exit code 137</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa assimetria tem uma consequência prática para o agendador. Ele reserva o <em>request</em>, não o
+limit. Se você declara 100m de request e 2000m de limit, o agendador trata o pod como 100m e o coloca num
+nó que pode não ter 2000m livres — quando o pico chegar, o pod vai disputar CPU com os vizinhos e perder.
+É o fenômeno do <em>overcommit</em>: a soma dos limites passa da capacidade, e o cluster aposta que os
+picos não coincidem. A aposta costuma dar certo; quando não dá, todo mundo fica lento ao mesmo tempo.</p>
+
+<p>Para memória a aposta é mais perigosa, porque o perdedor não fica lento: morre. Por isso a regra prática
+da casa é limitar memória sempre, com folga de 30% a 50% sobre o consumo típico, e tratar CPU com mais
+elasticidade. Um pod sem limite de memória é um vizinho que pode derrubar o nó inteiro — e o capítulo de
+eviction e OOMKilled existe justamente por causa dele.</p>
+
+<h2>6. A soma dos containers do mesmo pod</h2>
+
+<p>A última peça da conta é que <code>resources</code> é por container, e o agendador soma todos os
+containers do pod antes de decidir. Um pod com <code>web</code> de 800m e um sidecar de 300m pede 1100m —
+mais do que meio nó. Quem olha só o container principal erra a conta por 30% e depois não entende por que
+cabem menos pods do que o esperado.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="pronto:Deployment/cardapio=4;;campo:Deployment/cardapio|spec.template.spec.containers.1.resources.requests.cpu=100m">
+  <p class="try-task">São quatro réplicas e cada pod tem dois containers. Com o sidecar em
+  <code>300m</code>, cada pod pede 1100m e só três cabem. Baixe o sidecar para <code>100m</code> e faça os
+  quatro subirem.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "800m"
+        - name: metricas
+          image: metricas:1.0
+          resources:
+            requests:
+              cpu: "300m"</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-qdmpt9864w-hdv2d   0/2     Pending   0          5m
+cardapio-qdmpt9864w-kcn78   2/2     Running   0          7m
+cardapio-qdmpt9864w-mc8sg   2/2     Running   0          9m
+cardapio-qdmpt9864w-n9mrb   2/2     Running   0          8m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "800m"
+        - name: metricas
+          image: metricas:1.0
+          resources:
+            requests:
+              cpu: "100m"</pre>
+</div>
+
+<p>Com 900m por pod, cada nó aceita dois (1800m) e os quatro sobram em dois nós. Antes, com 1100m, cabia um
+por nó e o quarto ficava na fila para sempre. Repare que a solução não mexeu no container principal: o
+sidecar era o problema, e sidecars pequenos são os campeões de “esqueci de declarar”. Um exportador de
+métricas mal dimensionado pode custar metade da densidade do cluster.</p>
+
+<p>Vale a mesma lógica para a memória: some os containers antes de comparar com o nó. E lembre que o
+request de cada container é independente — o agendador não olha “o pod como um todo” para decidir, ele soma
+e compara. Se um dos containers não declara nada, entra como zero, e o pod passa a pedir menos do que
+consome de verdade.</p>
+
+<h2>7. Quando a conta não fecha</h2>
+
+<p>Existem três saídas, e a escolha depende de qual lado está errado. A primeira é <strong>baixar o
+request</strong>: se o pod usa 200m em repouso e você pediu 700m, você está reservando farinha que não usa.
+A segunda é <strong>redistribuir</strong>: dividir o mesmo serviço em Deployments menores ou usar
+<code>nodeSelector</code> para espalhar melhor. A terceira é <strong>aumentar o cluster</strong>, que é a
+mais cara e a que todo mundo tenta primeiro.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Comando</th><th>O que ele responde</th></tr>
+</thead>
+<tbody>
+<tr><td>quantos pods estão prontos?</td><td><code>kubectl get deployments</code></td><td>a diferença entre o
+desejado e o que subiu</td></tr>
+<tr><td>onde eles caíram?</td><td><code>kubectl get pods -o wide</code></td><td>a coluna <code>NODE</code> e
+o desequilíbrio entre nós</td></tr>
+<tr><td>por que o pod não agenda?</td><td><code>kubectl get events</code></td><td>o
+<code>FailedScheduling</code> com <code>Insufficient cpu</code> ou <code>memory</code></td></tr>
+<tr><td>o que eu pedi mesmo?</td><td><code>kubectl get deployment nome -o yaml</code></td><td>os requests e
+limits que estão valendo no cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A ordem importa. Olhar os eventos antes de olhar o manifesto faz você consertar o sintoma; olhar o
+manifesto antes dos eventos faz você adivinhar. O caminho curto é sempre: <code>get deployments</code> para
+ver a diferença, <code>get pods</code> para ver o estado, <code>get events</code> para ver o motivo e
+<code>get -o yaml</code> para confirmar o que está declarado — porque o arquivo do repositório pode não ser
+o que está no cluster.</p>
+
+<h2>8. O que o painel calcula (e o que ele não mede)</h2>
+
+<p>O painel faz exatamente a conta do agendador: soma requests por nó, compara com a capacidade, agenda o
+que cabe e deixa o resto em <code>Pending</code> com o evento correspondente. É por isso que esta aula
+funciona bem aqui — o assunto é aritmética de capacidade, e aritmética é o que o motor sabe fazer.</p>
+
+<p>O que ele não faz é medir consumo. <code>kubectl top</code> responde
+<code>error: Metrics API not available</code>, porque não há cAdvisor nem servidor de métricas no painel. Num
+cluster real, é o <code>top</code> que diz se o request está grande demais; aqui, a única forma de descobrir
+é olhar o comportamento do aplicativo e ajustar. Vale dizer também que o painel não impõe o limite de
+memória: ele não roda container, então nada é morto por <code>OOMKilled</code> — esse estado aparece nas
+aulas como transcrição, sempre identificada.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a sexta em que ninguém coube</h3>
+<p>Um deploy de sexta mudou o request de memória do site de 128Mi para 1Gi “para garantir”. Os pods
+passaram a ocupar um quarto de cada nó, e o relatório noturno não encontrou lugar. O site não tinha
+problema nenhum: o exagero dele expulsou o vizinho. Baixar para 256Mi resolveu sem tocar em uma linha de
+código.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o nó que ficou com todos os pods pequenos</h3>
+<p>Doze pods de 100m se distribuíram quatro por nó. Quando um nó reiniciou para manutenção, oito pods
+caíram de uma vez e os quatro restantes não tinham capacidade para receber os outros. O conserto não foi
+pedir mais CPU: foi reduzir o número de réplicas por nó com uma regra de espalhamento e deixar folga de
+verdade em cada nó.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o sidecar que ninguém dimensionou</h3>
+<p>Um proxy de service mesh entrou no pod com request padrão de 500m. A conta do time continuava a mesma —
+“nosso site pede 200m” —, mas o pod passou a pedir 700m e a densidade caiu pela metade. O sintoma foi
+<code>Pending</code> em produção e nenhuma mudança no código do site. Desde então, o checklist de deploy
+inclui “some os containers” antes de aprovar.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Como o agendador decide se um pod cabe?</p>
+<label><input type="radio" name="q1"> soma a capacidade de todos os nós e compara com o pedido</label>
+<label><input type="radio" name="q1"> olha nó por nó, somando os requests já reservados naquele
+nó</label>
+<label><input type="radio" name="q1"> mede o consumo real do pod antes de agendar</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Um pod pede 100m de CPU e tem limite de 2000m. O que o
+agendador reserva?</p>
+<label><input type="radio" name="q2"> 2000m, porque é o teto</label>
+<label><input type="radio" name="q2"> nada, porque a diferença é grande demais</label>
+<label><input type="radio" name="q2"> 100m — o limite não entra na conta do agendamento</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Dois containers no mesmo pod pedem 800m e 300m. Quanto o
+pod pede ao agendador?</p>
+<label><input type="radio" name="q3"> 1100m</label>
+<label><input type="radio" name="q3"> 800m, o maior deles</label>
+<label><input type="radio" name="q3"> 300m, o menor deles</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a conta do domingo</h2>
+<p>O cluster da Ana tem três nós de 2000m. Ela quer 15 réplicas e cada pod tem um container. Qual é o maior
+request de CPU que ainda deixa as 15 réplicas prontas?</p>
+<div class="ex-code">requests: cpu: "<input aria-label="resposta 1" data-answer="400m"
+placeholder="...">"</div>
+<p class="ex-dica">Dica: são 6000m no total para 15 pods — mas a conta é por nó. Cada nó precisa aceitar
+cinco pods: 2000 ÷ 5 = 400.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>requests</code> é o que o pod reserva e o que o agendador lê; <code>limits</code> é o teto que o
+runtime impõe. A conta é sempre por nó: capacidade dividida pelo request, arredondada para baixo, vezes o
+número de nós. Doze pods de 700m em três nós de 2000m dão seis prontos e seis em <code>Pending</code>.</p>
+
+<p>A soma é por container: 800m mais 300m é um pod de 1100m, e um sidecar esquecido derruba a densidade.
+CPU acima do limite vira lentidão; memória acima do limite vira <code>OOMKilled</code>. O limite não entra na
+conta do agendamento, e é isso que permite <em>overcommit</em> — útil para picos, perigoso para
+memória.</p>
+
+<p>Para diagnosticar, a ordem é <code>get deployments</code>, <code>get pods -o wide</code>,
+<code>get events</code> e <code>get -o yaml</code>. O painel faz a aritmética do agendador, mas não mede
+consumo: <code>top</code> não existe aqui. Na próxima aula a Ana aprende o nome que o cluster dá ao
+resultado dessa aritmética: as classes de QoS.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>O agendador olha nó por nó, somando requests — nunca a média do cluster.</li>
+  <li>Pods por nó = capacidade do nó ÷ request do pod (arredondado para baixo).</li>
+  <li><code>resources</code> é por container; o pod é a soma dos containers.</li>
+  <li>O limit não é reservado: por isso cabe <em>overcommit</em> — e por isso memória sem limite é
+  perigosa.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

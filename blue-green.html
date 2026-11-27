@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blue-green | Guia Kubernetes</title>
+<meta name="description" content="Blue-green no Kubernetes: dois Deployments completos, um Service que decide quem atende, Service de teste antes da virada, volta instantânea e o custo escondido.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Blue-<span class="hl">green</span></h1>
+<p class="intro">A Ana vai trocar o layout da vitrine e quer poder voltar atrás no mesmo minuto, sem esperar pod
+subir e sem rezar para o rollout terminar. O padrão <strong>blue-green</strong> faz isso de um jeito quase
+bobo de tão simples: dois ambientes completos no ar, azul e verde, e um Service que aponta para um deles. A
+virada é uma linha no seletor; a volta é a mesma linha ao contrário. Nesta aula a Ana monta os dois lados,
+testa o verde por um endereço separado, vira a chave e descobre por que o banco de dados é a parte que ninguém
+conta.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que são “azul” e “verde” e por que os dois ficam no ar ao mesmo tempo.</li>
+  <li>Como montar os dois Deployments com o mesmo <code>app</code> e um rótulo de cor.</li>
+  <li>Como o Service decide quem atende, e por que a virada não toca nos pods.</li>
+  <li>Como testar o verde antes de virar, com um Service de preview.</li>
+  <li>O que acontece com conexões abertas e cache no momento da troca.</li>
+  <li>Por que o banco de dados é o verdadeiro limite do blue-green.</li>
+  <li>Quanto custa manter os dois lados e quando desligar o antigo.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a virada que precisa ser um clique</h2>
+
+<p>A vitrine nova está pronta. O layout mudou, as fotos mudaram, o texto mudou. A Ana já testou no computador
+dela e quer publicar. Só que publicar do jeito normal — trocar a imagem do Deployment — significa esperar o
+rollout, ver pods subindo um a um e, se algo der errado, esperar o rollback. São minutos em que ninguém sabe
+direito qual versão está atendendo quem. O passo a passo desse caminho tradicional está na aula de
+<a href="rolling-update.html">Rolling update</a>.</p>
+
+<p>O blue-green troca a pergunta. Em vez de “como substituir os pods aos poucos?”, ele pergunta “como ter os
+dois conjuntos prontos e escolher qual atende?”. O conjunto azul é a versão atual; o conjunto verde é a nova.
+Os dois rodam ao mesmo tempo, completos. O que muda entre um e outro é só uma etiqueta no Service.</p>
+
+<p>A vantagem é a velocidade: a virada não espera imagem baixar, não espera probe, não espera nada. Os pods do
+verde já estão prontos antes de você virar a chave. E a volta é igualmente instantânea, porque o azul continua
+lá, inteiro, só esperando.</p>
+
+<p>O custo também é fácil de entender: você paga o dobro enquanto os dois estão no ar. Duas vezes os pods, duas
+vezes a memória, duas vezes a CPU. É o preço da virada instantânea — e é por isso que blue-green aparece mais
+em serviços pequenos e em momentos de risco do que como estado permanente.</p>
+
+<h2>2. Dois ambientes, um roteador</h2>
+
+<p>Chame de ambiente o conjunto de tudo o que atende uma requisição: os pods, o Service, a configuração. No
+blue-green, cada cor tem o seu conjunto completo. O Service da cor ativa é o roteador: ele tem um seletor, e
+quem casa com aquele seletor recebe tráfego.</p>
+
+<p>O ponto que confunde é que os dois conjuntos têm o mesmo nome de aplicação. Azul e verde rodam
+<code>cardapio</code>, com a etiqueta <code>app: cardapio</code>, e se diferenciam por uma segunda etiqueta —
+aqui, <code>cor: blue</code> e <code>cor: green</code>. O Service da padaria seleciona
+<code>app: cardapio, cor: blue</code>. Trocar a cor no seletor move todo o tráfego de uma vez.</p>
+
+<dl class="anatomy">
+<dt>blue</dt>
+<dd>O conjunto que está atendendo hoje. Continua rodando durante e depois da virada, como plano B.</dd>
+<dt>green</dt>
+<dd>O conjunto novo, completo, pronto para assumir. Fica em espera até a virada.</dd>
+<dt>cutover</dt>
+<dd>O momento da virada: a mudança do seletor do Service para a cor nova. Não envolve reiniciar pods.</dd>
+<dt>preview</dt>
+<dd>Um segundo Service, separado, apontando para o verde. Serve para testar a versão nova sem tocar no
+público.</dd>
+<dt>cor</dt>
+<dd>A etiqueta que separa os dois conjuntos. O Service usa; o Deployment do outro lado ignora.</dd>
+<dt>endpoints</dt>
+<dd>A lista de pods que o Service considera prontos. Na virada, ela troca de um conjunto para o outro.</dd>
+</dl>
+
+<p>Repare que o blue-green não tem nada de exótico: são dois Deployments comuns e dois Services comuns. Nenhum
+controlador novo, nenhuma anotação mágica. O que existe é disciplina de nomes e a consciência de que a virada é
+uma operação de rede, não de imagem.</p>
+
+<h2>3. Montando o lado verde</h2>
+
+<p>A caixa começa com o azul rodando e o verde inexistente. A missão é criar o verde com a versão 2.0, duas
+réplicas, o mesmo <code>app: cardapio</code> e a etiqueta <code>cor: green</code> no seletor e no template. O
+azul fica como está, com <code>cor: blue</code>.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:pods[cor=green]=2;;conta:pods[app=cardapio]=4;;texto:Running">
+  <p class="try-task">Crie o Deployment <code>cardapio-green</code> com duas réplicas, imagem
+  <code>cardapio:2.0</code> e <code>cor: green</code>. O painel tem de mostrar quatro pods: dois azuis e dois
+  verdes.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-blue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: blue
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: blue
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio-blue created
+
+NAME                             READY   STATUS    RESTARTS   AGE
+cardapio-blue-zv6ghmcjmg-s76cj   1/1     Running   0          7m
+cardapio-blue-zv6ghmcjmg-tzltf   1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-blue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: blue
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: blue
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-green
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: green
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: green
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Quatro pods, duas versões, nenhum tráfego ainda para o verde: o Service continua apontando para o azul. Essa
+é a situação normal do blue-green antes da virada — o verde existe, está saudável e é invisível para o cliente.
+Se algo estiver errado com a imagem nova, você descobre agora, sem ninguém reclamar.</p>
+
+<pre class="term">$ kubectl get pods -l app=cardapio -o wide
+NAME                             READY   STATUS    RESTARTS   AGE   IP            NODE
+cardapio-blue-6b7c9f4d5c-2xj8p   1/1     Running   0          36m   10.244.1.7    guia-worker
+cardapio-blue-6b7c9f4d5c-9qk4m   1/1     Running   0          36m   10.244.2.9    guia-worker2
+cardapio-green-7f8d6b9c4d-hw2pl  1/1     Running   0          2m    10.244.2.14   guia-worker2
+cardapio-green-7f8d6b9c4d-tz6vn  1/1     Running   0          2m    10.244.3.5    guia-worker3</pre>
+
+<p>Essa é a saída de um cluster local de três nós, com o verde recém-criado. Repare que o nome do pod carrega a
+cor, o IP é interno e os nós variam. Nada aqui diz qual conjunto atende: quem responde isso é o Service, e por
+isso a conferência da virada é sempre nos endpoints, nunca na lista de pods.</p>
+
+<p>Um detalhe que evita dor: dê aos Deployments nomes que digam a cor, e não “v2” ou “novo”. Daqui a três meses,
+<code>novo</code> é o antigo e ninguém lembra de nada. <code>cardapio-blue</code> e <code>cardapio-green</code>
+envelhecem bem, e é fácil automatizar a limpeza por cor depois.</p>
+
+<h2>4. O Service é a chave</h2>
+
+<p>Com os dois conjuntos prontos, a virada é uma linha. O Service da padaria tem
+<code>selector: { app: cardapio, cor: blue }</code>; para virar, troca-se <code>blue</code> por
+<code>green</code>. Nenhum pod é criado, nenhum é destruído, nenhuma imagem é baixada. O que muda é a lista de
+endpoints que o Service entrega ao resto do cluster.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="campo:Service/cardapio|spec.selector.cor=green;;campo:Service/cardapio-preview|spec.selector.cor=green;;conta:pods[cor=green]=2">
+  <p class="try-task">O Service principal aponta para <code>cor: blue</code>. Vire a chave: troque o seletor
+  dele para <code>cor: green</code>, mantendo o Service de preview como está. Os dois passam a apontar para o
+  verde.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+    cor: blue
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio-preview
+spec:
+  selector:
+    app: cardapio
+    cor: green
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-blue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: blue
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: blue
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-green
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: green
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: green
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0</pre>
+<pre class="out">
+service/cardapio created
+service/cardapio-preview created
+deployment.apps/cardapio-blue created
+deployment.apps/cardapio-green created
+
+NAME               ENDPOINTS                                AGE
+cardapio           10.244.10.129:8080,10.244.167.59:8080    2m
+cardapio-preview   10.244.168.108:8080,10.244.233.71:8080   20s
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+    cor: green
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio-preview
+spec:
+  selector:
+    app: cardapio
+    cor: green
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-blue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: blue
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: blue
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-green
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: green
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: green
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0</pre>
+</div>
+
+<p>O painel mostra os endpoints dos dois Services. Antes da correção, o principal listava os IPs azuis; depois,
+os verdes. O preview já apontava para o verde e continua igual — é o endereço que você usa para conferir a
+versão nova antes de virar a chave principal.</p>
+
+<p>Essa separação é o que torna o blue-green seguro. Sem um Service de preview, a única forma de testar o verde
+é virar o principal e ver o que acontece. Com ele, o time testa a versão nova por um endereço interno, com o
+público intacto, e a virada passa a ser uma decisão — não uma aposta.</p>
+
+<h2>5. A virada na vida real</h2>
+
+<p>Na teoria, trocar o seletor é instantâneo. Na prática, três coisas levam alguns segundos: o controlador
+precisa recalcular os endpoints, cada nó precisa receber a lista nova, e as conexões que já estavam abertas
+continuam indo para o destino antigo até fechar. Em um site comum, isso é questão de segundos; em aplicações
+com conexões longas, pode ser questão de horas.</p>
+
+<pre class="term">$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                            AGE
+cardapio   10.244.1.7:8080,10.244.2.9:8080      41m
+
+$ kubectl patch service cardapio -p '{"spec":{"selector":{"app":"cardapio","cor":"green"}}}'
+service/cardapio patched
+
+$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                             AGE
+cardapio   10.244.2.14:8080,10.244.3.5:8080      41m</pre>
+
+<p>Os IPs mudaram, a idade do Service não. Nenhum pod nasceu, nenhum morreu. É a assinatura do blue-green: a
+única coisa que se move é a lista de destinos. Se o <code>get endpoints</code> continuar mostrando os IPs
+antigos depois de um minuto, o seletor não está casando com ninguém — confira as etiquetas dos pods.</p>
+
+<p>Essa transcrição é de um cluster local de três nós, e o comando é o <code>patch</code> que muda o seletor sem
+editar arquivo. No fluxo do repositório, o normal é mudar o YAML e aplicar com <code>kubectl apply -f</code>: o
+resultado é o mesmo, e o arquivo continua contando a história. Use <code>patch</code> em emergência, quando o
+repositório está longe.</p>
+
+<p>Duas armadilhas de propagação. A primeira é o cache de DNS: se algum cliente resolve o nome do Service e
+guarda o resultado por muito tempo, ele pode continuar batendo no destino antigo. A segunda é o balanceador na
+frente — um Ingress ou um LoadBalancer pode manter conexões abertas com o Service antigo por um tempo. Nenhuma
+das duas impede a virada; as duas pedem paciência para declarar vitória.</p>
+
+<h2>6. O banco de dados é o limite</h2>
+
+<p>Aqui está o parágrafo que separa quem já fez blue-green de verdade de quem só leu sobre. Serviço sem estado
+troca de cor sem drama: os pods verdes não guardam nada, e a sessão do cliente está no navegador. Banco de dados
+não é assim. Durante a virada, as duas versões existem e podem estar escrevendo no mesmo banco ao mesmo tempo.</p>
+
+<p>Se a versão verde precisa de uma coluna nova, ela não pode simplesmente “migrar e usar”. Enquanto o azul
+ainda estiver no ar, ele não conhece a coluna e pode quebrar. O caminho que funciona tem três etapas: primeiro
+acrescentar a coluna sem usá-la (compatível com os dois), depois publicar o verde que já escreve nas duas
+formas, e só no fim remover a coluna antiga, quando o azul não existir mais.</p>
+
+<p>Esse padrão se chama migração em etapas — expandir, migrar, contrair. Ele existe porque o blue-green
+pressupõe convivência. Se o seu sistema não consegue conviver com duas versões, o blue-green vai te dar uma
+tela branca com um erro de SQL, e a volta instantânea não resolve: os dados já foram gravados no formato
+novo.</p>
+
+<p>Uma consequência prática: teste a migração no banco antes de virar. Suba o verde, deixe o azul rodando,
+faça uma compra no azul e outra no verde, e confira se os dois leem o que o outro escreveu. Se não, o problema
+não é Kubernetes — é o contrato entre as versões.</p>
+
+<h2>7. Quanto custa e quando desligar</h2>
+
+<p>O blue-green dobra o custo enquanto os dois lados estão no ar. Em um serviço de dois pods, isso é barato. Em
+um de duzentos, é uma decisão de orçamento. Por isso a pergunta “quanto tempo o azul fica ligado?” precisa de
+resposta antes da virada: alguns times desligam em uma hora, outros mantêm uma semana.</p>
+
+<p>Manter o azul ligado é um seguro: se o verde der problema depois da virada, a volta é um seletor. Desligar
+cedo demais tira esse seguro. O meio-termo mais comum é manter por um ou dois dias, observar erros e latência,
+e então escalar o azul para zero — deixando o Deployment lá, com zero réplicas, para a próxima troca.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Momento</th><th>O que está no ar</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td>antes</td><td>azul (2 pods), verde subindo</td><td>esperar o verde ficar pronto e testar pelo preview</td></tr>
+<tr><td>virada</td><td>azul (2) + verde (2)</td><td>trocar o seletor do Service principal</td></tr>
+<tr><td>estabilização</td><td>os dois, verde atendendo</td><td>observar erros e latência por algumas horas</td></tr>
+<tr><td>limpeza</td><td>verde (2), azul em zero</td><td>escalar o azul para 0 e guardar o manifesto</td></tr>
+<tr><td>volta</td><td>azul (2) + verde (2)</td><td>seletor de volta para blue e, depois, verde em zero</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:pods[cor=blue]=0;;conta:pods[cor=green]=2;;pronto:Deployment/cardapio-green=2">
+  <p class="try-task">Depois de dois dias estável, é hora de economizar: deixe o azul com zero réplicas e o
+  verde com as duas. O Deployment azul continua existindo, para a próxima troca.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-blue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: blue
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: blue
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-green
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: green
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: green
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0</pre>
+<pre class="out">
+deployment.apps/cardapio-blue created
+deployment.apps/cardapio-green created
+
+NAME                              READY   STATUS    RESTARTS   AGE
+cardapio-blue-hp6csr4p79-58pkx    1/1     Running   0          8m
+cardapio-blue-hp6csr4p79-9vqb2    1/1     Running   0          48s
+cardapio-green-zjcmcj9wn9-d9f4p   1/1     Running   0          5m
+cardapio-green-zjcmcj9wn9-plwln   1/1     Running   0          4m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-blue
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: blue
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: blue
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-green
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      cor: green
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        cor: green
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0</pre>
+</div>
+
+<p>O ciclo não é “azul e verde para sempre”. É uma troca de papéis: na próxima publicação, o verde é o atual e
+o azul é o novo. Os nomes continuam os mesmos, as imagens é que mudam. Quem automatiza costuma manter um
+terceiro nome estável (<code>cardapio</code>) e tratar as cores como detalhe interno.</p>
+
+<p>E lembre dos objetos que ficam para trás: ConfigMaps com nomes de cor, Secrets duplicados, volumes. Se o
+verde usa um ConfigMap <code>cardapio-green</code>, o azul usa <code>cardapio-blue</code>, e cada um precisa
+ser limpo no seu momento. Duplicar configuração é fácil; esquecer a limpeza é mais fácil ainda.</p>
+
+<h2>8. Blue-green, canário e rolling: qual escolher</h2>
+
+<p>As três abordagens resolvem o mesmo problema por caminhos diferentes, e a escolha depende de quanto risco
+você quer correr e quanto pode pagar. O rolling update é o padrão e quase sempre é suficiente. O canário é para
+quando você quer <em>medir</em> a versão nova com pouca gente. O blue-green é para quando você quer
+<em>trocar</em> de uma vez, com volta imediata.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Critério</th><th>Rolling update</th><th>Canário</th><th>Blue-green</th></tr>
+</thead>
+<tbody>
+<tr><td>quantas versões no ar</td><td>duas por segundos</td><td>duas por tempo controlado</td><td>duas completas</td></tr>
+<tr><td>custo extra</td><td>1 pod</td><td>1 ou 2 pods</td><td>o dobro do conjunto</td></tr>
+<tr><td>tempo da virada</td><td>minutos</td><td>horas, com promoção gradual</td><td>segundos</td></tr>
+<tr><td>volta atrás</td><td>rollout undo</td><td>escalar o canário para zero</td><td>seletor de volta</td></tr>
+<tr><td>mede a versão nova antes?</td><td>não</td><td>sim, com tráfego real</td><td>sim, pelo preview</td></tr>
+<tr><td>exige banco compatível?</td><td>sim</td><td>sim</td><td>sim, e por mais tempo</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Se você tem banco relacional e migração de schema, o rolling update com migração em etapas costuma ser mais
+barato e igualmente seguro. O blue-green brilha quando a mudança é grande na apresentação e pequena nos dados —
+layout, framework de front-end, uma versão de biblioteca. É exatamente o caso da vitrine da Ana.</p>
+
+<p>Também vale saber o que o blue-green não resolve: ele não distribui carga melhor, não aquece cache e não
+corrige um bug de lógica. Se a versão verde está quebrada, a virada só torna o problema mais visível — e a
+volta é o único consolo.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a virada não mudou nada</h3>
+<p>A Ana trocou o seletor para <code>cor: green</code>, mas os pods verdes tinham
+<code>app: cardapio-v2</code> em vez de <code>app: cardapio</code>. Resultado: o Service não casou com ninguém,
+os endpoints ficaram vazios e o site saiu do ar. Seletor é interseção: todas as etiquetas precisam casar. O
+<code>get endpoints</code> mostrando vazio é o sinal.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: metade dos clientes via a versão antiga</h3>
+<p>O cache na frente do Service continuou entregando o HTML do azul por vinte minutos. A virada no Kubernetes
+foi instantânea; a do mundo real, não. Antes de culpar o cluster, confira o cache e o TTL do DNS. Em blue-green,
+“virar” inclui saber quanto tempo cada camada leva para perceber.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o banco recusou a versão nova</h3>
+<p>O verde esperava uma coluna que ainda não existia, e cada pedido virava erro 500. A volta para o azul
+resolveu o sintoma, mas os dados gravados no formato novo ficaram. O conserto veio dias depois, com uma
+migração em etapas. Blue-green exige que as duas versões conversem com o mesmo banco.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que muda no momento da virada do blue-green?</p>
+<label><input type="radio" name="q1"> a imagem dos pods azuis</label>
+<label><input type="radio" name="q1"> o seletor do Service, que passa a apontar para o verde</label>
+<label><input type="radio" name="q1"> o nome do Deployment</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Para que serve o Service de preview?</p>
+<label><input type="radio" name="q2"> para dividir o tráfego em 50%</label>
+<label><input type="radio" name="q2"> para substituir o Service principal na virada</label>
+<label><input type="radio" name="q2"> para testar o verde sem tocar no público</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual é o maior risco do blue-green num sistema com banco?</p>
+<label><input type="radio" name="q3"> as duas versões conviverem escrevendo no mesmo banco</label>
+<label><input type="radio" name="q3"> o Service perder os endpoints sozinho</label>
+<label><input type="radio" name="q3"> o Deployment azul ser apagado pelo cluster</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a etiqueta da cor</h2>
+<p>Complete o seletor do Service que faz o tráfego ir para o conjunto verde.</p>
+<div class="ex-code">spec:
+  selector:
+    app: cardapio
+    cor: <input aria-label="resposta 1" data-answer="green" placeholder="..."></div>
+<p class="ex-dica">Dica: é o valor da etiqueta usada no Deployment novo, não o nome do Deployment.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Blue-green é manter dois conjuntos completos no ar e escolher qual atende pela etiqueta do Service. Azul é o
+atual, verde é o novo; os dois têm o mesmo <code>app</code> e se separam por <code>cor</code>. A virada troca o
+seletor — nada sobe, nada desce — e a volta é a mesma operação ao contrário.</p>
+
+<p>O Service de preview é o que torna o padrão seguro: testa-se o verde por um endereço separado antes de virar
+a chave. A virada leva segundos no cluster e mais um pouco no mundo real, por causa de conexões abertas, cache e
+DNS. O custo é o dobro de recursos enquanto os dois lados estão no ar.</p>
+
+<p>O limite é o banco. Duas versões convivendo exigem schema compatível e migração em etapas; sem isso, a volta
+instantânea não salva os dados já gravados. Com essa condição atendida, o blue-green é a forma mais direta de
+publicar uma mudança grande com risco pequeno.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Dois Deployments completos: <code>cor: blue</code> e <code>cor: green</code>, mesmo <code>app</code>.</li>
+  <li>A virada é o seletor do Service; a volta é o seletor ao contrário.</li>
+  <li>Service de preview testa o verde sem tocar no público.</li>
+  <li>Endpoints vazios = seletor não casa; confira todas as etiquetas, não só a cor.</li>
+  <li>Conexões abertas e cache continuam no destino antigo por um tempo.</li>
+  <li>Banco: migração em etapas (expandir, migrar, contrair) antes de virar.</li>
+  <li>O azul fica ligado como seguro e é escalado para zero na limpeza.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

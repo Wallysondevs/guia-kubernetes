@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apply e dry-run | Guia Kubernetes</title>
+<meta name="description" content="O que o kubectl apply faz com o seu arquivo: created, configured e unchanged, o que o dry-run de cliente e o de servidor validam, e o hábito de conferir antes de aplicar.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>apply e <span class="hl">dry-run</span></h1>
+<p class="intro">A Ana já tem o <code>cardapio.yaml</code> escrito com cuidado e já sabe ler YAML. Falta o
+gesto do dia a dia: entregar o arquivo ao cluster e entender o que ele responde. Nesta aula ela descobre por
+que o <code>kubectl apply</code> é diferente de criar, o que significam as palavras <code>created</code>,
+<code>configured</code> e <code>unchanged</code>, e como testar um manifesto sem tocar em nada — com o
+<code>--dry-run</code>, que é o equivalente a experimentar a roupa antes de comprar. É o comando que ela vai
+digitar mais vezes na vida de operadora de cluster.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que <code>apply</code> é declarativo e <code>create</code> é imperativo.</li>
+  <li>O que o cluster compara para responder <code>created</code>, <code>configured</code> ou
+  <code>unchanged</code>.</li>
+  <li>O que o <code>-f</code> aceita: um arquivo, uma pasta, vários arquivos e a entrada padrão.</li>
+  <li>A diferença entre <code>--dry-run=client</code> e <code>--dry-run=server</code>.</li>
+  <li>Como conferir o que vai mudar com <code>kubectl diff</code> antes de aplicar.</li>
+  <li>Que o apply não é transacional: um documento com erro não desfaz os outros.</li>
+  <li>Por que aplicar duas vezes o mesmo arquivo é seguro — e o que isso muda no seu jeito de trabalhar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: “não mudou nada”</h2>
+
+<p>O <code>cardapio.yaml</code> da Ana descreve o pod do site: nome, imagem <code>cardapio:1.0</code>, uma
+porta. Ela roda <code>kubectl apply -f cardapio.yaml</code>, recebe <code>pod/cardapio created</code> e o site
+sobe. Ótimo.</p>
+
+<p>No dia seguinte, ela mexe no arquivo, acrescenta uma etiqueta e roda o mesmo comando de novo. A resposta
+é <code>pod/cardapio unchanged</code>. “Unchanged” quer dizer “não mudou” — e a Ana entra em pânico: o
+comando não funcionou? O arquivo está errado? Ela roda outra vez, a resposta é a mesma, e ela começa a
+desconfiar do cluster.</p>
+
+<p>Não há nada errado. <code>unchanged</code> é a melhor notícia possível: o cluster já está exatamente como
+o arquivo pede. O que ela queria era <code>configured</code>, que aparece quando o arquivo descreve algo
+diferente do que existe e o cluster ajusta. Os três verbos — <code>created</code>, <code>configured</code>,
+<code>unchanged</code> — são o vocabulário inteiro do apply, e cada um responde a uma pergunta diferente.</p>
+
+<p>Tem ainda a segunda parte do problema, que é o medo. Aplicar um arquivo muda coisa de verdade: apaga
+container, troca imagem, reinicia pod. Como testar sem arriscar? Existe um jeito, e ele se chama
+<code>--dry-run</code>. A aula inteira é sobre esses dois gestos: aplicar com consciência e ensaiar sem
+consequência.</p>
+
+<h2>2. Declarativo: você descreve, o cluster resolve</h2>
+
+<p>O jeito imperativo é dar ordens: “crie um pod com esta imagem”, “mude a imagem para 2.0”, “apague o pod”.
+Cada comando é uma ação, e você precisa saber em que estado o cluster está para escolher a próxima. É o que o
+<code>kubectl run</code> e o <code>kubectl create</code> fazem.</p>
+
+<p>O jeito declarativo é entregar o retrato do que você quer: “este pod deve existir, com esta imagem, com
+esta etiqueta”. Você não diz o que fazer; diz como deve ficar. O cluster compara com o que existe e calcula
+sozinho a diferença. Se o pod não existe, cria. Se existe com imagem velha, atualiza. Se já está igual, não
+faz nada e te avisa.</p>
+
+<p>A analogia da padaria ajuda. O pedido imperativo é a cliente dizendo “corta mais um pão de queijo, agora
+põe na sacola, agora fecha a sacola”. O declarativo é a lista de produção do dia: “às seis da manhã, 40 pães
+franceses e 60 de queijo na vitrine”. Se às seis já tem 40 franceses, ninguém faz nada; se tem 10, alguém
+assou 30; se tem 60, alguém tirou 20. Quem executa não precisa de instruções passo a passo — precisa do
+número certo e de olhos para comparar.</p>
+
+<p>O manifesto é a lista de produção. O <code>kubectl apply -f</code> é a pessoa que lê a lista e ajusta a
+vitrine. O cluster é quem mantém a vitrine igual à lista, mesmo depois que você foi embora — e essa última
+parte é o que dá sentido a tudo: o controlador continua comparando o estado desejado com o real, muito tempo
+depois do seu comando.</p>
+
+<h2>3. O que o apply faz, linha por linha</h2>
+
+<p>Quando você digita <code>kubectl apply -f cardapio.yaml</code>, acontece uma sequência curta. O kubectl lê
+o arquivo, converte cada documento em um objeto com <code>kind</code>, <code>name</code> e
+<code>namespace</code>. Depois pergunta ao cluster se aquele objeto existe. Se não existe, manda criar e
+imprime <code>created</code>. Se existe, compara o que o arquivo pede com o que está guardado: diferente,
+manda atualizar e imprime <code>configured</code>; igual, não manda nada e imprime
+<code>unchanged</code>.</p>
+
+<dl class="anatomy">
+<dt>estado desejado</dt>
+<dd>O que o seu arquivo descreve. É a única coisa que você controla: imagem, réplicas, etiquetas, portas.</dd>
+<dt>estado atual</dt>
+<dd>O que o cluster tem guardado naquele instante, com os valores que o servidor acrescentou por padrão.</dd>
+<dt>diff</dt>
+<dd>A diferença entre os dois. O apply calcula essa diferença e manda só ela — não reenvia o objeto inteiro,
+e por isso o campo que outro time mudou não é atropelado.</dd>
+<dt>dry-run</dt>
+<dd>O ensaio: faz todo o trabalho de validação e comparação, mas não grava. Serve para descobrir o erro
+antes de ele virar incidente.</dd>
+<dt>idempotência</dt>
+<dd>A propriedade de aplicar o mesmo arquivo dez vezes e o resultado ser sempre o mesmo. É o que permite
+guardar o manifesto no repositório e rodar o pipeline sem medo.</dd>
+</dl>
+
+<p>Há dois jeitos de calcular essa diferença, e vale saber que existem. O apply clássico, do lado do cliente,
+guarda no próprio objeto uma anotação com a última versão que você aplicou
+(<code>kubectl.kubernetes.io/last-applied-configuration</code>) e usa três versões para decidir o que mudar: a
+que você aplicou antes, a que está no cluster agora e a do arquivo. O <code>--server-side</code> muda o
+cálculo para o servidor, que passa a ser dono de cada campo do objeto. Para o dia a dia de quem está
+começando, o resultado prático é o mesmo: os três verbos. O resto é assunto de time grande.</p>
+
+<p>A caixa abaixo tem o mesmo pod descrito duas vezes no arquivo. Rode como está e repare na segunda linha da
+resposta: <code>unchanged</code>, porque o segundo documento pede exatamente o que o primeiro criou. Depois
+mude a imagem do segundo documento para <code>cardapio:2.0</code> e rode de novo.</p>
+
+<div class="tryk8s" data-goal="texto:configured;;campo:Pod/cardapio|spec.containers.0.image=cardapio:2.0">
+  <p class="try-task">O segundo documento repete o pod com a mesma imagem. Troque a imagem dele para
+  <code>cardapio:2.0</code> e rode: o painel tem de responder <code>configured</code>.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+pod/cardapio created
+pod/cardapio unchanged
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:2.0</pre>
+</div>
+
+<p>O primeiro documento criou o pod; o segundo encontrou o pod existente e comparou. Com a mesma imagem,
+nada a fazer: <code>unchanged</code>. Com a imagem nova, o cluster troca o container e responde
+<code>configured</code>. Repare que o pod continua sendo um só — <code>created</code> seguido de
+<code>configured</code> não são dois pods, são duas passadas sobre o mesmo objeto. E note o que
+<code>configured</code> não faz: ele não “recria do zero”. Ele ajusta o que mudou, e o resto do objeto fica
+como estava.</p>
+
+<p>É isso que torna o apply seguro de rodar de novo. O mesmo arquivo, aplicado cem vezes, deixa o cluster no
+mesmo estado: uma vez <code>created</code>, noventa e nove vezes <code>unchanged</code>. Quem guarda manifesto
+no repositório conta com essa propriedade — é ela que permite rodar o pipeline a cada mudança sem perguntar
+“já apliquei isso?”.</p>
+
+<h2>4. O <code>-f</code> e o que ele aceita</h2>
+
+<p>O <code>-f</code> é de <em>file</em>, mas aceita mais que um arquivo. Um caminho de arquivo é o caso
+comum. Um diretório faz o kubectl ler todos os <code>.yaml</code> e <code>.json</code> de dentro e aplicar em
+ordem alfabética. Vários <code>-f</code> na mesma linha aplicam vários arquivos, na ordem em que aparecem. E
+<code>-f -</code> lê da entrada padrão, o que permite gerar manifesto com um script e mandar direto para o
+cluster.</p>
+
+<p>Ordem importa quando um objeto depende de outro: um ConfigMap precisa existir antes do pod que o usa. Com
+um arquivo só, quem manda é a ordem dos documentos. Com uma pasta, é a ordem alfabética do nome dos arquivos
+— motivo pelo qual muita gente numera (<code>01-config.yaml</code>, <code>02-site.yaml</code>) ou prefere
+aplicar arquivo por arquivo. O kubectl não adivinha dependência.</p>
+
+<p>Existe também o <code>-k</code>, que aponta para uma pasta com <code>kustomization.yaml</code> e monta o
+manifesto a partir de pedaços. É o assunto de outra aula; por ora, saiba que o <code>-f</code> e o
+<code>-k</code> são alternativas e que o kubectl exige um dos dois: sem <code>-f</code> nem
+<code>-k</code>, ele responde <code>error: must specify one of -f and -k</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>kubectl apply</code></th><th><code>kubectl create</code></th><th><code>kubectl replace</code></th></tr>
+</thead>
+<tbody>
+<tr><td>o que faz</td><td>cria ou atualiza conforme a diferença</td><td>cria uma vez</td><td>troca o objeto
+inteiro</td></tr>
+<tr><td>se já existe</td><td>atualiza e diz <code>configured</code></td><td>erro
+<code>AlreadyExists</code></td><td>substitui</td></tr>
+<tr><td>se não existe</td><td>cria e diz <code>created</code></td><td>cria</td><td>erro
+<code>NotFound</code></td></tr>
+<tr><td>guardar no repositório</td><td>é feito para isso</td><td>não: o comando é a receita</td><td>não:
+perde o histórico do objeto</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um aviso de honestidade sobre o painel deste guia: ele é um cluster simulado e simplifica o
+<code>create</code> — rodar <code>kubectl create deployment</code> duas vezes ali responde “created” nas duas,
+quando o cluster de verdade responderia <code>Error from server (AlreadyExists)</code> na segunda. O apply é
+o caminho que o guia usa justamente porque não tem essa ambiguidade.</p>
+
+<h2>5. Dry-run no cliente: o ensaio sem rede</h2>
+
+<p><code>--dry-run=client</code> faz o kubectl trabalhar no seu computador e parar antes de enviar. Ele lê o
+arquivo, monta o objeto, confere o básico — YAML válido, campos de tipo conhecido, nome presente — e imprime
+o que <em>seria</em> aplicado. Nenhum byte vai para o cluster, nenhum objeto é criado, nenhum pod reinicia.
+A resposta é uma linha com o sufixo entre parênteses:</p>
+
+<pre class="term">$ kubectl apply -f cardapio.yaml --dry-run=client
+pod/cardapio created (dry run)</pre>
+
+<p>Esse <code>(dry run)</code> no fim é a marca de que nada foi gravado. É especialmente útil no meio de um
+arquivo grande, quando você só quer saber se o YAML fecha, e quando você quer ver o objeto final com
+<code>-o yaml</code> — o jeito mais rápido de descobrir por que o cluster reclamou de um campo: veja o que o
+kubectl montou.</p>
+
+<p>O limite é claro: o cliente não tem o cluster. Ele não sabe se aquele nome já existe, se o namespace foi
+criado, se a imagem é privada, se a cota do time estourou, se um webhook de admissão vai recusar. Também não
+acrescenta os valores padrão do servidor (política de pull, política de reinício, IP do serviço). Ou seja:
+dry-run de cliente pega erro de <em>forma</em>; erro de <em>estado</em> passa batido.</p>
+
+<p>Na prática, o uso é este: antes de aplicar, rode com <code>--dry-run=client</code> para garantir que o
+arquivo está bem formado. Se ele reclamar, é o seu YAML. Se ele passar, o arquivo está pronto para o próximo
+teste — o do servidor.</p>
+
+<h2>6. Dry-run no servidor: o ensaio de verdade</h2>
+
+<p><code>--dry-run=server</code> manda o manifesto para o API server com um pedido explícito de “valide e não
+grave”. O servidor faz tudo o que faria num apply normal — preenche os padrões, valida os campos, consulta o
+nome, roda os webhooks de admissão, checa cota — e, no último passo, em vez de gravar, devolve a resposta.
+Ela vem com outra marca:</p>
+
+<pre class="term">$ kubectl apply -f cardapio.yaml --dry-run=server
+pod/cardapio created (server dry run)</pre>
+
+<p>Aqui está a diferença que importa. O servidor sabe se o nome <code>cardapio</code> já é de outro objeto,
+se o namespace <code>padaria</code> existe, se a imagem está num registro permitido pela política do time, se
+o pod cabe na cota. O que ele não faz é reservar nada: outro apply pode criar o mesmo nome meio segundo
+depois. Dry-run de servidor é validação, não reserva.</p>
+
+<p>O custo é que ele conversa com o cluster: precisa de permissão, precisa de conexão, e às vezes um webhook
+lento faz o comando demorar. Por isso o hábito é: cliente primeiro (rápido, offline), servidor depois (lento,
+completo), apply no fim. Quando o dry-run de servidor passa, o apply quase sempre passa — e quando ele falha,
+você descobriu o problema sem ter reiniciado pod nenhum.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>--dry-run=client</code></th><th><code>--dry-run=server</code></th></tr>
+</thead>
+<tbody>
+<tr><td>quem valida</td><td>o kubectl, na sua máquina</td><td>o API server, no cluster</td></tr>
+<tr><td>precisa de conexão</td><td>não</td><td>sim, e de permissão</td></tr>
+<tr><td>pega o quê</td><td>YAML inválido, campo obrigatório faltando, tipo errado</td><td>nome já usado,
+namespace inexistente, cota, webhook, regra do time</td></tr>
+<tr><td>acrescenta padrões</td><td>não</td><td>sim</td></tr>
+<tr><td>grava algo</td><td>não</td><td>não</td></tr>
+<tr><td>resposta</td><td><code>(dry run)</code></td><td><code>(server dry run)</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Enquanto a Ana aprende, o par de comandos que resolve quase tudo é este: primeiro
+<code>kubectl apply -f cardapio.yaml --dry-run=server</code>, depois, sem medo,
+<code>kubectl apply -f cardapio.yaml</code>. Duas linhas, e o incidente que ela teria às oito da manhã vira
+uma mensagem no terminal.</p>
+
+<h2>7. Conferir o que vai mudar</h2>
+
+<p>Validar responde “o arquivo é aceitável”. Conferir responde outra pergunta: “o que exatamente vai mudar?”.
+Para isso existe o <code>kubectl diff -f cardapio.yaml</code>, que compara o arquivo com o que está no cluster
+e imprime a diferença no formato de patch, campo por campo. Quando há diferença, o comando sai com código 1;
+quando não há, sai com 0. Isso o torna perfeito para pipeline: dá para transformar “tem diferença” em
+“alguém esqueceu de aplicar” sem olhar a tela.</p>
+
+<p>Além do diff, três leituras ajudam antes de qualquer apply em ambiente de verdade. A primeira é
+<code>kubectl get pod cardapio -o yaml</code>: mostra o objeto como o cluster guardou, com os padrões e o
+status, e frequentemente revela que o seu arquivo diz uma coisa e o objeto diz outra. A segunda é
+<code>kubectl describe</code>: os eventos contam se o pod está reiniciando e por quê. A terceira é o próprio
+resumo do apply depois de rodar: <code>created</code> onde você esperava <code>configured</code> costuma
+significar que o nome mudou sem querer.</p>
+
+<p>E há o <code>describe</code> da diferença — o que o time da Ana chama de “ler antes de apertar o botão”.
+Manifesto é código: mudança de imagem derruba container, mudança de porta quebra o Service, mudança de
+etiqueta faz o Service parar de achar o pod. Nada disso aparece no YAML; aparece na comparação com o que já
+está lá.</p>
+
+<h2>8. Quando o apply falha</h2>
+
+<p>Nem todo erro é de YAML. Depois que o arquivo fecha, o cluster ainda valida o conteúdo, e as mensagens
+mudam de tom. A mais comum é o nome faltando: um pod sem <code>metadata.name</code> é recusado com
+<code>The Pod "" is invalid: metadata.name: Required value</code>. O nome entre aspas vazio é a pista — não é
+“nome errado”, é “nome ausente”. A caixa abaixo tem esse caso. Rode, leia e dê um nome ao pod.</p>
+
+<div class="tryk8s" data-goal="texto:pod/cardapio created;;campo:Pod/cardapio|spec.containers.0.image=cardapio:1.0">
+  <p class="try-task">O manifesto não tem <code>metadata.name</code>, e o apply recusa o objeto inteiro.
+  Acrescente <code>name: cardapio</code> embaixo de <code>metadata</code> e rode.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+The Pod "" is invalid: metadata.name: Required value
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>Outra classe de erro é a identidade. Um nome com maiúscula, espaço ou acento é recusado com a regra
+inteira na mensagem; um <code>apiVersion</code> que não combina com o <code>kind</code> é recusado com
+<code>resource mapping not found</code>; um <code>namespace</code> que não existe aparece como
+<code>namespaces "padaria" not found</code>. Em todos esses casos, nada é criado — o objeto nem chegou a
+existir.</p>
+
+<p>E há um comportamento que surpreende: <strong>o apply não é transacional</strong>. Cada documento do
+arquivo é tratado por si. Se o primeiro é válido e o segundo tem um nome inválido, o primeiro é criado, o
+segundo volta como erro, e o terceiro é aplicado normalmente. Não existe “desfazer tudo” quando um falha —
+diferente do que acontece num banco de dados. A caixa abaixo mostra isso: três pods, um com nome inválido.</p>
+
+<div class="tryk8s" data-goal="conta:pods=3;;texto:pod/forno created">
+  <p class="try-task">O segundo pod se chama <code>Forno</code>, com maiúscula, e o cluster recusa. Corrija o
+  nome para <code>forno</code> e rode: os três pods têm de existir.</p>
+<pre class="yaml" data-file="site.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: Forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: caixa
+spec:
+  containers:
+    - name: caixa
+      image: caixa:1.0</pre>
+<pre class="out">
+pod/cardapio created
+pod/caixa created
+The Pod "Forno" is invalid: metadata.name: Invalid value: "Forno": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: caixa
+spec:
+  containers:
+    - name: caixa
+      image: caixa:1.0</pre>
+</div>
+
+<p>Antes do conserto, dois pods existem e um erro aparece. Depois, três. Guarde a lição nas duas direções: um
+erro no meio não impede o resto, e é por isso que um pipeline precisa conferir o código de saída do comando,
+não só procurar a palavra “error” na tela. O apply sai com código diferente de zero quando qualquer documento
+falha — é isso que faz o pipeline parar.</p>
+
+<p>Sobre o que fazer quando falha: leia a mensagem inteira, mesmo comprida. Ela segue o padrão
+<code>The <em>Kind</em> "nome" is invalid: caminho.do.campo: motivo</code>. O caminho é o mapa do tesouro —
+<code>spec.containers[0].ports[0].containerPort</code> aponta o container, a porta e o campo. Corrija no
+arquivo, rode o dry-run, aplique de novo. Nunca “conserte na mão” com <code>kubectl edit</code>: a próxima
+aplicação do arquivo desfaz o conserto, porque o arquivo é a verdade.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o apply que “não fez nada”</h3>
+<p>Ela mudou a etiqueta no arquivo, aplicou e recebeu <code>unchanged</code>. Conferiu o arquivo: a etiqueta
+estava lá. O problema era que o manifesto aberto no editor não era o que ela estava aplicando — ela rodou o
+comando apontando para outro arquivo, de uma pasta vizinha. O <code>unchanged</code> foi honesto: aquele outro
+arquivo estava igual ao cluster. O hábito que resolve é aplicar com o caminho completo e olhar o
+<code>-f</code> na saída antes de reclamar do cluster.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o dry-run que passou e o apply que falhou</h3>
+<p>O dry-run de cliente aprovou o arquivo e o apply recusou, porque o pod com aquele nome já existia em outro
+namespace — coisa que só o servidor sabe. O conserto foi trocar o ensaio: <code>--dry-run=server</code>
+antes do apply. Desde então, o time dela usa cliente para forma e servidor para estado, sempre nessa
+ordem.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o arquivo com três documentos e um erro</h3>
+<p>O <code>site.yaml</code> tinha pod, ConfigMap e Service. O ConfigMap estava com nome inválido e o apply
+criou os outros dois — o site subiu pela metade e o Service ficou sem configuração. Ela aprendeu a conferir o
+código de saída do comando no pipeline e a aplicar por partes quando o arquivo é grande. O apply ser
+permissivo é conveniência no terminal e armadilha na automação.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que <code>unchanged</code> quer dizer?</p>
+<label><input type="radio" name="q1"> que o comando não encontrou o arquivo</label>
+<label><input type="radio" name="q1"> que o cluster recusou a mudança</label>
+<label><input type="radio" name="q1"> que o cluster já está exatamente como o arquivo descreve</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">2. Qual dry-run descobre que o nome já está em uso?</p>
+<label><input type="radio" name="q2"> <code>--dry-run=client</code>, porque ele lê o arquivo inteiro</label>
+<label><input type="radio" name="q2"> <code>--dry-run=server</code>, porque é o servidor que conhece o estado
+do cluster</label>
+<label><input type="radio" name="q2"> nenhum dos dois: só o apply descobre</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Um documento do arquivo é inválido. O que acontece com os
+outros?</p>
+<label><input type="radio" name="q3"> são aplicados mesmo assim: o apply trata documento por documento</label>
+<label><input type="radio" name="q3"> nada é aplicado: o apply desfaz tudo quando um falha</label>
+<label><input type="radio" name="q3"> o kubectl para no primeiro erro e pede confirmação</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: ensaiar antes de aplicar</h2>
+<p>Você quer validar o manifesto no cluster, com todos os padrões e verificações do servidor, mas sem gravar
+nada. Complete o comando:</p>
+<div class="ex-code">kubectl apply -f cardapio.yaml <input aria-label="resposta 1" data-answer="--dry-run=server" placeholder="..."></div>
+<p class="ex-dica">Dica: são dois traços, a palavra “dry”, hífen e “run”, sinal de igual e o nome de quem
+valida. A resposta do comando termina com <code>(server dry run)</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>kubectl apply</code> é declarativo: você entrega o retrato do que quer e o cluster calcula a
+diferença. A resposta tem três formas — <code>created</code> quando o objeto nasceu,
+<code>configured</code> quando ele existia e mudou, <code>unchanged</code> quando já estava igual. Aplicar o
+mesmo arquivo várias vezes é seguro, e é essa idempotência que permite guardar manifesto no repositório.</p>
+
+<p>O <code>-f</code> aceita um arquivo, uma pasta, vários arquivos ou a entrada padrão; a ordem dos documentos
+importa quando um objeto depende de outro. O <code>--dry-run=client</code> valida a forma sem falar com o
+cluster e responde <code>(dry run)</code>. O <code>--dry-run=server</code> valida o estado — nome, namespace,
+cota, webhook — e responde <code>(server dry run)</code>. Nenhum dos dois grava. O <code>kubectl diff</code>
+mostra o que mudaria e sai com código 1 quando há diferença.</p>
+
+<p>Quando algo falha, a mensagem diz o caminho do campo e o motivo: nome ausente, nome inválido,
+<code>apiVersion</code> que não combina, namespace inexistente. E o apply não é transacional: um documento com
+erro não desfaz os outros, então pipeline bom confere o código de saída. Com isso, a Ana consegue entregar
+manifesto com a mesma calma com que confere uma encomenda antes de fechar a caixa. A próxima aula entra no
+objeto que ela mais aplica: o <a href="pod-manifesto.html">manifesto completo do pod</a>, campo por campo.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>apply</code> compara e ajusta; <code>create</code> cria uma vez; <code>replace</code> troca
+  tudo.</li>
+  <li><code>created</code> nasceu, <code>configured</code> mudou, <code>unchanged</code> já estava igual.</li>
+  <li><code>-f</code> aceita arquivo, pasta, vários arquivos e <code>-</code> para entrada padrão.</li>
+  <li><code>--dry-run=client</code> pega erro de forma; <code>--dry-run=server</code> pega erro de
+  estado.</li>
+  <li>Nenhum dry-run grava: <code>(dry run)</code> e <code>(server dry run)</code> são só resposta.</li>
+  <li><code>kubectl diff -f</code> mostra o que mudaria; código 1 quando há diferença.</li>
+  <li>O apply não desfaz nada quando um documento falha; confira o código de saída.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

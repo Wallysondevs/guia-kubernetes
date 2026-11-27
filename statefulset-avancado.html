@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StatefulSet avançado | Guia Kubernetes</title>
+<meta name="description" content="StatefulSet avançado: podManagementPolicy Parallel, DNS por pod no Service headless, atualização por partição, OnDelete e o que fazer com os claims ao escalar.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>StatefulSet <span class="hl">avançado</span></h1>
+<p class="intro">O cluster de banco da padaria da Ana já sobe, já tem um disco por réplica e já sobrevive a
+reinícios. Agora começa a parte chata: subir três réplicas em fila leva vinte minutos, atualizar a imagem
+reinicia as três de uma vez, e ninguém sabe ao certo o que acontece com os discos quando o time aperta o
+botão de escalar. Nesta aula a Ana mexe nas quatro alavancas que separam um StatefulSet de brinquedo de um
+de produção: a política de subida, o DNS por pod, a atualização por partição e o destino dos claims.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Quando <code>Parallel</code> ajuda e quando ele quebra o cluster.</li>
+  <li>Como cada pod ganha um DNS próprio e o que o Service headless faz de diferente.</li>
+  <li>O que <code>publishNotReadyAddresses</code> resolve num cluster que está nascendo.</li>
+  <li>Como atualizar só uma parte das réplicas com <code>partition</code>.</li>
+  <li>O que <code>OnDelete</code> muda no seu jeito de operar.</li>
+  <li>Como selecionar uma réplica específica pela etiqueta de posição.</li>
+  <li>Quais campos não podem ser editados depois que o set existe.</li>
+  <li>O que fazer com os claims ao escalar para baixo e ao apagar o set.</li>
+</ul>
+</div>
+
+<h2>1. A cena: vinte minutos para subir e um deploy que derruba tudo</h2>
+
+<p>O StatefulSet da Ana tem três réplicas e a política padrão, <code>OrderedReady</code>. Numa manhã de
+segunda, o nó que rodava o <code>web-0</code> foi reiniciado e o cluster inteiro teve de subir de novo: o
+controlador criou o <code>web-0</code>, esperou ele ficar pronto, criou o <code>web-1</code>, esperou, criou o
+<code>web-2</code>. Vinte minutos depois, o banco estava de pé — correto, previsível e lento.</p>
+
+<p>Na quarta, o time mudou a imagem do container. O StatefulSet atualiza na ordem inversa: derruba o
+<code>web-2</code>, sobe com a imagem nova, espera, derruba o <code>web-1</code>, e assim por diante. Funciona,
+mas cada passo é uma réplica a menos no cluster de banco. Se a imagem nova tiver um problema, o time descobre
+quando já perdeu duas réplicas — e a terceira está a caminho.</p>
+
+<p>As duas situações têm remédio dentro do próprio StatefulSet. A primeira pede <code>Parallel</code>; a
+segunda pede <code>partition</code> para atualizar um pod de cada vez, de propósito, e olhar o resultado. O
+resto desta aula é sobre essas alavancas e sobre o que elas mexem no armazenamento.</p>
+
+<h2>2. As quatro alavancas do avançado</h2>
+
+<p>Um StatefulSet básico tem cinco campos: <code>serviceName</code>, <code>replicas</code>,
+<code>selector</code>, <code>template</code> e <code>volumeClaimTemplates</code>. O avançado mexe em quatro
+outros, que controlam <em>como</em> o set se comporta ao subir, ao descer e ao ser atualizado.</p>
+
+<dl class="anatomy">
+<dt>podManagementPolicy</dt>
+<dd><code>OrderedReady</code> (padrão) sobe e desce um por vez; <code>Parallel</code> cria e remove todos sem
+esperar prontidão.</dd>
+<dt>updateStrategy</dt>
+<dd>Como aplicar uma mudança de template: <code>RollingUpdate</code> (padrão, automático, do maior ordinal
+para o menor) ou <code>OnDelete</code> (nada acontece até você apagar o pod).</dd>
+<dt>partition</dt>
+<dd>Dentro de <code>RollingUpdate</code>: só os pods com ordinal maior ou igual à partição são atualizados. Com
+<code>partition: 2</code> e três réplicas, só o <code>web-2</code> muda.</dd>
+<dt>publishNotReadyAddresses</dt>
+<dd>No Service: publica os pods no DNS mesmo antes de ficarem prontos. É o que permite aos membros de um
+cluster se encontrarem durante a formação.</dd>
+<dt>DNS do pod</dt>
+<dd><code>web-0.web.default.svc.cluster.local</code>. O primeiro pedaço é o nome do pod, o segundo o
+<code>serviceName</code>.</dd>
+<dt>retentionPolicy do claim</dt>
+<dd><code>spec.persistentVolumeClaimRetentionPolicy</code>, com <code>whenDeleted</code> e
+<code>whenScaled</code>. Sem ela, os claims ficam para sempre.</dd>
+</dl>
+
+<p>Nada disso muda a identidade dos pods — nomes, discos e ordem continuam valendo. O que muda é o tempo, a
+segurança e a fatura. É um bom exemplo de como Kubernetes separa “o que” de “como”: o “o que” está no
+template; o “como” está nessas alavancas de operação.</p>
+
+<h2>3. Subir sem fila: Parallel</h2>
+
+<p>Com <code>OrderedReady</code>, o controlador espera cada pod ficar <code>Ready</code> antes de criar o
+próximo. Isso é exatamente o que um banco precisa: o segundo nó só entra quando o primeiro aceita conexões.
+Mas nem todo workload com identidade precisa disso — um cache com shard, por exemplo, não forma cluster: cada
+pod é independente e só precisa do seu número e do seu disco.</p>
+
+<p>Para esses casos existe <code>Parallel</code>. Todos os pods são criados ao mesmo tempo, sem espera de
+prontidão. O ganho é tempo de subida; o custo é que o seu programa precisa aguentar encontrar os vizinhos
+incompletos. A caixa começa com a política padrão e sem regra de retenção de claim. A missão é ligar as duas
+coisas: subir em paralelo e dizer que, ao escalar para baixo, o claim da réplica que saiu deve ser apagado.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:StatefulSet/web|spec.podManagementPolicy=Parallel;;campo:StatefulSet/web|spec.persistentVolumeClaimRetentionPolicy.whenScaled=Delete;;pronto:StatefulSet/web=3">
+  <p class="try-task">Acrescente <code>podManagementPolicy: Parallel</code> e a política de retenção
+  <code>persistentVolumeClaimRetentionPolicy</code> com <code>whenScaled: Delete</code> e
+  <code>whenDeleted: Retain</code>. Rode e confira as três réplicas prontas.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: dados
+              mountPath: /dados
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi</pre>
+<pre class="out">
+statefulset.apps/web created
+
+NAME    READY   STATUS    RESTARTS   AGE
+web-0   1/1     Running   0          9m
+web-1   1/1     Running   0          3m
+web-2   1/1     Running   0          7m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  podManagementPolicy: Parallel
+  persistentVolumeClaimRetentionPolicy:
+    whenScaled: Delete
+    whenDeleted: Retain
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: dados
+              mountPath: /dados
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi</pre>
+</div>
+
+<p>Sobre a retenção, vale ser preciso porque isso muda a aula anterior na sua cabeça. Sem
+<code>persistentVolumeClaimRetentionPolicy</code>, o comportamento é <code>Retain</code> nos dois casos: os
+claims ficam quando você escala para baixo e ficam quando você apaga o set. Com <code>whenScaled: Delete</code>,
+o claim da réplica removida é apagado junto — ótimo para cache, péssimo para banco. Com
+<code>whenDeleted: Delete</code>, apagar o StatefulSet leva os claims todos, o que é conveniente em ambiente
+de teste e assustador em produção.</p>
+
+<p>Não existe almoço grátis: <code>Parallel</code> reduz o tempo de subida e aumenta a chance de o programa
+ver o cluster incompleto; <code>whenScaled: Delete</code> limpa a fatura e apaga dado. As duas decisões são de
+operação, não de manifesto bonito, e é por isso que elas costumam ser diferentes entre o ambiente de teste e o
+de produção.</p>
+
+<h2>4. DNS por pod e o Service headless</h2>
+
+<p>A promessa de “identidade” só se completa quando os outros conseguem <em>achar</em> a réplica. Isso vem do
+Service apontado em <code>serviceName</code>, que precisa ser <em>headless</em>: um Service com
+<code>clusterIP: None</code>. Em vez de um IP virtual único, o DNS dele devolve os IPs dos pods, e cada pod
+ganha um nome próprio.</p>
+
+<p>O nome tem três pedaços: <code>web-0</code> (pod), <code>web</code> (Service) e o resto do domínio do
+cluster. É esse nome que o programa usa para dizer “quero falar com a réplica 1” — e ele vale enquanto o pod
+existir, sobrevivendo a reinícios. A caixa começa com um Service comum, com IP virtual, e sem publicar pods
+não prontos.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="campo:Service/web|spec.clusterIP=None;;campo:Service/web|spec.publishNotReadyAddresses=true;;conta:endpoints=1;;texto:10.244.">
+  <p class="try-task">Transforme o Service em headless com <code>clusterIP: None</code> e acrescente
+  <code>publishNotReadyAddresses: true</code>. Rode e confira os endpoints com os IPs dos três pods.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+service/web created
+statefulset.apps/web created
+
+NAME   ENDPOINTS                                                    AGE
+web    10.244.211.221:8080,10.244.51.225:8080,10.244.141.230:8080   9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>O painel mostra os <em>endpoints</em> — a lista de IPs que o Service conhece. Com o Service headless, não
+existe um IP único: existem três, um por pod.</p>
+
+<pre class="term">NAME   ENDPOINTS                                                    AGE
+web    10.244.212.221:8080,10.244.53.225:8080,10.244.215.230:8080   9m</pre>
+
+<p>Repare que a porta é a <code>targetPort</code> de cada pod. O DNS de cada um é montado a partir da posição:
+<code>web-0.web</code>, <code>web-1.web</code>, <code>web-2.web</code>. Num cluster real, a resolução completa
+é <code>web-0.web.default.svc.cluster.local</code>; de dentro do mesmo namespace, <code>web-0.web</code>
+basta.</p>
+
+<p>O <code>publishNotReadyAddresses</code> é o detalhe que salva o primeiro boot. Normalmente, um pod só entra
+no DNS do Service quando fica <code>Ready</code> — mas o pod só fica <code>Ready</code> quando o programa
+consegue falar com os vizinhos, e ele não consegue falar porque não está no DNS. É um ovo e galinha clássico
+de cluster de banco, e a saída é publicar os endereços antes da prontidão. O custo é que clientes normais
+podem ser mandados para um pod que ainda não aceita conexão; por isso a recomendação é usar esse Service só
+para o tráfego interno do cluster, com um Service separado para os clientes.</p>
+
+<h2>5. Atualizar por partes: partition</h2>
+
+<p>A segunda alavanca é a que evita o deploy que derruba tudo. Com <code>updateStrategy.type: RollingUpdate</code>
+e <code>partition: 2</code>, o StatefulSet atualiza só os pods com ordinal maior ou igual a 2 — ou seja, só o
+<code>web-2</code>. O <code>web-0</code> e o <code>web-1</code> continuam com a imagem antiga, intocados. É um
+canário que aproveita a numeração: o último da fila é o primeiro a testar.</p>
+
+<p>A caixa começa com a estratégia <code>OnDelete</code>, que é o oposto: nada acontece sozinho. A missão é
+passar para o modo automático com a partição em 2, para que o time possa observar o <code>web-2</code> antes de
+liberar o resto.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:StatefulSet/web|spec.updateStrategy.type=RollingUpdate;;campo:StatefulSet/web|spec.updateStrategy.rollingUpdate.partition=2;;pronto:StatefulSet/web=3">
+  <p class="try-task">Troque a estratégia para <code>RollingUpdate</code> e acrescente
+  <code>rollingUpdate: {partition: 2}</code>. Rode e confira as três réplicas prontas.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: dados
+              mountPath: /dados
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi</pre>
+<pre class="out">
+statefulset.apps/web created
+
+NAME    READY   STATUS    RESTARTS   AGE
+web-0   1/1     Running   0          9m
+web-1   1/1     Running   0          3m
+web-2   1/1     Running   0          7m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web
+  replicas: 3
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: dados
+              mountPath: /dados
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi</pre>
+</div>
+
+<p>Como o canário funciona na prática: você muda a imagem no template e mantém <code>partition: 2</code>. O
+controlador recria o <code>web-2</code> com a imagem nova e para. Você olha os logs, mede, espera. Se estiver
+bom, muda a partição para 1 — agora o <code>web-1</code> também é recriado — e depois para 0, liberando o
+<code>web-0</code>. Se estiver ruim, volta a imagem antiga no template antes de baixar a partição: só o
+<code>web-2</code> passou pelo problema.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Estratégia</th><th>Quem atualiza e quando</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>RollingUpdate</code> sem partição</td><td>todos, do maior para o menor, esperando cada um ficar
+pronto</td><td>rotina, imagem já confiável</td></tr>
+<tr><td><code>RollingUpdate</code> com <code>partition: n</code></td><td>só os ordinais maiores ou iguais a
+<code>n</code></td><td>canário, mudança arriscada, migração de schema</td></tr>
+<tr><td><code>OnDelete</code></td><td>ninguém: você apaga o pod e o controlador recria com o template
+novo</td><td>controle total, janela marcada, banco que não pode reiniciar sozinho</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O painel não executa a substituição dos pods, porque não há kubelet para derrubar e subir container: ele
+guarda a estratégia e mostra o objeto com os campos certos. A prova da missão é o campo; a dança dos pods é
+comportamento de cluster real, e a descrição acima é como ela acontece.</p>
+
+<h2>6. OnDelete: quando o time recicla os pods</h2>
+
+<p><code>OnDelete</code> parece “desligar a atualização”, e é quase isso. Com ele, mudar o template não faz
+nada: o controlador espera você apagar cada pod. Quando você apaga o <code>web-1</code>, ele renasce com o
+template novo — e só ele. É o modo preferido de quem tem banco com janela de manutenção marcada e não quer
+acordar com três réplicas reiniciando às três da manhã.</p>
+
+<p>Para operar assim, você precisa de um jeito de mirar um pod específico. O nome já é único, mas a etiqueta
+também ajuda: cada pod de StatefulSet ganha <code>statefulset.kubernetes.io/pod-name</code>. É esta a saída do
+painel para os três pods com as etiquetas:</p>
+
+<pre class="term">NAME    READY   STATUS    RESTARTS   AGE   LABELS
+web-0   1/1     Running   0          9m    app=web,statefulset.kubernetes.io/pod-name=web-0
+web-1   1/1     Running   0          3m    app=web,statefulset.kubernetes.io/pod-name=web-1
+web-2   1/1     Running   0          7m    app=web,statefulset.kubernetes.io/pod-name=web-2</pre>
+
+<p>Com essa etiqueta, você cria um Service que só aponta para o <code>web-0</code> — útil para dar ao líder um
+endereço de leitura e escrita — ou seleciona um pod para inspeção. E, no modo <code>OnDelete</code>, o
+procedimento de atualização vira: apagar o <code>web-2</code>, esperar, conferir, apagar o <code>web-1</code>,
+conferir, apagar o <code>web-0</code>. Mais lento, mais seguro, e explícito sobre quem mandou.</p>
+
+<h2>7. O que não dá para mudar depois</h2>
+
+<p>StatefulSet é rígido em alguns campos, e a rigidez é proteção: mudar <code>selector</code> mudaria a quais
+pods o set pertence; mudar <code>serviceName</code> mudaria o DNS de todas as réplicas; acrescentar ou alterar
+<code>volumeClaimTemplates</code> mudaria o disco de pods que já existem. No cluster real, o servidor recusa
+essas edições com <code>Forbidden: updates to statefulset spec for fields other than ...</code>.</p>
+
+<p>O caminho, quando você realmente precisa, é o que os operadores chamam de “recriar com órfãos”: apagar o
+StatefulSet com <code>--cascade=orphan</code>, o que remove o controlador mas deixa os pods e claims vivos;
+editar o manifesto; e aplicar de novo. O set novo adota os pods existentes, porque o <code>selector</code>
+continua casando e os nomes continuam os mesmos. Sem o <code>orphan</code>, apagar o set derrubaria os pods — e,
+sem <code>Retain</code> nos claims, poderia levar os discos também.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Pode editar?</th><th>Como contornar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>replicas</code>, <code>template</code>, <code>updateStrategy</code></td><td>sim</td><td>—</td></tr>
+<tr><td><code>selector</code></td><td>não</td><td>recriar o set adotando os pods com etiquetas compatíveis</td></tr>
+<tr><td><code>serviceName</code></td><td>não</td><td>recriar; os pods trocam de DNS</td></tr>
+<tr><td><code>volumeClaimTemplates</code></td><td>não</td><td>criar um molde novo, migrar os dados e recriar</td></tr>
+<tr><td><code>podManagementPolicy</code></td><td>sim</td><td>afeta só os pods criados depois</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Vale decorar o terceiro caso porque ele aparece em toda migração: você não pode “só aumentar o disco” de um
+StatefulSet editando o molde. O que se faz é criar um molde novo com o tamanho maior, subir uma réplica que o
+use, copiar os dados e repetir. É trabalhoso de propósito: mudar o tamanho do disco de um banco em produção
+merece trabalho.</p>
+
+<h2>8. Apagar sem levar os dados</h2>
+
+<p>Chegamos ao ponto que mais dói na operação. Apagar o StatefulSet, por padrão, apaga os pods e
+<em>mantém</em> os claims — o que é uma proteção e um problema de fatura ao mesmo tempo. Apagar o PVC, por sua
+vez, segue a política da StorageClass (aula anterior): <code>Delete</code> leva o volume, <code>Retain</code>
+deixa o PV órfão.</p>
+
+<p>A novidade desta aula é que o próprio StatefulSet pode cuidar disso, com
+<code>persistentVolumeClaimRetentionPolicy</code>. <code>whenScaled</code> decide o que acontece com o claim de
+uma réplica removida por escala; <code>whenDeleted</code> decide o que acontece com todos os claims quando o
+set é apagado. Os dois aceitam <code>Retain</code> (padrão) e <code>Delete</code>.</p>
+
+<p>A combinação segura para banco é <code>whenScaled: Retain</code> e <code>whenDeleted: Retain</code>: nada é
+apagado sem uma pessoa. A combinação cômoda para cache é <code>Delete</code> nos dois: o dado é descartável e a
+fatura agradece. A combinação perigosa é <code>whenScaled: Delete</code> num banco com escala automática — cada
+ida e volta de réplica levaria um pedaço dos dados embora.</p>
+
+<p>Existe ainda um caso de borda: quando o set é apagado com <code>--cascade=orphan</code>, os pods continuam
+vivos e os claims também, independentemente da política. A política só age quando o controlador é quem remove
+o pod. Saber a diferença entre “apagar o dono” e “apagar o dono e os filhos” evita o susto de ver o banco
+sumir num comando errado.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a subida de domingo em paralelo</h3>
+<p>O time de cache da Ana usa StatefulSet com <code>Parallel</code> porque cada shard é independente. Quando
+o nó cai, os três voltam em trinta segundos, não em vinte minutos. O banco, que forma cluster, continua em
+<code>OrderedReady</code> e aceita esperar. Duas escolhas diferentes para o mesmo recurso — e as duas certas,
+porque a pergunta é sobre o programa, não sobre o Kubernetes.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o canário que pegou o bug</h3>
+<p>Uma migração de schema entrou com <code>partition: 2</code>. O <code>web-2</code> subiu com a imagem nova e
+começou a reiniciar em laço. O time viu em dois minutos, voltou a imagem no template e recriou um pod. As
+réplicas 0 e 1 nunca souberam que existiu migração. Sem partição, o mesmo bug teria derrubado as três.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: os claims que ninguém apagou</h3>
+<p>Depois de três meses de escala elástica, o time descobriu dezenove claims órfãos, de réplicas que existiram
+por uma tarde. A conta do disco cresceu sem que ninguém mexesse em nada. A correção foi ligar
+<code>whenScaled: Delete</code> no ambiente de teste e criar um Job mensal que lista claims sem pod
+correspondente no de produção — onde apagar automático é risco, não alívio.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que <code>podManagementPolicy: Parallel</code> faz?</p>
+<label><input type="radio" name="q1"> sobe os pods na ordem inversa, do maior para o menor</label>
+<label><input type="radio" name="q1"> cria e remove todos os pods sem esperar prontidão</label>
+<label><input type="radio" name="q1"> permite mais de um pod por ordinal</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Com <code>partition: 2</code> e três réplicas, quais pods são
+atualizados?</p>
+<label><input type="radio" name="q2"> os três</label>
+<label><input type="radio" name="q2"> só o <code>web-0</code> e o <code>web-1</code></label>
+<label><input type="radio" name="q2"> só o <code>web-2</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Para que serve <code>publishNotReadyAddresses</code>?</p>
+<label><input type="radio" name="q3"> para os pods entrarem no DNS antes de ficarem prontos, o que permite ao
+cluster se formar</label>
+<label><input type="radio" name="q3"> para o Service aceitar pods de outros namespaces</label>
+<label><input type="radio" name="q3"> para o pod subir mesmo sem volume montado</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o DNS da réplica</h2>
+<p>Complete o nome que leva à réplica número 1 do StatefulSet <code>web</code>, dentro do namespace
+<code>default</code>:</p>
+<div class="ex-code">web-1.<input aria-label="resposta 1" data-answer="web" placeholder="...">.default.svc.cluster.local</div>
+<p class="ex-dica">Dica: o segundo pedaço é o valor de <code>serviceName</code>, não o nome do StatefulSet — no
+nosso exemplo os dois coincidem, e é aí que a confusão nasce.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O StatefulSet avançado é sobre operação: quatro alavancas que decidem tempo, segurança e custo.
+<code>podManagementPolicy</code> troca a fila por pressa; <code>updateStrategy</code> com
+<code>partition</code> transforma o deploy em canário por ordinal; <code>OnDelete</code> devolve o comando para
+o time; <code>publishNotReadyAddresses</code> deixa o cluster se encontrar enquanto nasce.</p>
+
+<p>No armazenamento, a novidade é a <code>persistentVolumeClaimRetentionPolicy</code>: sem ela, os claims
+sobrevivem à escala e à exclusão do set, o que protege o dado e acumula disco. Com <code>whenScaled</code> e
+<code>whenDeleted</code> você decide caso a caso — e a decisão certa para banco quase sempre é
+<code>Retain</code>.</p>
+
+<p>E fique com o mapa do que é imutável: <code>selector</code>, <code>serviceName</code> e
+<code>volumeClaimTemplates</code> não se editam. Para mudar, o caminho é apagar com
+<code>--cascade=orphan</code>, editar e aplicar de novo, adotando os pods existentes. É trabalhoso porque é
+uma mudança de identidade — e identidade, neste workload, é justamente o que não se troca no meio do
+caminho.</p>
+
+<div class="note">
+<h3>Para lembrar</h3>
+<ul>
+<li><code>OrderedReady</code> espera prontidão; <code>Parallel</code> não espera.</li>
+<li>Service headless = <code>clusterIP: None</code>; cada pod ganha <code>nome.service</code>.</li>
+<li><code>publishNotReadyAddresses</code> publica o pod no DNS antes de ele ficar pronto.</li>
+<li><code>partition: n</code> atualiza só os ordinais maiores ou iguais a <code>n</code>.</li>
+<li><code>OnDelete</code> não atualiza nada sozinho: você apaga o pod.</li>
+<li><code>statefulset.kubernetes.io/pod-name</code> identifica a réplica em seletores.</li>
+<li><code>selector</code>, <code>serviceName</code> e <code>volumeClaimTemplates</code> não se editam.</li>
+<li><code>--cascade=orphan</code> apaga o dono e mantém pods e claims.</li>
+<li><code>whenScaled</code> e <code>whenDeleted</code> decidem o destino dos claims.</li>
+<li>Sem política de retenção, claim fica: a fatura é que avisa.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

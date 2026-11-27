@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PodDisruptionBudget | Guia Kubernetes</title>
+<meta name="description" content="PodDisruptionBudget na prática: minAvailable e maxUnavailable, despejo voluntário contra queda involuntária, o drain que espera, e por que o PDB não protege um rollout.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Pod<span class="hl">Disruption</span>Budget</h1>
+<p class="intro">A Ana marcou a manutenção do cluster para terça de madrugada. Vai atualizar os três nós, um por
+vez, e cada nó precisa ser esvaziado — todos os pods que moram nele saem. O site da padaria tem três
+réplicas, mas nada garante que elas estejam em nós diferentes, nem que o cluster espere antes de tirar a
+segunda. O <strong>PodDisruptionBudget</strong> é o contrato que responde “quantas réplicas podem sumir ao
+mesmo tempo?”. Nesta aula a Ana escreve esse contrato, entende por que ele só vale para despejo voluntário e
+descobre o guarda que ele <em>não</em> substitui.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é uma interrupção voluntária — e por que queda de nó não é uma delas.</li>
+  <li>O objeto <code>policy/v1</code> e os dois campos que importam: <code>minAvailable</code> e
+  <code>maxUnavailable</code>.</li>
+  <li>Como porcentagens são arredondadas e o que o cluster faz com frações.</li>
+  <li>Como ler <code>ALLOWED DISRUPTIONS</code> e por que ele muda sozinho.</li>
+  <li>O que o <code>kubectl drain</code> faz quando o orçamento não permite.</li>
+  <li>Os quatro erros que deixam um PDB sem proteger nada.</li>
+  <li>A diferença entre o PDB e o <code>maxUnavailable</code> do Deployment.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a manutenção de terça</h2>
+
+<p>O cluster da padaria roda em três máquinas. Na terça, a Ana vai atualizar o sistema de cada uma e reiniciar.
+Reiniciar uma máquina significa esvaziá-la: o Kubernetes manda cada pod daquele nó embora e o agendador
+recoloca os pods nos outros nós. Se duas máquinas forem esvaziadas ao mesmo tempo — ou se o esvaziamento não
+esperar os pods novos ficarem prontos —, o site pode ficar sem nenhuma réplica por alguns segundos.</p>
+
+<p>Para quem está comprando pão, “alguns segundos” é uma tela de erro. E é justamente numa manutenção
+planejada que esse erro é inaceitável: você sabe que vai acontecer, tem data e hora, e mesmo assim o site cai.
+O PodDisruptionBudget existe para transformar essa decisão em um número escrito no repositório, em vez de
+confiança na sorte do agendador.</p>
+
+<p>A ideia é simples: você declara quantas réplicas do seu serviço precisam continuar de pé. O cluster, antes
+de tirar um pod, consulta esse número. Se tirar o pod deixar o serviço abaixo do combinado, ele espera. Não é
+uma proteção contra falhas — é uma proteção contra <em>você mesmo</em>, ou contra o processo automatizado que
+você mandou fazer manutenção.</p>
+
+<p>O nome assusta porque tem três palavras compridas. Traduzindo: <em>orçamento de interrupção de pods</em>. Um
+orçamento de quanto você aceita perder. Pense no cartaz da padaria: “nunca menos de dois padeiros no balcão”.
+Se um padeiro precisa sair para o almoço, outro tem que estar lá primeiro.</p>
+
+<h2>2. Voluntário não é involuntário</h2>
+
+<p>A primeira distinção da aula, e a que mais confunde: o PDB só olha para interrupções
+<strong>voluntárias</strong>. Interrupção voluntária é aquela que alguém pediu ao cluster pela API de
+despejo: esvaziar um nó para manutenção, atualizar o sistema da máquina, desligar um nó de um pool, fazer
+escala para baixo com cuidado. O cluster tem tempo de perguntar “posso tirar este pod agora?”.</p>
+
+<p>Interrupção involuntária é o que acontece sem aviso: o nó perde energia, o kernel entra em pânico, a máquina
+virtual é recolhida pelo provedor, o container estoura a memória e é morto, o disco falha — o caso de
+<a href="eviction-e-oom.html">OOMKilled</a> está na aula de eviction. Nada disso passa pela API de despejo, então
+nada disso consulta o PDB. Se o nó cai, os pods dele caem junto — o orçamento não
+tem voto.</p>
+
+<p>Há uma terceira coisa que também não é despejo: apagar o pod com <code>kubectl delete pod</code>. O comando
+manda o objeto embora, e o Deployment recria outro; o PDB não bloqueia. É por isso que testar o PDB com
+<code>delete pod</code> não prova nada — o caminho é o <code>drain</code> ou a API de eviction.</p>
+
+<dl class="anatomy">
+<dt>PodDisruptionBudget</dt>
+<dd>Objeto do grupo <code>policy/v1</code> que declara quantas réplicas de um conjunto podem ficar
+indisponíveis durante um despejo voluntário.</dd>
+<dt>interrupção voluntária</dt>
+<dd>Despejo pedido pela API de eviction: <code>kubectl drain</code>, atualização de nó, manutenção
+planejada, desligamento ordenado.</dd>
+<dt>interrupção involuntária</dt>
+<dd>Falha sem aviso: nó cai, container estoura memória, disco morre, máquina é recolhida. O PDB não
+participa.</dd>
+<dt>despejo (eviction)</dt>
+<dd>O pedido que o cluster avalia: “possa este pod sair agora?”. É aqui que o orçamento é consultado.</dd>
+<dt>drain</dt>
+<dd>Comando que esvazia um nó: marca o nó como não agendável e despeja os pods dele, um a um, respeitando os
+orçamentos.</dd>
+</dl>
+
+<p>Guardar essa separação resolve metade dos mal-entendidos de plantão. Quando o site cai às três da manhã e
+alguém pergunta “o PDB não devia ter protegido?”, a resposta é: protegido contra o quê? Se foi queda de nó,
+o PDB não tem nada a ver; se foi manutenção, aí sim vale investigar por que o orçamento permitiu.</p>
+
+<h2>3. O objeto, linha por linha</h2>
+
+<p>Um PDB tem quatro partes: a versão da API, o tipo, a identidade e o <code>spec</code>. Dentro do
+<code>spec</code>, só dois assuntos: <em>quem</em> ele protege (o <code>selector</code>) e <em>quanto</em>
+precisa ficar de pé (<code>minAvailable</code> ou <code>maxUnavailable</code>).</p>
+
+<pre class="file" data-file="pdb.yaml">apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cardapio
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: cardapio</pre>
+
+<p>O <code>selector</code> funciona como em todo lugar do Kubernetes: ele casa com pods pelas etiquetas, no
+mesmo namespace do PDB. Aqui, todos os pods com <code>app: cardapio</code> — os três do Deployment. Se o
+Deployment usa <code>app: cardapio</code> no <code>template</code>, o PDB enxerga o conjunto inteiro, inclusive
+os pods que estão sendo trocados durante um rollout.</p>
+
+<p>O <code>minAvailable: 2</code> diz “nunca menos de dois disponíveis”. O cluster calcula quantos pods do
+conjunto estão prontos e subtrai o mínimo: sobram as interrupções permitidas. Com três prontos e mínimo de
+dois, uma interrupção é permitida. Depois do primeiro despejo, o pod novo entra e fica pronto, a conta se
+refaz e outra interrupção é liberada.</p>
+
+<p>Antes de escrever o PDB, porém, o conjunto precisa existir e estar pronto. O orçamento é uma conta sobre
+pods prontos; se você tem duas réplicas e pede mínimo de duas, o número permitido é zero e nenhuma manutenção
+anda. A caixa abaixo começa com duas réplicas e pede três — o estado que o PDB da padaria vai proteger.</p>
+
+<div class="tryk8s" data-goal="pronto:Deployment/cardapio=3;;conta:pods[app=cardapio]=3;;texto:3/3">
+  <p class="try-task">O Deployment está com duas réplicas. Suba para três e rode: o painel tem de mostrar
+  <code>3/3</code> no READY e três pods com <code>app=cardapio</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /saude
+              port: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /saude
+              port: 8080</pre>
+</div>
+
+<p>Duas coisas acontecem quando você muda <code>replicas</code> de 2 para 3: o Deployment cria um ReplicaSet
+novo? Não — mudar só o número de réplicas não mexe no <code>template</code>, então o mesmo ReplicaSet é
+escalado e ganha mais um pod. A etiqueta <code>app: cardapio</code> passa a casar com três pods, e é esse
+conjunto que o PDB vai contar.</p>
+
+<p>A <code>readinessProbe</code> no manifesto é o que o cluster de verdade usa para decidir se um pod está
+“disponível” para a conta do PDB. O painel deste guia não roda container: ele agenda e marca os pods como
+prontos pelo agendamento, e a probe aparece no manifesto e no <code>describe</code>. Vale saber a diferença,
+porque é ela que decide o orçamento num cluster real.</p>
+
+<h2>4. minAvailable e maxUnavailable: o mesmo número, dois lados</h2>
+
+<p>Você escolhe <em>um</em> dos dois campos, nunca os dois. <code>minAvailable</code> olha para o que precisa
+sobrar; <code>maxUnavailable</code> olha para o que pode faltar. Com três réplicas, “mínimo de dois” e “no
+máximo um fora” são a mesma coisa — e o cluster trata os dois como o mesmo cálculo, só que a partir de pontos
+diferentes.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Pergunta que responde</th><th>Com 3 réplicas</th><th>Interrupções permitidas</th></tr>
+</thead>
+<tbody>
+<tr><td><code>minAvailable: 2</code></td><td>quantos precisam ficar de pé</td><td>2 de 3</td><td>1</td></tr>
+<tr><td><code>maxUnavailable: 1</code></td><td>quantos podem sair</td><td>1 de 3</td><td>1</td></tr>
+<tr><td><code>minAvailable: 100%</code></td><td>todos precisam ficar</td><td>3 de 3</td><td>0 — manutenção trava</td></tr>
+<tr><td><code>maxUnavailable: 0</code></td><td>nenhum pode sair</td><td>3 de 3</td><td>0 — manutenção trava</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A linha que trava a manutenção é a mais importante da tabela, e é a que mais gente escreve sem pensar. Um
+orçamento de zero interrupções não deixa o <code>drain</code> terminar: ele fica repetindo a tentativa até
+alguém mudar o PDB ou o número de réplicas. Isso pode ser intencional — um serviço que realmente não pode
+perder ninguém —, mas então a manutenção precisa de outro plano: mais réplicas, um nó reserva, ou aceitar o
+bloqueio com os olhos abertos.</p>
+
+<p>Porcentagens são aceitas nos dois campos, e o arredondamento segue a direção segura: <code>minAvailable:
+50%</code> com três réplicas vira 2 (arredonda para cima, porque prometer menos do que se pediu é pior);
+<code>maxUnavailable: 50%</code> com três réplicas vira 1 (arredonda para baixo, pelo mesmo motivo). O
+resultado é sempre o mais conservador dos dois lados.</p>
+
+<p>Para um serviço com poucas réplicas, prefira números inteiros. “50%” num Deployment que hoje tem 2 e amanhã
+tem 5 significa coisas diferentes a cada dia, e a conta que você fez na cabeça durante o incidente não vale
+mais. Número fixo é previsível; porcentagem é conveniente. Escolha sabendo o que está escolhendo.</p>
+
+<h2>5. O drain que espera</h2>
+
+<p>Antes do despejo, vale ver o tabuleiro. A caixa abaixo cria o Deployment com três réplicas e mostra
+onde cada pod caiu. O agendador espalha: com três nós e três réplicas, é comum um pod por nó — e é essa
+distribuição que faz a manutenção de um nó custar apenas uma réplica.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="conta:pods=3;;texto:guia-worker;;texto:Running">
+  <p class="try-task">Crie o Deployment com três réplicas e use <code>-o wide</code> para ver a coluna NODE.
+  O painel tem de mostrar três pods em <code>Running</code>, um deles no <code>guia-worker</code>.</p>
+<pre class="yaml">kubectl create deployment cardapio --image=cardapio:1.0 --replicas=2
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create deployment cardapio --image=cardapio:1.0 --replicas=2
+deployment.apps/cardapio created
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-pvx6crj8rr-64bgk   1/1     Running   0          3m
+cardapio-pvx6crj8rr-w5m2v   1/1     Running   0          1m
+</pre>
+  <pre class="solucao">kubectl create deployment cardapio --image=cardapio:1.0 --replicas=3
+kubectl get pods -o wide</pre>
+</div>
+
+<p>Se os três pods caírem no mesmo nó, o PDB não ajuda: um <code>drain</code> levaria os três de uma vez e o
+orçamento não teria para onde empurrar ninguém. Espalhar é trabalho do agendador, e ele faz isso por padrão
+quando há espaço — mas nada impede que um nó fique sobrecarregado. Em produção, vale conferir com
+<code>-o wide</code> depois de cada mudança grande de réplicas.</p>
+
+<p>Agora a parte que só aparece num cluster de verdade. O <code>kubectl drain</code> marca o nó como não
+agendável e despeja os pods um a um. Para cada pod, ele pede a eviction; o controlador de disrupção responde
+sim ou não conforme os PDBs que casam com aquele pod. Quando a resposta é não, o comando espera e tenta de
+novo — e a mensagem é esta, copiada de um cluster local de três nós:</p>
+
+<pre class="term">$ kubectl drain guia-worker --ignore-daemonsets --delete-emptydir-data
+node/guia-worker cordoned
+evicting pod default/cardapio-6d8f89b786-88dn9
+evicting pod default/cardapio-6d8f89b786-nxfdg
+error when evicting pods/"cardapio-6d8f89b786-88dn9" -n "default" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/cardapio-6d8f89b786-88dn9 evicted
+node/guia-worker drained</pre>
+
+<p>Leia em ordem. O nó é isolado (<code>cordoned</code>), dois pods são candidatos. O primeiro é recusado com
+<code>Cannot evict pod as it would violate the pod's disruption budget</code> — “não posso despejar: violaria
+o orçamento”. O comando não desiste: tenta de novo em cinco segundos. Nesse intervalo, o cluster reagenda o
+pod em outro nó e o pod novo fica pronto; a conta refaz e o despejo passa. No fim, <code>drained</code>.</p>
+
+<p>O detalhe que a Ana precisava entender: o <code>drain</code> não falha de uma vez, ele <em>espera</em>. Se
+o pod novo não ficar pronto — imagem errada, probe falhando, nó sem espaço —, o comando fica ali para sempre,
+repetindo a mensagem. É um dos travamentos mais comuns em manutenção, e a causa quase nunca está no PDB: está
+no pod que não sobe.</p>
+
+<p>Do outro lado, o PDB mostra o que está valendo. Esta é a saída real do <code>kubectl get pdb</code> e do
+<code>describe</code>, do mesmo cluster de prova:</p>
+
+<pre class="term">$ kubectl get pdb
+NAME       MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+cardapio   2               N/A               1                     12s
+
+$ kubectl describe pdb cardapio
+Name:           cardapio
+Namespace:      default
+Min available:  2
+Selector:       app=cardapio
+Status:
+    Allowed disruptions:  1
+    Current:              3
+    Desired:              3
+    Total:                3
+Events:            &lt;none&gt;</pre>
+
+<p><code>ALLOWED DISRUPTIONS</code> é o número que decide a manutenção. Ele é recalculado o tempo todo:
+<code>Current</code> menos <code>Min available</code>, limitado por <code>Total</code>. Com três pods prontos e
+mínimo de dois, sobra um. Se um pod ficar <code>0/1</code> por causa de uma probe, <code>Allowed
+disruptions</code> vira zero e a manutenção trava — mesmo com o PDB “certo”.</p>
+
+<h2>6. Os quatro jeitos de um PDB não proteger nada</h2>
+
+<p>Um PDB mal escrito é pior do que nenhum, porque dá a sensação de proteção. Os quatro tropeços abaixo
+explicam quase todos os casos em que alguém jura que configurou e o serviço caiu.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que está errado</th><th>Como aparece</th><th>O conserto</th></tr>
+</thead>
+<tbody>
+<tr><td><code>selector</code> não casa com os pods</td><td><code>ALLOWED DISRUPTIONS</code> alto e nenhum pod
+protegido</td><td>copiar a etiqueta exata do <code>template</code></td></tr>
+<tr><td>PDB em outro namespace</td><td>o PDB existe, mas não vê os pods</td><td>criar no mesmo namespace do
+workload</td></tr>
+<tr><td>pods não ficam prontos</td><td>orçamento em zero e manutenção travada</td><td>conferir probe, imagem e
+recursos antes do drain</td></tr>
+<tr><td><code>minAvailable</code> igual ao total</td><td>zero interrupções para sempre</td><td>deixar uma folga
+ou aumentar réplicas</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O primeiro é traiçoeiro por parecer certo. O PDB usa <code>matchLabels</code>; se o Deployment tem
+<code>app: cardapio</code> e <code>tier: web</code>, um seletor só com <code>app</code> casa; um seletor com
+<code>app: cardapio-web</code> não casa com ninguém, e o PDB fica protegendo o vazio. Nada no cluster reclama:
+PDB sem pods é um objeto válido.</p>
+
+<p>O segundo é de organização: PDB é recurso de namespace. Um PDB no <code>default</code> não enxerga pods da
+<code>padaria</code>, mesmo que as etiquetas sejam idênticas. Em times que usam um namespace por ambiente, esse
+erro aparece quando alguém copia o YAML e esquece o <code>-n</code>.</p>
+
+<p>Os dois últimos são de conta, não de sintaxe. Um PDB protege <em>pods prontos</em>; se a probe está
+falhando ou a imagem está errada, não há o que proteger, e o orçamento fica em zero para sempre. E
+<code>minAvailable</code> igual ao total de réplicas é o mesmo que proibir manutenção: o cluster obedece e não
+deixa ninguém sair.</p>
+
+<h2>7. PDB e rollout: dois guardas diferentes</h2>
+
+<p>Aqui está a confusão que custa um plantão. O PDB protege contra <em>despejo</em>. Um rollout não despeja
+nada: o Deployment sobe pods novos, espera ficarem prontos e só então derruba os antigos, seguindo o
+<code>maxUnavailable</code> e o <code>maxSurge</code> da estratégia. O PDB não bloqueia rollout, e o
+<code>maxUnavailable</code> do Deployment não bloqueia drain. São dois guardas, cada um na sua porta.</p>
+
+<p>Isso significa que você precisa dos dois. O PDB cuida da manutenção; o <code>maxUnavailable</code> cuida da
+publicação. Se o Deployment publica com <code>maxUnavailable: 1</code> e o PDB pede dois de três, um rollout
+ruim ainda pode deixar o serviço com duas réplicas — abaixo do que o PDB promete, porque o PDB não foi
+consultado.</p>
+
+<p>A caixa abaixo ajusta o lado do rollout. Ela começa com o padrão de 25% e pede uma troca sem perder
+ninguém: <code>maxUnavailable: 0</code> com <code>maxSurge: 1</code> — um pod extra sobe, fica pronto, e só
+então um antigo sai. O Deployment termina com três prontos porque o <code>maxSurge</code> dá espaço para o
+pod novo antes de qualquer saída.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/cardapio|spec.strategy.rollingUpdate.maxUnavailable=0;;campo:Deployment/cardapio|spec.strategy.rollingUpdate.maxSurge=1;;pronto:Deployment/cardapio=3">
+  <p class="try-task">O Deployment está com a estratégia padrão. Acrescente
+  <code>strategy.rollingUpdate</code> com <code>maxUnavailable: 0</code> e <code>maxSurge: 1</code>, e rode:
+  os três pods têm de continuar prontos.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   3/3     3            3           2m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>O painel mostra <code>3/3</code> e o Deployment com a estratégia nova. Repare que este manifesto não tem
+PDB nenhum: o <code>maxUnavailable: 0</code> é do Deployment, e vale só para o momento em que ele troca pods.
+Se amanhã a Ana esvaziar um nó, quem responde é o PDB — e se ele não existir, o <code>drain</code> tira os pods
+sem perguntar.</p>
+
+<p>Um detalhe de conta que confunde: <code>maxUnavailable: 0</code> e <code>maxSurge: 0</code> ao mesmo tempo é
+uma combinação proibida pelo cluster real, porque não sobra espaço para nada. O painel deste guia não valida
+essa regra, então guarde: se um dos dois for zero, o outro precisa ser maior que zero.</p>
+
+<h2>8. O que o painel mostra (e o que ele não mostra)</h2>
+
+<p>O motor deste guia conhece os tipos que aparecem nas aulas: pods, Deployments, ReplicaSets, Services,
+ConfigMaps, Secrets, Jobs, StatefulSets, HPA, Ingress, Namespaces, nós e eventos. Ele <em>não</em> registra
+<code>policy/v1</code>: se você colar um PDB na caixa, a resposta é
+<code>no kind is registered for this resource</code>, e <code>kubectl get pdb</code> devolve
+<code>the server doesn't have a resource type "pdb"</code>. Não é erro do seu manifesto — é o limite do
+simulador, e é por isso que os PDBs desta aula aparecem em <code>pre.file</code> e em transcrições de um
+cluster de prova.</p>
+
+<p>O que o painel faz bem, e por isso as caixas acima existem: ele agenda de verdade, espalha pods entre os
+três nós, calcula prontos e recria pods quando um rollout acontece. É esse lado — o conjunto de pods que o
+orçamento conta — que dá para praticar aqui. O que ele não tem é o controlador de disrupção, o pedaço que
+responde sim ou não ao despejo.</p>
+
+<p>Se você quiser ver o PDB funcionando de verdade no seu computador, o caminho é criar um cluster kind com
+três nós, aplicar o Deployment e o PDB, e rodar <code>kubectl drain</code> num nó com
+<code>--ignore-daemonsets --delete-emptydir-data</code>. A mensagem
+<code>Cannot evict pod as it would violate the pod's disruption budget</code> aparece exatamente como no
+terminal acima. É uma das experiências mais instrutivas do Kubernetes, porque o comando fica visivelmente
+esperando.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o PDB estava lá, mas o service caiu</h3>
+<p>A Ana configurou <code>minAvailable: 1</code> num serviço de três réplicas e achou que estava protegida. O
+cluster caiu inteiro por falta de energia, e o PDB não teve papel nenhum: queda de nó é interrupção
+involuntária. O orçamento só vale para despejo voluntário — para sobreviver a queda de nó, o que conta é ter
+réplicas em nós diferentes e um Service com endpoints saudáveis.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o drain ficou parado a noite inteira</h3>
+<p>O comando <code>drain</code> repetia a mensagem de violação de orçamento a cada cinco segundos. O PDB pedia
+dois de três, mas um pod estava <code>0/1</code> por uma probe errada, então o permitido era zero. O conserto
+não foi no PDB: era a probe. Antes de culpar o orçamento, olhe <code>kubectl get pods</code> e veja se os três
+estão prontos de verdade.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o PDB que protegia o namespace errado</h3>
+<p>O time copiou o PDB para o ambiente de teste e esqueceu o <code>namespace</code>. O objeto foi criado no
+<code>default</code>, os pods estavam em <code>padaria</code>, e o seletor não casou com ninguém. O
+<code>describe</code> mostrava <code>Current: 0</code> e <code>Allowed disruptions: 0</code> — um PDB que
+parece configurado e não enxerga nada. Sempre confira o namespace ao copiar YAML.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o PodDisruptionBudget protege?</p>
+<label><input type="radio" name="q1"> qualquer pod, contra qualquer tipo de queda</label>
+<label><input type="radio" name="q1"> pods contra despejo voluntário, como o de um <code>drain</code></label>
+<label><input type="radio" name="q1"> o nó contra falha de hardware</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Com três réplicas prontas e <code>minAvailable: 2</code>,
+quantas interrupções o cluster permite?</p>
+<label><input type="radio" name="q2"> três</label>
+<label><input type="radio" name="q2"> nenhuma</label>
+<label><input type="radio" name="q2"> uma</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Quem impede um rollout de deixar o serviço sem réplicas?</p>
+<label><input type="radio" name="q3"> o <code>maxUnavailable</code> da estratégia do Deployment</label>
+<label><input type="radio" name="q3"> o PDB, que também bloqueia rollout</label>
+<label><input type="radio" name="q3"> o <code>restartPolicy</code> dos pods</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o orçamento da vitrine</h2>
+<p>Complete o PDB que garante pelo menos duas réplicas de pé num serviço com três, casando a etiqueta
+<code>app: cardapio</code>.</p>
+<div class="ex-code">apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cardapio
+spec:
+  <input aria-label="resposta 1" data-answer="minAvailable" placeholder="...">: 2
+  selector:
+    matchLabels:
+      app: cardapio</div>
+<p class="ex-dica">Dica: o campo que olha para o que precisa <em>sobrar</em>; o outro olha para o que pode
+faltar.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>PodDisruptionBudget é um orçamento de indisponibilidade para interrupções voluntárias. Ele mora em
+<code>policy/v1</code>, escolhe pods por <code>selector</code> no mesmo namespace e declara
+<code>minAvailable</code> ou <code>maxUnavailable</code> — nunca os dois. O cluster calcula
+<code>Allowed disruptions</code> a partir dos pods prontos e recusa o despejo quando a conta não fecha.</p>
+
+<p>O orçamento não é proteção contra falha: queda de nó, OOM e <code>kubectl delete pod</code> passam por
+fora. Ele não substitui o <code>maxUnavailable</code> do Deployment, que cuida do rollout; são dois guardas
+com portas diferentes. E um PDB com seletor errado, namespace errado ou mínimo igual ao total não protege
+nada — ou trava a manutenção para sempre.</p>
+
+<p>Na prática: garanta réplicas prontas, escreva o PDB com o mesmo rótulo do <code>template</code>, deixe uma
+folga de pelo menos uma réplica e teste com <code>drain</code> num cluster de verdade. O sinal de que está
+funcionando é o comando esperar em vez de seguir em frente.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>PDB vale para despejo voluntário; queda de nó é involuntária e passa por fora.</li>
+  <li><code>policy/v1</code>, <code>selector</code> por etiquetas e <code>minAvailable</code> ou
+  <code>maxUnavailable</code>.</li>
+  <li><code>Allowed disruptions</code> = pods prontos − mínimo. Ele muda a cada pod que sobe ou cai.</li>
+  <li>Mínimo igual ao total (ou máximo zero) trava a manutenção de propósito.</li>
+  <li><code>drain</code> espera e tenta de novo; se o pod novo não fica pronto, ele não termina.</li>
+  <li>Rollout é do Deployment (<code>maxUnavailable</code>/<code>maxSurge</code>), não do PDB.</li>
+  <li>Seletor e namespace errados deixam o PDB protegendo o vazio.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

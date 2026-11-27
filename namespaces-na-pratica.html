@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Namespaces na prática | Guia Kubernetes</title>
+<meta name="description" content="Namespaces na prática: criar antes de usar, o -n em todo comando, apagar sem levar o banco junto, o namespace no manifesto e como evitar o objeto no lugar errado.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Namespaces na <span class="hl">prática</span></h1>
+<p class="intro">A Ana já entendeu o conceito: namespace é a pasta lógica do cluster, e dois objetos com o
+mesmo nome convivem se estiverem em pastas diferentes. O que ela precisa agora é do dia a dia — criar a pasta
+antes de usar, não esquecer o <code>-n</code> na metade dos comandos, apagar sem levar o banco junto, e saber
+qual das três formas de escolher o namespace está valendo no comando que ela acabou de digitar. Nesta aula a
+padaria abre a filial, e o cluster responde a cada passo.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Criar o namespace antes do primeiro objeto — e o erro exato de quem esquece.</li>
+  <li>O <code>-n</code> em cada comando, e o que acontece quando ele falta.</li>
+  <li>Apagar namespace: o que leva junto e por que limpar antes é hábito.</li>
+  <li>O namespace escrito no manifesto e a diferença entre ele e a flag.</li>
+  <li>O nome completo de um Service visto de outro namespace.</li>
+  <li>O namespace corrente do contexto e o script que não depende dele.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a filial da padaria</h2>
+
+<p>O site da Ana cresceu. Além da loja do centro, ela abriu uma filial e quer testar mudanças de cardápio
+sem mexer no que os clientes veem. O plano é simples: o mesmo Deployment, a mesma imagem, o mesmo Service —
+um em <code>producao</code>, outro em <code>teste</code>. Duas cópias do mesmo manifesto, dois namespaces,
+zero chance de um experimento derrubar a loja.</p>
+
+<p>No papel é fácil. Na prática, a Ana passou a tarde de ontem fazendo três coisas erradas em sequência:
+criou o objeto antes do namespace (e leu um erro que parecia do objeto), rodou <code>kubectl get pods</code>
+sem <code>-n</code> e concluiu que o pod tinha sumido, e apagou o namespace <code>teste</code> levando junto
+um banco de ensaio que ela nem lembrava que estava lá. Nenhuma das três coisas foi falta de conceito. Foram
+falhas de <em>prática</em>, e é isso que esta aula arruma.</p>
+
+<p>Vale guardar a imagem certa: namespace não é uma partição nem uma máquina separada. Tudo continua no
+mesmo cluster, nos mesmos nós, na mesma rede. O namespace separa <em>nomes</em>, e é isso que permite o
+mesmo <code>cardapio</code> existir duas vezes. Quem separa rede é NetworkPolicy; quem separa recurso é
+cota; quem separa cluster é outro cluster. Namespace separa o espaço de nomes — e, por consequência, o
+lugar onde você procura as coisas.</p>
+
+<h2>2. As três formas de escolher o namespace</h2>
+
+<p>Antes dos comandos, é preciso saber <em>quem manda</em>. Um objeto pode receber namespace de três
+lugares, e quando dois deles discordam um vence. O vocabulário:</p>
+
+<dl class="anatomy">
+<dt>namespace</dt>
+<dd>A divisão lógica onde o objeto mora. É um objeto do cluster como outro qualquer: tem nome e idade, e
+pode ser listado com <code>kubectl get namespaces</code>.</dd>
+<dt>metadata.namespace</dt>
+<dd>O campo do manifesto que diz onde o objeto deve nascer. Quando existe, é ele que vale — o
+<code>-n</code> vira só o padrão para quem não tem o campo.</dd>
+<dt>-n / --namespace</dt>
+<dd>A flag do comando. Escolhe em qual namespace o kubectl vai <em>procurar</em> ou <em>criar</em>. Sem
+ela, o kubectl usa o namespace corrente do contexto.</dd>
+<dt>namespace corrente</dt>
+<dd>O valor guardado no contexto do kubeconfig. É o que aparece quando você não escreve nem
+<code>-n</code> nem <code>metadata.namespace</code>. Nasce como <code>default</code>.</dd>
+<dt>escopo</dt>
+<dd>Se o tipo de objeto vive em namespace ou não. Pod, Deployment, Service e ConfigMap vivem; Node,
+Namespace e PersistentVolume não.</dd>
+</dl>
+
+<p>A regra prática que resolve 90% dos casos: <strong>no manifesto, escreva o namespace; no terminal, escreva
+o <code>-n</code></strong>. O manifesto é o que fica guardado e viaja; o <code>-n</code> é o que você lê na
+tela e confere na hora. Quando os dois discordam, o manifesto ganha — e é por isso que um arquivo copiado de
+outro projeto pode criar o objeto “no lugar errado” mesmo com <code>-n</code> na linha de comando.</p>
+
+<h2>3. Criar antes de usar: o erro de ordem</h2>
+
+<p>O cluster não cria namespace por você. Se o comando aponta para uma pasta que não existe, ele recusa o
+objeto inteiro — e a mensagem fala do namespace, não do pod. A caixa abaixo começa exatamente assim.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:namespace/padaria created;;texto:pod/cardapio created;;texto:Running">
+  <p class="try-task">O pod é criado no namespace <code>padaria</code>, que ainda não existe. Comece criando
+  o namespace, repita o <code>run</code> e termine listando com <code>-n padaria</code> para ver o pod em
+  <code>Running</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0 -n padaria
+kubectl get pods -n padaria</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0 -n padaria
+Error from server (NotFound): error when creating "STDIN": namespaces "padaria" not found
+
+ana@notebook:~$ kubectl get pods -n padaria
+No resources found in padaria namespace.
+</pre>
+<pre class="solucao">kubectl create namespace padaria
+kubectl run cardapio --image=cardapio:1.0 -n padaria
+kubectl get pods -n padaria</pre>
+</div>
+
+<p>O painel mostra a recusa: <code>Error from server (NotFound): error when creating "STDIN": namespaces
+"padaria" not found</code>. Três informações numa frase. O <code>NotFound</code> é o tipo do erro. O
+<code>namespaces "padaria" not found</code> é o que faltou. E o <code>STDIN</code> aparece porque o objeto veio
+de um comando, não de um arquivo — com <code>apply -f</code>, ali estaria o nome do seu YAML, o que ajuda a
+saber qual dos arquivos da pasta estava errado.</p>
+
+<p>Depois do <code>create</code>, as duas linhas seguintes funcionam e o painel mostra o pod em
+<code>Running</code>. Repare que a listagem também leva <code>-n padaria</code>: sem ela, o comando olharia o
+<code>default</code> e responderia <code>No resources found in default namespace.</code> — verdade, mas não a
+verdade que a Ana queria ver.</p>
+
+<h2>4. O <code>-n</code> que falta não dá erro</h2>
+
+<p>Este é o engano mais caro do tema, porque não produz mensagem vermelha. Você cria num namespace, lista em
+outro, e recebe uma lista vazia — que o kubectl apresenta com a maior tranquilidade do mundo. Não é falha, é
+uma pergunta feita no lugar errado. A tabela abaixo é a cola que vale colar no monitor:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Comando</th><th>Sem <code>-n</code>, olha…</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kubectl get pods</code></td><td>o namespace corrente (<code>default</code>)</td><td><code>-n padaria</code> para ver os da padaria; <code>-n teste</code> para os do teste</td></tr>
+<tr><td><code>kubectl run</code>, <code>create</code>, <code>expose</code></td><td>cria no namespace corrente</td><td>passe <code>-n</code> em cada linha; conferir depois com <code>get … -n</code></td></tr>
+<tr><td><code>kubectl delete</code>, <code>logs</code>, <code>describe</code></td><td>procura só no namespace corrente</td><td>o mesmo <code>-n</code>; objeto “inexistente” quase sempre está em outro lugar</td></tr>
+<tr><td><code>kubectl get nodes</code></td><td>não aceita <code>-n</code>: nó não mora em namespace</td><td>nada a fazer — o escopo é do tipo, não do comando</td></tr>
+<tr><td><code>kubectl get ns</code></td><td>lista todos os namespaces</td><td>é o primeiro comando quando aparece <code>NotFound</code> de namespace</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A linha do <code>nodes</code> explica metade dos comandos que “não funcionam”: o <code>-n</code> só faz
+sentido para tipo que vive em namespace. E a do <code>delete</code> merece atenção redobrada, porque é a
+única que pode apagar a coisa errada — <code>kubectl delete deployment cardapio</code> sem <code>-n</code>
+apaga o do <code>default</code>, e a Ana já fez isso achando que estava limpando o teste.</p>
+
+<p>Sobre listar tudo de uma vez: o kubectl de verdade aceita <code>-A</code> (ou
+<code>--all-namespaces</code>) e devolve uma coluna <code>NAMESPACE</code> na frente. No painel deste guia a
+listagem é sempre a do namespace corrente, então o caminho é conferir um por um com <code>-n</code>. É mais
+devagar e ensina melhor: quem lista por namespace vê o que está em cada um.</p>
+
+<h2>5. Apagar um namespace: o comando que leva tudo</h2>
+
+<p>Apagar namespace é o comando mais perigoso do Nível 1. Ele não pede confirmação, não lista o que vai
+levar, e responde com uma linha curta. Em cluster de verdade, tudo o que está dentro vai junto — pods,
+deployments, services, configmaps, secrets e os discos pedidos por PersistentVolumeClaim daquele namespace. A
+transcrição abaixo é de um cluster real:</p>
+
+<pre class="term">ana@notebook:~$ kubectl delete namespace teste
+namespace "teste" deleted
+
+ana@notebook:~$ kubectl get pods -n teste
+No resources found in teste namespace.
+
+ana@notebook:~$ kubectl get namespaces
+NAME          STATUS   AGE
+default       Active   9d
+kube-system   Active   9d
+producao      Active   3d</pre>
+
+<p>O <code>No resources found in teste namespace.</code> depois do delete é a prova de que não sobrou nada:
+nem o namespace, nem os pods. Enquanto o cluster termina de apagar, o namespace aparece com
+<code>STATUS</code> igual a <code>Terminating</code> — pode levar minutos se houver volume preso. Nesse
+estado não dá para criar nada nele; a saída é esperar ou investigar o que está segurando.</p>
+
+<p>O hábito que salva: <strong>limpar antes de apagar</strong>. Listar o que existe no namespace, tipo por
+tipo, e decidir conscientemente o que vai embora. A caixa abaixo treina exatamente isso — o pod sai primeiro,
+o namespace depois. Detalhe do painel: ele apaga o objeto Namespace mas não o conteúdo dele, então a meta só
+fecha quando o pod é apagado antes; é o mesmo procedimento que se recomenda num cluster de verdade, onde o
+delete do namespace levaria tudo de uma vez.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:pod/cardapio deleted;;texto:namespace/teste deleted;;texto:No resources found in teste namespace.">
+  <p class="try-task">O namespace <code>teste</code> é descartável, mas ainda tem um pod dentro. Apague o pod
+  e depois o namespace, e confirme no fim que a listagem está vazia.</p>
+<pre class="yaml">kubectl create namespace teste
+kubectl run cardapio --image=cardapio:1.0 -n teste
+kubectl delete namespace teste
+kubectl get pods -n teste</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create namespace teste
+namespace/teste created
+
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0 -n teste
+pod/cardapio created
+
+ana@notebook:~$ kubectl delete namespace teste
+namespace/teste deleted
+
+ana@notebook:~$ kubectl get pods -n teste
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          1m
+</pre>
+<pre class="solucao">kubectl create namespace teste
+kubectl run cardapio --image=cardapio:1.0 -n teste
+kubectl delete pod cardapio -n teste
+kubectl delete namespace teste
+kubectl get pods -n teste</pre>
+</div>
+
+<p>Repare na diferença das respostas: <code>pod/cardapio deleted</code> e
+<code>namespace/teste deleted</code>. Mesmo formato, escopos diferentes. E repare no que a listagem final diz:
+<code>No resources found in teste namespace.</code> — a frase que, no começo da aula, era sinal de confusão,
+aqui é sinal de trabalho bem feito.</p>
+
+<h2>6. O namespace escrito no manifesto</h2>
+
+<p>Quando o time guarda tudo em arquivo, o namespace vira uma linha do YAML — e é comum precisar de dois
+objetos no mesmo arquivo: o namespace e o que vai dentro dele. Multi-documento resolve isso com
+<code>---</code> entre os blocos, e a ordem importa: o namespace tem de vir primeiro, porque o
+<code>apply</code> aplica na ordem em que lê.</p>
+
+<div class="tryk8s" data-goal="texto:namespace/padaria created;;texto:deployment.apps/cardapio created;;texto:Running" data-get="pods -n padaria">
+  <p class="try-task">O Deployment aponta para o namespace <code>padaria</code>, que ainda não existe no
+  arquivo. Acrescente o objeto <code>Namespace</code> no começo, separado por <code>---</code>, e rode.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  namespace: padaria
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+Error from server (NotFound): error when creating "STDIN": namespaces "padaria" not found
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  namespace: padaria
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Sem o primeiro documento, o painel responde <code>Error from server (NotFound): error when creating
+"STDIN": namespaces "padaria" not found</code> — a mesma frase da seção 3, agora causada por um arquivo e não
+por um comando. Com ele, as duas linhas de criação aparecem e a listagem no fim mostra os dois pods em
+<code>Running</code>, direto no namespace <code>padaria</code>.</p>
+
+<p>Aqui vale a comparação das três formas de escolher o namespace, porque cada uma tem um custo:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Forma</th><th>Onde fica</th><th>Quando usar</th><th>Risco</th></tr>
+</thead>
+<tbody>
+<tr><td><code>metadata.namespace</code></td><td>no manifesto, versionado</td><td>o que precisa cair sempre no mesmo lugar</td><td>copiar o arquivo para outro ambiente e esquecer de trocar</td></tr>
+<tr><td><code>-n nome</code></td><td>na linha do comando</td><td>explorar, conferir, apagar um objeto específico</td><td>esquecer em uma linha e agir no namespace errado</td></tr>
+<tr><td>namespace do contexto</td><td>no kubeconfig da máquina</td><td>sessão inteira trabalhando num ambiente só</td><td>ninguém que lê o histórico sabe onde o comando agiu</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A recomendação que fecha a seção: manifesto com namespace explícito, <code>-n</code> no terminal, e
+contexto no <code>default</code>. Assim o comando perigoso é sempre explícito, e o arquivo é sempre
+reproduzível.</p>
+
+<h2>7. O nome completo de um Service entre namespaces</h2>
+
+<p>Dentro do mesmo namespace, um pod chama o outro pelo nome curto do Service: <code>http://cardapio</code>.
+Fora dele, o nome curto não resolve — e o erro que aparece é de DNS, não de Service: “não achei esse nome”.
+O endereço completo tem três partes, e a ordem é do mais específico para o mais geral:
+<code>cardapio.padaria.svc.cluster.local</code> é “o Service <code>cardapio</code>, no namespace
+<code>padaria</code>, na zona <code>svc</code>, do cluster local”.</p>
+
+<p>Duas abreviações funcionam: <code>cardapio.padaria</code> (o cluster completa o resto) e, de dentro do
+próprio namespace, só <code>cardapio</code>. O que não funciona é <code>padaria/cardapio</code> — não existe
+barra em nome de Service; a barra é do kubectl, não do DNS. Guarde também que o endereço aponta para o
+Service, nunca para o pod: o IP do pod muda a cada reinício, o nome do Service não.</p>
+
+<p>É por isso que a arquitetura da Ana separa o que é “interno de um ambiente” do que é “compartilhado”. O
+banco de dados mora em <code>producao</code> e ninguém de <code>teste</code> chega nele por acidente: para
+chegar, alguém precisa escrever o nome completo, com namespace, de propósito. O nome comprido é uma cerca
+barata.</p>
+
+<h2>8. O namespace corrente do contexto</h2>
+
+<p>A terceira forma de escolher o namespace é a mais confortável e a mais traiçoeira: mudar o padrão do
+contexto. A partir daí, todo comando sem <code>-n</code> age naquele namespace, como se você tivesse digitado
+a flag em cada linha. A transcrição é de um cluster real:</p>
+
+<pre class="term">ana@notebook:~$ kubectl config set-context --current --namespace=padaria
+Context "kind-guia" modified.
+
+ana@notebook:~$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          3m
+
+ana@notebook:~$ kubectl config set-context --current --namespace=default
+Context "kind-guia" modified.</pre>
+
+<p>Repare que não há confirmação nem aviso: o comando imprime <code>Context "kind-guia" modified.</code> e
+muda o padrão da sua sessão. Quem entra depois na mesma máquina herda o contexto e passa a ver o cluster pela
+lente de outro namespace. Se um dia <code>kubectl get pods</code> devolver algo inesperado, esse comando é o
+primeiro suspeito — e a cura é voltar para <code>default</code> explicitamente.</p>
+
+<p>Em script, o padrão é não depender de contexto nenhum. Guarde o namespace numa variável e passe sempre ela:
+<code>NS=padaria</code> e depois <code>kubectl get pods -n "$NS"</code>, <code>kubectl logs cardapio -n
+"$NS"</code>, <code>kubectl delete pod cardapio -n "$NS"</code>. Mudar de ambiente vira uma linha; e quem lê
+o script enxerga o alvo de cada comando sem precisar adivinhar o contexto de quem executou.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: “o pod sumiu”</h3>
+<p>O pod estava lá, rodando há quarenta minutos. A Ana rodou <code>kubectl get pods</code> no
+<code>default</code> e viu a lista vazia. Antes de reiniciar qualquer coisa, o comando certo é
+<code>kubectl get pods -n padaria</code> — e, na dúvida, <code>kubectl get ns</code> para lembrar quais
+pastas existem. Lista vazia não é objeto inexistente; é busca no lugar errado.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o apply que caiu no default</h3>
+<p>O manifesto não tinha <code>namespace</code> e o comando foi rodado sem <code>-n</code>. O Deployment
+nasceu no <code>default</code>, o Service que deveria apontar para ele não o encontrou (estava em
+<code>padaria</code>) e o site ficou fora do ar. O conserto: escrever <code>metadata.namespace</code> no
+arquivo, apagar o objeto criado no lugar errado e aplicar de novo. Manifesto sem namespace é uma bomba de
+tempo em cluster com mais de uma pasta.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a limpeza que levou o banco de ensaio</h3>
+<p>Alguém apagou o namespace <code>teste</code> para “começar limpo”, e com ele foi o banco que o time usava
+para ensaiar migração. Não houve confirmação nem lista do que seria apagado. A regra que entrou no README:
+antes de apagar um namespace, listar o conteúdo por tipo — <code>pods</code>, <code>deployments</code>,
+<code>services</code>, <code>configmaps</code>, <code>persistentvolumeclaims</code> — e responder por escrito
+o que pode ir embora.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O comando <code>kubectl get pods</code> sem
+<code>-n</code> lista:</p>
+<label><input type="radio" name="q1"> os pods de todos os namespaces</label>
+<label><input type="radio" name="q1"> apenas os pods do <code>kube-system</code></label>
+<label><input type="radio" name="q1"> apenas os pods do namespace corrente</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O manifesto tem <code>metadata.namespace: padaria</code> e
+o comando foi <code>kubectl apply -f cardapio.yaml</code>, sem <code>-n</code>. O objeto vai para:</p>
+<label><input type="radio" name="q2"> <code>padaria</code>, porque o campo do manifesto manda</label>
+<label><input type="radio" name="q2"> <code>default</code>, porque não houve <code>-n</code></label>
+<label><input type="radio" name="q2"> os dois, em espelho</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. <code>kubectl delete namespace teste</code> num cluster de
+verdade:</p>
+<label><input type="radio" name="q3"> apaga só o objeto Namespace e deixa o conteúdo</label>
+<label><input type="radio" name="q3"> apaga o namespace e tudo o que está dentro dele</label>
+<label><input type="radio" name="q3"> pede confirmação com a lista do que será apagado</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o manifesto que não diz onde mora</h2>
+<p>Um Deployment precisa nascer sempre no namespace <code>padaria</code>, mesmo que quem aplique esteja com
+outro contexto. Complete o campo do manifesto que garante isso:</p>
+<div class="ex-code">metadata:
+  name: cardapio
+  <input aria-label="resposta 1" data-answer="namespace" placeholder="...">: padaria</div>
+<p class="ex-dica">Dica: a flag <code>-n</code> vale para um comando; o campo do manifesto vale para sempre.
+Quando os dois discordam, quem manda é o manifesto. O valor tem de ser minúsculo, com hífen se precisar, e o
+namespace precisa existir antes.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Namespace é a pasta lógica do cluster, e o dia a dia é feito de três decisões: onde o objeto nasce (o
+campo <code>metadata.namespace</code>, que vence), onde o comando procura (a flag <code>-n</code>) e qual é o
+padrão da sessão (o namespace do contexto, que você quase nunca deve mudar). Criar o namespace vem antes de
+criar o objeto; sem ele, a resposta é <code>Error from server (NotFound): namespaces "x" not found</code>, e
+nada é criado pela metade.</p>
+
+<p>Lista vazia não é erro: <code>No resources found in default namespace.</code> quer dizer que a busca foi
+feita ali. Confira com <code>-n</code> antes de concluir que o objeto sumiu. E lembre que nó, namespace e
+volume não moram em namespace — o <code>-n</code> nesses tipos não faz sentido.</p>
+
+<p>Apagar namespace leva tudo o que está dentro, sem confirmação e sem lista: limpe antes, listando por tipo.
+Entre namespaces, o Service só responde pelo nome completo (<code>cardapio.padaria.svc.cluster.local</code>),
+e em script o certo é passar o namespace por variável, sem depender do contexto. Na próxima aula a Ana aprende
+a ler o que o kubectl devolve — tabela, YAML, JSON — e a escolher o formato certo para cada pergunta, na
+aula de <a href="kubectl-output.html">saída do kubectl</a>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+<li><code>kubectl create namespace padaria</code> antes de qualquer objeto; sem isso, <code>NotFound</code>
+de namespace.</li>
+<li><code>-n</code> em todo comando; sem ele, o alvo é o namespace corrente, e a lista vazia engana.</li>
+<li><code>metadata.namespace</code> manda no manifesto; <code>-n</code> só preenche o que falta.</li>
+<li><code>delete namespace</code> leva o conteúdo inteiro: limpe antes, listando por tipo.</li>
+<li>Nome completo entre namespaces: <code>servico.namespace.svc.cluster.local</code>.</li>
+<li>Script com <code>NS=padaria</code> e <code>-n "$NS"</code> em todas as linhas: sem surpresa de
+contexto.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

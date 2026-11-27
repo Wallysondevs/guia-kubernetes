@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cluster, node e pod | Guia Kubernetes</title>
+<meta name="description" content="A hierarquia do Kubernetes explicada com a padaria: o cluster é o conjunto, o node é a máquina e o pod é o pacote que roda — com os comandos que mostram cada um.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Cluster, <span class="hl">node</span> e pod</h1>
+<p class="intro">Na aula passada a Ana entregou o primeiro pedido ao Kubernetes e viu um pod nascer. Mas
+onde esse pod nasceu, exatamente? Dentro de qual computador? Quem escolheu? Essas perguntas têm três
+respostas encaixadas uma na outra: o pod mora num nó, e os nós formam o cluster. Nesta aula a Ana abre cada
+caixa: vê as máquinas que compõem o cluster, descobre em qual delas o pod caiu, olha o endereço de rede que
+o pod ganhou e põe dois containers no mesmo pacote para entender o que é — e o que não é — um pod.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um cluster e o que significa “estar conectado” a um.</li>
+  <li>O que é um nó, quais papéis ele pode ter e o que roda dentro dele.</li>
+  <li>O que é um pod, na prática: rede própria, IP próprio, um ou mais containers.</li>
+  <li>Como ver os nós, o nó do pod e o IP do pod com o kubectl.</li>
+  <li>Por que <code>READY 2/2</code> quer dizer dois containers, não dois pods.</li>
+  <li>Onde o painel deste guia é simplificado, para você não se enganar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a padaria virou três máquinas</h2>
+
+<p>No começo era um notebook. O site rodava ali, e o Kubernetes também podia rodar ali, num cluster de
+estudo. Depois a padaria cresceu: entrou o sistema de encomendas, entrou o painel do fornecedor, entrou o
+cronômetro do forno. Rodar tudo num computador só passou a ser arriscado — se ele cai, cai tudo. A solução
+natural é espalhar: uma máquina para o site, outra para as encomendas, outra de reserva.</p>
+
+<p>Só que espalhar traz o problema de sempre: quem decide o que vai onde? Quem percebe que uma máquina
+morreu? Quem recoloca o que estava nela? O Kubernetes resolve isso juntando as máquinas num conjunto único,
+com um endereço só, e tratando o conjunto como se fosse uma coisa. Esse conjunto é o
+<strong>cluster</strong>. Para o seu <code>kubectl</code>, não existem “três servidores”: existe um cluster,
+e você pede para ele.</p>
+
+<p>Dentro do cluster, cada máquina é um <strong>nó</strong>. E o que o cluster coloca em cima de um nó nunca
+é “um programa solto”: é um <strong>pod</strong>. Três palavras, três escalas. Pense no cluster como a
+padaria inteira, no nó como uma das cozinhas e no pod como a bandeja que sai do forno para um pedido — a
+cozinha pode ter várias bandejas, e a bandeja não escolhe em qual cozinha vai.</p>
+
+<h2>2. Cluster: um endereço, um contexto</h2>
+
+<p>Do lado de fora, um cluster é basicamente um endereço de API e uma credencial. O <code>kubectl</code>
+guarda isso num arquivo de configuração, o <code>~/.kube/config</code>, e organiza em
+<strong>contextos</strong>: cada contexto diz “para este endereço, com esta credencial, neste namespace”. Quando
+você tem mais de um cluster — o de estudo e o da empresa, por exemplo —, trocar de um para o outro é trocar
+de contexto.</p>
+
+<pre class="term">ana@notebook:~$ kubectl config get-contexts
+CURRENT   NAME        CLUSTER     AUTHINFO    NAMESPACE
+*         kind-guia   kind-guia   kind-guia   default
+ana@notebook:~$ kubectl config current-context
+kind-guia</pre>
+
+<p>O asterisco marca o contexto em uso. <code>kind-guia</code> é o nome que o kind deu ao cluster de estudo
+— “kind” mais o nome que você escolheu na criação. É esse mesmo nome que aparece na coluna
+<code>CLUSTER</code> e no <code>AUTHINFO</code>, porque num cluster de estudo o acesso é local e simples: o
+kind escreve a configuração no seu notebook e você já está autenticado.</p>
+
+<p>Uma confusão comum: o cluster não é “o programa <code>kubectl</code>”. O <code>kubectl</code> é o
+telefone; o cluster é quem atende. Você pode desligar o notebook, reinstalar o <code>kubectl</code>, trocar
+de terminal — o cluster continua lá, com os objetos que você criou. E o contrário também: se o cluster
+sumir, o <code>kubectl</code> continua no seu PATH, respondendo “connection refused” a tudo.</p>
+
+<h2>3. Nó: a máquina que faz o trabalho</h2>
+
+<p>Um nó é uma máquina — física ou virtual — que participa do cluster. Cada nó tem nome, endereço IP,
+sistema operacional, versão do runtime de containers e uma etiqueta padrão com o próprio nome
+(<code>kubernetes.io/hostname</code>). Você quase nunca precisa saber disso tudo; precisa saber
+<em>quantos</em> nós existem, se estão <code>Ready</code> e quanto de CPU e memória cada um oferece.</p>
+
+<p>Os nós têm papéis. O <strong>control plane</strong> é o nó do cérebro: nele rodam o API server, o etcd, o
+scheduler e os controladores. Os <strong>workers</strong> são os nós de trabalho, onde os seus pods rodam.
+Num cluster de estudo com kind, é comum existir um nó de controle e um ou dois workers — e o nó de controle
+também aceita pods, o que confunde quem espera que ele fique “reservado”. Em cluster de produção, o nó de
+controle costuma ficar isolado por segurança.</p>
+
+<p>Cada nó carrega etiquetas, e a mais importante no começo é <code>kubernetes.io/hostname</code>, com o
+nome do nó como valor. Elas não são enfeite: o agendador usa etiquetas para decidir onde um pod cabe, e você
+também pode usar (nas aulas de labels e selectors) para dizer “este pod só roda em nó com disco”. Por isso
+vale a pena saber que nó tem nome, e que o nome é o identificador usado em toda parte.</p>
+
+<dl class="anatomy">
+<dt>cluster</dt>
+<dd>O conjunto de nós, com um endereço de API e um estado guardado. É a unidade que o seu kubectl enxerga.</dd>
+<dt>nó (<em>node</em>)</dt>
+<dd>Uma máquina do cluster. Tem nome, IP e capacidade de CPU e memória.</dd>
+<dt>control plane</dt>
+<dd>O nó (ou nós) que rodam o cérebro: API server, etcd, scheduler e controladores.</dd>
+<dt>kubelet</dt>
+<dd>O agente que roda em cada nó e cuida dos containers daquela máquina, obedecendo ao cluster.</dd>
+<dt>pod</dt>
+<dd>A menor unidade que o cluster agenda: um ou mais containers com o mesmo IP e o mesmo ciclo de vida.</dd>
+<dt>container</dt>
+<dd>O processo empacotado que de fato executa o seu programa. Vive dentro do pod.</dd>
+</dl>
+
+<h2>4. Pod: o pacote com rede própria</h2>
+
+<p>Um pod é um envelope. Dentro dele vai pelo menos um container — o seu programa — e, opcionalmente, outros
+containers que precisam ficar lado a lado. Todos os containers de um pod compartilham o mesmo endereço de
+rede e o mesmo volume de arquivos, e é isso que faz o pod ser mais do que “um container com outro nome”:
+dentro do pod, os containers conversam por <code>localhost</code>, como programas na mesma máquina.</p>
+
+<p>Cada pod ganha um IP próprio no momento em que nasce. Esse IP é interno ao cluster: ninguém na internet
+chega nele, e ele muda quando o pod é recriado. Quem quiser falar com o site de fora precisa de um Service,
+que é assunto do Nível 2 — por enquanto, guarde a ideia de que o IP do pod é descartável e o nome do pod
+também.</p>
+
+<p>E o pod tem um ciclo de vida curto por natureza. Ele nasce, roda e morre; quem cuida de manter a
+quantidade certa é o controlador (o Deployment, na aula 1). Não existe “consertar um pod”: existe apagar e
+deixar o controlador criar outro. Você vai ver isso na prática em toda a carreira.</p>
+
+<p>Antes de seguir, uma promessa útil para o resto do guia: nenhum desses três nomes é decorativo. Cluster
+aparece em todo comando que você roda; nó aparece quando algo não cabe ou não sobe; pod aparece em praticamente
+toda tabela. Se você conseguir dizer, em qualquer momento, “este pod está neste nó deste cluster”, já entendeu
+a estrutura que o Kubernetes usa para organizar tudo.</p>
+
+<h2>5. Vendo os nós</h2>
+
+<p>A primeira coisa a fazer em qualquer cluster novo é perguntar quem são as máquinas. O comando básico é
+<code>kubectl get nodes</code>. A caixa abaixo começa com ele; a missão é usar a variação que mostra os
+detalhes de rede e de sistema de cada nó.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:INTERNAL-IP;;texto:containerd;;texto:Ready">
+  <p class="try-task">A tabela só mostra nome, papel e versão. Acrescente <code>-o wide</code> ao comando dos
+  nós para ver também o IP interno e o runtime de containers.</p>
+<pre class="yaml">kubectl get nodes</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get nodes
+NAME                 STATUS   ROLES           AGE   VERSION
+guia-control-plane   Ready    control-plane   8m    v1.37.3
+guia-worker          Ready    &lt;none&gt;          4m    v1.37.3
+guia-worker2         Ready    &lt;none&gt;          4m    v1.37.3
+</pre>
+<pre class="solucao">kubectl get nodes -o wide</pre>
+</div>
+
+<p>Com <code>-o wide</code> entram três colunas novas: <code>INTERNAL-IP</code> (o endereço do nó dentro da
+rede do cluster), <code>OS-IMAGE</code> e <code>KERNEL-VERSION</code> mais o <code>CONTAINER-RUNTIME</code>,
+que aqui é <code>containerd://1.7.24</code>. O <code>containerd</code> é quem efetivamente baixa a imagem e
+liga o container; o Kubernetes manda, ele executa.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Coluna do <code>get nodes</code></th><th>O que significa</th><th>Quando importa</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NAME</code></td><td>nome do nó, único no cluster</td><td>para descrever o problema a alguém</td></tr>
+<tr><td><code>STATUS</code></td><td><code>Ready</code> ou <code>NotReady</code></td><td><code>NotReady</code>:
+o kubelet do nó parou de responder</td></tr>
+<tr><td><code>ROLES</code></td><td><code>control-plane</code> ou <code>&lt;none&gt;</code></td><td>saber quem é
+cérebro e quem é trabalho</td></tr>
+<tr><td><code>AGE</code></td><td>desde quando o nó existe</td><td>nó recém-criado ainda está baixando
+imagens</td></tr>
+<tr><td><code>VERSION</code></td><td>versão do Kubernetes do nó</td><td>nó com versão diferente do resto pede
+atenção</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Se o <code>get nodes</code> responde <code>Ready</code> em todos, o cluster está saudável por baixo. Se
+algum aparece <code>NotReady</code>, comece por ali: os pods daquele nó serão marcados como perdidos e
+recriados em outro lugar. O cluster prefere recriar a insistir num nó que não responde.</p>
+
+<h2>6. Onde o meu pod caiu?</h2>
+
+<p>A tabela do <code>get pods</code> não mostra o nó. Para descobrir onde um pod está e qual IP ele ganhou,
+o caminho mais direto é o <code>describe</code>: ele abre o objeto inteiro e, nas primeiras linhas, diz o nó
+e o endereço. A caixa abaixo cria um pod e precisa descrevê-lo.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Node:;;texto:IP:;;texto:forno:1.0">
+  <p class="try-task">O pod foi criado, mas ninguém viu onde ele caiu. Acrescente a linha
+  <code>kubectl describe pod forno</code> e rode.</p>
+<pre class="yaml">kubectl run forno --image=forno:1.0</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run forno --image=forno:1.0
+pod/forno created
+</pre>
+<pre class="solucao">kubectl run forno --image=forno:1.0
+kubectl describe pod forno</pre>
+</div>
+
+<p>As primeiras linhas do <code>describe</code> são um resumo de identidade: <code>Name</code>,
+<code>Namespace</code>, <code>Service Account</code> e as duas que interessam aqui. <code>Node:</code>
+mostra o nó e o IP dele, separados por barra. <code>IP:</code> é o endereço do pod dentro da rede do
+cluster. Mais abaixo vêm os containers, o estado de cada um, e no fim os eventos.</p>
+
+<p>Se você preferir a informação em tabela, existe o atalho: <code>kubectl get pods -o wide</code> acrescenta
+<code>IP</code> e <code>NODE</code> ao <code>get pods</code>. A transcrição abaixo é de um cluster local com
+dois pods:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods -o wide
+NAME       READY   STATUS    RESTARTS   AGE   IP               NODE                 NOMINATED NODE   READINESS GATES
+cardapio   1/1     Running   0          2m    10.244.3.71      guia-control-plane   &lt;none&gt;           &lt;none&gt;
+forno      1/1     Running   0          5m    10.244.145.245   guia-control-plane   &lt;none&gt;           &lt;none&gt;</pre>
+
+<p>Repare que os dois pods estão no mesmo nó e têm IPs diferentes. Isso é o normal: o nó hospeda vários pods,
+e cada pod tem o seu endereço. Em cluster com mais nós, você veria pods espalhados — e é justamente esse
+espalhamento que protege o serviço quando uma máquina cai.</p>
+
+<p>Uma última leitura da tabela: o <code>AGE</code> de cada pod conta desde que ele nasceu. Se você olhar
+duas vezes e o pod mais novo estiver sempre com poucos minutos, é sinal de que algo está recriando pods — o
+controlador trabalha, mas o pod não fica de pé. Quem conta essa história direito é o
+<code>RESTARTS</code>, junto com o <code>describe</code>: reinício é container morrendo dentro do mesmo pod;
+nome novo é pod inteiro sendo recriado.</p>
+
+<h2>7. Dois containers, um pod</h2>
+
+<p>Um pod pode ter mais de um container, e isso não é exceção esquisita: é o padrão quando dois programas
+precisam estar sempre juntos. Um exemplo clássico é o do programa que exporta métricas: ele lê o que o
+programa principal está fazendo, e faz sentido que os dois estejam no mesmo pacote, no mesmo nó, no mesmo
+IP.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/forno|spec.containers.1.name=metricas;;texto:2/2">
+  <p class="try-task">Acrescente um segundo container ao pod, com nome <code>metricas</code> e imagem
+  <code>metricas:1.0</code>, na mesma lista de <code>containers</code>. A coluna READY tem de passar a
+  mostrar <code>2/2</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   1/1     Running   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+    - name: metricas
+      image: metricas:1.0</pre>
+</div>
+
+<p>O <code>READY 2/2</code> é a prova visual: são dois containers prontos de dois pedidos, num pod só. O
+número à esquerda da barra é quantos estão prontos; o da direita é quantos foram declarados. Se um dos dois
+não ficar pronto, a fração cai para <code>1/2</code> e o pod inteiro é considerado não pronto — o que faz
+sentido, porque o pacote é uma unidade só.</p>
+
+<p>Essa característica tem consequência: container extra no mesmo pod é casamento. Se o exportador de
+métricas morre, o pod inteiro é reiniciado, inclusive o programa principal. Por isso a decisão de juntar
+containers num pod deve ser tomada só quando os dois realmente dependem um do outro — a aula de sidecar
+volta nisso com calma.</p>
+
+<h2>8. O que a caixa faz (e o que ela simplifica)</h2>
+
+<p>Vale ser honesto sobre o painel deste guia, porque ele é o seu laboratório até você ter um cluster. Ele
+guarda um cluster simulado em memória, com nós, um agendador, controladores e objetos, e responde com as
+mesmas mensagens do <code>kubectl</code> de verdade. Mas o agendador é simplificado: no painel, os pods caem
+sempre no nó <code>guia-control-plane</code>. Num cluster real, o scheduler escolhe entre os nós olhando
+capacidade e etiquetas, e você veria pods espalhados.</p>
+
+<p>Também não há kubelet de verdade no painel: o container não é executado. Por isso você não verá
+<code>CrashLoopBackOff</code>, <code>ImagePullBackOff</code> ou logs do programa dentro das caixas — essas
+cenas aparecem no guia como transcrição de um cluster real, sempre identificadas. O que o painel faz bem é o
+que é cálculo: validar manifesto, criar objetos, agendar, casar etiquetas, calcular endpoints.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Quem responde</th><th>Como ver</th></tr>
+</thead>
+<tbody>
+<tr><td>Quantas máquinas existem?</td><td>o cluster</td><td><code>kubectl get nodes</code></td></tr>
+<tr><td>Em qual máquina está o pod?</td><td>o pod (campo <code>Node</code>)</td><td><code>kubectl describe pod</code>
+ou <code>get pods -o wide</code></td></tr>
+<tr><td>Qual o IP do pod?</td><td>o pod (campo <code>IP</code>)</td><td>o mesmo <code>describe</code></td></tr>
+<tr><td>Quantos containers tem o pod?</td><td>o pod</td><td><code>READY 2/2</code> no <code>get pods</code></td></tr>
+<tr><td>Quanto de CPU o nó tem?</td><td>o nó</td><td><code>kubectl describe node</code> (assunto da aula de
+recursos)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o pod que mudou de nó sozinho</h3>
+<p>A Ana anotou o nó de um pod para investigar e, no dia seguinte, o pod estava em outro nó com outro nome.
+Não foi mágica nem bug: o pod morreu, o controlador criou outro, e o scheduler achou lugar em outro nó. Pod é
+descartável; o que é estável é o nome do Deployment. Anotar o nome do pod num caderno é sempre uma foto
+tirada hoje de algo que muda amanhã.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: dois containers, um IP</h3>
+<p>Ela colocou o exportador de métricas num pod separado e depois não conseguia fazer o programa principal
+conversar com ele por <code>localhost</code>. Claro: <code>localhost</code> só funciona dentro do mesmo pod.
+Entre pods, a conversa é por IP ou por nome de Service, e cada pod tem o seu. A decisão de juntar ou separar
+containers é, antes de tudo, uma decisão sobre rede e ciclo de vida.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o nó NotReady e os pods órfãos</h3>
+<p>Um dos nós do cluster ficou <code>NotReady</code> porque o kubelet parou de responder. Os pods daquele nó
+foram marcados como perdidos depois de alguns minutos, e os controladores criaram substitutos nos nós que
+estavam saudáveis. Por isso o cluster com vários nós aguenta a queda de um: não é o pod que é imortal, é o
+conjunto que se reorganiza.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="1"><p class="mc-q">1. Qual é a ordem, do maior para o menor?</p>
+<label><input type="radio" name="q1"> cluster, nó, pod, container</label>
+<label><input type="radio" name="q1"> cluster, pod, nó, container</label>
+<label><input type="radio" name="q1"> nó, cluster, container, pod</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o <code>READY 2/2</code> informa?</p>
+<label><input type="radio" name="q2"> dois pods em dois nós</label>
+<label><input type="radio" name="q2"> duas réplicas do Deployment</label>
+<label><input type="radio" name="q2"> dois containers prontos, de dois declarados no pod</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Onde descobrir em qual nó o pod está?</p>
+<label><input type="radio" name="q3"> na coluna AGE do <code>get pods</code></label>
+<label><input type="radio" name="q3"> no <code>kubectl describe pod</code>, no campo <code>Node</code></label>
+<label><input type="radio" name="q3"> no manifesto, em <code>metadata.name</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o campo do nó</h2>
+<p>No <code>describe pod</code>, qual é o campo que mostra o nó onde o pod está rodando?</p>
+<div class="ex-code"><input aria-label="resposta 1" data-answer="Node" placeholder="...">:            guia-control-plane/192.0.2.28</div>
+<p class="ex-dica">Dica: é uma palavra em inglês, com N maiúsculo, e vem logo abaixo de <code>Service
+Account</code> no resumo do <code>describe</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Cluster é o conjunto de máquinas que o Kubernetes gerencia com um endereço só; nó é cada máquina, com
+papel de control plane ou de trabalho; pod é o envelope que o cluster agenda, com IP próprio e um ou mais
+containers. Container é o que executa o seu programa.</p>
+
+<p>Para ver as máquinas, <code>kubectl get nodes</code> (e <code>-o wide</code> para IP e runtime). Para
+saber onde um pod caiu, <code>kubectl describe pod</code> e leia <code>Node</code> e <code>IP</code> — ou use
+<code>kubectl get pods -o wide</code>. E se o pod tem dois containers, o <code>READY 2/2</code> mostra isso:
+dois prontos de dois declarados.</p>
+
+<p>Guarde a ideia que sustenta o resto do guia: nada disso é permanente. Pod nasce e morre, IP muda, nó pode
+ficar <code>NotReady</code>. O que permanece é o que você descreveu. Na próxima aula a Ana olha para o outro
+lado da moeda: por que tudo isso vale a pena, com as três dores que o Kubernetes resolve e as duas que ele
+não resolve.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Cluster = conjunto; nó = máquina; pod = pacote que roda num nó.</li>
+  <li>O pod tem IP próprio; o IP muda quando o pod é recriado.</li>
+  <li>Containers do mesmo pod conversam por <code>localhost</code>.</li>
+  <li><code>kubectl get nodes -o wide</code> mostra IP interno e runtime.</li>
+  <li><code>kubectl describe pod</code> mostra <code>Node</code> e <code>IP</code>.</li>
+  <li><code>READY 2/2</code> é container, não pod.</li>
+  <li>No painel do guia, todo pod cai no mesmo nó: o agendador é simplificado.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

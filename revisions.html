@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revisões | Guia Kubernetes</title>
+<meta name="description" content="Revisões de um Deployment na prática: rollout history, a anotação de revisão, o change-cause, o rollout restart e o revisionHistoryLimit que decide quanta memória guardar.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Revisões</span></h1>
+<p class="intro">Sexta-feira, alguém pergunta à Ana quando o cálculo do frete mudou. Ela lembra que foi “na
+semana passada”, mas não sabe dizer qual versão, nem quantas publicações aconteceram depois. O Deployment
+sabe. Ele guarda um número para cada geração do modelo de pod, mantém as anteriores por perto e responde
+com uma tabela de duas colunas. Nesta aula a Ana aprende a ler essa memória, a escrever o motivo de cada
+mudança e a decidir quanta memória vale a pena manter.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é uma revisão de Deployment e o que ela guarda.</li>
+  <li>Ler o <code>kubectl rollout history</code> e a anotação de revisão no <code>describe</code>.</li>
+  <li>Forçar uma revisão nova com <code>kubectl rollout restart</code>.</li>
+  <li>Registrar o motivo com a anotação <code>kubernetes.io/change-cause</code>.</li>
+  <li>Controlar quantas revisões ficam guardadas com <code>revisionHistoryLimit</code>.</li>
+  <li>Ligar revisão a rollback: é a mesma memória, usada de outro jeito.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a pergunta que ninguém sabe responder</h2>
+
+<p>“Quando o frete mudou?” parece pergunta de negócio, mas é pergunta de operação. A resposta está em
+saber qual versão do site rodava na terça, qual rodava na quinta e o que mudou entre as duas. Num time sem
+histórico, a resposta é um arqueiro de commits, mensagens de chat e memória. Num Deployment, a resposta está
+a um comando de distância — desde que alguém tenha registrado o motivo, porque o cluster guarda o
+<em>quê</em>, não o <em>por quê</em>.</p>
+
+<p>Cada vez que o modelo de pod muda — imagem nova, variável de ambiente, limite de memória —, o
+controlador cria uma <strong>revisão</strong>. A primeira é 1; cada mudança soma um. A revisão não é um
+backup do objeto inteiro: é a fotografia do <code>template</code> naquele momento, e o suficiente para
+recriar os pods daquela geração. É por isso que voltar é barato e por que o histórico tem limite.</p>
+
+<p>O número aparece em dois lugares que vale conhecer: na anotação
+<code>deployment.kubernetes.io/revision</code>, que o controlador mantém sozinho, e na tabela do
+<code>rollout history</code>. Os dois mostram a mesma coisa por caminhos diferentes — um é o objeto, o
+outro é o comando. Saber os dois evita a situação de olhar o <code>describe</code> e não reconhecer o
+número que o colega citou no chat.</p>
+
+<h2>2. O vocabulário da memória</h2>
+
+<p>Cinco termos resolvem esta aula, e todos aparecem no dia a dia de quem publica. Vale ler devagar, porque
+as palavras são parecidas: revisão é a geração; anotação de revisão é o número escrito no objeto;
+change-cause é o motivo que alguém registrou; revisionHistoryLimit é quantas gerações ficam guardadas; e
+restart é o comando que força uma geração nova sem mudar a imagem.</p>
+
+<dl class="anatomy">
+<dt>revisão</dt>
+<dd>Número inteiro que identifica uma geração do <code>template</code>. Começa em 1 e sobe a cada mudança
+no modelo de pod.</dd>
+<dt>anotação de revisão</dt>
+<dd>O campo <code>deployment.kubernetes.io/revision</code>, mantido pelo controlador. Aparece no
+<code>describe</code> e no <code>-o yaml</code>.</dd>
+<dt>change-cause</dt>
+<dd>A anotação <code>kubernetes.io/change-cause</code>, escrita por você com o motivo da mudança. É o que
+transforma o histórico em algo legível.</dd>
+<dt>revisionHistoryLimit</dt>
+<dd>Quantas revisões antigas ficam guardadas. Padrão 10; as mais velhas são descartadas quando o número
+passa do limite.</dd>
+<dt>rollout restart</dt>
+<dd>Comando que cria uma revisão nova sem alterar o modelo. Serve para forçar a recriação dos pods — por
+exemplo, para pegar um ConfigMap atualizado.</dd>
+</dl>
+
+<p>Uma confusão comum: “revisão” não é o mesmo que “ReplicaSet”. Na prática, cada revisão costuma ter o seu
+ReplicaSet, e é por isso que os nomes se parecem. Mas você não precisa decorar a relação: o
+<code>describe</code> mostra o ReplicaSet atual em <code>NewReplicaSet</code> e os antigos em
+<code>OldReplicaSets</code>, e o <code>history</code> mostra os números. Cada um responde a uma pergunta
+diferente.</p>
+
+<h2>3. Lendo o histórico</h2>
+
+<p>O comando é <code>kubectl rollout history deployment/cardapio</code>. A saída é uma tabela de duas
+colunas: <code>REVISION</code> e <code>CHANGE-CAUSE</code>. Quando ninguém registrou nada, a segunda coluna
+é uma sequência de <code>&lt;none&gt;</code> — e é aí que a maior parte dos times vive, com um histórico
+tecnicamente correto e praticamente inútil.</p>
+
+<p>Na primeira vez que você roda, vê uma linha só. Depois de uma publicação, duas. Depois de um rollback,
+três — porque o rollback também é uma publicação. O número nunca diminui: a memória cresce para frente,
+como um diário, não como um estado que volta. Essa propriedade é o que permite responder “quantas vezes
+mudamos isso este mês?” com um comando em vez de um chute.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Comando</th><th>O que você vê</th></tr>
+</thead>
+<tbody>
+<tr><td>quantas revisões existem?</td><td><code>kubectl rollout history deployment/cardapio</code></td>
+<td>uma linha por geração, com o motivo quando anotado</td></tr>
+<tr><td>qual é a revisão atual?</td><td><code>kubectl describe deployment cardapio</code></td><td>a
+anotação <code>deployment.kubernetes.io/revision</code>, no topo</td></tr>
+<tr><td>o que rodava na revisão 2?</td><td><code>kubectl get replicasets</code> e depois
+<code>-o yaml</code></td><td>o template guardado por aquela geração</td></tr>
+<tr><td>o motivo foi registrado?</td><td><code>kubectl get deployment cardapio -o yaml</code></td>
+<td>o bloco <code>metadata.annotations</code> com o <code>change-cause</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa tabela é o mapa. O <code>history</code> responde a pergunta de contagem; o <code>describe</code>
+responde “onde estou agora”; o ReplicaSet responde “o que exatamente rodava”; e o <code>-o yaml</code>
+responde “alguém explicou?”. Quatro comandos, quatro respostas diferentes — e nenhum deles substitui os
+outros, o que explica por que tanta gente se perde no meio do caminho.</p>
+
+<h2>4. rollout restart: uma revisão sem mudar nada</h2>
+
+<p>Existe uma situação estranha à primeira vista: você quer que os pods sejam recriados, mas não mudou
+nada no modelo. Acontece quando um ConfigMap ou um Secret mudou por fora e os pods ainda usam o valor
+antigo em memória. O <code>kubectl rollout restart</code> resolve isso criando uma revisão nova com o mesmo
+conteúdo — o suficiente para o controlador trocar todos os pods.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:restarted;;texto:REVISION;;objeto:Deployment/cardapio">
+  <p class="try-task">Rode o <code>rollout restart</code> e compare o histórico antes e depois. A revisão
+  tem de subir sem que a imagem mude.</p>
+<pre class="yaml">kubectl describe deployment cardapio
+kubectl rollout history deployment/cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl describe deployment cardapio
+Name:              cardapio
+Namespace:         default
+CreationTimestamp: Fri, 27 Nov 2026 15:50:21 +0000
+Labels:            app=cardapio
+Annotations:       deployment.kubernetes.io/revision: "1"
+Selector:          app=cardapio
+Pod Template:
+  Labels:  app=cardapio
+  Containers:
+   web:
+    Image:        cardapio:1.0
+    Port:         8080/TCP
+    Environment:  &lt;none&gt;
+    Mounts:       &lt;none&gt;
+Conditions:
+  Type        Status   Reason
+  Available   True     MinimumReplicasAvailable
+OldReplicaSets:  &lt;none&gt;
+NewReplicaSet:   cardapio-wj4jsx2tcw (2/2 replicas created)
+Events:
+  Type     Reason              Age   From                    Message
+  Normal   Created             20s   deployment-controller   created by ana
+  Normal   ScalingReplicaSet   26s   deployment-controller   Scaled up replica set cardapio-wj4jsx2tcw to 2
+
+ana@notebook:~$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+</pre>
+<pre class="solucao">kubectl rollout history deployment/cardapio
+kubectl rollout restart deployment/cardapio
+kubectl rollout history deployment/cardapio
+kubectl describe deployment cardapio</pre>
+</div>
+
+<p>A resposta tem duas linhas que contam tudo: <code>deployment.apps/cardapio restarted</code> e, no
+histórico, uma revisão a mais. No <code>describe</code>, a anotação
+<code>deployment.kubernetes.io/revision</code> acompanha o número. Nada de imagem nova, nada de manifesto
+alterado — só uma geração nova, o que basta para o controlador substituir os pods.</p>
+
+<pre class="term">$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+
+$ kubectl rollout restart deployment/cardapio
+deployment.apps/cardapio restarted
+
+$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+2          &lt;none&gt;</pre>
+
+<p>Essa é a saída que a caixa devolve, copiada do painel. Repare que a coluna da causa continua vazia: o
+restart não inventa motivo. Se você roda <code>rollout restart</code> toda sexta-feira para pegar
+configuração nova, o histórico vira uma lista de números sem explicação — e a pergunta “quando o frete
+mudou?” volta a ser um mistério. É o problema que a próxima seção resolve.</p>
+
+<h2>5. Registrando o motivo com change-cause</h2>
+
+<p>A anotação <code>kubernetes.io/change-cause</code> é uma convenção: o Kubernetes não a cria, só a
+respeita. Você escreve com <code>kubectl annotate</code> e, num cluster de verdade, o valor aparece na
+coluna <code>CHANGE-CAUSE</code> do histórico. O hábito saudável é anotar antes ou logo depois de cada
+publicação, com uma frase curta que alguém de fora entenda.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:annotated;;texto:change-cause">
+  <p class="try-task">Registre a causa <code>publica a 2.0</code> no Deployment e confira a anotação no
+  <code>-o yaml</code>.</p>
+<pre class="yaml">kubectl rollout history deployment/cardapio
+kubectl get deployments</pre>
+<pre class="out">
+ana@notebook:~$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">kubectl annotate deployment/cardapio kubernetes.io/change-cause="publica a 2.0"
+kubectl get deployment cardapio -o yaml
+kubectl rollout history deployment/cardapio</pre>
+</div>
+
+<p>O <code>annotate</code> responde <code>deployment.apps/cardapio annotated</code>, e o
+<code>-o yaml</code> passa a mostrar o bloco de anotações no topo do objeto. Este é o trecho que o painel
+devolve:</p>
+
+<pre class="term">$ kubectl get deployment cardapio -o yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    kubernetes.io/change-cause: publica a 2.0
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 2
+  revisionHistoryLimit: 10</pre>
+
+<p>Uma honestidade sobre o painel: ele guarda a anotação e a mostra no <code>-o yaml</code>, mas o
+<code>rollout history</code> continua imprimindo <code>&lt;none&gt;</code> na coluna — o motor não
+recalcula essa coluna a partir das anotações. Num cluster de verdade, o valor aparece ali. O que você deve
+levar daqui é o hábito e o comando; a coluna preenchida é o resultado num cluster real.</p>
+
+<p>Escolha o texto pensando em quem lê seis meses depois. “deploy” não diz nada; “publica a 2.0 — corrige
+frete duplicado” diz tudo. Se o time usa convenção (issue, versão, autor), siga a convenção: o valor é
+livre, e o valor está justamente em ser previsível. Anotar é barato; reconstruir a história depois é caro.</p>
+
+<h2>6. revisionHistoryLimit: quanta memória guardar</h2>
+
+<p>O <code>revisionHistoryLimit</code> decide quantas revisões antigas o controlador mantém. O padrão é 10,
+e ele existe por um motivo prático: cada revisão guardada custa um ReplicaSet parado, com zero pods, mas
+com o objeto e o template. Em clusters com centenas de Deployments, isso vira muitos objetos — e o limite
+é a forma de dizer “guarde as últimas N, o resto pode ir”.</p>
+
+<div class="tryk8s" data-cenario="padaria" data-goal="campo:Deployment/cardapio|spec.revisionHistoryLimit=3;;texto:configured">
+  <p class="try-task">Baixe o limite do histórico para <code>3</code> revisões e rode.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio configured
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>O painel responde <code>deployment.apps/cardapio configured</code> e o valor passa a ser 3. O número
+baixo tem uma consequência que ninguém lembra até precisar: se a revisão boa foi descartada, o
+<code>rollback --to-revision</code> não a encontra. Existe um equilíbrio entre economizar objetos e ter para
+onde voltar — e ele depende de quantas publicações o time faz por semana.</p>
+
+<p>O número do limite também conversa com a frequência de publicação. Um time que publica uma vez por
+semana guarda dez revisões e tem dois meses e meio de memória; um time que publica cinco vezes por dia
+guarda dez e tem dois dias. Nesse segundo caso, o histórico do cluster deixa de ser a fonte da verdade e o
+repositório assume — mas o <code>undo</code> rápido continua útil para o incidente da hora, e é por isso
+que raramente vale zerar o limite.</p>
+
+<p>Há um caso em que o limite é zero: quando você não quer histórico nenhum, porque o controle está no
+repositório e no pipeline. É defensável em ambiente efêmero; em produção, é apostar que nada vai dar
+errado. Um meio-termo comum é guardar de 5 a 10 revisões, o suficiente para voltar algumas publicações e
+não tanto a ponto de acumular lixo.</p>
+
+<h2>7. O que uma revisão guarda (e o que ela não guarda)</h2>
+
+<p>A revisão guarda o <code>template</code>: imagem, portas, variáveis, recursos, etiquetas do pod. Não
+guarda o número de réplicas como parte da geração — escalar não cria revisão, como você viu na aula de
+rolling update —, nem as anotações do Deployment, nem o estado dos pods. É um recorte do modelo, não do
+mundo.</p>
+
+<p>Isso explica três comportamentos que parecem bugs. Primeiro, voltar para uma revisão antiga não devolve
+o número de réplicas daquela época: o <code>undo</code> restaura o template e mantém a escala atual.
+Segundo, mudar só <code>metadata.labels</code> não cria revisão. Terceiro, uma revisão antiga não traz de
+volta um pod que já morreu — ela só permite criar pods novos com aquele modelo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mudança</th><th>Cria revisão?</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>imagem, env, porta, recursos</td><td>sim</td><td>está no <code>template</code>, que é o que a
+revisão fotografa</td></tr>
+<tr><td><code>rollout restart</code></td><td>sim</td><td>gera uma revisão com o mesmo conteúdo para trocar os
+pods</td></tr>
+<tr><td><code>spec.replicas</code></td><td>não</td><td>escala não faz parte do modelo de pod</td></tr>
+<tr><td>anotações e etiquetas do Deployment</td><td>não</td><td>são do objeto, não do pod</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Se você quer ver o modelo de uma geração antiga, o caminho é olhar os ReplicaSets: cada um carrega o
+template que criou. <code>kubectl get replicasets</code> lista os que existem, e o
+<code>kubectl get replicaset nome -o yaml</code> mostra a imagem e os campos daquela geração. É a forma de
+responder “o que exatamente rodava na revisão 2?” quando o histórico só tem números.</p>
+
+<h2>8. Revisões e rollback: a mesma memória</h2>
+
+<p>O rollback não é um recurso separado: é o histórico sendo usado ao contrário. Quando você roda
+<code>kubectl rollout undo</code>, o controlador copia o template de uma revisão anterior e cria uma
+revisão nova. Por isso o número sobe depois de voltar, e por isso o <code>revisionHistoryLimit</code>
+importa tanto: sem revisões guardadas, não há para onde voltar.</p>
+
+<p>Há uma consequência prática que muda a rotina do time. Se cada publicação é anotada com uma causa, o
+histórico vira uma linha do tempo legível, e o rollback deixa de ser um salto no escuro. A pergunta
+“podemos voltar para a versão de terça?” ganha uma resposta objetiva: a revisão 7, com a causa “ajuste de
+promoção de terça”, está guardada e pode ser restaurada com um comando.</p>
+
+<p>O ciclo completo, no dia a dia, tem quatro passos e nenhum é opcional. Anotar a causa antes de
+publicar (<code>annotate</code> com a frase combinada), publicar (<code>apply</code> ou
+<code>set image</code>), acompanhar (<code>rollout status</code>) e conferir a revisão
+(<code>rollout history</code>). Quem pula o primeiro descobre depois que o histórico não serve para nada;
+quem pula o último publica sem saber se a revisão registrada é a que está no ar.</p>
+
+<p>Vale combinar as duas ferramentas com o calendário. Publicações de sexta merecem histórico maior e
+anotação mais cuidadosa, porque quem vai diagnosticar no fim de semana não é quem publicou. É uma decisão
+de processo, não de YAML — mas o YAML é onde ela fica registrada.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o histórico que só tinha números</h3>
+<p>A Ana precisou saber qual revisão introduziu a taxa de entrega. O histórico tinha oito linhas e oito
+<code>&lt;none&gt;</code>. Ela acabou comparando os ReplicaSets um a um para descobrir a imagem de cada
+geração — vinte minutos de trabalho que uma anotação de dez palavras teria economizado. Na semana seguinte,
+o time adotou a convenção de anotar toda publicação.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o restart de rotina que virou confusão</h3>
+<p>Um script reiniciava os Deployments toda madrugada para pegar configuração nova. Em um mês, o histórico
+tinha trinta revisões e nenhuma causa; o limite de 10 já havia descartado a versão que funcionava. A
+solução foi trocar o restart por uma anotação de configuração que dispara rollout só quando o conteúdo
+muda — e aumentar o limite para 20.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a revisão que sobreviveu ao incidente</h3>
+<p>Depois de um incidente, a auditoria perguntou quando a imagem mudou e quem autorizou. O time mostrou o
+histórico com as causas anotadas e a data de cada revisão. Não foi preciso procurar em chat nem em
+memória. Histórico bom não serve só para voltar: serve para explicar, meses depois, o que aconteceu.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que cria uma revisão nova?</p>
+<label><input type="radio" name="q1"> mudar <code>spec.replicas</code></label>
+<label><input type="radio" name="q1"> mudar o <code>template</code> ou rodar <code>rollout
+restart</code></label>
+<label><input type="radio" name="q1"> anotar o Deployment com <code>change-cause</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Para que serve a anotação
+<code>kubernetes.io/change-cause</code>?</p>
+<label><input type="radio" name="q2"> para aumentar o número da revisão</label>
+<label><input type="radio" name="q2"> para forçar a recriação dos pods</label>
+<label><input type="radio" name="q2"> para registrar o motivo da mudança e preencher a coluna
+<code>CHANGE-CAUSE</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que o <code>revisionHistoryLimit</code> controla?</p>
+<label><input type="radio" name="q3"> quantas revisões antigas ficam guardadas para rollback</label>
+<label><input type="radio" name="q3"> quantos pods podem existir durante o rollout</label>
+<label><input type="radio" name="q3"> quantas vezes o Deployment pode reiniciar</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o diário do cardápio</h2>
+<p>A Ana vai publicar três versões nesta semana e quer que o histórico explique cada uma. Complete o nome
+da anotação que guarda o motivo e responda: qual comando mostra a lista de revisões?</p>
+<div class="ex-code">kubernetes.io/<input aria-label="resposta 1" data-answer="change-cause"
+placeholder="...">: "semana 12: promoção de inverno"</div>
+<p class="ex-dica">Dica: a anotação tem hífen entre as duas palavras em inglês, e o comando que lista é o
+mesmo das caixas 1 e 2.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Revisão é a geração do <code>template</code>: número que começa em 1 e sobe a cada mudança no modelo de
+pod. O <code>rollout history</code> lista as revisões; o <code>describe</code> mostra a anotação
+<code>deployment.kubernetes.io/revision</code>. Escalar e anotar não criam revisão;
+<code>rollout restart</code> cria, mesmo sem mudar a imagem.</p>
+
+<p>A coluna <code>CHANGE-CAUSE</code> só é útil quando alguém a preenche com
+<code>kubernetes.io/change-cause</code>. O <code>revisionHistoryLimit</code> decide quantas revisões ficam
+guardadas — e revisão descartada é rollback que não existe. Cada revisão guarda o modelo de pod, não o
+número de réplicas, não os pods, não o estado do mundo.</p>
+
+<p>Com isso, a Ana fecha o ciclo do Deployment: criar, escalar, publicar, voltar, escolher a estratégia e
+entender o histórico. As próximas aulas fecham o ciclo de publicação — <code>rollout status</code> e
+deploy sem queda — e depois o guia muda de camada, com o Service dando um endereço estável para esses pods
+que tanto mudam de nome.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl rollout history deployment/nome</code> mostra as revisões.</li>
+  <li><code>kubernetes.io/change-cause</code> registra o motivo; sem ele, o histórico é só número.</li>
+  <li><code>revisionHistoryLimit</code> (padrão 10) decide quantas revisões sobrevivem.</li>
+  <li>Revisão guarda o <code>template</code>, não réplicas, pods ou anotações do Deployment.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job Paralelo | Guia Kubernetes</title>
+<meta name="description" content="Job paralelo na prática: completions, parallelism, backoffLimit e restartPolicy, com o Job das miniaturas da padaria da Ana rodando de verdade na caixa.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Job <span class="hl">paralelo</span></h1>
+<p class="intro">A Ana trocou o cardápio da padaria e tem 240 fotos novas para publicar no site. Cada foto
+precisa virar três miniaturas — a da vitrine, a do celular e a do papel — e o programa que faz isso já
+está escrito: recebe uma foto, gera as três, sai. São 240 execuções curtas, não um site que precisa ficar
+no ar. Na aula passada de Deployment a Ana aprendeu a manter processo vivo; agora ela precisa do
+contrário: uma tarefa que começa, termina e para. É o <strong>Job</strong> — e, como são 240 tarefas, ela
+vai querer mais de uma rodando ao mesmo tempo, sem perder a conta de quantas faltam.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que um Job garante e por que ele não é um Deployment nem um pod solto.</li>
+  <li><code>completions</code>: quantas vezes a tarefa precisa dar certo.</li>
+  <li><code>parallelism</code>: quantas cópias rodam ao mesmo tempo.</li>
+  <li>Como as duas contas se combinam e como estimar o tempo total.</li>
+  <li><code>backoffLimit</code>, <code>activeDeadlineSeconds</code> e o <code>restartPolicy</code> que o
+  Job exige.</li>
+  <li>Ler o Job pronto: <code>COMPLETIONS</code>, pods em <code>Completed</code> e o evento
+  <code>BackoffLimitExceeded</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: 240 fotos, uma noite</h2>
+
+<p>O programa das miniaturas é bobo de tão simples: abre a foto, gera três tamanhos, grava na pasta
+<code>/dados/miniaturas</code>. Roda em menos de dois segundos. O problema não é o programa, é a
+quantidade. A Ana já sabe o que acontece se ela tentar resolver no notebook: abre um terminal, dispara o
+programa para a foto 1, espera, dispara para a foto 2 e assim por diante. Na foto 57 ela se distrai, fecha
+a tampa, e a partir dali nada mais roda. Ninguém sabe em qual foto parou.</p>
+
+<p>A primeira ideia que passa pela cabeça de quem vem de fora é “coloco um Deployment com 240
+réplicas”. Funciona uma vez e vira um problema eterno: o Deployment não foi feito para terminar. Se o
+programa sai com sucesso, o Deployment considera aquilo uma falha e liga o processo de novo. No dia
+seguinte a Ana tem 240 pods gerando as mesmas miniaturas outra vez, para sempre, queimando CPU de um
+cluster que ela paga por hora. Deployment é para o que precisa estar sempre no ar; o que precisa acabar
+tem outro objeto.</p>
+
+<p>O objeto é o Job. A ideia é a mesma que a do Deployment — um controlador cuidando de pods por você —
+só que com uma promessa diferente. O Deployment promete <em>“N cópias rodando agora, para sempre”</em>.
+O Job promete <em>“esta tarefa vai rodar até dar certo N vezes e então vai parar”</em>. Quando a última
+miniatura fica pronta, o Job fica em <code>Complete</code> e não cria mais nada. A Ana pode dormir.</p>
+
+<h2>2. Job, Deployment e pod solto: quem promete o quê</h2>
+
+<p>Vale fixar a diferença antes de escrever YAML, porque ela decide tudo o que vem depois. Um
+<strong>pod solto</strong> — aquele que a Ana criou com <code>kubectl run</code> sem
+<code>--restart=Always</code> — não tem dono. Se ele morre, ninguém recria; se ele termina, ninguém
+anota. Um <strong>Deployment</strong> tem dono e um número de réplicas: se um pod morre, nasce outro, e o
+número nunca chega a zero. Um <strong>Job</strong> tem dono e um número de <em>sucessos</em>: se um pod
+morre sem sucesso, nasce outro; quando os sucessos chegam ao combinado, o Job para de criar pods e se
+declara completo.</p>
+
+<p>Repare na palavra “sucesso”. Ela é o coração do Job. Um pod que termina com código 0 é um sucesso e
+conta para a meta; um pod que termina com código diferente de zero é uma falha e não conta. O Job não
+olha o relógio nem o conteúdo do arquivo gerado: ele olha o código de saída do container. Por isso o
+programa da Ana precisa sair com 0 quando a miniatura foi gravada e com 1 quando algo deu errado — se ele
+engolir o erro e sair com 0, o Job vai considerar pronto o que não está.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Objeto</th><th>O que ele garante</th><th>Quando termina</th><th>Na padaria</th></tr>
+</thead>
+<tbody>
+<tr><td>Pod solto</td><td>nada; existe até alguém apagar</td><td>nunca formalmente</td><td>um teste
+rápido no terminal</td></tr>
+<tr><td>Deployment</td><td>N réplicas rodando, sempre</td><td>não termina: repõe o que cai</td><td>o site
+do cardápio</td></tr>
+<tr><td>Job</td><td>N execuções com sucesso</td><td>quando os N sucessos acontecem</td><td>as 240
+miniaturas, o relatório do dia</td></tr>
+<tr><td>CronJob</td><td>um Job novo em cada horário</td><td>cada Job termina sozinho</td><td>o resumo das
+vendas às 23h</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um detalhe que confunde no começo: o Job também aparece no <code>kubectl get pods</code>, com nome
+comprido (<code>miniaturas-4k7pd</code>), igualzinho a um pod de Deployment. A diferença está no
+<code>STATUS</code>: o pod do Job termina em <code>Completed</code> e fica lá, parado, guardando o log
+para quem quiser ler. O pod do Deployment nunca chega nesse estado — se chegar, é porque o Deployment vai
+substituí-lo.</p>
+
+<h2>3. <code>completions</code>: quantas vezes a tarefa precisa dar certo</h2>
+
+<p>O campo que responde “quantas?” chama-se <code>spec.completions</code>. Se você não escreve nada, ele
+vale <code>1</code>: um Job comum, de uma execução só — gerar o relatório de ontem, rodar a migração do
+banco, apagar as fotos duplicadas. A Ana precisa de 240, então ela escreve 240. O controlador do Job vai
+criando pods até que a soma de pods em <code>Succeeded</code> chegue a 240.</p>
+
+<p>Quando o último pod termina, o Job ganha uma condição chamada <code>Complete</code> e para de criar
+pods. Os pods antigos <em>não</em> são apagados: eles ficam em <code>Completed</code> para que o log de
+cada execução continue disponível. Isso é ótimo para investigar (“a foto 137 saiu torta?”) e péssimo para
+a limpeza do cluster, porque 240 pods parados ocupam espaço na API. Por isso existe
+<code>ttlSecondsAfterFinished</code>: passado esse tempo depois do fim, o Job e os pods dele são apagados
+sozinhos.</p>
+
+<p>O jeito mais rápido de ver se o Job acabou é a coluna <code>COMPLETIONS</code> do
+<code>kubectl get jobs</code>: ela mostra “sucessos/combinado”. Enquanto estiver <code>3/240</code>, falta
+muito; em <code>240/240</code>, acabou. A transcrição abaixo é de um cluster de verdade, com o mesmo Job
+de 240 miniaturas rodando:</p>
+
+<pre class="term">$ kubectl get jobs
+NAME         COMPLETIONS   DURATION   AGE
+miniaturas   240/240       14m        14m
+
+$ kubectl get pods
+NAME               READY   STATUS      RESTARTS   AGE
+miniaturas-4k7pd   0/1     Completed   0          13m
+miniaturas-9xm2s   0/1     Completed   0          12m
+miniaturas-jj8vq   0/1     Completed   0          12m</pre>
+
+<p>Duas leituras que valem o preço da aula. Primeiro: <code>READY 0/1</code> com
+<code>STATUS Completed</code> não é problema — é o retrato de um pod que já fez o trabalho e não está
+mais rodando. Segundo: <code>RESTARTS 0</code> quer dizer que o container não precisou reiniciar dentro
+do pod, e não que o Job rodou uma vez só; cada linha é uma execução diferente.</p>
+
+<h2>4. <code>parallelism</code>: quantas de uma vez</h2>
+
+<p>Se <code>completions</code> diz “quantas no total”, <code>spec.parallelism</code> diz “quantas ao mesmo
+tempo”. O padrão também é <code>1</code>, e esse padrão é uma escolha conservadora de propósito: um Job
+de 240 execuções com <code>parallelism: 1</code> roda uma de cada vez, em fila, sem susto. Se cada
+miniatura leva 2 segundos, são 480 segundos — oito minutos. Aceitável para uma noite.</p>
+
+<p>O problema é quando a tarefa não é de 2 segundos. Se cada uma levasse 40 segundos (uma foto grande, um
+vídeo, uma chamada a um serviço externo), 240 execuções em fila seriam 160 minutos. É aí que entra o
+paralelismo: com <code>parallelism: 4</code>, o Job mantém quatro pods trabalhando juntos e repõe cada um
+que termina, como quatro atendentes numa padaria movimentada. A conta do tempo cai para perto de um
+quarto — desde que o cluster tenha espaço para os quatro ao mesmo tempo.</p>
+
+<p>“Desde que o cluster tenha espaço” é a parte que a Ana aprendeu a respeitar na aula de requests. Cada
+pod dos quatro pede CPU e memória; se o pedido não couber nos nós, o quarto pod fica em
+<code>Pending</code> e o Job anda mais devagar do que ela planejou. Paralelismo não cria máquina: ele usa
+a que existe. Num cluster de três nós pequenos, <code>parallelism: 4</code> costuma ser o teto confortável
+para uma tarefa leve; <code>parallelism: 40</code> só faz fila de pods pendentes.</p>
+
+<div class="tryk8s" data-goal="objeto:Job/miniaturas;;campo:Job/miniaturas|spec.completions=6;;campo:Job/miniaturas|spec.parallelism=2" data-get="jobs">
+  <p class="try-task">O Job das miniaturas está com <code>completions: 6</code> e sem
+  <code>parallelism</code>, então ele roda uma de cada vez. Acrescente <code>parallelism: 2</code> para
+  que duas rodem juntas e rode a caixa.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: miniaturas
+spec:
+  completions: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: miniaturas
+          image: miniaturas:1.0</pre>
+<pre class="out">
+job.batch/miniaturas created
+
+NAME         AGE
+miniaturas   7m
+</pre>
+<pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: miniaturas
+spec:
+  completions: 6
+  parallelism: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: miniaturas
+          image: miniaturas:1.0</pre>
+</div>
+
+<p>No painel as seis execuções aparecem de uma vez, porque cada uma termina no mesmo instante — não há
+espera de verdade ali dentro. Num cluster real, com <code>parallelism: 2</code>, no máximo dois pods
+ficam ativos por vez e os outros quatro só nascem quando os primeiros terminam. O que a meta confere é o
+campo: <code>spec.parallelism: 2</code> no Job que existe no cluster.</p>
+
+<h2>5. As duas contas juntas: a fila e os trabalhadores</h2>
+
+<p>Juntando as duas ideias, o Job paralelo é uma fila com vários atendentes. <code>completions</code> é o
+tamanho da fila: quantos itens precisam ser atendidos. <code>parallelism</code> é o número de atendentes:
+quantos trabalham ao mesmo tempo. O controlador fica olhando a fila e os atendentes e faz a coisa óbvia —
+se um atendente termina e ainda há item, ele chama outro; se todos terminaram e a fila está vazia, fecha a
+padaria.</p>
+
+<p>Essa metáfora ajuda a entender um comportamento que assusta: o número de pods do Job <em>muda</em> com
+o tempo. Num Job de 240 com paralelismo 4, o <code>kubectl get pods</code> mostra 4 pods ativos, depois
+3 ativos e 1 terminando, depois 4 de novo. Não é instabilidade; é o controlador repondo quem saiu. Quem
+olha só uma vez pode achar que o Job está “perdendo” pods. A coluna que importa é a de sucessos.</p>
+
+<p>Há um segundo jeito de dividir o trabalho, que não é fila: o <strong>indexado</strong>. Com
+<code>completionMode: Indexed</code>, cada pod recebe um índice fixo de 0 a
+<code>completions - 1</code> e sabe exatamente qual pedaço do trabalho é o dele — a foto de número 137,
+por exemplo. Serve para quando o trabalho pode ser fatiado sem fila central (processar 240 arquivos que
+já existem, cada um no seu pod). A vantagem é que o pod que cai é recriado com o <em>mesmo</em> índice, e
+não com o próximo da fila. A desvantagem é que o programa precisa saber ler esse índice e que a divisão
+tem de ser mais ou menos uniforme.</p>
+
+<p>Fila ou índice, o resultado é o mesmo: o Job sabe quantos sucessos faltam e o cluster não precisa de
+alguém digitando comando para cada foto. É a diferença entre a Ana passando a noite acordada e a Ana
+dormindo enquanto o cluster trabalha.</p>
+
+<h2>6. Quando uma tarefa falha: <code>backoffLimit</code></h2>
+
+<p>Nem toda execução dá certo na primeira. A foto pode estar corrompida, o disco pode encher por um
+minuto, a rede pode piscar. O Job não desiste na primeira falha: ele tenta de novo, com espera crescente
+— 10 segundos, 20, 40, até 5 minutos entre tentativas. Quem define quantas tentativas ele aguenta é
+<code>spec.backoffLimit</code>, cujo padrão é <code>6</code>. Passou disso, o Job inteiro é marcado como
+<code>Failed</code> com o motivo <code>BackoffLimitExceeded</code> e para de criar pods.</p>
+
+<p>Esse desenho é generoso de propósito, e é bom entender o que ele significa na prática: um Job com
+<code>completions: 240</code> e o <code>backoffLimit</code> padrão pode falhar 6 vezes <em>no total</em>
+antes de desistir, não 6 vezes por item. Se a foto 12 está corrompida e sempre falha, o Job vai gastar as
+tentativas nela e desistir do lote inteiro. Para esses casos existem duas saídas: baixar o
+<code>backoffLimit</code> para falhar rápido e investigar, ou tratar o erro dentro do programa e sair com
+0 quando o item é irrecuperável (deixando um registro do que foi pulado).</p>
+
+<p>Num cluster de verdade, o resultado de um Job que desistiu aparece assim — repare que os pods que
+falharam continuam lá, e que o log do último deles diz o que o programa reclamou:</p>
+
+<pre class="term">$ kubectl describe job notas
+Name:             notas
+Namespace:        default
+Labels:           batch.kubernetes.io/job-name=notas
+...
+Status:
+  Conditions:
+    Type    Status  Reason
+    Failed  True    BackoffLimitExceeded
+  Failed:        3
+  Succeeded:     2
+Pods Statuses:  0 Active / 2 Succeeded / 3 Failed
+
+$ kubectl logs notas-7bq9k
+erro: a nota 41 veio sem o CNPJ do cliente</pre>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Padrão</th><th>O que faz</th><th>Quando mexer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>completions</code></td><td>1</td><td>quantos sucessos fecham o Job</td><td>tarefas em
+lote</td></tr>
+<tr><td><code>parallelism</code></td><td>1</td><td>quantos pods ativos ao mesmo tempo</td><td>quando há
+espaço no cluster e pressa</td></tr>
+<tr><td><code>backoffLimit</code></td><td>6</td><td>falhas toleradas antes de desistir</td><td>falhar
+rápido em tarefa crítica</td></tr>
+<tr><td><code>activeDeadlineSeconds</code></td><td>sem limite</td><td>tempo total; estourou, o Job é
+encerrado</td><td>tarefa que pode travar para sempre</td></tr>
+<tr><td><code>ttlSecondsAfterFinished</code></td><td>sem limite</td><td>apaga o Job depois de pronto</td>
+<td>limpeza automática</td></tr>
+<tr><td><code>restartPolicy</code></td><td>obrigatório</td><td><code>OnFailure</code> ou
+<code>Never</code></td><td>sempre: o Job não aceita <code>Always</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>restartPolicy</code> é o campo que mais derruba iniciante (a <a href="restart-policy.html">aula de restartPolicy</a> mostra os três valores em detalhe), porque é o único da lista que o Job
+<em>exige</em>. No pod solto ele é opcional e vale <code>Always</code>; no Job não pode ser
+<code>Always</code>, porque um processo que reinicia para sempre nunca “termina com sucesso”. O manifesto
+precisa dizer <code>OnFailure</code> (o kubelet reinicia o container dentro do mesmo pod) ou
+<code>Never</code> (o pod morre e o Job cria outro). Esquecer a linha não é um erro de estilo: o
+<code>apply</code> recusa o manifesto inteiro.</p>
+
+<div class="tryk8s" data-goal="objeto:Job/notas;;campo:Job/notas|spec.backoffLimit=2;;texto:job.batch/notas created" data-get="jobs">
+  <p class="try-task">O Job das notas fiscais esqueceu o <code>restartPolicy</code> — rode e leia o erro.
+  Depois conserte com <code>restartPolicy: OnFailure</code> e um <code>backoffLimit: 2</code> (a Ana
+  prefere falhar rápido a insistir seis vezes) e rode de novo.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: notas
+spec:
+  completions: 3
+  template:
+    spec:
+      containers:
+        - name: notas
+          image: notas:1.0</pre>
+<pre class="out">
+The Job "notas" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+</pre>
+<pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: notas
+spec:
+  completions: 3
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: notas
+          image: notas:1.0</pre>
+</div>
+
+<p>O erro que aparece é literal: <code>spec.template.spec.restartPolicy: Required value: valid values:
+"OnFailure", "Never"</code>. Ele não diz que o campo está errado, diz que está faltando — e a diferença
+importa, porque a correção é acrescentar a linha no lugar certo, dentro de
+<code>spec.template.spec</code>, e não em <code>spec</code>. Errar o nível é o segundo tropeço mais comum:
+<code>restartPolicy</code> é campo de pod, então mora no template do pod.</p>
+
+<h2>7. O manifesto do Job, peça por peça</h2>
+
+<p>Com o vocabulário no lugar, o manifesto fica fácil de ler. Ele tem o mesmo esqueleto de todo objeto do
+Kubernetes — <code>apiVersion</code>, <code>kind</code>, <code>metadata</code>, <code>spec</code> — e o
+<code>spec</code> tem duas partes: as contas do Job (<code>completions</code>, <code>parallelism</code>,
+<code>backoffLimit</code>) e o <code>template</code>, que é o molde do pod que ele vai criar. Tudo o que
+você aprendeu de pod vale ali dentro: imagem, portas, variáveis, requests, volumes.</p>
+
+<dl class="anatomy">
+<dt>spec.completions</dt>
+<dd>Quantas execuções bem-sucedidas fecham o Job. Sem ele, vale 1. É a meta, não o número de pods que
+existem ao mesmo tempo.</dd>
+<dt>spec.parallelism</dt>
+<dd>Quantas execuções podem rodar juntas. Sem ele, vale 1. Se for maior que <code>completions</code>, o
+Job nunca cria mais pods do que faltam.</dd>
+<dt>spec.backoffLimit</dt>
+<dd>Quantas falhas o controlador tolera antes de marcar o Job como <code>Failed</code>. Padrão 6, com
+espera crescente entre tentativas.</dd>
+<dt>spec.activeDeadlineSeconds</dt>
+<dd>Tempo de vida do Job inteiro, contado do começo. Estourou, os pods são encerrados e o Job termina em
+<code>Failed</code> com motivo <code>DeadlineExceeded</code>. Bom para tarefa que pode travar.</dd>
+<dt>spec.template</dt>
+<dd>O molde do pod: <code>metadata.labels</code> e <code>spec</code> com containers,
+<code>restartPolicy</code> e recursos. O Job cria um pod novo a partir desse molde a cada execução.</dd>
+<dt>spec.completionMode</dt>
+<dd><code>NonIndexed</code> (padrão, fila) ou <code>Indexed</code> (cada pod com um índice fixo). Muda
+como o trabalho é dividido, não quantas vezes ele roda.</dd>
+</dl>
+
+<p>Uma coisa que o manifesto <em>não</em> tem: seletor. No Deployment você escreve
+<code>spec.selector</code> e precisa casar com as etiquetas do template; no Job, o controlador cria o
+seletor sozinho e ninguém mexe nele. Menos campo, menos erro — mas também menos controle: não dá para
+“adotar” pods soltos num Job.</p>
+
+<p>E tem o <code>status</code>, que você nunca escreve e sempre lê. Ele traz <code>succeeded</code>,
+<code>failed</code>, <code>active</code> e as condições <code>Complete</code> ou <code>Failed</code>. É a
+resposta do cluster à sua receita, e é onde o <code>kubectl describe job</code> vai buscar a frase que
+explica por que o Job parou.</p>
+
+<h2>8. Quando o Job não é a ferramenta certa</h2>
+
+<p>Job é para trabalho que acaba. Se a Ana quer o site no ar, é Deployment; se quer o resumo das vendas
+todas as noites às 23h, é CronJob (um Job que nasce no horário marcado); se quer um banco de dados com
+identidade fixa por pod, é StatefulSet. Usar Job para o site dá um site que sai do ar quando o Job
+completa; usar Deployment para as miniaturas dá 240 pods gerando a mesma coisa para sempre.</p>
+
+<p>Há ainda um caso em que o Job <em>parece</em> a resposta e não é: trabalho que precisa rodar antes do
+pod principal, uma vez por pod. Isso é init container, não Job. E há o caso inverso, em que o Job é a
+resposta e as pessoas esquecem: a limpeza semanal dos arquivos temporários, a exportação mensal do
+relatório, a migração do banco antes de subir a versão nova. Tudo isso é “faz uma vez, termina, me diz se
+deu certo”.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="conta:jobs=1;;texto:job.batch/miniaturas created;;texto:Succeeded">
+  <p class="try-task">A Ana começou pelo caminho errado: criou o Job com <code>--restart=Always</code> e
+  ganhou um Deployment que nunca termina. Troque a criação por <code>kubectl create job</code>, liste os
+  Jobs e veja o pod terminar em <code>Succeeded</code>.</p>
+<pre class="yaml">kubectl run miniaturas --image=miniaturas:1.0 --restart=Always
+kubectl get deployments</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run miniaturas --image=miniaturas:1.0 --restart=Always
+deployment.apps/miniaturas created
+
+ana@notebook:~$ kubectl get deployments
+NAME         READY   UP-TO-DATE   AVAILABLE   AGE
+miniaturas   1/1     1            1           7m
+</pre>
+<pre class="solucao">kubectl create job miniaturas --image=miniaturas:1.0
+kubectl get jobs
+kubectl get pods</pre>
+</div>
+
+<p>O <code>kubectl create job</code> é o atalho para uma execução única, sem <code>completions</code> nem
+<code>parallelism</code> — bom para testar a imagem antes de escrever o manifesto de 240. Repare que o
+pod do Job não fica em <code>Running</code>: ele termina em <code>Succeeded</code> e ali permanece. No
+cluster de verdade o <code>kubectl get pods</code> mostra <code>Completed</code> na coluna
+<code>STATUS</code>; é o mesmo estado, com o nome que o kubectl usa na tabela.</p>
+
+<p>Para esperar o fim de um Job no script de automação, existe <code>kubectl wait</code>:
+<code>kubectl wait --for=condition=complete job/miniaturas --timeout=15m</code>. Ele fica bloqueado até a
+condição <code>Complete</code> aparecer ou o tempo acabar — é o que se usa num pipeline, no lugar de
+<code>sleep 600</code> e fé.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o Job que falhou e não conta o porquê</h3>
+<p>A Ana roda o Job das notas e vê <code>Failed</code> no <code>get jobs</code>. O motivo não está ali:
+está no <code>kubectl describe job notas</code>, na condição <code>BackoffLimitExceeded</code>, e nos
+eventos dos pods. O passo seguinte é <code>kubectl logs</code> no pod que falhou — que continua existindo
+justamente para isso. Job não apaga o pod que falhou; ele guarda a cena do crime.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Job que nunca termina</h3>
+<p>Um Job de 240 itens em <code>1/240</code> há três horas quase sempre quer dizer que o programa trava
+sem sair. Não é falha (nada saiu com erro), é travamento. Sem <code>activeDeadlineSeconds</code>, o Job
+espera para sempre. Com <code>activeDeadlineSeconds: 3600</code>, ele mesmo encerra os pods no prazo e
+marca <code>DeadlineExceeded</code> — e a Ana acorda com um Job falhado e um log para ler, em vez de com
+um Job pendurado.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o Job rodou duas vezes</h3>
+<p>Ela rodou o Job de 240, o Job completou, e no dia seguinte rodou <code>kubectl apply</code> do mesmo
+arquivo de novo. Nasceu um Job novo (o nome é o mesmo, mas o objeto anterior já tinha terminado) e as 240
+miniaturas foram geradas outra vez. Job não tem memória entre execuções: se o trabalho precisa ser
+idempotente — rodar duas vezes sem estragar —, isso é responsabilidade do programa, não do Kubernetes.
+O <code>ttlSecondsAfterFinished</code> ajuda a não deixar lixo, mas não impede a segunda rodada.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<p>Três perguntas rápidas antes do exercício. Responda sem voltar ao texto; depois confira.</p>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Um Job com <code>completions: 240</code> e
+<code>parallelism: 4</code>. Quantas execuções rodam ao mesmo tempo?</p>
+<label><input type="radio" name="q1"> 240, uma para cada foto</label>
+<label><input type="radio" name="q1"> no máximo 4, repostas à medida que terminam</label>
+<label><input type="radio" name="q1"> 1, porque o padrão do Job é sequencial</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que acontece se o manifesto do Job não tiver
+<code>restartPolicy</code>?</p>
+<label><input type="radio" name="q2"> o Job assume <code>Always</code> e reinicia para sempre</label>
+<label><input type="radio" name="q2"> o Job assume <code>OnFailure</code> e funciona</label>
+<label><input type="radio" name="q2"> o <code>apply</code> recusa: o campo é obrigatório e só aceita
+<code>OnFailure</code> ou <code>Never</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O Job terminou com <code>Failed</code> e motivo
+<code>BackoffLimitExceeded</code>. O que isso quer dizer?</p>
+<label><input type="radio" name="q3"> as tentativas acabaram: o Job falhou mais vezes do que o
+<code>backoffLimit</code> permitia</label>
+<label><input type="radio" name="q3"> o cluster ficou sem memória e matou os pods</label>
+<label><input type="radio" name="q3"> o tempo máximo do Job (<code>activeDeadlineSeconds</code>)
+estourou</label>
+</div>
+
+<h2>Exercício: o Job da fornada</h2>
+
+<p>A padaria assa 120 fornadas por semana e cada fornada gera um arquivo de registro. Escreva o Job
+<code>fornadas</code>, com a imagem <code>fornadas:1.0</code>, que roda 120 execuções, quatro de cada vez,
+com <code>backoffLimit: 3</code> e o <code>restartPolicy</code> correto. Depois responda: qual campo diz
+<em>quantas vezes</em> a tarefa precisa dar certo?</p>
+
+<div class="exercise">
+<div class="ex-code">spec.<input aria-label="resposta 1" data-answer="completions" placeholder="...">: 120</div>
+
+<p class="ex-dica">Dica: <code>completions</code> é a meta de sucessos; <code>parallelism</code> é quantas
+rodam juntas. O <code>restartPolicy</code> fica dentro de <code>spec.template.spec</code>, junto dos
+containers.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Job é o objeto do trabalho que acaba: ele cria pods até que um número combinado de execuções termine
+com sucesso e então para. <code>completions</code> é esse número (padrão 1) e <code>parallelism</code> é
+quantas rodam ao mesmo tempo (padrão 1). Juntos, eles transformam 240 fotos numa fila com quatro
+atendentes: o controlador repõe cada pod que termina até a fila esvaziar.</p>
+
+<p>Falhas são esperadas e têm orçamento: <code>backoffLimit</code> (padrão 6) diz quantas o Job tolera
+antes de desistir com <code>BackoffLimitExceeded</code>; <code>activeDeadlineSeconds</code> limita o tempo
+total para o caso de travamento; <code>ttlSecondsAfterFinished</code> limpa o Job depois de pronto. E o
+<code>restartPolicy</code> não é opcional: o Job só aceita <code>OnFailure</code> ou <code>Never</code>,
+e o campo mora em <code>spec.template.spec</code>.</p>
+
+<p>Para ler o que aconteceu, <code>kubectl get jobs</code> mostra <code>COMPLETIONS</code> em
+“sucessos/combinado”; os pods ficam em <code>Completed</code> guardando o log; o
+<code>kubectl describe job</code> traz a condição final e o evento que explica a parada. Job não é
+Deployment: um quer ficar, o outro quer acabar — e confundir os dois é o caminho mais rápido para 240 pods
+eternos gerando a mesma miniatura.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Job = trabalho que termina; Deployment = processo que fica.</li>
+  <li><code>completions</code>: quantos sucessos; <code>parallelism</code>: quantos por vez.</li>
+  <li><code>COMPLETIONS 240/240</code> é o Job completo; pod <code>Completed</code> é sucesso
+  arquivado.</li>
+  <li><code>restartPolicy</code> no Job: <code>OnFailure</code> ou <code>Never</code>, dentro do
+  template.</li>
+  <li><code>backoffLimit</code> estourou: <code>BackoffLimitExceeded</code>; leia os logs do pod que
+  falhou.</li>
+  <li>CronJob é um Job com horário marcado; init container é outra coisa.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

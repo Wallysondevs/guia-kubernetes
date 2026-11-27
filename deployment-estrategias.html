@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Estratégias de rollout | Guia Kubernetes</title>
+<meta name="description" content="Recreate e RollingUpdate na prática: escolher a estratégia do Deployment, entender maxSurge e maxUnavailable, fazer a conta das réplicas e saber quando cada uma serve.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Estratégias</span> de rollout</h1>
+<p class="intro">A Ana já sabe publicar e já sabe voltar. Falta decidir <em>como</em> a troca acontece — e
+essa decisão muda o que o cliente sente. Numa tarde de teste, ela publicou uma versão que mudava a tabela
+de pedidos e viu metade das requisições falhar, porque as duas versões conviveram por dois minutos. Nesta
+aula ela conhece os dois jeitos que o Kubernetes oferece — <code>Recreate</code> e
+<code>RollingUpdate</code> — e os dois botões que dizem quanto o serviço pode apertar no meio da troca:
+<code>maxSurge</code> e <code>maxUnavailable</code>.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>As duas estratégias de rollout e o que cada uma faz com os pods.</li>
+  <li>Escrever <code>spec.strategy</code> no manifesto, com os valores que o cluster aceita.</li>
+  <li>Ler os padrões do Kubernetes com <code>get -o yaml</code> e a documentação com
+  <code>explain</code>.</li>
+  <li>Entender <code>maxSurge</code> e <code>maxUnavailable</code>, em número e em porcentagem.</li>
+  <li>Fazer a conta com poucas réplicas, lembrando como o Kubernetes arredonda.</li>
+  <li>Escolher a estratégia certa para cada tipo de serviço.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a versão que precisava de silêncio</h2>
+
+<p>O site da padaria tem uma parte que quase nunca muda: a página do cardápio. E tem uma parte que muda
+toda semana: o cálculo de promoções. As duas rodam no mesmo Deployment, com duas réplicas. Numa
+quinta-feira, a Ana publicou uma versão que mudava a forma como a promoção era gravada — e a versão velha,
+que ainda estava atendendo, gravava no formato antigo. O resultado foi uma tabela com dois formatos e um
+relatório que somava errado.</p>
+
+<p>Não havia bug no código. Havia duas versões no ar ao mesmo tempo, cada uma falando uma língua. Um
+rolling update bem configurado deixa isso acontecer de propósito, porque a alternativa — derrubar tudo e
+subir tudo — é pior para quem está comprando pão. Mas existe um caso em que derrubar tudo é o certo: quando
+as versões <em>não podem</em> conviver.</p>
+
+<p>É exatamente essa a decisão que a estratégia de rollout resolve. Ela não é sobre velocidade nem sobre
+quantidade de pods: é sobre <strong>quanto tempo as duas versões convivem</strong>. <code>Recreate</code>
+diz “nenhum segundo”: todos os pods antigos morrem, depois os novos nascem. <code>RollingUpdate</code> diz
+“o tempo que precisar”: os novos entram, os antigos saem aos poucos. Não existe resposta universal — existe
+a resposta certa para o seu serviço.</p>
+
+<h2>2. Duas estratégias, um campo</h2>
+
+<p>Tudo vive em <code>spec.strategy</code>, um bloco curto com <code>type</code> e, quando o tipo é
+<code>RollingUpdate</code>, um sub-bloco <code>rollingUpdate</code>. Se você não escrever nada, o
+Kubernetes assume <code>RollingUpdate</code> com 25% para cima e 25% para baixo. Ou seja: quem nunca
+escolheu já está usando rolling update, com os valores padrão.</p>
+
+<dl class="anatomy">
+<dt>strategy</dt>
+<dd>O bloco do manifesto que decide como os pods antigos são substituídos pelos novos.</dd>
+<dt>Recreate</dt>
+<dd>Todos os pods antigos são encerrados antes de qualquer pod novo nascer. Há um intervalo sem nenhuma
+réplica: downtime garantido.</dd>
+<dt>RollingUpdate</dt>
+<dd>Pods novos sobem enquanto os antigos ainda atendem; a troca é gradual. É o padrão do Kubernetes.</dd>
+<dt>maxSurge</dt>
+<dd>Quantos pods <em>acima</em> do número desejado podem existir durante a troca. Pode ser número
+(<code>1</code>) ou porcentagem (<code>25%</code>).</dd>
+<dt>maxUnavailable</dt>
+<dd>Quantos pods <em>abaixo</em> do desejado podem ficar durante a troca. Também aceita número ou
+porcentagem.</dd>
+</dl>
+
+<p>Uma distinção que vale ouro: <code>maxSurge</code> fala de pods <em>extras</em>, e
+<code>maxUnavailable</code> fala de pods <em>faltando</em>. Os dois ao mesmo tempo não podem ser zero,
+senão a troca nunca sai do lugar — não há pod novo para entrar nem pod velho para sair. O Kubernetes real
+recusa essa combinação com uma mensagem explícita; o painel deste guia não valida essa regra, então vale
+guardá-la na cabeça.</p>
+
+<h2>3. Recreate: tudo velho sai, tudo novo entra</h2>
+
+<p>A estratégia <code>Recreate</code> é a mais simples de entender e a mais fácil de sofrer. O controlador
+escala o ReplicaSet antigo para zero, espera todos os pods terminarem e só então cria o novo. Durante esse
+intervalo, o Service não tem endpoint nenhum e quem tentar acessar recebe erro de conexão. Em troca, você
+tem a garantia de que nunca existem duas versões ao mesmo tempo.</p>
+
+<p>A caixa abaixo tem um erro de propósito: o valor <code>BlueGreen</code> não existe no campo. Rode e
+leia a mensagem, que lista os valores aceitos — é a melhor documentação que existe, porque vem do próprio
+cluster.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/cardapio|spec.strategy.type=Recreate;;conta:pods=2">
+  <p class="try-task">Troque o tipo para <code>Recreate</code>, rode e confira os dois pods criados.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  strategy:
+    type: BlueGreen
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.strategy.type: Unsupported value: "BlueGreen": supported values: "Recreate", "RollingUpdate"
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>A mensagem é <code>spec.strategy.type: Unsupported value: "BlueGreen": supported values: "Recreate",
+"RollingUpdate"</code>. Duas palavras em inglês e a lista completa do que o campo aceita. Não existe
+BlueGreen como estratégia nativa do Deployment: o padrão blue-green se monta com dois Deployments e um
+Service que aponta para um deles, e tem aula própria no nível de escala e disponibilidade. Aqui, o que
+importa é que o campo é fechado: dois valores, sem invenção.</p>
+
+<p>Vale saber quando <code>Recreate</code> é a escolha adulta, e não a preguiçosa. Se a versão nova muda o
+formato de um dado que a versão velha lê, conviver é perigoso. Se o serviço tem um único escritor — um
+processo que não pode rodar em duas cópias ao mesmo tempo, como um consumidor de fila com ordem
+garantida —, conviver é impossível. Nesses casos, alguns segundos de indisponibilidade planejada valem
+mais do que minutos de dados inconsistentes.</p>
+
+<h2>4. RollingUpdate: o padrão que quase ninguém configura</h2>
+
+<p>Se você não escrever <code>strategy</code>, o Deployment nasce com <code>RollingUpdate</code> e os
+valores padrão de 25% e 25%. Isso quer dizer que a maioria dos manifestos por aí nunca escolheu nada — e
+funciona bem, porque o padrão é razoável para serviços sem estado. O problema é descobrir isso no meio de
+uma emergência; melhor ler os valores antes.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:maxSurge: 25%;;texto:maxUnavailable: 25%;;texto:Recreate">
+  <p class="try-task">Leia os valores padrão com <code>kubectl get deployment cardapio -o yaml</code> e
+  depois a documentação do campo com <code>kubectl explain deployment.spec.strategy</code>.</p>
+<pre class="yaml">kubectl explain deployment
+kubectl get deployments</pre>
+<pre class="out">
+ana@notebook:~$ kubectl explain deployment
+KIND:       Deployment
+VERSION:    apps/v1
+
+DESCRIPTION:
+     Deployment enables declarative updates for Pods and ReplicaSets.
+
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">kubectl get deployment cardapio -o yaml
+kubectl explain deployment.spec.strategy</pre>
+</div>
+
+<p>O <code>-o yaml</code> mostra o objeto inteiro, com os campos que você não escreveu já preenchidos pelo
+cluster. É a única forma de saber o que está valendo de verdade, porque o arquivo do repositório pode estar
+silencioso sobre o assunto. O trecho que interessa é este:</p>
+
+<pre class="term">spec:
+  progressDeadlineSeconds: 600
+  replicas: 2
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: cardapio
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate</pre>
+
+<p>Esse bloco é a resposta do painel para o Deployment da padaria, copiada do <code>-o yaml</code>. Repare
+que <code>rollingUpdate</code> só existe porque o tipo é <code>RollingUpdate</code>; com
+<code>Recreate</code>, o sub-bloco desaparece. E repare nos dois <code>25%</code>: eles significam coisas
+diferentes, e é aí que a aula fica interessante.</p>
+
+<p>A segunda metade do segredo é o <code>kubectl explain</code>, que lê a documentação do próprio tipo
+direto do cluster. Ele não precisa de internet e nunca está desatualizado em relação à versão que está
+rodando. Esta é a saída que o painel devolve para o campo da estratégia:</p>
+
+<pre class="term">KIND:       Deployment
+VERSION:    apps/v1
+
+FIELD: strategy &lt;DeploymentStrategy&gt;
+
+DESCRIPTION:
+     The deployment strategy to use to replace existing pods with new ones.
+
+FIELDS:
+   type	&lt;string&gt;
+     Type of deployment. Can be "Recreate" or "RollingUpdate". Default is
+     RollingUpdate.
+
+   rollingUpdate	&lt;RollingUpdateDeployment&gt;
+     Rolling update config params. Present only if DeploymentStrategyType =
+     RollingUpdate.</pre>
+
+<p>Repare que o texto diz “Default is RollingUpdate”: a confirmação de que quem não escolhe nada ganha
+rolling update. E diz também que <code>rollingUpdate</code> só está presente quando o tipo é
+<code>RollingUpdate</code> — o que explica por que o bloco some quando você escolhe
+<code>Recreate</code>. Duas frases que economizam meia hora de tentativa e erro.</p>
+
+<h2>5. maxSurge e maxUnavailable: os dois botões</h2>
+
+<p>Com duas réplicas, <code>maxSurge: 25%</code> permite zero vírgula cinco pod a mais — e o Kubernetes
+arredonda <em>para cima</em>, então permite um. <code>maxUnavailable: 25%</code> permite zero vírgula
+cinco a menos, e aqui ele arredonda <em>para baixo</em>: zero. Traduzindo: durante a troca, podem existir
+até três pods (dois desejados mais um extra) e nunca menos de dois atendendo. É um rolling update sem
+queda, com o dobro de pods por alguns segundos.</p>
+
+<p>A caixa abaixo pede uma configuração explícita para três réplicas: no máximo um pod extra e nenhum
+pod faltando. Esse é o ajuste clássico de quem quer zero downtime e tem recurso sobrando para o pico.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/cardapio|spec.strategy.rollingUpdate.maxSurge=1;;campo:Deployment/cardapio|spec.strategy.rollingUpdate.maxUnavailable=0;;conta:pods=3">
+  <p class="try-task">Com <code>replicas: 3</code>, ajuste <code>maxSurge: 1</code> e
+  <code>maxUnavailable: 0</code> e rode.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 50%
+      maxUnavailable: 50%
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   3/3     3            3           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Com <code>maxUnavailable: 0</code>, o controlador é obrigado a criar um pod novo antes de apagar
+qualquer antigo. Com <code>maxSurge: 1</code>, ele nunca cria dois de uma vez. O resultado é uma troca
+lenta e segura: três pods antigos, um novo entra, fica pronto, um antigo sai, repete. Quatro pods no pico,
+nunca menos de três prontos. Se você tivesse 100 réplicas, os mesmos valores dariam 101 no pico — daí a
+vantagem de usar porcentagem em serviços grandes.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Configuração</th><th>Pods no pico</th><th>Pods mínimos</th><th>Para quem serve</th></tr>
+</thead>
+<tbody>
+<tr><td><code>maxSurge: 1</code>, <code>maxUnavailable: 0</code></td><td>desejado + 1</td><td>o
+desejado</td><td>zero downtime com recurso sobrando</td></tr>
+<tr><td><code>maxSurge: 0</code>, <code>maxUnavailable: 1</code></td><td>o desejado</td><td>desejado −
+1</td><td>cluster apertado, tolera uma falta</td></tr>
+<tr><td><code>25%</code> e <code>25%</code> (padrão)</td><td>desejado + 25%</td><td>desejado −
+25%</td><td>serviço comum, sem exigência forte</td></tr>
+<tr><td><code>Recreate</code></td><td>o desejado</td><td>zero durante a troca</td><td>versões que não
+podem conviver</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O arredondamento é a parte que mais confunde e a que mais importa em serviços pequenos. Regra prática:
+<code>maxSurge</code> arredonda para cima, <code>maxUnavailable</code> arredonda para baixo. Com uma
+réplica só e o padrão de 25%, você tem surge 1 e unavailable 0 — ou seja, dois pods no pico e nunca zero.
+Com quatro réplicas e 25%, surge 1 e unavailable 1. Com três réplicas e 25%, surge 1 e unavailable 0. É por
+isso que “25%” não quer dizer a mesma coisa em Deployments de tamanhos diferentes.</p>
+
+<h2>6. Fazendo a conta antes de publicar</h2>
+
+<p>Vale calcular antes, no papel, e não durante o incidente. Pergunte três coisas: quantas réplicas eu
+tenho, quantos pods a mais eu aguento, quantos pods a menos o serviço tolera. As respostas vêm do
+significado de cada botão, não de fé. Um serviço que atende bem com metade da capacidade tolera
+<code>maxUnavailable: 50%</code>; um serviço no limite não tolera nada acima de zero.</p>
+
+<p>O limite físico entra na conta também. Se o cluster não tem CPU para o pod extra, o rollout trava com o
+pod novo em <code>Pending</code> — e aí <code>maxSurge: 1</code> vira um problema, não uma proteção. Em
+cluster apertado, a configuração honesta é <code>maxSurge: 0</code> com <code>maxUnavailable: 1</code>:
+aceita um pod a menos durante a troca em vez de pedir espaço que não existe. É uma escolha de engenharia,
+não um detalhe de YAML.</p>
+
+<p>Outra conta que ninguém faz: o tempo. Cada passo do rolling update espera o pod novo ficar pronto, e
+“pronto” inclui a verificação de prontidão. Com 20 réplicas, <code>maxSurge: 1</code> e 30 segundos por
+pod, a troca leva dez minutos. Se o seu deploy precisa terminar em dois, ou você aceita mais surge ou
+aceita mais unavailable. Não existe almoço grátis: os dois botões são a negociação entre velocidade e
+folga.</p>
+
+<h2>7. Qual escolher: o critério que não é técnico</h2>
+
+<p>A pergunta certa não é “qual é mais moderna”. É “as duas versões podem conviver?”. Se a resposta for
+sim, <code>RollingUpdate</code> — e você ganha zero downtime de graça. Se for não, <code>Recreate</code> —
+e você ganha consistência ao preço de alguns segundos fora do ar. Serviços sem estado, APIs idempotentes e
+sites de conteúdo quase sempre podem conviver. Migrações de schema, tarefas com escrita única e mudanças de
+contrato quase nunca podem.</p>
+
+<p>Quando a resposta é “não sei”, trate como “não pode” até provar o contrário. É mais barato planejar uma
+janela de manutenção do que descobrir a incompatibilidade com clientes na tela. E vale lembrar que
+<code>Recreate</code> não é sinônimo de desleixo: com um Service na frente, o intervalo sem pods vira erro
+de conexão rápido, e um bom monitoramento avisa antes do cliente reclamar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Situação</th><th>Estratégia</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>site de cardápio, sem estado</td><td><code>RollingUpdate</code></td><td>as versões são
+intercambiáveis; não há motivo para cair</td></tr>
+<tr><td>versão nova muda o formato do dado</td><td><code>Recreate</code></td><td>conviver produz dado
+inconsistente</td></tr>
+<tr><td>consumidor de fila com ordem única</td><td><code>Recreate</code></td><td>duas cópias processariam
+a mesma fila em paralelo</td></tr>
+<tr><td>cluster sem folga de recurso</td><td><code>RollingUpdate</code> com
+<code>maxSurge: 0</code></td><td>troca sem pedir pod extra que não cabe</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. O que o painel mostra (e o que ele não mostra)</h2>
+
+<p>O painel valida a estratégia como o cluster valida: valor fora da lista é recusado com a mensagem que
+lista os aceitos. Ele também guarda os valores no objeto, e o <code>-o yaml</code> devolve o bloco
+<code>strategy</code> completo, com os padrões preenchidos. Isso é o suficiente para aprender a escrever e
+a ler o campo.</p>
+
+<p>O que ele não faz é encenar a troca passo a passo: sem kubelet, não há pods antigos saindo e novos
+entrando em ritmo de <code>maxSurge</code>. Num cluster real, o <code>get pods</code> durante um rolling
+update mostra sufixos das duas gerações convivendo, e o número de pods sobe até o pico permitido. Aqui, o
+que você vê é o resultado final da configuração — e a mensagem de erro quando ela está errada, que é onde
+90% dos problemas começam.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o pico que não coube</h3>
+<p>A Ana configurou <code>maxSurge: 2</code> num cluster que já estava no limite. O rollout travou: os dois
+pods extras ficaram em <code>Pending</code> e os antigos não saíram, porque a estratégia proíbe faltar
+pod. O site continuou no ar, com a versão velha, e o deploy ficou parado até alguém reduzir o surge. A
+estratégia certa depende do cluster, não só do serviço.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a janela de manutenção que ninguém avisou</h3>
+<p>Um serviço interno foi migrado para <code>Recreate</code> sem aviso. Durante quarenta segundos, o
+sistema de notas fiscais não respondeu e as notas ficaram numa fila. Nada se perdeu, mas o suporte recebeu
+vinte chamados. Estratégia é decisão de produto também: quem escolhe <code>Recreate</code> precisa avisar
+quem depende do serviço.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o maxUnavailable que ninguém leu</h3>
+<p>Com quatro réplicas e <code>maxUnavailable: 50%</code>, a troca derrubou duas de uma vez e o tempo de
+resposta dobrou por um minuto. O time achou que era tráfego. Era configuração. Ler os dois números antes
+de publicar custa menos do que explicar depois por que o site ficou lento no meio da tarde.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual estratégia derruba todos os pods antigos antes de
+subir os novos?</p>
+<label><input type="radio" name="q1"> <code>RollingUpdate</code></label>
+<label><input type="radio" name="q1"> <code>Recreate</code></label>
+<label><input type="radio" name="q1"> <code>BlueGreen</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O que <code>maxUnavailable: 0</code> garante durante a
+troca?</p>
+<label><input type="radio" name="q2"> que nunca haverá menos pods prontos do que o número desejado</label>
+<label><input type="radio" name="q2"> que nenhum pod extra será criado</label>
+<label><input type="radio" name="q2"> que a troca será instantânea</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">3. Com 3 réplicas, <code>maxSurge: 25%</code> e
+<code>maxUnavailable: 25%</code>, quantos pods podem existir no pico?</p>
+<label><input type="radio" name="q3"> 3</label>
+<label><input type="radio" name="q3"> 5</label>
+<label><input type="radio" name="q3"> 4</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a troca sem queda</h2>
+<p>O Deployment da vitrine tem quatro réplicas e precisa de zero downtime, com no máximo um pod extra.
+Complete o campo que diz quantos pods podem faltar durante a troca e responda: qual é o valor certo?</p>
+<div class="ex-code">maxUnavailable: <input aria-label="resposta 1" data-answer="0" placeholder="..."></div>
+<p class="ex-dica">Dica: se nenhum pod pode faltar, o valor é o menor inteiro possível. Com
+<code>maxSurge: 1</code>, a troca acontece criando antes de apagar.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Estratégia é a resposta a “as duas versões podem conviver?”. <code>Recreate</code> diz não e aceita
+downtime; <code>RollingUpdate</code> diz sim e troca aos poucos. O campo é <code>spec.strategy.type</code>,
+e o cluster só aceita esses dois valores — qualquer outro é recusado com a lista do que vale.</p>
+
+<p>Dentro do <code>RollingUpdate</code>, <code>maxSurge</code> é quantos pods extras podem existir e
+<code>maxUnavailable</code> é quantos podem faltar. Porcentagens arredondam para cima no surge e para baixo
+no unavailable, o que muda o resultado em serviços pequenos. <code>maxSurge: 1</code> com
+<code>maxUnavailable: 0</code> é a receita de zero downtime quando há recurso; <code>maxSurge: 0</code>
+com <code>maxUnavailable: 1</code> é a receita de cluster apertado.</p>
+
+<p>Os padrões (25% e 25%) são razoáveis e quase nunca lidos. Ler o <code>-o yaml</code> antes de publicar
+evita descobrir a configuração no meio do incidente. Na próxima aula a Ana olha para o outro lado dessa
+história: as revisões — quantas ficam guardadas, como marcar a causa de cada uma e por que o histórico é
+a memória do Deployment.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>spec.strategy.type</code> aceita <code>Recreate</code> ou <code>RollingUpdate</code>.</li>
+  <li><code>maxSurge</code> = pods extras; <code>maxUnavailable</code> = pods faltando.</li>
+  <li>Porcentagem arredonda para cima no surge e para baixo no unavailable.</li>
+  <li>Zero downtime pede <code>maxSurge</code> maior que zero e <code>maxUnavailable: 0</code> — e
+  recurso no cluster para o pod extra.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

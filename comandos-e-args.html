@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>command e args | Guia Kubernetes</title>
+<meta name="description" content="command e args no Kubernetes: como substituir o ENTRYPOINT e o CMD da imagem, o que acontece quando você troca os dois e como ler o exit code no describe.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>command e <span class="hl">args</span></h1>
+<p class="intro">A imagem <code>cardapio:1.0</code> da Ana já sabe como começar: quando o pod sobe, o
+programa abre o servidor na porta 8080 e fica esperando pedidos. Isso funciona até o dia em que ela
+precisa do <em>mesmo</em> programa em outro modo — um que só mostra a versão, outro que roda a migração do
+banco e termina. O lugar onde se troca isso é o manifesto, nos campos <code>command</code> e
+<code>args</code>. Nesta aula a Ana descobre por que esses dois campos confundem tanto, aprende a regra
+que resolve 90% dos casos e vê o que acontece quando eles são trocados: o pod sobe, morre e reinicia em
+loop.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que a imagem já traz pronto (o <code>ENTRYPOINT</code> e o <code>CMD</code> do Dockerfile).</li>
+  <li>Como <code>command</code> e <code>args</code> substituem esses dois pedaços.</li>
+  <li>A tabela oficial: o que roda em cada combinação dos dois campos.</li>
+  <li>Por que a ordem de um <code>sh -c</code> importa e como o erro aparece no cluster.</li>
+  <li>O que fazer quando o container termina: exit code, <code>Completed</code> e <code>CrashLoopBackOff</code>.</li>
+  <li>Onde ver o comando que está de fato rodando, no <code>describe</code> e no <code>-o yaml</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o mesmo programa, outro modo</h2>
+
+<p>O site da padaria é um programa Node pequeno. A imagem <code>cardapio:1.0</code> foi construída com uma
+instrução no fim do Dockerfile parecida com esta: <code>CMD ["node", "servidor.js"]</code>. É por isso que a
+Ana nunca precisou dizer <em>como</em> rodar o programa: ela manda a imagem, e a imagem já sabe o que
+fazer.</p>
+
+<p>Só que o mesmo código tem outros modos. Existe um arquivo <code>versao.js</code> que imprime a versão e
+sai. Existe um <code>migrar.js</code> que arruma as tabelas do banco e sai. Nenhum dos dois abre servidor na
+porta 8080 — os dois fazem uma coisa e terminam. Se a Ana criar um pod com a imagem do jeito que está, ele
+vai abrir o servidor e ficar lá para sempre; ela precisa de um pod que rode <em>outro</em> comando.</p>
+
+<p>É exatamente para isso que existem <code>command</code> e <code>args</code>. Eles não mudam a imagem:
+mudam o que o cluster executa <strong>naquele pod</strong>, naquela execução. A mesma imagem pode abrir o
+servidor num pod e rodar a migração em outro, sem rebuild, sem tag nova, sem imagem duplicada.</p>
+
+<h2>2. A receita que já vem dentro da imagem</h2>
+
+<p>Antes de mexer, vale entender o que a imagem entrega. Todo Dockerfile termina com duas instruções
+opcionais que formam, juntas, o comando de partida. O <code>ENTRYPOINT</code> é o <em>executável</em> — o
+que é chamado primeiro. O <code>CMD</code>, quando vem depois do entrypoint, é a lista de
+<em>parâmetros</em> padrão. Pense num bolo de padaria: a imagem é a receita impressa, com o nome do bolo e
+o recheio já sugerido.</p>
+
+<p>O Kubernetes pega esses dois pedaços e batiza de outro jeito, o que é metade da confusão: o
+<code>command</code> do manifesto fala com o <code>ENTRYPOINT</code> da imagem, e o <code>args</code> do
+manifesto fala com o <code>CMD</code>. Os nomes não combinam, e é por isso que tanta gente troca os dois na
+primeira vez.</p>
+
+<dl class="anatomy">
+<dt>ENTRYPOINT (imagem)</dt>
+<dd>O executável de partida, definido no Dockerfile. É quem o <code>command</code> do manifesto
+substitui.</dd>
+<dt>CMD (imagem)</dt>
+<dd>Os parâmetros padrão, também do Dockerfile. É o que o <code>args</code> do manifesto substitui.</dd>
+<dt>command</dt>
+<dd>Campo do manifesto, uma <em>lista</em> de strings: o executável e, se você quiser, os primeiros
+argumentos. Sobrescreve o <code>ENTRYPOINT</code>.</dd>
+<dt>args</dt>
+<dd>Campo do manifesto, também uma lista: só os argumentos. Sobrescreve o <code>CMD</code>.</dd>
+<dt>exit code</dt>
+<dd>O número que o processo devolve ao terminar. <code>0</code> é sucesso; qualquer outro é falha, e cada
+número tem um significado.</dd>
+</dl>
+
+<p>Quando a Ana não escreve nenhum dos dois no manifesto, o cluster usa os dois da imagem. É o caso de
+todos os pods que ela criou até agora na
+<a href="primeiro-pod.html">aula do primeiro pod</a> — eles funcionaram justamente porque a imagem tinha
+um padrão bom.</p>
+
+<h2>3. command: você assume o volante</h2>
+
+<p>O <code>command</code> é uma lista, e cada item é uma palavra do comando. Para rodar o script de versão,
+a Ana escreve assim:</p>
+
+<pre class="file" data-file="versao.yaml">spec:
+  containers:
+    - name: versao
+      image: cardapio:1.0
+      command: ["node", "versao.js"]</pre>
+
+<p>Repare que é uma lista com dois itens, não uma frase. Se você escrever a lista numa linha só, com
+colchetes, o YAML entende. Se preferir o formato de baixo, com hífen em cada item, também vale — é o mesmo
+conteúdo:</p>
+
+<pre class="file" data-file="versao.yaml">spec:
+  containers:
+    - name: versao
+      image: cardapio:1.0
+      command:
+        - node
+        - versao.js</pre>
+
+<p>Ao definir <code>command</code>, o <code>ENTRYPOINT</code> da imagem é ignorado por inteiro. Isso tem uma
+consequência que pega muita gente: se a imagem não tem um shell — as imagens "distroless" e algumas
+mínimas não têm —, você não pode escrever <code>["sh", "-c", "..."]</code>, porque o <code>sh</code> não
+existe lá dentro. O comando falha antes de rodar qualquer coisa, com
+<code>exec: "sh": executable file not found in $PATH</code>. O erro não é seu YAML; é a imagem que não tem
+esse programa.</p>
+
+<p>E o <code>args</code>, nesse caso? Se você define <code>command</code> e não define
+<code>args</code>, os parâmetros padrão da imagem são descartados. O cluster roda exatamente o que está na
+sua lista, nada mais. É por isso que <code>command: ["node", "versao.js"]</code> funciona: você escreveu o
+programa e o argumento no mesmo lugar.</p>
+
+<h2>4. args: só os parâmetros, o programa fica</h2>
+
+<p>O <code>args</code> é o irmão educado: ele troca só os parâmetros e deixa o executável da imagem no
+lugar. Serve quando o que muda é o <em>modo</em>, não o programa. A imagem <code>nginx</code>, por exemplo,
+tem <code>ENTRYPOINT ["/docker-entrypoint.sh"]</code> e um <code>CMD</code> que roda o nginx em primeiro
+plano. Para mudar o comportamento sem perder o entrypoint, a Ana escreve só os argumentos.</p>
+
+<pre class="file" data-file="estatico.yaml">spec:
+  containers:
+    - name: estatico
+      image: nginx:1.29
+      args: ["-c", "/etc/nginx/nginx.conf"]</pre>
+
+<p>Aqui a regra é a inversa: como você não escreveu <code>command</code>, o <code>ENTRYPOINT</code> da
+imagem continua valendo, e os seus <code>args</code> entram no lugar do <code>CMD</code>. O nginx recebe
+<code>-g "daemon off;"</code> e fica em primeiro plano — que é o que o Kubernetes quer, porque container
+que termina é container que o cluster tenta reiniciar.</p>
+
+<p>Juntando as duas ideias, existe uma tabela oficial, do próprio manual do Kubernetes, que mostra as
+quatro combinações. Vale decorar pela lógica: <strong>o que você escreve vence</strong>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th><code>command</code></th><th><code>args</code></th><th>O que o container executa</th></tr>
+</thead>
+<tbody>
+<tr><td>não</td><td>não</td><td><code>ENTRYPOINT</code> + <code>CMD</code> da imagem</td></tr>
+<tr><td>sim</td><td>não</td><td>só o seu <code>command</code> — o <code>CMD</code> da imagem é ignorado</td></tr>
+<tr><td>não</td><td>sim</td><td><code>ENTRYPOINT</code> da imagem + os seus <code>args</code></td></tr>
+<tr><td>sim</td><td>sim</td><td>o seu <code>command</code> + os seus <code>args</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Leia a segunda linha com atenção, porque ela é a que surpreende: <strong>definir
+<code>command</code> sozinho joga fora os argumentos da imagem</strong>. Se o entrypoint original era
+<code>["node", "servidor.js", "--porta"]</code> e o CMD era <code>["8080"]</code>, escrever
+<code>command: ["node"]</code> não te dá "node com o resto"; te dá só <code>node</code>, esperando entrada
+pelo teclado que nunca vem.</p>
+
+<h2>5. Os dois juntos: o caso de quem quer controle total</h2>
+
+<p>Quando <code>command</code> e <code>args</code> aparecem juntos, você controla tudo — e é aí que a
+maioria dos manifestos reais vive. É o caso de rodar um shell com um script embutido, muito comum para
+tarefas de manutenção:</p>
+
+<pre class="file" data-file="assar.yaml">spec:
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      command: ["/bin/sh"]
+      args: ["-c", "echo assando; sleep 30"]</pre>
+
+<p>O comando executado é a concatenação: <code>/bin/sh</code> seguido de <code>-c</code>,
+<code>echo assando; sleep 30</code>. O <code>-c</code> diz ao shell "o próximo item é o script". Sem ele, o
+shell tentaria abrir um arquivo chamado <code>echo</code> e reclamaria. Com ele, o texto vira um programa
+de verdade, com ponto e vírgula, redirecionamento e tudo o mais.</p>
+
+<p>Duas observações práticas. A primeira: o shell no <code>command</code> e o <code>-c</code> no
+<code>args</code> — sempre nessa ordem, porque <code>/bin/sh</code> é o executável. A segunda: nesse
+formato, o processo principal do container é o <code>sh</code>, e não o seu programa. Se o programa morrer,
+o shell devolve o código e o container termina. Faz diferença quando a aula de probes chegar; por ora,
+guarde que o primeiro item da lista é quem manda.</p>
+
+<h2>6. O tropeço número um: command e args invertidos</h2>
+
+<p>Como os nomes não combinam com o Dockerfile e os dois são listas de strings, o erro é quase inevitável:
+colocar as flags no <code>command</code> e o executável no <code>args</code>. O YAML não reclama — é tudo
+texto. O cluster aceita. O pod é criado. E o container tenta executar um programa chamado <code>-c</code>,
+que não existe.</p>
+
+<p>A caixa abaixo tem esse manifesto, de propósito. Rode, leia a resposta do cluster e depois conserte:
+<code>/bin/sh</code> é o <code>command</code>; <code>-c</code> e o script são
+<code>args</code>.</p>
+
+<div class="tryk8s" data-get="pod forno -o yaml" data-goal="campo:Pod/forno|spec.containers.0.command=/bin/sh;;campo:Pod/forno|spec.containers.0.args.0=-c;;campo:Pod/forno|spec.containers.0.args.1=echo assando">
+  <p class="try-task">Conserte a ordem: o executável vai em <code>command</code> e as flags em
+  <code>args</code>. Depois rode e confira no objeto, no painel, onde cada coisa caiu.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      command: ["-c", "echo assando"]
+      args: ["/bin/sh"]</pre>
+<pre class="out">
+pod/forno created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+  namespace: default
+spec:
+  containers:
+    - args:
+        - /bin/sh
+      command:
+        - "-c"
+        - echo assando
+      image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      name: forno
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.144.245
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      command: ["/bin/sh"]
+      args: ["-c", "echo assando"]</pre>
+</div>
+
+<p>O painel mostra o objeto inteiro depois do <code>apply</code>, no formato do
+<code>kubectl get pod forno -o yaml</code>. Procure o bloco do container: <code>command:</code> com
+<code>/bin/sh</code> e <code>args:</code> com os dois itens. Se você rodar sem consertar, o mesmo bloco
+mostra o inverso — e é essa inversão que produz o <code>CrashLoopBackOff</code> da seção 8.</p>
+
+<p>Vale um aviso honesto sobre o painel: ele mostra alguns campos internos da simulação
+(<code>iniciadoEm</code>, <code>no</code>, <code>ready</code>) e não é uma cópia caractere por caractere do
+que um cluster real imprime. O que importa aqui é a estrutura: <code>spec.containers</code> é uma lista,
+cada container tem <code>name</code>, <code>image</code>, <code>command</code> e <code>args</code>, e o
+<code>status</code> conta o que o cluster fez.</p>
+
+<h2>7. O tropeço número dois: as flags no lugar do programa</h2>
+
+<p>O segundo erro clássico é o inverso do primeiro, e acontece com imagens que já têm um entrypoint
+esperto, como o nginx. A pessoa quer apontar o nginx para outro arquivo de configuração, vê o campo
+<code>command</code> no manifesto e escreve a flag ali. O resultado: o entrypoint do nginx é descartado, e
+o container tenta executar um programa chamado <code>-c</code>, que não existe.</p>
+
+<p>A caixa abaixo está assim. Conserte movendo as flags para <code>args</code> e deixando o
+<code>command</code> fora — quem escolhe o programa é a imagem.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/estatico|spec.containers.0.args.0=-c;;campo:Pod/estatico|spec.containers.0.args.1=/etc/nginx/nginx.conf;;texto:Running">
+  <p class="try-task">Tire o <code>command</code> e ponha os dois itens em <code>args</code>: a flag
+  <code>-c</code> e o caminho do arquivo de configuração. O <code>ENTRYPOINT</code> da imagem volta a valer
+  e o pod fica <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: estatico
+spec:
+  containers:
+    - name: estatico
+      image: nginx:1.29
+      command: ["-c", "/etc/nginx/nginx.conf"]</pre>
+<pre class="out">
+pod/estatico created
+
+NAME       READY   STATUS    RESTARTS   AGE
+estatico   1/1     Running   0          24s
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: estatico
+spec:
+  containers:
+    - name: estatico
+      image: nginx:1.29
+      args: ["-c", "/etc/nginx/nginx.conf"]</pre>
+</div>
+
+<p>A diferença entre as duas caixas é a lição inteira desta aula. Na primeira, o programa é seu e você
+escreve os dois campos. Na segunda, o programa é da imagem e você escreve só o <code>args</code>. O
+manifesto não tem como adivinhar sua intenção: se você preenche <code>command</code>, você está dizendo
+"esqueça o entrypoint, o programa sou eu".</p>
+
+<h2>8. Quando o comando termina: exit code, Completed e CrashLoop</h2>
+
+<p>Comando que termina não é erro por si só. <code>versao.js</code> imprime e sai com código
+<code>0</code>; o container fica com o estado <code>Terminated</code> e o motivo <code>Completed</code>. O
+pod, com a política padrão <code>Always</code>, reinicia o container — e você vê o
+<code>RESTARTS</code> subindo, sem que nada esteja quebrado. Isso é o assunto da
+<a href="restart-policy.html">aula de restartPolicy</a>, e é a razão de tarefas que terminam usarem
+<code>Job</code> em vez de pod solto.</p>
+
+<p>Quando o programa falha, o número do exit code diz muita coisa. Ele é a única informação que o cluster
+tem do seu processo — o container não tem canal para explicar o que deu errado.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Exit code</th><th>Significa</th><th>Onde olhar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>0</code></td><td>terminou bem</td><td><code>Completed</code> no describe</td></tr>
+<tr><td><code>1</code></td><td>erro do próprio programa</td><td><code>kubectl logs</code>, a mensagem de erro aparece ali</td></tr>
+<tr><td><code>126</code></td><td>achou o arquivo, mas não pôde executar</td><td>permissão do binário na imagem</td></tr>
+<tr><td><code>127</code></td><td>comando não encontrado</td><td>nome errado no <code>command</code>, ou imagem sem aquele binário</td></tr>
+<tr><td><code>137</code></td><td>morto por SIGKILL, quase sempre memória</td><td>o evento <code>OOMKilled</code> no describe</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O caso da troca de <code>command</code> com <code>args</code> não chega a rodar o programa: o runtime
+tenta executar <code>-c</code> e não encontra. O cluster marca a falha de start e reinicia. Esta é a
+transcrição de um cluster local com esse manifesto, para você ver o formato — o painel do guia não simula
+container rodando, então aqui a saída vem de fora:</p>
+
+<pre class="term">$ kubectl get pods
+NAME    READY   STATUS             RESTARTS      AGE
+forno   0/1     CrashLoopBackOff   4 (28s ago)   2m11s
+
+$ kubectl describe pod forno | tail -n 8
+Events:
+  Type     Reason     Age                    From               Message
+  ----     ------     ----                   ----               -------
+  Normal   Pulled     2m11s                  kubelet            Successfully pulled image "cardapio:1.0"
+  Warning  Failed     2m11s (x3 over 2m11s)   kubelet            Error: failed to start container "forno": exec: "-c": executable file not found in $PATH
+  Normal   Pulled     2m10s                  kubelet            Successfully pulled image "cardapio:1.0"
+  Warning  BackOff    28s (x5 over 2m9s)     kubelet            Back-off restarting failed container forno in pod forno_default</pre>
+
+<p>Leia a mensagem com calma: <em>exec: "-c": executable file not found in $PATH</em>. O cluster tentou
+executar um programa chamado <code>-c</code>. Nenhum log de aplicação vai aparecer, porque a aplicação
+nunca começou — e é por isso que <code>kubectl logs</code> vem vazio nesse caso, enquanto o
+<code>describe</code> explica tudo nos eventos. Regra prática: <code>logs</code> é o que o programa disse;
+<code>describe</code> é o que o cluster tentou fazer.</p>
+
+<h2>9. Ver o comando que está rodando</h2>
+
+<p>Rampa de leitura, na ordem em que eu faria: <code>kubectl get pods</code> para ver o estado,
+<code>kubectl describe pod</code> para ver o comando, os args e o último estado, e
+<code>kubectl get pod -o yaml</code> para ver exatamente o que você entregou. O describe de um pod que rodou
+um comando curto fica assim (transcrição):</p>
+
+<pre class="term">Containers:
+  versao:
+    Image:          cardapio:1.0
+    Command:
+      node
+    Args:
+      versao.js
+    State:          Terminated
+      Reason:       Completed
+      Exit Code:    0
+      Started:      Fri, 27 Nov 2026 15:50:25 +0000
+      Finished:     Fri, 27 Nov 2026 15:50:26 +0000
+    Ready:          False
+    Restart Count:  0</pre>
+
+<p>Esses dois campos — <code>Command</code> e <code>Args</code> — são a prova do que você escreveu. Se o
+describe mostra <code>Command: -c</code>, o manifesto está invertido; se mostra o comando certo e o pod
+ainda assim reinicia, o problema é dentro do programa, e aí é <code>logs</code>. Quando <code>Command</code>
+não aparece, é porque você não definiu <code>command</code>: quem manda é a imagem.</p>
+
+<p>A caixa abaixo é um terminal, como nos primeiros passos do guia: cada linha é um comando. Ela cria um pod
+sem <code>command</code> e sem <code>args</code> e pede o objeto inteiro. O objetivo é você ver que os dois
+campos simplesmente não estão lá — e que, mesmo assim, o pod está <code>Running</code>.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:restartPolicy: Always;;texto:image: cardapio:1.0;;texto:phase: Running">
+  <p class="try-task">Crie o pod e troque o <code>get pods</code> pela leitura do objeto inteiro
+  (<code>-o yaml</code>). Procure <code>command</code> e <code>args</code>: não existem.</p>
+<pre class="yaml">kubectl run forno --image=cardapio:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run forno --image=cardapio:1.0
+pod/forno created
+
+ana@notebook:~$ kubectl get pods
+NAME    READY   STATUS    RESTARTS   AGE
+forno   1/1     Running   0          5m
+</pre>
+<pre class="solucao">kubectl run forno --image=cardapio:1.0
+kubectl get pod forno -o yaml</pre>
+</div>
+
+<p>O que o painel mostra é o pod inteiro, com os campos que o cluster preencheu sozinho:
+<code>restartPolicy: Always</code>, <code>dnsPolicy: ClusterFirst</code>,
+<code>terminationGracePeriodSeconds: 30</code>, <code>imagePullPolicy</code>. Esses valores não estavam no
+seu comando e mesmo assim existem — são os padrões do Kubernetes, e conhecê-los evita susto quando você
+compara o que escreveu com o que aparece na tela.</p>
+
+<p>Sobre o <code>kubectl run</code>: ele aceita argumentos depois de <code>--</code>, e esses argumentos
+viram <code>args</code> no pod. Funciona no cluster de verdade, mas o painel do guia não simula essa parte
+— aqui, comando e argumentos entram pelo manifesto, que é onde você vai conviver com eles no dia a dia.</p>
+
+<h2>10. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a migração do banco que rodava de novo toda hora</h3>
+<p>A Ana criou um pod com <code>command: ["node", "migrar.js"]</code> para arrumar o banco. O script rodou,
+saiu com <code>0</code>, e o pod reiniciou — porque <code>restartPolicy</code> padrão é <code>Always</code>.
+A migração rodou de novo. E de novo. O conserto não é no <code>command</code>: é trocar o tipo de objeto
+por um <code>Job</code>, que sabe que tarefa que termina é tarefa cumprida.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o "sh: not found" da imagem mínima</h3>
+<p>O time dela trocou a imagem base por uma distroless, menor e mais segura, e os manifests que usavam
+<code>command: ["sh", "-c", "..."]</code> pararam de subir, com exit code <code>127</code> e a mensagem
+<code>exec: "sh": executable file not found in $PATH</code>. Não era YAML errado: a imagem não tem shell.
+A saída é chamar o binário direto (<code>["node", "script.js"]</code>) ou voltar para uma base com
+shell.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o comando certo, o pod errado</h3>
+<p>Um pod de teste com <code>args</code> apontando para um arquivo de configuração em <code>/config</code>
+subiu, mas saiu com código <code>1</code> e a mensagem "ENOENT: no such file or directory". O comando estava
+certo; o arquivo é que não existia dentro do container. É a diferença entre <em>como</em> rodar (command e
+args) e <em>com o que</em> rodar (ConfigMap, volume, variável de ambiente) — assuntos das próximas
+aulas.</p>
+</div>
+
+<h2>11. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O <code>command</code> do manifesto substitui qual
+pedaço da imagem?</p>
+<label><input type="radio" name="q1"> os parâmetros padrão (o <code>CMD</code> do Dockerfile)</label>
+<label><input type="radio" name="q1"> o executável de partida (o <code>ENTRYPOINT</code>)</label>
+<label><input type="radio" name="q1"> a imagem inteira, que precisa ser reconstruída</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Você definiu só <code>args: ["-g", "daemon off;"]</code>
+no pod do nginx. O que roda?</p>
+<label><input type="radio" name="q2"> só <code>-g daemon off;</code>, sem o nginx</label>
+<label><input type="radio" name="q2"> o <code>CMD</code> original da imagem, e os seus args são
+ignorados</label>
+<label><input type="radio" name="q2"> o <code>ENTRYPOINT</code> da imagem com os seus args no lugar do
+<code>CMD</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O pod está em <code>CrashLoopBackOff</code> e
+<code>kubectl logs</code> volta vazio. Por onde começar?</p>
+<label><input type="radio" name="q3"> pelo <code>describe</code>: os eventos dizem se o container chegou a
+iniciar</label>
+<label><input type="radio" name="q3"> apagar o pod e criar de novo, sem olhar nada</label>
+<label><input type="radio" name="q3"> aumentar as réplicas, para ter mais chance de subir</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o pod que só imprime a versão</h2>
+<p>Escreva no papel o manifesto de um pod chamado <code>versao</code>, com a imagem
+<code>cardapio:1.0</code>, que rode <code>node versao.js</code> e termine. Onde vai cada pedaço?</p>
+<div class="ex-code">spec:
+  containers:
+    - name: versao
+      image: cardapio:1.0
+      <input aria-label="resposta 1" data-answer="command" placeholder="...">: ["node", "versao.js"]</div>
+<p class="ex-dica">Dica: o programa e o argumento caminham juntos quando o programa é escolhido por você.
+Se o executável viesse da imagem, você escreveria só os parâmetros em <code>args</code>.</p>
+</div>
+
+<h2>12. Resumo</h2>
+
+<p>A imagem carrega um comando de partida, feito de duas peças: o <code>ENTRYPOINT</code> (o executável) e o
+<code>CMD</code> (os parâmetros padrão). No manifesto do pod, <code>command</code> substitui o
+<code>ENTRYPOINT</code> e <code>args</code> substitui o <code>CMD</code>. Os dois são listas de strings, e a
+regra é simples: o que você escreve vence, e o que você deixa de fora mantém o padrão da imagem — com a
+exceção importante de que definir <code>command</code> sozinho descarta os argumentos da imagem.</p>
+
+<p>O tropeço comum é inverter os dois, e o sintoma é peculiar: o pod é criado, entra em
+<code>CrashLoopBackOff</code>, <code>kubectl logs</code> não mostra nada e o <code>describe</code> traz
+<code>exec: "-c": executable file not found in $PATH</code>. Comando que termina bem fica
+<code>Completed</code> com exit code <code>0</code>; comando que termina mal deixa o código (1, 126, 127,
+137) no describe, e é por ali que se começa o diagnóstico.</p>
+
+<p>Para ver o que está de fato rodando, <code>kubectl describe pod</code> mostra <code>Command</code> e
+<code>Args</code>, e <code>-o yaml</code> mostra o que você entregou. Na próxima aula a Ana olha para o
+outro lado da conta: quanto de CPU e de memória o pod pede e quanto ele pode consumir — os campos que
+decidem se o pod cabe num nó.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>command</code> substitui o <code>ENTRYPOINT</code>; <code>args</code> substitui o
+  <code>CMD</code>.</li>
+  <li>Os dois são listas: <code>["/bin/sh", "-c"]</code>, não uma frase entre aspas.</li>
+  <li>Só <code>args</code>: o programa continua sendo o da imagem. Só <code>command</code>: os args da
+  imagem somem.</li>
+  <li>Exit code <code>127</code> é comando não encontrado; <code>137</code> é quase sempre memória;
+  <code>0</code> é sucesso.</li>
+  <li><code>describe</code> mostra o que o cluster tentou; <code>logs</code> mostra o que o programa
+  disse.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

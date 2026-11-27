@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ingress com TLS | Guia Kubernetes</title>
+<meta name="description" content="Ingress com TLS no Kubernetes: bloco tls, Secret do tipo kubernetes.io/tls, redirecionamento de HTTP para HTTPS e os erros que deixam o cadeado quebrado.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Ingress com <span class="hl">TLS</span></h1>
+<p class="intro">O site da Ana já abria em <code>padaria.test</code>, mas o navegador mostrava aquele aviso
+cinza de “não seguro” ao lado do endereço. Para o cliente, o aviso parece defeito; para o navegador, é o
+contrário: ele está dizendo que ninguém provou quem é aquele servidor. Resolver isso é ligar HTTPS no
+Ingress — um certificado guardado num Secret, um bloco <code>tls</code> apontando para ele e, de preferência,
+um empurrão para que ninguém continue entrando por HTTP.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o cadeado do navegador realmente significa.</li>
+  <li>Onde o certificado e a chave ficam dentro do cluster.</li>
+  <li>Como declarar <code>spec.tls</code> no Ingress, com hosts e secretName.</li>
+  <li>Por que o tipo do Secret precisa ser <code>kubernetes.io/tls</code>.</li>
+  <li>Como redirecionar HTTP para HTTPS sem trocar o Ingress.</li>
+  <li>O que fazer quando o certificado é válido e o navegador continua reclamando.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o aviso cinza ao lado do endereço</h2>
+
+<p>Tudo funcionava. A Ana digitava <code>padaria.test</code>, o cardápio aparecia, os pedidos entravam. Mas o
+navegador mostrava “Não seguro” ao lado do endereço, e um cliente perguntou se o site era falso. Não era: era
+HTTP puro. Sem HTTPS, o tráfego viaja legível e o navegador não tem como saber se está falando com a padaria
+ou com alguém se passando por ela.</p>
+
+<p>HTTPS resolve as duas coisas de uma vez. A primeira é o sigilo: o conteúdo vai cifrado, e quem interceptar
+a conexão vê bytes sem sentido. A segunda é a identidade: o servidor apresenta um certificado assinado por uma
+autoridade em que o navegador confia, dizendo “este endereço pertence a esta empresa”. O cadeado é o resumo
+visual dessa conferência.</p>
+
+<p>No Kubernetes, ligar isso é trabalho do controller de Ingress. Ele termina a conexão TLS — ou seja, é ele
+quem apresenta o certificado e descriptografa a requisição — e só depois aplica as regras de host e caminho
+que você escreveu na aula anterior. Para isso, ele precisa de dois arquivos: o certificado e a chave privada.
+Esses dois moram num Secret.</p>
+
+<h2>2. Certificado, chave e o Secret que guarda os dois</h2>
+
+<p>Vale separar os conceitos antes do YAML, porque os nomes se confundem. O <strong>certificado</strong> é
+público: ele diz “este é o domínio padaria.test e esta é a chave pública”. A <strong>chave privada</strong> é
+secreta: é ela que prova que o servidor é dono do certificado. Juntos, os dois formam o par que o TLS usa.</p>
+
+<dl class="anatomy">
+<dt>TLS</dt>
+<dd>O protocolo que cifra e autentica a conexão. É o “S” de HTTPS.</dd>
+<dt>certificado</dt>
+<dd>Arquivo público que liga um domínio a uma chave pública, assinado por uma autoridade certificadora.</dd>
+<dt>chave privada</dt>
+<dd>Arquivo secreto que só o dono do certificado tem. Sem ela, o servidor não consegue completar a
+conexão.</dd>
+<dt>Secret <code>kubernetes.io/tls</code></dt>
+<dd>O tipo de Secret que guarda <code>tls.crt</code> e <code>tls.key</code>. O controller procura exatamente
+esses dois nomes.</dd>
+<dt>termination</dt>
+<dd>O ponto onde o TLS termina. No Ingress, termina no controller: o tráfego segue para o pod já em HTTP,
+dentro da rede do cluster.</dd>
+<dt>bloco tls</dt>
+<dd>A parte do Ingress que lista os hosts do certificado e o Secret que o guarda.</dd>
+<dt>cert-manager</dt>
+<dd>Controlador que emite e renova certificados automaticamente, escrevendo o Secret para você.</dd>
+<dt>HSTS</dt>
+<dd>Cabeçalho que manda o navegador usar sempre HTTPS naquele domínio, mesmo que o link seja HTTP.</dd>
+</dl>
+
+<p>Guarde a divisão: o Ingress não “tem” o certificado; ele aponta para um Secret que tem. Isso permite usar o
+mesmo certificado em vários Ingress e trocar o certificado sem tocar nas regras de roteamento. E explica um
+erro comum: você atualizou o certificado, mas o Secret tem outro nome, e o Ingress continua servindo o
+antigo.</p>
+
+<h2>3. O primeiro passo: o bloco tls no Ingress</h2>
+
+<p>O Ingress da aula anterior roteia, mas não fala TLS. Acrescentar o bloco é curto: uma lista de
+<code>hosts</code> e o <code>secretName</code>. A caixa começa com o Ingress sem o bloco.</p>
+
+<div class="tryk8s" data-get="ingress" data-goal="texto:padaria.test;;campo:Ingress/cardapio|spec.tls.0.secretName=padaria-tls">
+  <p class="try-task">Acrescente ao <code>spec</code> o bloco <code>tls</code> com o host
+  <code>padaria.test</code> e o segredo <code>padaria-tls</code>. Rode e confira a tabela.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+<pre class="out">
+ingress.networking.k8s.io/cardapio created
+
+NAME       CLASS   HOSTS          ADDRESS      PORTS     AGE
+cardapio   nginx   padaria.test   192.0.2.10   80, 443   2m
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - padaria.test
+      secretName: padaria-tls
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>O painel mostra o Ingress criado, com <code>HOSTS padaria.test</code> e <code>PORTS 80, 443</code>. O
+<code>PORTS</code> já aparecia antes, porque o Ingress descreve as duas portas da borda — quem decide se 443
+vai funcionar é o controller, com o certificado em mãos.</p>
+
+<p>Duas observações que economizam tempo. Primeiro: <code>tls</code> é uma lista, e cada item tem os seus
+<code>hosts</code> e o seu <code>secretName</code>. Um Ingress pode servir dois domínios com dois certificados
+diferentes, cada um no seu item. Segundo: o host do bloco <code>tls</code> precisa casar com o host da regra.
+Se a regra é <code>padaria.test</code> e o TLS diz <code>www.padaria.test</code>, o controller entrega o
+certificado errado e o navegador reclama — o roteamento funciona, o cadeado não.</p>
+
+<h2>4. O Secret que o controller espera</h2>
+
+<p>O <code>secretName</code> aponta para um Secret que precisa existir e ser do tipo certo. O tipo
+<code>kubernetes.io/tls</code> é o que diz ao Kubernetes “aqui dentro há um certificado e uma chave”, e as
+chaves internas têm nomes fixos: <code>tls.crt</code> e <code>tls.key</code>. A caixa tem um Secret com o tipo
+errado, o que costuma acontecer com quem cria o segredo à mão.</p>
+
+<div class="tryk8s" data-get="secrets" data-goal="campo:Secret/padaria-tls|type=kubernetes.io/tls">
+  <p class="try-task">O Secret foi criado como <code>Opaque</code>. Troque o tipo para
+  <code>kubernetes.io/tls</code> e rode: o controller só aceita esse tipo para terminar TLS.</p>
+<pre class="yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: padaria-tls
+type: Opaque
+data:
+  tls.crt: Y2VydGlmaWNhZG8tZGEtcGFkYXJpYQ==
+  tls.key: Y2hhdmUtcHJpdmFkYS1kYS1wYWRhcmlh</pre>
+<pre class="out">
+secret/padaria-tls created
+
+NAME          DATA   AGE
+padaria-tls   2      4m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Secret
+metadata:
+  name: padaria-tls
+type: kubernetes.io/tls
+data:
+  tls.crt: Y2VydGlmaWNhZG8tZGEtcGFkYXJpYQ==
+  tls.key: Y2hhdmUtcHJpdmFkYS1kYS1wYWRhcmlh</pre>
+</div>
+
+<p>O painel mostra o Secret criado com dois dados. O conteúdo é base64, que é codificação, não criptografia —
+qualquer pessoa com acesso ao objeto consegue ler. É por isso que o Secret tem controle de acesso próprio, e
+é por isso que colocar chave privada em repositório público é um incidente, não um detalhe.</p>
+
+<p>O jeito tradicional de criar esse Secret é o comando, que evita o base64 na mão:</p>
+
+<pre class="file" data-file="criar-secret-tls.sh">kubectl create secret tls padaria-tls \
+  --cert=padaria.crt \
+  --key=padaria.key</pre>
+
+<p>O comando lê os dois arquivos, monta o objeto com o tipo certo e os nomes certos, e cria. Se os arquivos
+não combinarem — certificado de um par, chave de outro —, o comando recusa na hora. É uma vantagem sobre
+escrever o YAML à mão, onde um erro de colagem só aparece quando o cliente abre o site.</p>
+
+<p>O Secret de TLS tem quatro peças que precisam estar todas certas. A tabela abaixo é a conferência rápida,
+na ordem em que o controller olha:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Peça</th><th>Como deve estar</th><th>Se estiver errada</th></tr>
+</thead>
+<tbody>
+<tr><td>tipo</td><td><code>kubernetes.io/tls</code></td><td>o controller ignora o Secret e serve o
+certificado padrão dele</td></tr>
+<tr><td>certificado</td><td>chave <code>tls.crt</code>, em base64</td><td>erro “certificate not found” nos logs
+do controller</td></tr>
+<tr><td>chave privada</td><td>chave <code>tls.key</code>, em base64</td><td>o handshake falha; o navegador não
+completa a conexão</td></tr>
+<tr><td>namespace</td><td>o mesmo do Ingress</td><td>o Ingress não acha o Secret e não termina TLS</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare na primeira linha: um Secret com o conteúdo certo mas o tipo errado não funciona. Não é preciosismo
+— o tipo é o que autoriza o controller a tratá-lo como material de TLS. E repare na última: Secret é objeto de
+namespace, então o mesmo certificado usado em dois namespaces precisa existir nos dois.</p>
+
+<h2>5. A caixa: o host do TLS que não casa</h2>
+
+<p>Este é o erro mais silencioso da aula. O certificado é válido, o Secret está certo, o Ingress foi aceito —
+e o navegador mostra aviso de nome errado. O motivo é que o host listado no <code>tls</code> não é o host que
+o cliente acessa.</p>
+
+<div class="tryk8s" data-get="ingress" data-goal="texto:padaria.test;;campo:Ingress/cardapio|spec.tls.0.hosts.0=padaria.test">
+  <p class="try-task">A regra atende <code>padaria.test</code>, mas o <code>tls</code> declara
+  <code>www.padaria.test</code>. Alinhe o host do <code>tls</code> com o da regra e rode.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - www.padaria.test
+      secretName: padaria-tls
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+<pre class="out">
+ingress.networking.k8s.io/cardapio created
+
+NAME       CLASS   HOSTS          ADDRESS      PORTS     AGE
+cardapio   nginx   padaria.test   192.0.2.10   80, 443   2m
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - padaria.test
+      secretName: padaria-tls
+  rules:
+    - host: padaria.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>A tabela do <code>get ingress</code> mostra o mesmo <code>HOSTS padaria.test</code> nos dois casos — ela
+não distingue o host da regra do host do certificado. A prova está no <code>describe</code>: é lá que aparece a
+linha <code>TLS</code> dizendo quais hosts o Secret cobre. Esta é uma transcrição de um cluster real, do caso
+certo:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe ingress cardapio
+Name:             cardapio
+Namespace:        default
+Address:          192.0.2.10
+Ingress Class:    nginx
+TLS:
+  padaria-tls terminates padaria.test
+Rules:
+  Host          Path  Backends
+  ----          ----  --------
+  padaria.test
+                /     cardapio:80 (10.244.2.7:8080)
+Events:
+  Type    Reason  Age   From                      Message
+  ----    ------  ----  ----                      -------
+  Normal  Sync    21s   nginx-ingress-controller  Scheduled for sync</pre>
+
+<p>A linha <code>padaria-tls terminates padaria.test</code> é a frase que você quer ler: “este segredo
+termina TLS para este host”. Se ela mostrar outro host, é ali que está o desencontro. Se ela não aparecer, o
+bloco <code>tls</code> não foi lido — confira se está dentro de <code>spec</code> e se o YAML está válido.</p>
+
+<h2>6. HTTP para HTTPS: o empurrão</h2>
+
+<p>Com o TLS ligado, o site responde nas duas portas: 80 em HTTP e 443 em HTTPS. Isso é conveniente e
+perigoso: um cliente antigo continua entrando por HTTP, sem cadeado e sem cifra. O jeito de resolver é mandar
+o controller redirecionar tudo para HTTPS.</p>
+
+<p>Não existe campo padrão no Ingress para isso — é uma anotação do controller, e cada um tem a sua. No
+ingress-nginx, as duas mais usadas são:</p>
+
+<pre class="file" data-file="annotations-tls.yaml">metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"</pre>
+
+<p>A primeira liga o redirecionamento quando o Ingress tem TLS configurado. A segunda força mesmo quando não
+há TLS — útil em cluster onde o certificado é terminado antes, num balanceador na frente. Repare nas aspas:
+anotação é sempre texto, então <code>"true"</code> com aspas, nunca o booleano do YAML. Um erro comum é
+escrever <code>true</code> sem aspas; alguns controllers aceitam, outros ignoram em silêncio.</p>
+
+<p>Para conferir o redirecionamento, o teste é de linha de comando. Esta é uma transcrição de cluster real,
+de um <code>curl</code> pedindo a versão HTTP e recebendo o empurrão:</p>
+
+<pre class="term">ana@notebook:~$ curl -i http://padaria.test/cardapio
+HTTP/1.1 308 Permanent Redirect
+Location: https://padaria.test/cardapio
+Server: nginx
+
+ana@notebook:~$ curl -i https://padaria.test/cardapio
+HTTP/2 200
+content-type: text/html; charset=utf-8
+strict-transport-security: max-age=31536000; includeSubDomains</pre>
+
+<p>O <code>308</code> é o redirecionamento, e o <code>Location</code> mostra para onde. A segunda resposta traz
+o <code>strict-transport-security</code>: é o HSTS que o controller adiciona, dizendo ao navegador que aquele
+domínio só deve ser acessado por HTTPS pelos próximos 31536000 segundos — um ano. A partir da primeira visita,
+o próprio navegador troca o esquema antes de sair da máquina.</p>
+
+<p>Um aviso sobre o HSTS: ele é fácil de ligar e chato de desligar. Depois que o navegador recebe o cabeçalho,
+ele passa a recusar HTTP naquele domínio pelo tempo declarado. Se o certificado quebrar nesse meio-tempo, o
+cliente não consegue nem cair para HTTP para ver o erro — ele vê a tela de aviso do navegador. Em site novo,
+vale começar com um <code>max-age</code> curto e aumentar depois de tudo estável.</p>
+
+<h2>7. Quem emite e quem renova</h2>
+
+<p>Até aqui o certificado apareceu pronto. Na vida real, alguém precisa pedi-lo a uma autoridade certificadora
+e renová-lo antes de vencer — certificado vencido é o incidente mais bobo e mais comum de todos. Há dois
+caminhos.</p>
+
+<p>O manual: você compra o certificado, recebe dois arquivos, cria o Secret com <code>kubectl create secret
+tls</code> e repete o processo a cada renovação, de preferência com um lembrete no calendário. Funciona bem
+para um domínio só e para quem gosta de controle.</p>
+
+<p>O automático: o cert-manager roda no cluster, lê objetos <code>Certificate</code> e conversa com a
+autoridade (Let’s Encrypt, por exemplo) para emitir e renovar sozinho, gravando o resultado no Secret que o
+Ingress já usa. Você declara o pedido e ele cuida do resto — inclusive de renovar trinta dias antes de
+vencer. Em cluster de produção, é o caminho normal; a pegadinha é que ele também pode falhar, e aí o sintoma
+é o mesmo de sempre: cadeado quebrado.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma no navegador</th><th>Causa provável</th><th>Onde olhar</th></tr>
+</thead>
+<tbody>
+<tr><td>“Não seguro”, sem cadeado</td><td>o Ingress não tem TLS, ou a porta 443 não chega ao controller</td>
+<td><code>describe ingress</code>, linha <code>TLS</code></td></tr>
+<tr><td>aviso de nome errado</td><td>o certificado não cobre aquele host</td><td>hosts do <code>tls</code> ×
+host da regra</td></tr>
+<tr><td>certificado vencido</td><td>renovação não aconteceu</td><td>validade do Secret e eventos do
+cert-manager</td></tr>
+<tr><td>cadeado com erro 502</td><td>TLS ok, backend sem resposta</td><td>Service, endpoints e pods</td></tr>
+<tr><td>redireciona em loop</td><td>controller atrás de outro proxy já em HTTPS</td><td>anotações de
+redirecionamento e cabeçalho <code>X-Forwarded-Proto</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa tabela é a ordem em que se investiga. Primeiro, o certificado existe e é apresentado? Depois, cobre o
+nome certo? Depois, está no prazo? Só então vale olhar o backend — porque um erro 502 depois do cadeado é
+problema de aplicação, não de TLS. Misturar as duas coisas faz a Ana mexer no certificado quando o problema
+estava no Service.</p>
+
+<h2>8. O que o painel mostra e o que ele não mostra</h2>
+
+<p>Como nas aulas de rede, o painel não abre conexão: ele aplica o manifesto, guarda o objeto e mostra o que o
+<code>kubectl get</code> responderia. Você consegue provar que o bloco <code>tls</code> está no lugar certo, que
+o Secret tem o tipo certo e que o host casa. O handshake de verdade, o cadeado e o redirecionamento aparecem
+nas transcrições acima, identificadas como tal.</p>
+
+<p>Isso não é limitação do seu aprendizado: é a mesma separação que existe na vida real entre “o manifesto
+está correto” e “o cliente consegue conectar”. A primeira é conferível em segundos com
+<code>kubectl</code>; a segunda depende de DNS, firewall, controller e certificado ao mesmo tempo — e por isso
+tem um roteiro próprio.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o cadeado quebrado só no celular</h3>
+<p>No notebook da Ana o site abria com cadeado; no celular, aviso. O certificado cobria
+<code>www.padaria.test</code>, e o celular abria <code>padaria.test</code> — o encurtador do aplicativo de
+mensagens tinha removido o <code>www</code>. O conserto foi declarar os dois hosts no <code>tls</code> e na
+regra, e pedir um certificado que cobrisse ambos.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o certificado renovado que não entrou no ar</h3>
+<p>O cert-manager renovou o certificado e gravou no Secret. O site continuou mostrando o antigo por horas. O
+controller tinha cacheado o certificado e só recarregava ao ver o Secret mudar — e o Secret mudou, mas o
+controller estava sem permissão de leitura naquele namespace. Descoberto nos logs do controller, não no
+Ingress.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o loop de redirecionamento</h3>
+<p>Depois de colocar um balanceador na frente do cluster, o site passou a dar “redirecionamentos demais”. O
+balanceador terminava TLS e mandava HTTP para o controller; o controller, com
+<code>force-ssl-redirect</code>, mandava de volta para HTTPS. O conserto foi desligar o redirecionamento no
+Ingress e deixar o balanceador cuidar disso.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Onde ficam o certificado e a chave que o Ingress usa?</p>
+<label><input type="radio" name="q1"> dentro do manifesto do Ingress, em texto claro</label>
+<label><input type="radio" name="q1"> num Secret do tipo <code>kubernetes.io/tls</code>, apontado pelo
+<code>secretName</code></label>
+<label><input type="radio" name="q1"> na imagem do container da aplicação</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O cadeado aparece, mas com aviso de nome errado. Qual é a
+causa mais provável?</p>
+<label><input type="radio" name="q2"> o Service não tem endpoints</label>
+<label><input type="radio" name="q2"> o <code>pathType</code> está como <code>Exact</code></label>
+<label><input type="radio" name="q2"> o certificado não cobre o host que o cliente acessa</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Para que serve o redirecionamento HTTP para HTTPS?</p>
+<label><input type="radio" name="q3"> para que quem entre por HTTP seja levado a HTTPS, sem tráfego sem
+cifra</label>
+<label><input type="radio" name="q3"> para renovar o certificado automaticamente</label>
+<label><input type="radio" name="q3"> para o Ingress dispensar o controller</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: aponte o certificado</h2>
+<p>Complete o campo do bloco <code>tls</code> que diz qual Secret guarda o certificado e a chave.</p>
+<div class="ex-code">tls:
+  - hosts:
+      - padaria.test
+    <input aria-label="resposta 1" data-answer="secretName" placeholder="...">: padaria-tls</div>
+<p class="ex-dica">Dica: é o nome do Secret do tipo <code>kubernetes.io/tls</code>, no mesmo namespace do
+Ingress.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>HTTPS no Ingress é a combinação de três peças: um Secret do tipo <code>kubernetes.io/tls</code> com
+<code>tls.crt</code> e <code>tls.key</code>, um bloco <code>tls</code> no Ingress listando os hosts e o
+<code>secretName</code>, e um controller capaz de terminar TLS. O host do bloco precisa casar com o host da
+regra; quando não casa, o roteamento continua e o cadeado quebra.</p>
+
+<p>Para que ninguém entre por HTTP, o controller oferece redirecionamento por anotação, e o HSTS faz o
+navegador lembrar disso sozinho. E o certificado precisa ser renovado: manualmente, com
+<code>kubectl create secret tls</code>, ou automaticamente, com o cert-manager. Certificado vencido é o
+incidente mais evitável do Kubernetes.</p>
+
+<p>Na próxima aula o assunto muda de HTTP para rede pura: como impedir que um pod fale com outro, mesmo dentro
+do cluster, usando NetworkPolicy — e por que essa política só vale se o plugin de rede do cluster
+implementar.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>O certificado e a chave vivem num Secret <code>kubernetes.io/tls</code>, com <code>tls.crt</code> e
+  <code>tls.key</code>.</li>
+  <li>O Ingress só aponta: <code>spec.tls[].secretName</code>.</li>
+  <li>Host do <code>tls</code> tem de casar com o host da regra.</li>
+  <li><code>describe ingress</code> mostra a linha <code>TLS</code> que prova o que foi lido.</li>
+  <li>Redirecionamento é anotação do controller, com <code>"true"</code> entre aspas.</li>
+  <li>Renovação manual ou com cert-manager; certificado vencido derruba o site.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

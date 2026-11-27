@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prioridade e preempção | Guia Kubernetes</title>
+<meta name="description" content="PriorityClass e preempção no Kubernetes: a fila do agendador, valores permitidos, quem pode ser despejado, preemptionPolicy Never e por que prioridade não reserva CPU.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Prioridade e <span class="hl">preempção</span></h1>
+<p class="intro">Sexta-feira à tarde é o pior dia da Ana: o relatório mensal roda no cluster, come toda a CPU
+disponível, e o pod do caixa do balcão fica <code>Pending</code> esperando um pedaço de núcleo. O cliente está na
+frente do balcão e o sistema não abre. A pergunta não é “como dar mais CPU?”, é “quem tem o direito de passar na
+frente?”. Nesta aula a Ana aprende <strong>PriorityClass</strong> e <strong>preempção</strong>: como o cluster
+ordena a fila e como ele decide despejar alguém para caber quem é mais importante.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Como o agendador decide a ordem: prioridade primeiro, tempo de espera depois.</li>
+  <li>O que é um <code>PriorityClass</code>, quais valores são permitidos e para que serve o
+  <code>globalDefault</code>.</li>
+  <li>Como um pod referencia a classe com <code>priorityClassName</code>.</li>
+  <li>O que é preempção e o que acontece com o pod despejado.</li>
+  <li>Quem nunca é escolhido como vítima e por quê.</li>
+  <li>Por que prioridade não é reserva de CPU e como o pod de prioridade alta ainda fica
+  <code>Pending</code>.</li>
+  <li>Como usar <code>preemptionPolicy: Never</code> para ordenar a fila sem derrubar ninguém.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o relatório contra o balcão</h2>
+
+<p>Todo fim de mês a Ana dispara o relatório de vendas: um Job que lê o banco inteiro, calcula totais e grava um
+PDF. Ele roda por vinte minutos e, nesse tempo, pede bastante CPU. O cluster da padaria tem três nós pequenos,
+e o Job, sozinho, ocupa o que sobrou de todos eles.</p>
+
+<p>Enquanto isso, o pod do caixa começa a reiniciar. O Deployment pede duas réplicas, mas só uma cabe; a outra
+fica <code>Pending</code> com a mensagem <code>Insufficient cpu</code>. Quando o relatório termina, o pod sobe.
+Na sexta seguinte, a história se repete — e é aí que a Ana percebe que o problema não é falta de CPU no mês, é
+falta de <em>ordem de importância</em>.</p>
+
+<p>Prioridade no Kubernetes é exatamente isso: um número que diz quem espera e quem passa. Não é um limite, não
+é uma reserva e não é um aumento de máquina. É uma posição na fila. E, quando a fila não cabe, é também o
+direito de pedir que alguém menos importante saia.</p>
+
+<p>A confusão mais comum é achar que “prioridade alta” garante recursos. Garante <em>vez</em>, não
+<em>espaço</em>. Se nenhum nó tem o que o pod precisa, ele fica <code>Pending</code> do mesmo jeito, e a
+preempção pode não ajudar — o cluster vai dizer isso na mensagem. Guarde essa distinção, porque ela voltará em
+quase toda seção.</p>
+
+<h2>2. A fila do agendador</h2>
+
+<p>Quando um pod nasce, ele entra numa fila. O agendador pega pods dessa fila e procura um nó onde eles caibam,
+avaliando CPU e memória pedidas, etiquetas de nó, <a href="taints-e-tolerations.html">taints</a> e
+afinidades. Se não acha, o pod fica
+<code>Pending</code> e volta para a fila; a próxima tentativa acontece quando algo muda no cluster.</p>
+
+<p>A fila não é por ordem de chegada. O agendador ordena por <strong>prioridade</strong> — quanto maior o
+número, mais cedo o pod é avaliado — e, entre prioridades iguais, por tempo de espera. Um pod de prioridade
+alta criado agora passa na frente de um de prioridade zero que está esperando há dez minutos.</p>
+
+<p>Essa ordem é o que faz o caixa abrir antes do relatório. Mas repare no que ela não resolve: se o relatório
+já está rodando e ocupou todos os nós, o pod do caixa não tem onde caber. Ordem na fila não libera espaço
+ocupado. Para isso existe a preempção, que é o assunto da seção 4.</p>
+
+<dl class="anatomy">
+<dt>PriorityClass</dt>
+<dd>Objeto de <code>scheduling.k8s.io/v1</code> com um nome e um número. É o rótulo de importância que os pods
+usam.</dd>
+<dt>value</dt>
+<dd>O número da classe. Quanto maior, mais importante. Classes do time vão até 1 bilhão.</dd>
+<dt>priorityClassName</dt>
+<dd>O campo do pod que aponta para a classe. Sem ele, o pod tem prioridade 0 (ou a classe padrão do
+cluster).</dd>
+<dt>preempção</dt>
+<dd>O mecanismo que remove pods de prioridade menor para abrir espaço para um pod de prioridade maior.</dd>
+<dt>vítima</dt>
+<dd>O pod escolhido para sair numa preempção. Ele é encerrado com o tempo de graça normal e recriado pelo dono
+depois.</dd>
+<dt>globalDefault</dt>
+<dd>Marca uma classe como padrão para pods que não declaram <code>priorityClassName</code>. Só uma pode ter
+isso.</dd>
+</dl>
+
+<p>Uma coisa que confunde no começo: prioridade e <code>requests</code> não são a mesma coisa e não se
+substituem. A prioridade decide a ordem; o <code>requests</code> decide o tamanho. Um pod de prioridade máxima
+sem <code>requests</code> é agendado como se fosse minúsculo — e pode ser o primeiro a ser despejado quando a
+memória apertar. O cluster precisa saber quanto você quer para decidir onde você cabe.</p>
+
+<h2>3. Criando a classe e usando no pod</h2>
+
+<p>PriorityClass é um objeto de cluster, não de namespace: uma vez criada, qualquer pod de qualquer namespace
+pode usá-la pelo nome. O manifesto é curto — nome, número e duas decisões.</p>
+
+<pre class="file" data-file="prioridade.yaml">apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: balcao
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Caixa e balcão: o cliente está esperando"</pre>
+
+<pre class="term">$ kubectl get priorityclass
+NAME                      VALUE        GLOBAL-DEFAULT   AGE
+balcao                    1000000      false            3m
+relatorio                 100000       false            2m
+system-cluster-critical   2000000000   false            47d
+system-node-critical      2000001000   false            47d</pre>
+
+<p>Essa é a saída de um cluster local de três nós, com as classes do time criadas. Repare que as classes do
+sistema estão ali desde a instalação, com valores que ninguém alcança. A coluna
+<code>GLOBAL-DEFAULT</code> mostra <code>false</code> em todas — nenhuma delas sequestra os pods que não
+declaram classe.</p>
+
+<p>O <code>value</code> é o número que ordena a fila. Valores acima de 1 bilhão são reservados para as classes
+do sistema (<code>system-cluster-critical</code> e <code>system-node-critical</code>), então o seu número
+máximo é <code>1000000000</code>. Não precisa de precisão cirúrgica: use faixas — 1000 para trabalho de fundo,
+100000 para serviços internos, 1000000 para o que o cliente vê.</p>
+
+<p>O <code>globalDefault: false</code> diz que esta classe não é o padrão do cluster. Se você marcar
+<code>true</code>, todo pod sem <code>priorityClassName</code> passa a receber esse valor — e isso muda o
+comportamento de coisas que você nem instalou. Só uma classe pode ser padrão, e quase nunca vale a pena.</p>
+
+<p>O <code>preemptionPolicy</code> decide se essa classe pode despejar outras. O padrão é
+<code>PreemptLowerPriority</code>; a alternativa é <code>Never</code>, que ainda dá vez na fila, mas nunca
+derruba ninguém. Voltamos a ela na seção 7, porque é a opção mais subestimada do assunto.</p>
+
+<p>Com a classe criada, o pod só precisa apontar para ela. A caixa abaixo tem o pod do caixa sem
+<code>priorityClassName</code>; a missão é acrescentar <code>priorityClassName: balcao</code>. O painel não tem
+o objeto PriorityClass, mas guarda e mostra o campo no pod — que é o que o agendador lê.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/caixa|spec.priorityClassName=balcao;;texto:Running;;conta:pods=1">
+  <p class="try-task">Acrescente <code>priorityClassName: balcao</code> ao pod do caixa e rode. O manifesto
+  tem de sair com o campo e o pod em <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: caixa
+  labels:
+    app: caixa
+spec:
+  containers:
+    - name: caixa
+      image: caixa:1.0
+      resources:
+        requests:
+          cpu: 250m
+          memory: 128Mi</pre>
+<pre class="out">
+pod/caixa created
+
+NAME    READY   STATUS    RESTARTS   AGE
+caixa   1/1     Running   0          7m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: caixa
+  labels:
+    app: caixa
+spec:
+  priorityClassName: balcao
+  containers:
+    - name: caixa
+      image: caixa:1.0
+      resources:
+        requests:
+          cpu: 250m
+          memory: 128Mi</pre>
+</div>
+
+<p>O <code>priorityClassName</code> fica no <code>spec</code> do pod, ao lado de <code>containers</code>, e
+não dentro do container. É uma propriedade do pod inteiro, como o <code>restartPolicy</code>: todos os
+containers daquele pod têm a mesma prioridade.</p>
+
+<p>Num cluster de verdade, depois de aplicar, o <code>describe</code> mostra a linha
+<code>Priority: 1000000</code> e o <code>priorityClassName</code> na lista de tolerations e afinidades. O
+painel deste guia mantém <code>Priority: 0</code> porque não tem o registro de PriorityClass — o campo do
+manifesto é guardado, o efeito no agendamento não é simulado. A seção 8 volta nesse limite.</p>
+
+<h2>4. Preempção: abrir espaço à força</h2>
+
+<p>Quando um pod de prioridade alta não cabe em nó nenhum, o agendador tenta uma segunda estratégia: procurar um
+nó onde, removendo pods de prioridade menor, o novo passaria a caber. Se encontra, ele marca as vítimas para
+saída, espera o encerramento e agenda o pod novo no espaço liberado.</p>
+
+<p>Não é um assassinato imediato. O pod vítima recebe o pedido de encerramento e tem o tempo de graça normal —
+trinta segundos por padrão — para terminar o que estava fazendo. Se ele faz parte de um Deployment, o
+controlador cria outro em algum lugar; se não couber em lugar nenhum, esse outro fica <code>Pending</code>. A
+preempção não cria capacidade: ela só troca quem está usando.</p>
+
+<p>Quando nem isso funciona, o evento diz. Esta é a mensagem real que o cluster devolve quando avaliou os três
+nós e concluiu que despejar alguém não ajudaria:</p>
+
+<pre class="term">Events:
+  Type     Reason            Age   From               Message
+  ----     ------            ----  ----               -------
+  Warning  FailedScheduling  11s   default-scheduler  0/3 nodes are available: 3 Insufficient cpu.
+  preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.</pre>
+
+<p>Leia a segunda linha com cuidado: “preempção não ajuda no agendamento”. Isso quer dizer que, mesmo removendo
+todos os pods de prioridade menor, o pod novo continuaria sem caber — porque o que falta é maior do que qualquer
+coisa que se possa liberar. Nesse caso, a solução não é prioridade: é reduzir o pedido, aumentar o cluster ou
+esperar o Job terminar.</p>
+
+<p>Há também o caso em que o pod novo é <em>maior</em> do que qualquer nó. Aí a mensagem fala de
+<code>Insufficient cpu</code> em todos os nós e nenhuma vítima resolve, porque o problema é o tamanho do
+pedido. Prioridade não estica máquina.</p>
+
+<h2>5. Quem pode ser vítima (e quem nunca é)</h2>
+
+<p>O agendador não despeja qualquer coisa. As classes do sistema têm os números mais altos, então os pods de
+infraestrutura — DNS, proxy de rede, agente de métricas — ficam acima de qualquer classe que você criar. Além
+disso, pods com prioridade maior ou igual à do candidato nunca são escolhidos: a comparação é sempre “menor
+que”.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Classe</th><th>Valor típico</th><th>Pode ser despejada por</th></tr>
+</thead>
+<tbody>
+<tr><td><code>system-node-critical</code></td><td>2000001000</td><td>ninguém</td></tr>
+<tr><td><code>system-cluster-critical</code></td><td>2000000000</td><td>ninguém</td></tr>
+<tr><td>sua classe mais alta</td><td>até 1000000000</td><td>só classes do sistema</td></tr>
+<tr><td>sua classe do meio</td><td>100000</td><td>classes acima dela</td></tr>
+<tr><td>sem <code>priorityClassName</code></td><td>0</td><td>todas as classes positivas</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>DaemonsSet merece uma nota: os pods de um DaemonSet são controlados por nó, mas isso não os torna imunes. Se
+o DaemonSet não declara <code>priorityClassName</code>, os pods dele têm prioridade 0 e podem ser despejados.
+Por isso é comum ver DaemonSets de infraestrutura com uma classe alta, para que um Job de relatório não derrube
+o agente de rede.</p>
+
+<p>Há ainda um detalhe de desempate: quando várias vítimas possíveis existem no nó, o agendador prefere as de
+menor prioridade; entre iguais, prefere as que têm menos tempo de vida e as que pedem mais recursos. A ideia é
+liberar bastante espaço pagando o menor preço. Você não controla essa escolha — só controla a prioridade dos
+seus pods.</p>
+
+<p>E o que acontece com a vítima? Ela é encerrada com <code>SIGTERM</code>, tem o tempo de graça para fechar
+conexões, e o evento dela registra a preempção. Se ela era um Job, o trabalho se perde e o Job pode ser
+recriado do zero. É por isso que Job de longa duração com prioridade baixa e um serviço interativo de
+prioridade alta é uma combinação que exige cuidado: o Job pode ser interrompido no meio.</p>
+
+<h2>6. Prioridade não é reserva</h2>
+
+<p>A frase que a Ana precisava ouvir: prioridade alta dá preferência na fila e direito de pedir espaço, mas não
+guarda CPU para ninguém. Se o nó está cheio e o cluster não consegue liberar nada — porque todos os pods têm
+prioridade igual ou maior, ou porque o pedido não cabe nem com o nó vazio —, o pod fica
+<code>Pending</code>.</p>
+
+<p>Um exemplo concreto, e é o da caixa abaixo. O pod do caixa tem prioridade alta e pede 8 núcleos num cluster
+de nós de 2 núcleos. Ele vai ficar <code>Pending</code> com <code>Insufficient cpu</code>, mesmo sendo o pod
+mais importante do prédio. Prioridade não muda o tamanho do pedido nem o tamanho do nó.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/caixa|spec.containers.0.resources.requests.cpu=500m">
+  <p class="try-task">Rode do jeito que está: o pod pede 8 núcleos e fica <code>Pending</code>. Reduza o
+  pedido para <code>500m</code> e rode de novo: o pod sobe, mesmo com a mesma prioridade.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: caixa
+spec:
+  priorityClassName: balcao
+  containers:
+    - name: caixa
+      image: caixa:1.0
+      resources:
+        requests:
+          cpu: "8"</pre>
+<pre class="out">
+pod/caixa created
+
+NAME    READY   STATUS    RESTARTS   AGE
+caixa   0/1     Pending   0          7m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: caixa
+spec:
+  priorityClassName: balcao
+  containers:
+    - name: caixa
+      image: caixa:1.0
+      resources:
+        requests:
+          cpu: 500m</pre>
+</div>
+
+<p>O painel mostra <code>0/1 Pending</code> antes e <code>1/1 Running</code> depois. O que mudou não foi a
+prioridade — foi o <code>requests</code>. É a demonstração mais direta de que as duas coisas vivem em planos
+diferentes: a fila e o tamanho.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>O que decide</th><th>Se faltar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>priorityClassName</code></td><td>a ordem na fila e o direito de preemptar</td><td>prioridade 0: todo mundo passa na frente</td></tr>
+<tr><td><code>requests</code></td><td>o tamanho do pod para o agendador</td><td>o pod é tratado como minúsculo e pode ser despejado</td></tr>
+<tr><td><code>limits</code></td><td>o teto que o container pode usar</td><td>o container pode consumir o nó inteiro</td></tr>
+<tr><td>classe de QoS</td><td>quem o kubelet despeja primeiro sob pressão</td><td>derivada de requests e limits; sem eles, <code>BestEffort</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Isso leva a uma regra prática de produção: <strong>sempre declare <code>requests</code></strong>. Sem
+<code>requests</code>, o agendador trata o pod como se ele não precisasse de nada, coloca-o num nó já cheio, e
+o container só descobre a falta de memória quando o kernel o mata por OOM. A classe de QoS — <code>Guaranteed</code>,
+<code>Burstable</code>, <code>BestEffort</code> — também depende disso, e é ela que decide quem o kubelet despeja
+primeiro quando o nó aperta.</p>
+
+<h2>7. Preempção sem despejo</h2>
+
+<p>Nem toda prioridade alta deveria derrubar alguém. Há casos em que você quer apenas que o seu pod seja
+avaliado antes — para pegar o primeiro espaço que abrir —, sem o direito de expulsar quem já está rodando. Para
+isso existe <code>preemptionPolicy: Never</code>.</p>
+
+<p>Com essa política, o pod continua tendo vez na fila: assim que um nó libera espaço, ele é o primeiro a ser
+agendado. Mas ele nunca escolhe vítimas. É a opção certa para relatórios, backups e qualquer carga que pode
+esperar sem prejudicar ninguém, e para ambientes em que derrubar um pod custa caro — um banco de dados, um
+processo com estado, um Job que perde horas de trabalho se for interrompido.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/relatorio|spec.priorityClassName=relatorio;;campo:Pod/relatorio|spec.preemptionPolicy=Never;;texto:Running">
+  <p class="try-task">O relatório precisa passar na frente da fila, mas não pode despejar o caixa. Acrescente
+  <code>priorityClassName: relatorio</code> e <code>preemptionPolicy: Never</code>, e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: relatorio
+spec:
+  containers:
+    - name: relatorio
+      image: relatorio:1.0
+      resources:
+        requests:
+          cpu: 500m
+          memory: 256Mi</pre>
+<pre class="out">
+pod/relatorio created
+
+NAME        READY   STATUS    RESTARTS   AGE
+relatorio   1/1     Running   0          2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: relatorio
+spec:
+  priorityClassName: relatorio
+  preemptionPolicy: Never
+  containers:
+    - name: relatorio
+      image: relatorio:1.0
+      resources:
+        requests:
+          cpu: 500m
+          memory: 256Mi</pre>
+</div>
+
+<p>O pod registra as duas escolhas no manifesto e sobe normalmente. Num cluster real, o
+<code>describe</code> mostraria <code>Preemption Policy: Never</code> e <code>Priority: 100000</code>. É uma
+combinação segura: o relatório espera menos e ninguém é interrompido por causa dele.</p>
+
+<p>Uma armadilha: <code>preemptionPolicy</code> é atributo da <em>classe</em>, não do pod, no cluster real. O
+campo do pod existe apenas como espelho do valor da classe e é o que o agendador consulta ao decidir. Se você
+mudar a classe depois, os pods já criados continuam com a política antiga até serem recriados. No painel, o
+campo é guardado como você escreveu, o que serve para aprender a estrutura.</p>
+
+<h2>8. O que o painel mostra (e o que ele não mostra)</h2>
+
+<p>O motor deste guia registra pods, Deployments, Services, ConfigMaps, Jobs, StatefulSets, HPA, Ingress,
+namespaces e nós. <code>PriorityClass</code> não está nessa lista: aplicar um objeto
+<code>scheduling.k8s.io/v1</code> devolve <code>no kind is registered for this resource</code>, e
+<code>kubectl get priorityclass</code> responde que o servidor não tem esse tipo. Por isso a classe aparece
+aqui em <code>pre.file</code> e nas transcrições.</p>
+
+<p>O que o painel faz de verdade, e é o que as caixas provam: guarda o <code>priorityClassName</code> e o
+<code>preemptionPolicy</code> no manifesto, agenda os pods nos três nós, calcula <code>requests</code> e devolve
+<code>Pending</code> quando não cabe. Também mostra o evento <code>FailedScheduling</code>, com a frase sobre
+preempção que você viu na seção 4 — a mesma que um cluster real escreve.</p>
+
+<p>Para ver a preempção acontecendo, o caminho é um cluster de verdade. Um exercício que vale a pena: crie dois
+pods que ocupem quase todo um nó, um deles com classe baixa; depois crie um terceiro com classe alta pedindo o
+mesmo tamanho. Em segundos, o pod de classe baixa é encerrado e o novo entra. O
+<code>kubectl get events --sort-by=.lastTimestamp</code> mostra a sequência, e o
+<code>kubectl describe pod</code> do despejado registra a preempção.</p>
+
+<p>Vale lembrar o limite: o painel não simula o despejo. Ele mostra o <code>Pending</code> e o motivo, que é a
+parte que ensina a diagnosticar. A parte de assistir alguém ser removido fica para o cluster local — e é uma das
+experiências mais instrutivas do Kubernetes, porque o evento aparece com data e hora.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: todo mundo com prioridade alta</h3>
+<p>A Ana criou classes altas para caixa, vitrine, relatório e backup. Como todas têm o mesmo valor, a fila volta
+a ser por tempo de espera — e o relatório, que começou antes, continua atropelando o caixa. Prioridade só
+organiza se houver diferença. Defina uma escala com poucos degraus e respeite.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o banco virou vítima</h3>
+<p>O pod do banco de dados não tinha <code>priorityClassName</code> e rodava com prioridade 0. Numa noite de
+pico, um Job de prioridade alta foi agendado e despejou o banco. O banco voltou, mas com o cache frio e trinta
+segundos de indisponibilidade. Banco de dados e qualquer coisa com estado precisam de classe alta — e,
+idealmente, de <code>preemptionPolicy: Never</code> nos vizinhos.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a preempção que não resolveu</h3>
+<p>O pod novo pedia 6 núcleos num cluster cujos nós têm 2. O cluster avaliou, tentou preempção, e respondeu
+“Preemption is not helpful for scheduling”. Não havia vítima suficiente para abrir 6 núcleos num nó de 2. O
+conserto foi reduzir o pedido e dividir o trabalho em três réplicas menores.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que a prioridade decide?</p>
+<label><input type="radio" name="q1"> quanto de CPU o pod recebe</label>
+<label><input type="radio" name="q1"> a ordem em que o pod é avaliado na fila do agendador</label>
+<label><input type="radio" name="q1"> em qual nó o pod vai rodar</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que é preempção?</p>
+<label><input type="radio" name="q2"> aumentar o nó automaticamente</label>
+<label><input type="radio" name="q2"> reiniciar o pod de maior prioridade</label>
+<label><input type="radio" name="q2"> remover pods de prioridade menor para abrir espaço</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Para que serve <code>preemptionPolicy: Never</code>?</p>
+<label><input type="radio" name="q3"> para ter vez na fila sem despejar ninguém</label>
+<label><input type="radio" name="q3"> para o pod nunca ser agendado</label>
+<label><input type="radio" name="q3"> para reservar CPU no nó</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a classe do balcão</h2>
+<p>Complete o pod do caixa para que ele use a classe de prioridade <code>balcao</code>.</p>
+<div class="ex-code">spec:
+  <input aria-label="resposta 1" data-answer="priorityClassName" placeholder="...">: balcao
+  containers:
+    - name: caixa
+      image: caixa:1.0</div>
+<p class="ex-dica">Dica: é o campo do <code>spec</code> do pod que aponta para o nome da PriorityClass, não um
+campo do container.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Prioridade é posição na fila do agendador. Ela vem de uma <code>PriorityClass</code> — um objeto de cluster
+com nome e número, até 1 bilhão para classes do time — e chega ao pod pelo campo
+<code>priorityClassName</code>. Quanto maior o número, mais cedo o pod é avaliado; entre iguais, vale a ordem de
+chegada.</p>
+
+<p>Preempção é o passo seguinte: quando o pod não cabe, o agendador procura pods de prioridade menor no nó e os
+encerra para abrir espaço. As vítimas saem com o tempo de graça normal e são recriadas pelos donos, muitas vezes
+em outro nó — ou ficam <code>Pending</code>. Classes do sistema e pods de prioridade maior ou igual nunca são
+vítimas.</p>
+
+<p>Prioridade não é reserva: sem <code>requests</code> o cluster não sabe o tamanho, e um pod importante ainda
+pode ficar <code>Pending</code>. Quando derrubar alguém é caro, use <code>preemptionPolicy: Never</code>: vez na
+fila, sem despejo. E lembre que o painel guarda o manifesto e mostra o <code>Pending</code>, mas a preempção em
+si acontece num cluster de verdade.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Prioridade = ordem na fila; <code>requests</code> = tamanho. Uma não substitui a outra.</li>
+  <li><code>PriorityClass</code> é de cluster; o pod aponta com <code>priorityClassName</code>.</li>
+  <li>Valores do time vão até 1 bilhão; acima disso é reservado ao sistema.</li>
+  <li>Preempção despeja pods de prioridade menor, com tempo de graça; não cria capacidade.</li>
+  <li><code>Preemption is not helpful for scheduling</code> = nem despejando tudo caberia.</li>
+  <li><code>preemptionPolicy: Never</code> dá vez sem derrubar ninguém.</li>
+  <li>DaemonSet sem classe também pode ser vítima: prioridade 0.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

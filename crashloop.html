@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CrashLoopBackOff | Guia Kubernetes</title>
+<meta name="description" content="CrashLoopBackOff: o container sobe, morre e reinicia sem parar. Como ler RESTARTS, Exit Code e Last State, usar kubectl logs --previous e ajustar o restartPolicy.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">CrashLoopBackOff</span></h1>
+<p class="intro">O pod do relatório da madrugada apareceu em <code>Running</code>, a Ana comemorou, e dois
+minutos depois ele estava de novo em <code>CrashLoopBackOff</code>, com <code>RESTARTS</code> em 7. Dessa
+vez o problema não é o cluster: é o programa. Ele sobe, faz alguma coisa, morre, e o kubelet o reinicia com
+uma espera cada vez maior. Nesta aula você aprende a ler essa dança — o número de reinícios, o código de
+saída, o estado anterior — e a descobrir o motivo antes de mexer em qualquer coisa.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que <code>CrashLoopBackOff</code> quer dizer, e por que o <code>RESTARTS</code> é a pista principal.</li>
+  <li>Quem reinicia o container e qual é o papel do <code>restartPolicy</code>.</li>
+  <li>Como ler <code>Last State</code>, <code>Exit Code</code> e <code>Reason</code> no <code>describe</code>.</li>
+  <li>Como usar <code>kubectl logs</code> e <code>kubectl logs --previous</code> para ver a mensagem do
+  programa.</li>
+  <li>As cinco causas que respondem por quase todo <code>CrashLoopBackOff</code>.</li>
+  <li>Por que um pod que termina com <code>Succeeded</code> não é um pod que falhou.</li>
+</ul>
+</div>
+
+<h2>1. A cena: sobe, morre, sobe de novo</h2>
+
+<p>O relatório é um programa de linha de comando: ele acorda de madrugada, lê as encomendas, monta um
+resumo em texto e termina. A Ana o colocou num pod, aplicou o manifesto e viu o status mudar em segundos:
+<code>ContainerCreating</code>, <code>Running</code>, <code>Error</code>, <code>CrashLoopBackOff</code>. O
+<code>RESTARTS</code> foi de 0 para 1, 2, 4, 7. Nenhuma mensagem no terminal, nenhum aviso além do nome
+comprido.</p>
+
+<p>A leitura errada é “o Kubernetes está reiniciando meu pod sem motivo”. A leitura certa é “o meu container
+está terminando, e o Kubernetes está fazendo o que você mandou: reiniciar”. O status tem duas partes de
+novo. <strong>Crash</strong> é a queda do container: o processo saiu, por erro ou porque terminou mesmo.
+<strong>LoopBackOff</strong> é a política de espera entre tentativas: dez segundos, vinte, quarenta, até
+cinco minutos. O cluster não está nervoso; ele está esperando o intervalo que ele mesmo calcula.</p>
+
+<p>Há uma diferença sutil, e é ela que confunde: o <code>STATUS</code> do pod pode voltar para
+<code>Running</code> entre uma tentativa e outra. Você olha a tela, vê verde, respira — e trinta segundos
+depois está vermelho de novo. O que não engana é a coluna <code>RESTARTS</code>: se ela sobe enquanto você
+olha, o container está morrendo em série. Pod que reinicia de propósito não existe; pod que reinicia sem
+parar é o que esta aula investiga.</p>
+
+<h2>2. Quem reinicia, e por quê</h2>
+
+<p>Três conceitos explicam o comportamento: o processo sai com um código, o kubelet lê esse código, e o
+<code>restartPolicy</code> diz o que fazer. Se o processo sai com zero, foi sucesso. Se sai com qualquer
+outro número, foi erro — e aí entra a política: <code>Always</code> reinicia em qualquer saída;
+<code>OnFailure</code> reinicia só quando o código é diferente de zero; <code>Never</code> não reinicia
+nunca.</p>
+
+<dl class="anatomy">
+<dt>CrashLoopBackOff</dt>
+<dd>O container sobe, termina e é reiniciado em ciclo, com espera crescente entre tentativas.</dd>
+<dt>exit code</dt>
+<dd>O número que o processo devolve ao sair. Zero é sucesso; 1 é erro genérico; 137 costuma ser morte por
+memória (128 + 9).</dd>
+<dt>restartPolicy</dt>
+<dd>A regra de reinício do pod: <code>Always</code> (padrão), <code>OnFailure</code> ou
+<code>Never</code>.</dd>
+<dt>backoff</dt>
+<dd>A espera crescente entre tentativas. Começa em segundos e chega a minutos; reinicia a contagem se o
+container ficar de pé por tempo suficiente.</dd>
+<dt>Last State</dt>
+<dd>No <code>describe</code>, o estado da execução anterior do container — onde aparecem o motivo e o código
+de saída.</dd>
+<dt>logs --previous</dt>
+<dd>Mostra a saída do container anterior, quando o atual ainda não produziu nada. É o comando que salva no
+meio do loop.</dd>
+<dt>livenessProbe</dt>
+<dd>A verificação de vida. Se falhar vezes seguidas, o kubelet mata o container e o reinicia — o que também
+aparece como reinício.</dd>
+</dl>
+
+<p>Guarde a consequência prática: reiniciar é comportamento normal, não punição. Um servidor web com
+<code>Always</code> que morre por falta de memória vai morrer de novo em loop, para sempre. O trabalho do
+diagnóstico não é parar o loop — é descobrir por que o processo sai antes de completar o trabalho.</p>
+
+<p>A escolha entre os três valores muda o comportamento de um jeito bem concreto. Vale comparar antes de
+escolher, porque é a decisão que transforma um pod que terminou num pod que reinicia para sempre.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Valor</th><th>O que faz</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Always</code></td><td>reinicia o container sempre que ele sai, com zero ou com erro</td>
+<td>servidor que deve ficar no ar; é o padrão dos pods</td></tr>
+<tr><td><code>OnFailure</code></td><td>reinicia só quando o código de saída é diferente de zero</td>
+<td>trabalho que pode ser repetido: relatórios, importações</td></tr>
+<tr><td><code>Never</code></td><td>nunca reinicia; o pod fica <code>Succeeded</code> ou
+<code>Failed</code></td><td>tarefa única em que repetir atrapalha</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare no caso do servidor: se o processo cai por erro de configuração, <code>Always</code> o reinicia
+para sempre — e é exatamente isso que produz o <code>CrashLoopBackOff</code>. O loop não é um defeito da
+política; é o sintoma de que o programa não consegue ficar de pé. Já no trabalho em lote, a política certa
+evita o loop: um relatório que terminou com zero não precisa rodar de novo.</p>
+
+<h2>3. A caixa: a política escrita em português</h2>
+
+<p>Antes de investigar o programa, vale conferir a regra que manda reiniciar. O campo
+<code>restartPolicy</code> aceita exatamente três valores em inglês, e escrever <code>sempre</code> não é
+“quase certo”: a API recusa o objeto inteiro. A caixa tem esse erro de propósito.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/relatorio|spec.restartPolicy=OnFailure">
+  <p class="try-task">O manifesto escreveu <code>sempre</code>. Rode, leia a lista de valores aceitos e
+  troque por <code>OnFailure</code> — o certo para um relatório que termina sozinho.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: relatorio
+spec:
+  restartPolicy: sempre
+  containers:
+    - name: relatorio
+      image: busybox:1.36</pre>
+<pre class="out">
+The Pod "relatorio" is invalid: spec.restartPolicy: Unsupported value: "sempre": supported values: "Always", "Never", "OnFailure"
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: relatorio
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: relatorio
+      image: busybox:1.36</pre>
+</div>
+
+<p>A resposta é <code>spec.restartPolicy: Unsupported value: "sempre": supported values: "Always", "Never",
+"OnFailure"</code>. A mensagem lista os três valores aceitos, na ordem em que o Kubernetes os conhece. É o
+tipo de erro bom: diz o que está errado e o que deveria estar lá.</p>
+
+<p>Com <code>OnFailure</code>, o pod sobe e o container termina. Se terminasse com zero, o pod ficaria
+<code>Succeeded</code> — e a política não o reiniciaria. Se terminasse com erro, ele seria reiniciado, e é
+nesse caso que você veria o <code>CrashLoopBackOff</code>. A escolha da política não conserta um programa
+quebrado; ela decide o que o cluster faz com o programa que já está quebrado.</p>
+
+<p>Repare que <code>restartPolicy</code> é campo do <em>pod</em>, não do container. Todos os containers de um
+pod obedecem à mesma regra. E ele é imutável depois que o pod nasceu: para trocar, apaga-se o pod e cria-se
+outro (num Deployment, isso é um novo rollout).</p>
+
+<h2>4. O describe de um container que morre</h2>
+
+<p>Agora o caso real: o container sobe e cai. O lugar onde isso fica registrado é o <code>describe</code>,
+na seção de containers. Esta é uma transcrição de cluster real, de um pod que já tinha reiniciado sete
+vezes:</p>
+
+<pre class="term">Containers:
+  relatorio:
+    Image:          cardapio:1.1
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       Error
+      Exit Code:    1
+      Started:      Fri, 27 Nov 2026 06:12:04 +0000
+      Finished:     Fri, 27 Nov 2026 06:12:05 +0000
+    Ready:          False
+    Restart Count:  7</pre>
+
+<p>Leia em três camadas. <code>State: Waiting</code> com <code>Reason: CrashLoopBackOff</code> é o agora: o
+container não está rodando, está esperando a próxima tentativa. <code>Last State: Terminated</code> é o
+anterior: ele rodou e saiu. <code>Exit Code: 1</code> é a resposta do programa ao sair — 1 é erro genérico.
+E <code>Restart Count: 7</code> é o placar.</p>
+
+<p>O tempo conta uma história também: começou às <code>06:12:04</code> e terminou às
+<code>06:12:05</code>. Um segundo de vida. Container que morre em um segundo não é “servidor que caiu depois
+de um tempo”: é programa que não chega a iniciar — falta configuração, falta arquivo, comando errado. Se o
+intervalo fosse de trinta minutos, a suspeita mudaria para vazamento de memória ou dependência que cai
+depois.</p>
+
+<p>Alguns códigos aparecem tanto que vale decorar. <strong>0</strong> é sucesso (e, com
+<code>OnFailure</code>, não reinicia). <strong>1</strong> é erro de aplicação. <strong>2</strong> costuma ser
+uso errado de comando. <strong>137</strong> é o famoso <code>OOMKilled</code>: o kernel matou o processo
+porque passou do limite de memória — nesse caso o <code>Reason</code> aparece como <code>OOMKilled</code> e
+o conserto é <code>resources.limits.memory</code>. <strong>143</strong> é <code>SIGTERM</code>: alguém pediu
+para o processo parar, o que é normal em desligamento.</p>
+
+<h2>5. A caixa: terminar não é falhar</h2>
+
+<p>Antes de ver por que o relatório morre, vale entender o que é <em>não</em> morrer. Um Job é um pod que
+roda até terminar, e o certo para ele é sair com zero — o status fica <code>Succeeded</code>, e o
+<code>READY</code> fica em <code>0/1</code>, porque não há nada pronto para receber tráfego. É um pod
+“morto de propósito”, e isso não é erro nenhum.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Succeeded">
+  <p class="try-task">A caixa começa só olhando os pods, e não há nenhum. Crie o Job com
+  <code>kubectl create job relatorio --image=busybox:1.36</code> e rode: o pod do Job aparece em
+  <code>Succeeded</code>.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+No resources found in default namespace.
+</pre>
+<pre class="solucao">kubectl create job relatorio --image=busybox:1.36
+kubectl get pods</pre>
+</div>
+
+<p>O painel mostra <code>relatorio-bzfhv   0/1   Succeeded</code>. O nome comprido vem do Job, que cria o pod
+com um sufixo próprio — a mesma ideia dos pods de Deployment. E o <code>0/1</code> aqui não é problema: um
+Job concluído não tem container rodando para ficar pronto.</p>
+
+<p>Essa distinção resolve metade das dúvidas de quem está começando: <code>Succeeded</code> com
+<code>RESTARTS</code> zero é sucesso; <code>CrashLoopBackOff</code> com <code>RESTARTS</code> subindo é
+falha; <code>Running</code> com <code>RESTARTS</code> subindo é falha intermitente, o caso mais chato de
+todos. E existe o caso do Job que falha: ele fica <code>Error</code> e o controlador tenta de novo até um
+limite — o <code>backoffLimit</code>, que por padrão é 6.</p>
+
+<h2>6. A caixa: o Job tem regra própria</h2>
+
+<p>Como o Job existe para terminar, ele não aceita a política <code>Always</code>. É uma regra do próprio
+tipo de recurso, e a mensagem do Kubernetes é bem direta. A caixa tem um Job com <code>Always</code> no
+template, do jeito que muita gente copia de um manifesto de Deployment.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="objeto:Job/relatorio;;texto:Succeeded">
+  <p class="try-task">O Job não aceita <code>restartPolicy: Always</code>. Troque por
+  <code>OnFailure</code> e rode: o Job é criado e o pod dele termina em <code>Succeeded</code>.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: relatorio
+spec:
+  template:
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: relatorio
+          image: busybox:1.36</pre>
+<pre class="out">
+The Job "relatorio" is invalid: spec.template.spec.restartPolicy: Unsupported value: "Always": supported values: "OnFailure", "Never"
+</pre>
+<pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: relatorio
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: relatorio
+          image: busybox:1.36</pre>
+</div>
+
+<p>A mensagem é <code>spec.template.spec.restartPolicy: Unsupported value: "Always": supported values:
+"OnFailure", "Never"</code> — dois valores, não três. Note também o caminho: dentro de um Job, o pod mora em
+<code>spec.template.spec</code>, porque o Job usa um modelo para criar pods, como o Deployment. Errar o
+caminho é o segundo erro mais comum: colocar <code>restartPolicy</code> em <code>spec</code> e não em
+<code>spec.template.spec</code> não dá erro, mas também não vale nada.</p>
+
+<p>Com <code>OnFailure</code>, o pod do Job nasce, o container roda e sai com zero, e o Job fica completo. A
+tabela do <code>get pods</code> mostra <code>Succeeded</code>, e a meta da caixa confere as duas coisas: que
+o objeto <code>Job/relatorio</code> existe e que o painel mostra o resultado. É a diferença entre “o cluster
+aceitou meu pedido” e “o trabalho terminou”.</p>
+
+<h2>7. As cinco causas de um CrashLoop</h2>
+
+<p>Depois de algumas horas de plantão, o padrão aparece. Quase todo <code>CrashLoopBackOff</code> cai em uma
+destas cinco famílias, e cada uma deixa uma marca diferente no <code>describe</code> ou no log.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Causa</th><th>Como aparece</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td>comando errado</td><td>exit 127, log com “not found”</td><td>corrigir <code>command</code> e
+<code>args</code></td></tr>
+<tr><td>configuração faltando</td><td>exit 1, log reclamando de variável ou arquivo</td><td>criar
+<code>env</code>, ConfigMap ou Secret que o programa lê</td></tr>
+<tr><td>arquivo não montado</td><td>exit 1, log com “no such file”</td><td>conferir
+<code>volumeMounts</code> e o caminho</td></tr>
+<tr><td>verificação de vida falhando</td><td><code>RESTARTS</code> sobe sem log de erro</td><td>ajustar
+<code>livenessProbe</code> (caminho, porta, tempo)</td></tr>
+<tr><td>memória estourada</td><td><code>Reason: OOMKilled</code>, exit 137</td><td>subir
+<code>resources.limits.memory</code> ou corrigir vazamento</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>As três primeiras são as que você vai encontrar nesta semana, e todas se resolvem lendo o log. A quarta é
+traiçoeira porque o log pode estar limpo: o container funciona, mas a verificação de vida bate na porta
+errada e o kubelet mata o processo por desconfiança. A quinta aparece com o <code>Reason</code> certo no
+<code>describe</code> e é a única em que o conserto costuma ser no manifesto, não no código.</p>
+
+<p>Uma sexta causa merece parágrafo: o programa que espera um serviço que ainda não existe. O banco sobe
+depois, o DNS interno demora, e o relatório tenta conectar nos primeiros segundos e desiste. Nesse caso o
+ciclo se resolve sozinho quando a dependência fica de pé — e o <code>backoff</code> é justamente o que dá
+tempo para isso. Se não resolver, o caminho é <code>initContainer</code> ou uma nova tentativa dentro do
+próprio programa.</p>
+
+<h2>8. Logs: a mensagem que o cluster não dá</h2>
+
+<p>O <code>describe</code> diz o que aconteceu; o log diz o que o programa achou disso. São duas fontes
+diferentes e você precisa das duas. O comando é <code>kubectl logs</code>, e ele tem uma variação que salva
+a vida no meio do loop: <code>--previous</code>, que mostra a saída do container <em>anterior</em>, já que o
+atual pode estar em espera e não ter produzido nada.</p>
+
+<pre class="term">ana@notebook:~$ kubectl logs relatorio
+ana@notebook:~$ kubectl logs relatorio --previous
+Iniciando o relatorio da madrugada
+Lendo /config/cardapio.json
+Erro: arquivo /config/cardapio.json nao encontrado
+ana@notebook:~$ </pre>
+
+<p>Esse é o caso clássico: o log atual vem vazio, o anterior conta tudo. A mensagem “arquivo não encontrado”
+aponta direto para o <code>volumeMounts</code> — provavelmente o ConfigMap não foi criado, ou o caminho
+montado é outro. Sem o <code>--previous</code>, a Ana teria concluído que o programa “não loga nada”, e
+perdido mais uma hora.</p>
+
+<p>Duas limitações do log valem saber. A primeira: log é do container, não do pod. Num pod com vários
+containers, use <code>-c nome</code> para escolher. A segunda: o log guarda só as últimas linhas (o kubelet
+rotaciona), então um container que reiniciou cinquenta vezes pode ter perdido a primeira mensagem — nesse
+caso, o <code>--previous</code> te dá a última execução, não a primeira.</p>
+
+<p>Dois complementos úteis do comando: <code>--tail=50</code> mostra só as últimas cinquenta linhas, e
+<code>-f</code> acompanha o log ao vivo, como um <code>tail -f</code>. Acompanhar ao vivo é ótimo para ver o
+programa subindo e cair na sua frente — a última linha antes do silêncio costuma ser a culpada. Em pod com
+mais de um container, <code>-c nome</code> escolhe qual log ler; sem ele, o kubectl pega o primeiro.</p>
+
+<p>E existe o log que não é do seu programa: mensagens do próprio runtime do container, quando a imagem
+falha ao iniciar por falta de permissão de arquivo ou comando inexistente. Elas também aparecem no
+<code>kubectl logs</code>, com o prefixo do runtime. Se a mensagem não parece ter sido escrita pelo seu
+código, provavelmente é disso que se trata — e o conserto volta a ser no manifesto, não no programa.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o “funciona no meu terminal”</h3>
+<p>A Ana rodou a imagem no notebook, com as variáveis de ambiente exportadas na sessão, e funcionou. No
+cluster, o pod caiu com exit 1 e o log dizia que faltava <code>DATABASE_URL</code>. O container não herda o
+ambiente do seu terminal: o que existe é o que está no manifesto, em <code>env</code> ou
+<code>envFrom</code>. O conserto foi declarar a variável no YAML.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o relatório que reiniciava de minuto em minuto</h3>
+<p>O relatório rodava em 40 segundos, terminava com zero e o pod voltava. O <code>restartPolicy</code> era
+<code>Always</code> — herdado de um manifesto copiado. Com <code>OnFailure</code>, o pod terminou uma vez e
+ficou em <code>Succeeded</code>. O programa nunca teve problema; a política é que mandava reiniciar um
+trabalho já concluído.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o log limpo e o reinício sem explicação</h3>
+<p>Um pod reiniciava a cada dois minutos com log vazio e exit 137. O <code>describe</code> mostrou
+<code>Reason: OOMKilled</code>: o limite era <code>limits.memory: 128Mi</code> e o programa usava 200 MB.
+Não havia bug — havia limite baixo. A Ana subiu para <code>512Mi</code> e o ciclo parou. Foi o caso em que o
+conserto coube numa linha de YAML.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que <code>CrashLoopBackOff</code> quer dizer?</p>
+<label><input type="radio" name="q1"> a imagem não pôde ser baixada</label>
+<label><input type="radio" name="q1"> o container sobe, termina e é reiniciado com espera
+crescente</label>
+<label><input type="radio" name="q1"> o pod não coube em nenhum nó</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Onde está o código de saída do container que morreu?</p>
+<label><input type="radio" name="q2"> no <code>describe</code>, em <code>Last State</code> /
+<code>Exit Code</code></label>
+<label><input type="radio" name="q2"> na coluna <code>AGE</code> do <code>get pods</code></label>
+<label><input type="radio" name="q2"> no campo <code>image</code> do manifesto</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">3. Um Job terminou com <code>Succeeded</code> e
+<code>RESTARTS</code> 0. É problema?</p>
+<label><input type="radio" name="q3"> sim, todo <code>0/1</code> é falha</label>
+<label><input type="radio" name="q3"> sim, porque o Job deveria ficar <code>Running</code> para
+sempre</label>
+<label><input type="radio" name="q3"> não: o trabalho terminou com sucesso</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: veja o log da execução anterior</h2>
+<p>O container atual está em espera e o <code>kubectl logs relatorio</code> veio vazio. Complete o comando
+com a opção que mostra a saída do container anterior.</p>
+<div class="ex-code">kubectl logs relatorio <input aria-label="resposta 1" data-answer="--previous|-p" placeholder="..."></div>
+<p class="ex-dica">Dica: é a opção que o kubectl usa para “a execução anterior”; existe também a forma curta,
+de uma letra.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>CrashLoopBackOff</code> é o container que sobe, sai e é reiniciado em ciclo, com espera crescente.
+O sintoma que não engana é o <code>RESTARTS</code> subindo; o status pode até voltar a <code>Running</code>
+entre tentativas. Quem decide reiniciar é o <code>restartPolicy</code>: <code>Always</code>,
+<code>OnFailure</code> ou <code>Never</code>, e um Job só aceita os dois últimos.</p>
+
+<p>A investigação tem duas fontes. O <code>describe</code> mostra <code>Last State</code>,
+<code>Reason</code> e <code>Exit Code</code> — 1 para erro de aplicação, 137 para memória estourada, e
+<code>OOMKilled</code> escrito por extenso. O <code>logs</code>, com <code>--previous</code> quando o atual
+está vazio, mostra a mensagem do programa: variável faltando, arquivo não encontrado, comando inexistente.
+Cinco causas cobrem quase tudo, e quatro delas se resolvem no manifesto.</p>
+
+<p>Na próxima aula o olho vai para as duas fontes com calma: o que exatamente o <code>kubectl logs</code>
+mostra, o que a seção de eventos do <code>describe</code> conta, e como usar uma para confirmar a outra. É a
+aula de logs e eventos.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>RESTARTS</code> subindo = container morrendo em série; o status pode oscilar.</li>
+  <li><code>restartPolicy</code> aceita <code>Always</code>, <code>OnFailure</code> e <code>Never</code>;
+  Job só aceita os dois últimos.</li>
+  <li><code>describe</code> → <code>Last State</code>, <code>Exit Code</code>, <code>Reason</code>.</li>
+  <li>Exit 1 = erro do programa; 137 / <code>OOMKilled</code> = memória.</li>
+  <li><code>kubectl logs --previous</code> mostra a execução anterior quando a atual está em espera.</li>
+  <li><code>Succeeded</code> com <code>RESTARTS</code> 0 é sucesso, não falha.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

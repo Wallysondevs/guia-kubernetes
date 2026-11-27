@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Labels e selectors | Guia Kubernetes</title>
+<meta name="description" content="Etiquetas e seletores no Kubernetes: como o Service acha os pods, o que muda entre label e annotation, os operadores de seletor e o erro de selector que não casa.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Labels e <span class="hl">selectors</span></h1>
+<p class="intro">O site da Ana está no ar, o Service existe, e mesmo assim a página responde erro: o Service
+não acha o pod. O motivo não é rede, não é porta e não é imagem — é uma etiqueta escrita diferente. Nesta
+aula ela aprende o par que faz o cluster inteiro se organizar: a <strong>label</strong>, que marca o objeto, e
+o <strong>selector</strong>, que escolhe objetos por marca. É o mecanismo que liga Service a pod, Deployment a
+pod e filtro de terminal a lista de objetos, e é a causa de metade dos “não funciona” de quem está
+começando.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é uma etiqueta, para que serve e as regras de nome e valor.</li>
+  <li>A diferença entre label, annotation e nome do objeto.</li>
+  <li>Selecionar por igualdade: <code>-l app=cardapio</code> e a vírgula como “e”.</li>
+  <li>Selecionar por conjunto: <code>in</code>, <code>notin</code> e <code>exists</code>.</li>
+  <li>Como o Service encontra os pods e o que é um endpoint vazio.</li>
+  <li>Como o Deployment seleciona os pods e por que o seletor tem de casar com o template.</li>
+  <li>Marcar, trocar e remover etiqueta com <code>kubectl label</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o Service que não acha ninguém</h2>
+
+<p>A Ana criou o pod do site e, para abrir de fora, criou um Service. O Service existe — aparece no
+<code>kubectl get services</code> com IP e porta. Mas a página não abre: quem tenta recebe erro de conexão
+recusada. Ela confere o pod, que está <code>Running</code>; confere a porta, que está certa; confere a imagem,
+que subiu. Nada.</p>
+
+<p>O que acontece é que o Service não conhece o pod. Ele não guarda o nome, não guarda o IP e não sabe onde o
+pod está. O Service guarda um <em>seletor</em>: um conjunto de etiquetas que ele procura nos pods. Se nenhum
+pod tem aquelas etiquetas, o Service existe e não tem para onde mandar tráfego — a lista de endpoints fica
+vazia. Funciona como um cartaz na porta da loja dizendo “entrega para quem tem o selo azul”: se ninguém tem o
+selo, a encomenda não sai, mesmo com a loja cheia.</p>
+
+<p>No caso dela, o pod tinha <code>app: cardapio</code> e o Service procurava <code>app: vitrine</code> —
+uma palavra escrita no dia em que ela testou outra coisa e esqueceu de voltar. A página ficou fora do ar por
+uma etiqueta. É a história mais comum deste assunto, e é por isso que a aula começa por ela.</p>
+
+<p>A boa notícia é que o mecanismo é simples e aparece em todo canto. Entender etiqueta e seletor é entender
+como o cluster se organiza sem que nada precise apontar para o nome de nada.</p>
+
+<h2>2. O que é uma etiqueta</h2>
+
+<p>Etiqueta (label) é um par de chave e valor que você cola num objeto para poder encontrá-lo depois. Não é
+identidade: dois pods podem ter a mesma etiqueta, e um pod pode ter dez. É marca, como a etiqueta de preço na
+vitrine — várias camisetas com a mesma etiqueta, e uma camiseta com duas etiquetas (tamanho e cor).</p>
+
+<p>Os nomes usados são livres, mas a convenção existe e ajuda. As mais comuns são <code>app</code> (qual
+programa é), <code>tier</code> (que papel ele tem: web, banco, fila), <code>versao</code> (qual versão está
+rodando) e <code>ambiente</code> (teste, produção). Quem trabalha em time grande usa as etiquetas
+recomendadas do Kubernetes: <code>app.kubernetes.io/name</code>,
+<code>app.kubernetes.io/component</code>, <code>app.kubernetes.io/part-of</code> e
+<code>app.kubernetes.io/managed-by</code>. Você não precisa delas para começar, mas reconhece quando
+aparecerem.</p>
+
+<p>As regras de formato são chatas e valem saber. A chave tem duas partes opcionais: um prefixo de domínio
+antes da barra (<code>padaria.loja.test/</code>) e o nome depois. O nome tem até 63 caracteres, usa letras,
+números, hífen, sublinhado e ponto, e começa e termina com letra ou número. O valor segue as mesmas regras e
+também tem até 63 caracteres — e pode ser vazio. Tudo minúsculo por convenção; ponto e sublinhado são
+aceitos, maiúscula no valor não é.</p>
+
+<p>O detalhe que mais quebra manifesto é o tipo. Etiqueta é sempre texto: <code>versao: "2"</code>, com aspas.
+Sem aspas, o YAML entrega número e o cluster recusa com <code>must be a string</code>. Você viu isso na aula
+de manifesto do pod; aqui vale repetir porque é nesta aula que a etiqueta passa a ter consequência — a
+numérica recusada derruba o pod, e o Service fica sem alvo.</p>
+
+<h2>3. Etiqueta, anotação e nome</h2>
+
+<p>Três coisas parecidas, três papéis diferentes. O <strong>nome</strong> identifica: é único dentro do
+namespace e é o que você digita em todo comando. A <strong>etiqueta</strong> agrupa: é o que o seletor usa e
+o que pode ser mudado depois sem recriar o objeto. A <strong>anotação</strong> guarda informação para
+ferramentas e pessoas, e nenhum seletor a usa.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>Nome</th><th>Etiqueta</th><th>Anotação</th></tr>
+</thead>
+<tbody>
+<tr><td>serve para</td><td>identificar o objeto</td><td>agrupar e selecionar</td><td>guardar informação
+auxiliar</td></tr>
+<tr><td>é único?</td><td>sim, no namespace</td><td>não: vários objetos têm a mesma</td><td>não</td></tr>
+<tr><td>dá para filtrar?</td><td>sim, por nome</td><td>sim, por seletor</td><td>não</td></tr>
+<tr><td>muda depois?</td><td>não: nome é imutável</td><td>sim, a qualquer momento</td><td>sim</td></tr>
+<tr><td>exemplo</td><td><code>cardapio</code></td><td><code>app: cardapio</code></td><td><code>dono:
+padaria</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Na prática, a etiqueta é o que liga as peças. O Deployment marca os pods que cria; o Service procura pods
+por marca; o comando <code>kubectl get</code> filtra por marca. Nenhum desses componentes conhece o nome do
+pod — e é bom que não conheça, porque o nome do pod muda toda vez que ele é recriado, e a etiqueta não.</p>
+
+<p>A anotação é o lugar de tudo o que é informação e não seleção: o link do chamado, o commit que gerou
+aquela imagem, a configuração do controlador de Ingress, o aviso de que aquele objeto é gerenciado por uma
+ferramenta. Se você se pegar querendo filtrar por um dado, ele é etiqueta; se quer só registrar, é
+anotação.</p>
+
+<h2>4. Selecionando por igualdade</h2>
+
+<p>Seletor por igualdade é a forma mais simples: chave igual a valor. No terminal, é o <code>-l</code> (de
+<em>label</em>) do <code>kubectl get</code>:</p>
+
+<pre class="file" data-file="terminal">kubectl get pods -l app=cardapio
+kubectl get pods -l app=cardapio,tier=web
+kubectl get pods -l tier!=forno</pre>
+
+<p>A primeira linha traz os pods cuja etiqueta <code>app</code> vale <code>cardapio</code>. A segunda usa
+vírgula, que significa “e”: os pods que têm as duas etiquetas. A terceira usa <code>!=</code>, que significa
+“diferente de” — e tem uma pegadinha: <code>tier!=forno</code> também traz pods que <strong>não têm</strong> a
+etiqueta <code>tier</code>. É a leitura literal de “o valor de tier não é forno”. Se você quer só os que têm
+a etiqueta e com outro valor, escreva a existência junto.</p>
+
+<p>Sem valor depois do sinal de igual, o filtro fica vazio e o kubectl devolve tudo. Com uma chave que não
+existe em pod nenhum, a resposta é sempre a mesma frase: <code>No resources found in default namespace.</code>
+Não é erro: é uma lista vazia, e é a pista número um de seletor errado.</p>
+
+<p>Para ver as etiquetas junto com os dados, existe o <code>--show-labels</code>, que acrescenta uma coluna
+no fim da tabela. Sem ele, você vê <code>NAME</code>, <code>READY</code>, <code>STATUS</code>,
+<code>RESTARTS</code> e <code>AGE</code>; com ele, aparece a coluna <code>LABELS</code> com os pares
+separados por vírgula. É o primeiro comando a rodar quando um Service não acha nada:</p>
+
+<pre class="term">$ kubectl get pods -l tier=web --show-labels
+NAME       READY   STATUS    RESTARTS   AGE   LABELS
+cardapio   1/1     Running   0          2m    run=cardapio,tier=web</pre>
+
+<p>Repare no <code>run=cardapio</code>: ele não foi escrito por ninguém, foi o <code>kubectl run</code> que
+colocou. É por isso que o pod criado na pressa tem uma etiqueta que ninguém escolheu — e por isso que o
+manifesto, que você escreve, é melhor: as etiquetas ficam explícitas e revisáveis.</p>
+
+<h2>5. Selecionando por conjunto</h2>
+
+<p>Existe uma segunda família de seletores, chamada de conjunto. Em vez de comparar com um valor só, ela
+pergunta se o valor está dentro de uma lista, se existe ou se não existe. No terminal, a sintaxe é entre
+parênteses e com espaço:</p>
+
+<pre class="file" data-file="terminal">kubectl get pods -l "app in (cardapio, vitrine)"
+kubectl get pods -l "tier notin (forno)"
+kubectl get pods -l tier
+kubectl get pods -l "!tier"</pre>
+
+<p>A primeira traz pods cujo <code>app</code> é <code>cardapio</code> ou <code>vitrine</code>. A segunda
+exclui os que têm <code>tier</code> igual a <code>forno</code>. A terceira é a forma curta de “tem a etiqueta
+<code>tier</code>, com qualquer valor”. A quarta é o contrário: “não tem a etiqueta <code>tier</code>”. As
+aspas existem porque o shell trataria o espaço e os parênteses de outro jeito.</p>
+
+<p>No manifesto, a versão por igualdade se chama <code>matchLabels</code> e a por conjunto se chama
+<code>matchExpressions</code>, que é uma lista com <code>key</code>, <code>operator</code> e
+<code>values</code>. Você vai encontrar as duas em Deployment, ReplicaSet, DaemonSet e StatefulSet. Já o
+<code>selector</code> de um Service aceita só a forma por igualdade, escrita como um mapa simples — o que é
+uma simplificação bem-vinda, porque Service com expressão é fonte de confusão.</p>
+
+<p>Uma nota sobre o painel deste guia: ele implementa o casamento por igualdade, que é o que Service,
+Deployment e o filtro <code>-l chave=valor</code> usam na maioria dos casos. A forma por conjunto é do
+kubectl de verdade, e é por isso que ela aparece aqui no formato de transcrição de terminal, não dentro de uma
+caixa. Se você digitar <code>-l "app in (a, b)"</code> no painel, ele vai tratar como um par esquisito e não
+achar nada — no cluster de verdade, acha.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Forma</th><th>Exemplo</th><th>Lê-se</th></tr>
+</thead>
+<tbody>
+<tr><td><code>=</code> ou <code>==</code></td><td><code>app=cardapio</code></td><td>tem a etiqueta com esse
+valor</td></tr>
+<tr><td><code>!=</code></td><td><code>tier!=forno</code></td><td>o valor é diferente, ou a etiqueta não
+existe</td></tr>
+<tr><td><code>in</code></td><td><code>app in (a, b)</code></td><td>o valor está na lista</td></tr>
+<tr><td><code>notin</code></td><td><code>tier notin (forno)</code></td><td>o valor não está na lista</td></tr>
+<tr><td>chave sozinha</td><td><code>tier</code></td><td>a etiqueta existe, com qualquer valor</td></tr>
+<tr><td><code>!</code></td><td><code>!tier</code></td><td>a etiqueta não existe</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Vírgula continua sendo “e” em qualquer família: <code>app=cardapio,tier=web</code> pede as duas. Não existe
+“ou” entre pares diferentes no mesmo seletor — para isso, use <code>in</code> com dois valores na mesma
+chave.</p>
+
+<h2>6. O Service encontra o pod</h2>
+
+<p>Agora o caso da Ana. O Service tem um campo <code>selector</code>, que é um mapa de etiquetas. O
+controlador de endpoints varre os pods do namespace, compara as etiquetas de cada um com esse mapa e monta a
+lista de quem casa. Só entra pod que está pronto; pod em <code>Pending</code> ou com container não pronto fica
+de fora. Essa lista é o objeto Endpoints, e é ela que o kube-proxy usa para mandar o tráfego.</p>
+
+<dl class="anatomy">
+<dt>label</dt>
+<dd>O par chave e valor colado no objeto: <code>app: cardapio</code>. Não identifica, agrupa.</dd>
+<dt>selector</dt>
+<dd>A consulta que escolhe objetos por etiqueta. O Service tem um; o Deployment tem outro; o
+<code>kubectl get -l</code> é o terceiro.</dd>
+<dt>matchLabels</dt>
+<dd>A forma de escrever o seletor por igualdade dentro do manifesto, como mapa de chave e valor.</dd>
+<dt>endpoint</dt>
+<dd>O par IP e porta de um pod que casa com o seletor e está pronto. Sem nenhum, o Service existe e não
+entrega.</dd>
+<dt>annotation</dt>
+<dd>Informação auxiliar, sem papel na seleção. O que não serve para filtrar vai aqui.</dd>
+</dl>
+
+<p>A caixa abaixo tem o caso completo: um pod marcado <code>app: cardapio</code> e um Service que procura
+<code>app: vitrine</code>. Rode, olhe a tabela de endpoints e conserte o seletor.</p>
+
+<div class="tryk8s" data-goal="texto:10.244." data-get="endpoints">
+  <p class="try-task">O Service procura <code>app: vitrine</code> e o pod está marcado com
+  <code>app: cardapio</code>. Faça o seletor casar com a etiqueta do pod e rode: a lista de endpoints tem de
+  mostrar o IP do pod.</p>
+<pre class="yaml" data-file="site.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: vitrine
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+pod/cardapio created
+service/cardapio created
+
+NAME       ENDPOINTS   AGE
+cardapio   &lt;none&gt;      2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>Antes do conserto, a tabela mostra <code>&lt;none&gt;</code> na coluna <code>ENDPOINTS</code>: o Service
+existe, o pod existe, e nada os liga. Depois, aparece o IP do pod com a porta de destino:</p>
+
+<pre class="term">$ kubectl get endpoints cardapio
+NAME       ENDPOINTS          AGE
+cardapio   10.244.4.71:8080   2m</pre>
+
+<p>É esse par que o Service entrega. Repare que a porta é a <code>targetPort</code> (8080), não a porta do
+Service (80) — o Service escuta em 80 e manda para a porta onde a aplicação realmente está. Quando o Service
+não tem endpoint, o <code>kubectl describe service</code> mostra <code>Endpoints: &lt;none&gt;</code> e o
+problema está sempre numa destas três coisas: o seletor não casa, o pod não está pronto, ou o pod está em
+outro namespace.</p>
+
+<p>O detalhe do namespace é o mais traiçoeiro. Seletor não atravessa namespace: um Service em
+<code>default</code> só enxerga pods em <code>default</code>. Dois objetos com as mesmas etiquetas em
+namespaces diferentes são invisíveis um para o outro, e não há mensagem de erro dizendo isso — há apenas a
+lista vazia.</p>
+
+<h2>7. O Deployment também seleciona</h2>
+
+<p>O Service não é o único que usa seletor. O Deployment usa um para saber <em>quais pods são dele</em>. Ele
+cria pods a partir de um modelo (<code>template</code>), marca cada pod com as etiquetas do modelo e depois
+fica procurando pods com aquelas etiquetas para contar quantos existem. Se um pod com a etiqueta
+desaparece, ele cria outro.</p>
+
+<p>É por isso que o seletor e as etiquetas do template têm de casar. Se o seletor procura
+<code>app: cardapio</code> e o template marca os pods com <code>app: vitrine</code>, o Deployment criaria pods
+que ele mesmo não reconhece — e criaria outro, e outro, num laço infinito. O cluster não deixa: recusa o
+objeto na validação, com a mensagem <code>selector does not match template labels</code>. A caixa abaixo tem
+esse erro.</p>
+
+<div class="tryk8s" data-goal="conta:pods[app=cardapio]=2;;texto:deployment.apps/cardapio created">
+  <p class="try-task">O template marca os pods com <code>app: vitrine</code>, mas o seletor procura
+  <code>app: cardapio</code>. Alinhe as duas etiquetas e rode: o Deployment tem de ficar com 2 pods
+  prontos.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: vitrine
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value: {"app":"vitrine"}: `selector` does not match template `labels`
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>A mensagem completa é <code>The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid
+value: {"app":"vitrine"}: `selector` does not match template `labels`</code>. Ela mostra o mapa que está no
+template e diz que o seletor não casa com ele. O conserto é sempre um dos dois lados: mudar o
+<code>matchLabels</code> ou mudar as etiquetas do template — e, quando o Deployment já existe há tempo, mudar
+o seletor é perigoso, porque ele deixa de reconhecer os pods antigos. Em objeto novo, comece pelo seletor e
+copie para o template.</p>
+
+<p>Há uma armadilha silenciosa aqui. Dois Deployments com o mesmo seletor disputam os mesmos pods: cada um
+conta os pods do outro, acha que tem demais e apaga; o outro recria; e o cluster fica nesse cabo de guerra.
+Nada estoura, nada avisa — só o número de pods pula. Etiqueta é barata de criar e cara de acertar; use um
+prefixo por aplicação (<code>app: cardapio</code>, <code>app: forno</code>) e nunca reaproveite o seletor de
+um Deployment para outra coisa.</p>
+
+<h2>8. Etiquetar na prática</h2>
+
+<p>Etiqueta muda depois que o objeto existe, e isso é uma vantagem: você pode marcar um pod para investigar,
+tirar uma etiqueta para o Service parar de mandar tráfego, ou trocar a versão para o time de monitoramento
+achar. O comando é <code>kubectl label</code>, na forma <code>tipo/nome chave=valor</code>:</p>
+
+<pre class="file" data-file="terminal">kubectl label pod/cardapio tier=web
+kubectl label pod/cardapio tier=forno --overwrite
+kubectl label pod/cardapio tier-</pre>
+
+<p>A primeira acrescenta; a segunda troca o valor (sem <code>--overwrite</code>, o kubectl recusa e avisa que
+a etiqueta já existe, para você não sobrescrever sem querer); a terceira remove, porque o hífen no fim do nome
+é o sinal de remoção. O kubectl responde <code>pod/cardapio labeled</code>, curto e seco.</p>
+
+<p>Veja a operação completa no painel: um pod criado na pressa com <code>kubectl run</code>, marcado à mão e
+depois filtrado. Antes de marcar, o filtro não acha nada; depois, acha.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:run=cardapio,tier=web">
+  <p class="try-task">O filtro procura <code>tier=web</code> e o pod só tem a etiqueta que o
+  <code>run</code> colocou. Acrescente a etiqueta <code>tier=web</code> ao pod e rode: a tabela tem de
+  mostrá-la na coluna <code>LABELS</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods -l tier=web --show-labels</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pods -l tier=web --show-labels
+No resources found in default namespace.
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl label pod/cardapio tier=web
+kubectl get pods -l tier=web --show-labels</pre>
+</div>
+
+<p>Repare na diferença entre as duas execuções. Sem a etiqueta, a resposta é <code>No resources found in
+default namespace.</code> — o filtro funcionou, e o resultado foi vazio. Com a etiqueta, a tabela aparece com
+uma linha só e a coluna <code>LABELS</code> mostrando <code>run=cardapio,tier=web</code>. É assim que se
+depura seletor: rode o filtro do Service à mão e veja se o pod aparece.</p>
+
+<p>E vale saber que a etiqueta pode ser colocada no próprio manifesto, embaixo de <code>metadata.labels</code>,
+o que é sempre preferível: fica versionada, aparece na revisão e não depende de alguém lembrar de rodar um
+comando. <code>kubectl label</code> é ferramenta de investigação e de conserto rápido, não de configuração
+permanente.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o Service sem endpoint depois do deploy</h3>
+<p>O time dela trocou a etiqueta do pod de <code>app: cardapio</code> para <code>app: cardapio-web</code> e
+esqueceu o Service. O deploy passou, os pods subiram, e o site caiu — porque o Service continuou procurando a
+etiqueta antiga. O sintoma foi <code>Endpoints: &lt;none&gt;</code> no describe. O conserto levou um minuto;
+o diagnóstico, quarenta, porque ninguém olhou o seletor.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod que dois Deployments disputavam</h3>
+<p>Uma cópia do manifesto foi criada com outro nome de Deployment e o mesmo seletor <code>app: cardapio</code>.
+Os dois passaram a contar os mesmos pods: um criava, o outro apagava, e o número oscilava sem parar. O
+<code>kubectl get pods</code> mostrava pods com <code>AGE</code> de segundos, sempre novos. O conserto foi
+dar seletor próprio a cada Deployment, com uma etiqueta a mais identificando o dono.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: filtrando o que interessa na hora do susto</h3>
+<p>Com trinta pods no namespace, achar o culpado no <code>get pods</code> é sorte. A Ana passou a marcar
+<code>tier</code> em tudo e a usar <code>kubectl get pods -l tier=web --show-labels</code> quando algo cai.
+Depois aprendeu o <code>-l app=cardapio,tier=web</code> para cruzar as duas etiquetas e chegar no pod exato.
+Filtro é a primeira ferramenta de diagnóstico, e custa uma linha no manifesto.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="1"><p class="mc-q">1. O que um Service guarda para achar os pods?</p>
+<label><input type="radio" name="q1"> um seletor: etiquetas que ele procura nos pods do mesmo namespace</label>
+<label><input type="radio" name="q1"> o nome do pod, definido na criação do Service</label>
+<label><input type="radio" name="q1"> o IP do pod, copiado do <code>kubectl get pods</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que <code>kubectl get pods -l app=cardapio,tier=web</code>
+faz?</p>
+<label><input type="radio" name="q2"> traz pods com qualquer uma das duas etiquetas</label>
+<label><input type="radio" name="q2"> traz pods com a etiqueta <code>app</code> e ignora o resto</label>
+<label><input type="radio" name="q2"> traz só pods que têm as duas etiquetas</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Por que o Deployment recusa seletor que não casa com as
+etiquetas do template?</p>
+<label><input type="radio" name="q3"> porque o YAML não aceita mapa dentro de mapa</label>
+<label><input type="radio" name="q3"> porque ele criaria pods que não reconhece como seus</label>
+<label><input type="radio" name="q3"> porque o Service não aceitaria o Deployment</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o filtro do terminal</h2>
+<p>Você quer listar só os pods marcados com <code>app=cardapio</code>. Complete o comando com a opção que faz
+o filtro por etiqueta:</p>
+<div class="ex-code">kubectl get pods <input aria-label="resposta 1" data-answer="-l" placeholder="..."> app=cardapio</div>
+<p class="ex-dica">Dica: são dois caracteres, um hífen e uma letra — a inicial de <em>label</em>. A forma
+longa é <code>--selector</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Etiqueta é um par de chave e valor que agrupa objetos; seletor é a consulta que escolhe por etiqueta.
+Nenhum componente do cluster precisa saber o nome de um pod — o Service acha os pods pelo seletor, o
+Deployment conta os pods pelo seletor, e você filtra a lista com <code>-l</code>. Nome identifica e não muda;
+etiqueta agrupa e muda; anotação registra e não filtra.</p>
+
+<p>No terminal, <code>-l chave=valor</code> filtra por igualdade, a vírgula é “e” e <code>!=</code> exclui. A
+família por conjunto usa <code>in</code>, <code>notin</code>, a chave sozinha e <code>!chave</code>. No
+manifesto, <code>matchLabels</code> é a forma por igualdade e <code>matchExpressions</code> a por conjunto. O
+Service só aceita igualdade.</p>
+
+<p>Quando um Service não entrega, o primeiro comando é <code>kubectl get endpoints</code>: <code>&lt;none&gt;</code>
+significa que nada casou — ou o pod não está pronto, ou está em outro namespace. E no Deployment, seletor e
+etiquetas do template têm de ser iguais, senão o cluster recusa com <code>selector does not match template
+labels</code>. Dois Deployments com o mesmo seletor disputam os mesmos pods e o número passa a oscilar. Com
+essa marcação entendida, a <a href="containers-e-imagens.html">próxima aula</a> abre o conteúdo do pod: os
+containers e as imagens que rodam dentro dele.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Etiqueta agrupa; nome identifica; anotação só registra.</li>
+  <li>Etiqueta é sempre texto: <code>versao: "2"</code>, com aspas.</li>
+  <li><code>kubectl get pods -l app=cardapio</code>; vírgula significa “e”.</li>
+  <li><code>-l tier</code> pergunta se a etiqueta existe; <code>-l "!tier"</code>, se não existe.</li>
+  <li>Service acha pod por seletor de igualdade, no mesmo namespace, e só pod pronto.</li>
+  <li><code>Endpoints: &lt;none&gt;</code> é seletor que não casa, pod não pronto ou outro namespace.</li>
+  <li>Deployment: seletor e <code>template.metadata.labels</code> têm de casar.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

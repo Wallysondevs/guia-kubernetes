@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service NodePort | Guia Kubernetes</title>
+<meta name="description" content="Service NodePort na prática: abrir o site para fora do cluster pela porta de cada nó, escolher a porta na faixa 30000-32767, acessar por qualquer nó e saber quando isso não basta.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Service <span class="hl">NodePort</span></h1>
+<p class="intro">O site da padaria funciona direitinho dentro do cluster: os pods conversam com o Service
+<code>cardapio</code> pelo nome, e tudo fica em ordem. Só que o cliente da Ana não está dentro do cluster —
+está na rua, com o celular. O ClusterIP não sai dali, e é para essa porta de saída que existe o
+<strong>NodePort</strong>: o mesmo Service, com um buraco a mais aberto em cada nó do cluster, num número de
+porta que qualquer máquina de fora consegue alcançar.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o NodePort acrescenta ao Service e o que ele não resolve.</li>
+  <li>As três portas do mesmo serviço: <code>port</code>, <code>targetPort</code> e
+  <code>nodePort</code>.</li>
+  <li>Por que a porta do nó fica na faixa de 30000 a 32767 e o que acontece fora dela.</li>
+  <li>Por que qualquer nó do cluster atende, mesmo o que não tem pod nenhum.</li>
+  <li>Como descobrir o IP do nó e testar de fora.</li>
+  <li>Quando o NodePort é suficiente e quando ele vira problema.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o cliente que queria ver o site</h2>
+
+<p>Na quinta-feira o padeiro quis mostrar o site novo para a filha, que mora em outra cidade. A Ana passou o
+endereço que usava nos testes — <code>http://cardapio</code> — e não funcionou. Depois passou o IP do Service,
+<code>10.96.147.79</code>, e também não. Nenhum dos dois sai do cluster: são endereços internos, como o
+ramal de um telefone dentro de uma empresa. Para alguém de fora ligar, é preciso um número que a telefonista
+externa conheça.</p>
+
+<p>O Kubernetes oferece três números assim, em ordem crescente de exposição: o NodePort, que abre uma porta
+em cada máquina do cluster; o LoadBalancer, que pede um IP público ao provedor; e o Ingress, que fica na
+frente dos dois e roteia por nome de domínio. O NodePort é o mais simples e o mais direto — e é por ele que
+todo mundo começa, porque não depende de nada além do próprio cluster.</p>
+
+<p>A ideia é fácil de visualizar. Cada nó do cluster é uma máquina com IP próprio: <code>192.0.2.21</code>,
+<code>192.0.2.22</code>, <code>192.0.2.28</code> no cluster de teste da Ana. O NodePort abre uma porta igual
+em <strong>todas</strong> elas e programa o encaminhamento: quem bater naquela porta, em qualquer nó, chega
+aos pods do Service. Você não precisa saber em que nó o pod está; o nó que recebe a conexão faz o
+encaminhamento.</p>
+
+<h2>2. O que o NodePort acrescenta</h2>
+
+<p>Tecnicamente, um Service do tipo NodePort é um Service ClusterIP com duas coisas a mais: uma porta aberta
+em cada nó e um campo novo no manifesto. O ClusterIP continua existindo — o Service continua tendo um IP
+interno, e quem está dentro do cluster continua podendo usá-lo. O NodePort é uma segunda porta de entrada, não
+uma substituição.</p>
+
+<dl class="anatomy">
+<dt>type: NodePort</dt>
+<dd>O tipo do Service que abre a porta em todos os nós. O ClusterIP continua sendo criado junto.</dd>
+<dt><code>nodePort</code></dt>
+<dd>A porta aberta em cada nó, entre 30000 e 32767. Se você não escolher, o cluster sorteia uma livre.</dd>
+<dt><code>port</code></dt>
+<dd>A porta do Service dentro do cluster, como no ClusterIP. É a que outros pods usam.</dd>
+<dt><code>targetPort</code></dt>
+<dd>A porta do container, onde o programa escuta. O caminho completo termina aqui.</dd>
+<dt>IP do nó</dt>
+<dd>O endereço de cada máquina do cluster. É o que o cliente de fora usa, junto com a porta do nó.</dd>
+</dl>
+
+<p>O caminho de uma requisição fica assim: o cliente chama <code>192.0.2.21:30080</code>; o kube-proxy do nó
+<code>guia-worker</code> vê a regra daquela porta, escolhe um pod do Service e encaminha para
+<code>10.244.x.y:8080</code>. Três números no caminho, e cada um tem um papel — trocar qualquer um deles
+quebra a corrente num ponto diferente.</p>
+
+<p>Uma consequência prática que surpreende: o nó que recebe a conexão não precisa ter pod nenhum. Se o
+cluster tem três nós e os dois pods do site estão em um deles, você acessa pelos três endereços — o nó sem
+pod encaminha para o nó que tem. Isso é bom para disponibilidade e é a razão pela qual o NodePort costuma
+funcionar “de primeira” mesmo quando você escolhe um nó qualquer para testar.</p>
+
+<h2>3. O manifesto com NodePort</h2>
+
+<p>A diferença em relação ao ClusterIP é uma linha de tipo e, opcionalmente, a escolha da porta. A caixa
+começa com o Service do jeito que estava na aula anterior e pede a transformação — com uma porta de nó
+fixa, para o time poder documentar o endereço.</p>
+
+<div class="tryk8s" data-get="services" data-goal="campo:Service/cardapio|spec.type=NodePort;;campo:Service/cardapio|spec.ports.0.nodePort=30080;;texto:30080">
+  <p class="try-task">Abra o Service para fora: mudar o tipo para <code>NodePort</code> e escolher a porta
+  <code>30080</code>. A coluna <code>PORT(S)</code> tem de mostrar <code>80:30080/TCP</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+pod/web created
+service/cardapio created
+
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        80/TCP    2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: NodePort
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080</pre>
+</div>
+
+<p>O painel do código inicial mostra <code>TYPE</code> em <code>ClusterIP</code> e <code>PORT(S)</code> em
+<code>80/TCP</code>: nenhuma porta aberta no nó. Depois da missão, <code>TYPE</code> vira
+<code>NodePort</code> e a coluna passa a mostrar <code>80:30080/TCP</code>. Essa notação é a chave de leitura
+da tabela: antes dos dois-pontos, a porta do Service; depois, a porta do nó.</p>
+
+<p>Repare que o ClusterIP não sumiu: a coluna <code>CLUSTER-IP</code> continua com <code>10.96.147.79</code>.
+Isso significa que o Service continua utilizável de dentro do cluster pelo nome e pelo IP, e que a porta
+30080 é um caminho <em>adicional</em>. Em times organizados, o front-end chama o back-end pelo ClusterIP e
+ninguém mais usa o NodePort; ele existe para o acesso externo e para o diagnóstico.</p>
+
+<h2>4. A faixa 30000–32767</h2>
+
+<p>A porta do nó não pode ser qualquer uma. O Kubernetes reserva a faixa de <strong>30000 a 32767</strong>
+para isso, para não competir com portas de sistema e com serviços do próprio cluster. Escolher 80, 8080 ou
+443 é o erro mais comum de quem vem do mundo das máquinas tradicionais — e o cluster recusa o objeto inteiro,
+com uma mensagem que explica a faixa.</p>
+
+<div class="tryk8s" data-get="services" data-goal="campo:Service/cardapio|spec.ports.0.nodePort=30080;;texto:service/cardapio created">
+  <p class="try-task">Rode do jeito que está e leia o erro. Depois troque a porta do nó para
+  <code>30080</code> e rode de novo.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: NodePort
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 80</pre>
+<pre class="out">
+pod/web created
+The Service "cardapio" is invalid: spec.ports[0].nodePort: Invalid value: 80: provided port is not in the valid range. The range of valid ports is 30000-32767
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: NodePort
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080</pre>
+</div>
+
+<p>Com <code>nodePort: 80</code>, o painel mostra o erro e nada é criado: o pod existe, o Service não. A
+mensagem é direta — <em>provided port is not in the valid range. The range of valid ports is
+30000-32767</em> —, e a tradução é “a porta escolhida não está na faixa válida”. Depois de trocar para
+<code>30080</code>, o Service nasce e a tabela mostra <code>80:30080/TCP</code>.</p>
+
+<p>Se você <strong>não</strong> declarar <code>nodePort</code>, o cluster escolhe uma livre dentro da faixa e
+a grava no objeto. Funciona, e tem um custo: a porta pode mudar se o Service for recriado, e o endereço que
+você documentou para o cliente deixa de valer. Em Service que alguém de fora usa, escolha a porta e trate-a
+como contrato — do mesmo jeito que você trata a porta 80.</p>
+
+<p>Escolher a porta também tem um risco próprio: a faixa é compartilhada por todo o cluster. Dois Services
+com a mesma <code>nodePort</code> brigam, e o segundo a ser criado é recusado. Em cluster com muitos times,
+esse é um motivo real para preferir LoadBalancer ou Ingress: eles não disputam a mesma faixa.</p>
+
+<h2>5. Acessando de fora</h2>
+
+<p>Com o Service criado, o endereço de acesso é <code>http://IP-DO-NÓ:30080</code>. O IP do nó sai do
+<code>kubectl get nodes -o wide</code>, na coluna <code>INTERNAL-IP</code>. A caixa abaixo usa o cluster com
+o site no ar e mostra o comando de criação, a tabela de Services e os IPs dos nós.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="campo:Service/cardapio|spec.type=NodePort;;texto:INTERNAL-IP;;texto:exposed">
+  <p class="try-task">Exponha o Deployment <code>cardapio</code> como NodePort, na porta 80 com destino 8080,
+  e confira o IP de cada nó com <code>get nodes -o wide</code>.</p>
+<pre class="yaml">kubectl expose deployment cardapio --port=80 --target-port=8080
+kubectl get services
+kubectl get nodes -o wide</pre>
+<pre class="out">
+ana@notebook:~$ kubectl expose deployment cardapio --port=80 --target-port=8080
+service/cardapio exposed
+
+ana@notebook:~$ kubectl get services
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        80/TCP    2m
+
+ana@notebook:~$ kubectl get nodes -o wide
+NAME                 STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                         KERNEL-VERSION     CONTAINER-RUNTIME
+guia-control-plane   Ready    control-plane   8m    v1.37.3   192.0.2.28    &lt;none&gt;        Debian GNU/Linux 12 (bookworm)   6.8.0-45-generic   containerd://1.7.24
+guia-worker          Ready    &lt;none&gt;          4m    v1.37.3   192.0.2.21    &lt;none&gt;        Debian GNU/Linux 12 (bookworm)   6.8.0-45-generic   containerd://1.7.24
+guia-worker2         Ready    &lt;none&gt;          4m    v1.37.3   192.0.2.22    &lt;none&gt;        Debian GNU/Linux 12 (bookworm)   6.8.0-45-generic   containerd://1.7.24
+</pre>
+  <pre class="solucao">kubectl expose deployment cardapio --port=80 --target-port=8080 --type=NodePort
+kubectl get services
+kubectl get nodes -o wide</pre>
+</div>
+
+<p>O painel do código inicial mostra um Service <code>ClusterIP</code> — o tipo padrão do <code>expose</code>
+— e a tabela de nós. Depois da missão, o Service aparece com <code>NodePort</code> e a coluna
+<code>PORT(S)</code> traz <code>80:31655/TCP</code>: o cluster sorteou a porta do nó, porque ninguém escolheu.
+E os nós mostram seus endereços internos: <code>192.0.2.28</code> no control plane, <code>192.0.2.21</code> e
+<code>192.0.2.22</code> nos workers.</p>
+
+<pre class="term">$ kubectl get services -o wide
+NAME       TYPE       CLUSTER-IP     EXTERNAL-IP   PORT(S)        SELECTOR       AGE
+cardapio   NodePort   10.96.147.79   &lt;none&gt;        80:30080/TCP   app=cardapio   2m</pre>
+
+<p>A transcrição acima é a resposta do painel para o Service com a porta fixa: <code>TYPE</code> em
+<code>NodePort</code>, <code>PORT(S)</code> com os dois números e <code>SELECTOR</code> à vista por causa do
+<code>-o wide</code>. Com ela e com o IP de um nó, o endereço de teste é
+<code>http://192.0.2.21:30080</code> — e o mesmo número funciona nos outros dois nós.</p>
+
+<p>Se o cluster está na sua máquina (um kind, um minikube), o IP do nó é interno à máquina virtual e o
+navegador do seu computador não chega nele. Aí o caminho é o túnel: <code>kubectl port-forward</code> para
+testar localmente, ou a ferramenta do cluster que publica a porta no host. É uma limitação do cluster de
+teste, não do NodePort — em cluster com IPs reais, o endereço funciona de qualquer lugar que tenha rota até
+o nó.</p>
+
+<h2>6. Firewall, balanceador e a vida real</h2>
+
+<p>Entre o cliente e a porta do nó existem pelo menos três coisas que costumam atrapalhar. A primeira é o
+firewall da máquina: a porta 30080 pode estar aberta no Kubernetes e fechada no sistema operacional do nó, ou
+no grupo de segurança do provedor de nuvem. O sintoma é o clássico tempo esgotado — conexão que não é
+recusada, apenas não responde.</p>
+
+<p>A segunda é o balanceador na frente. Em nuvem, o nó normalmente não tem IP público: quem fala com o mundo
+é um balanceador, que encaminha para a porta do nó nos bastidores. É exatamente assim que o tipo
+LoadBalancer funciona por baixo — ele cria um NodePort e pede ao provedor um IP público que aponte para
+ele.</p>
+
+<p>A terceira é o desenho do cliente. Um endereço <code>192.0.2.21:30080</code> amarra o cliente a um nó
+específico: se aquele nó cair, o endereço para de responder mesmo com o site no ar em outro nó. Quem resolve
+isso é um nome DNS com vários IPs ou um balanceador — o NodePort sozinho não é tolerante a falha de nó do
+ponto de vista de quem está fora.</p>
+
+<p>Por esses três motivos, o NodePort é ótimo para teste, para acesso interno controlado e para segurar o
+tipo LoadBalancer por baixo; e é ruim como endereço público de produção. Ninguém quer explicar para o cliente
+que o site é <code>http://192.0.2.21:31655</code>.</p>
+
+<h2>7. Os três tipos, lado a lado</h2>
+
+<p>Vale comparar os tipos antes de seguir, porque a escolha aparece em toda conversa de arquitetura. A
+diferença não é de capacidade — é de quem assume a parte externa.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tipo</th><th>Quem alcança</th><th>O que você precisa ter</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ClusterIP</code></td><td>só de dentro do cluster</td><td>nada além do cluster</td></tr>
+<tr><td><code>NodePort</code></td><td>quem tem rota até um nó, na porta certa</td><td>porta livre na faixa,
+firewall aberto</td></tr>
+<tr><td><code>LoadBalancer</code></td><td>a internet, por um IP público</td><td>provedor que saiba criar o
+balanceador (nuvem) ou um controlador no cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma coisa que confunde: os três são o mesmo objeto, com o campo <code>type</code> mudando. Um Service
+<code>LoadBalancer</code> também tem ClusterIP e também tem NodePort — ele é um NodePort com um pedido de IP
+público em cima. Por isso, ao investigar, vale olhar o tipo antes de qualquer coisa: um
+<code>get services</code> responde isso na segunda coluna.</p>
+
+<h2>8. Os tropeços do NodePort</h2>
+
+<p>O primeiro é a faixa: <code>nodePort</code> fora de 30000–32767 faz o cluster recusar o objeto, com a
+mensagem que você já viu. O segundo é a porta repetida: dois Services na mesma <code>nodePort</code> não
+convivem, e o segundo é recusado. O terceiro é o firewall — o Service está certo, o nó está certo, e o pacote
+morre no caminho.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Onde olhar</th><th>Causa provável</th></tr>
+</thead>
+<tbody>
+<tr><td>o Service não é criado</td><td>a mensagem do <code>apply</code></td><td><code>nodePort</code> fora da
+faixa ou já em uso</td></tr>
+<tr><td><code>PORT(S)</code> sem a parte do nó</td><td><code>get services</code></td><td>o tipo continua
+<code>ClusterIP</code></td></tr>
+<tr><td>conexão expira de fora</td><td>firewall do nó e do provedor</td><td>porta fechada no sistema ou no
+grupo de segurança</td></tr>
+<tr><td>funciona num nó e não em outro</td><td><code>get nodes</code> e rotas</td><td>nó sem rota, fora do
+balanceador, ou desligado</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="term">$ kubectl get nodes -o wide
+NAME                 STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP
+guia-control-plane   Ready    control-plane   8m    v1.37.3   192.0.2.28    &lt;none&gt;
+guia-worker          Ready    &lt;none&gt;          4m    v1.37.3   192.0.2.21    &lt;none&gt;
+guia-worker2         Ready    &lt;none&gt;          4m    v1.37.3   192.0.2.22    &lt;none&gt;</pre>
+
+<p>A transcrição acima é a resposta do painel para o cluster de teste: três nós prontos, sem IP externo. É
+com o <code>INTERNAL-IP</code> que se monta o endereço <code>http://192.0.2.21:30080</code>. Repare que
+nenhum nó tem <code>EXTERNAL-IP</code>: é por isso que o acesso de verdade, em nuvem, passa por um
+balanceador — e é por isso que o tipo LoadBalancer existe.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a porta 30080 que sumiu</h3>
+<p>A Ana recriou o Service com <code>kubectl delete service</code> e aplicou o manifesto de novo, sem
+<code>nodePort</code> no arquivo. O cluster sorteou outra porta, <code>31258</code>, e o endereço que estava
+no grupo do time parou de funcionar. A correção foi declarar a porta no manifesto e nunca mais recriar o
+Service “para limpar”. Em Service com endereço documentado, a porta é parte do contrato.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o cliente que só conhecia um nó</h3>
+<p>O sistema do contador da padaria tinha o IP de <code>guia-worker</code> fixo no arquivo de configuração.
+No dia em que o nó foi drenado para manutenção, o contador parou — e o site continuou no ar nos outros dois
+nós. A solução não foi Kubernetes: foi configurar um nome DNS com os três IPs, para o cliente escolher outro
+quando o primeiro não responder.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o NodePort que virou interno</h3>
+<p>Um time abriu um Service NodePort para o painel de administração “só para testar” e esqueceu. Meses
+depois, uma varredura de portas encontrou o painel exposto em todos os nós do cluster. NodePort é uma porta
+aberta de verdade: se o firewall do nó permite, qualquer um chega. Serviço interno não recebe
+NodePort.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual é o efeito de mudar o tipo de um Service para
+<code>NodePort</code>?</p>
+<label><input type="radio" name="q1"> o ClusterIP deixa de existir</label>
+<label><input type="radio" name="q1"> abre a mesma porta em todos os nós, mantendo o ClusterIP</label>
+<label><input type="radio" name="q1"> cria um IP público automaticamente</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Onde o cliente de fora aponta?</p>
+<label><input type="radio" name="q2"> no ClusterIP, na porta <code>port</code></label>
+<label><input type="radio" name="q2"> no IP do pod, na porta do container</label>
+<label><input type="radio" name="q2"> no IP de um nó, na porta <code>nodePort</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que <code>nodePort: 8080</code> é recusado?</p>
+<label><input type="radio" name="q3"> a porta do nó precisa estar entre 30000 e 32767</label>
+<label><input type="radio" name="q3"> o Kubernetes não aceita portas pares</label>
+<label><input type="radio" name="q3"> porque a 8080 já é usada pelo kubelet</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: as três portas</h2>
+<p>O site escuta na <code>8080</code>, o Service escuta na <code>80</code> e o nó deve abrir a
+<code>30080</code>. Complete o campo que abre a porta do nó:</p>
+<div class="ex-code">ports:
+  - port: 80
+    targetPort: 8080
+    <input aria-label="resposta 1" data-answer="nodePort" placeholder="...">: 30080</div>
+<p class="ex-dica">Dica: <code>port</code> é do Service, <code>targetPort</code> é do container e o campo que
+falta é do nó.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>NodePort é o tipo de Service que abre uma porta em cada nó do cluster, para o tráfego de fora chegar aos
+pods. O Service continua com ClusterIP e continua funcionando internamente; a porta do nó é um caminho a
+mais. No manifesto, são duas linhas: <code>type: NodePort</code> e, se quiser fixar, <code>nodePort</code>
+dentro do item de portas.</p>
+
+<p>A faixa é 30000–32767, e escolher fora dela é erro de criação. Sem escolha, o cluster sorteia uma porta
+livre — o que funciona até o dia em que o Service é recriado e o endereço documentado muda. A leitura da
+tabela é <code>80:30080/TCP</code>: porta do Service, dois-pontos, porta do nó.</p>
+
+<p>Qualquer nó atende, mesmo o que não tem pod, porque o encaminhamento acontece no nó. O que não existe no
+NodePort é tolerância do lado do cliente: um IP na configuração amarra o cliente a um nó. Para produção, o
+caminho é o LoadBalancer (um IP público na frente de todos os nós) ou o Ingress (nomes de domínio na frente
+de vários serviços).</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>type: NodePort</code> abre a porta em todos os nós e mantém o ClusterIP.</li>
+  <li>A faixa do <code>nodePort</code> é 30000–32767; fora dela, o objeto é recusado.</li>
+  <li>Sem <code>nodePort</code> declarado, o cluster sorteia — e pode sortear outra na próxima vez.</li>
+  <li>O endereço externo é <code>http://IP-DO-NÓ:nodePort</code>; qualquer nó serve.</li>
+  <li>Firewall do nó e grupo de segurança do provedor também precisam liberar a porta.</li>
+  <li>Para o cliente de verdade, prefira LoadBalancer ou Ingress.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

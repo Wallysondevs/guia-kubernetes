@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sidecar e multi-container | Guia Kubernetes</title>
+<meta name="description" content="Sidecar e pods com vários containers: rede e volumes compartilhados, localhost, ciclo de vida casado, logs por container e as portas que não podem repetir.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Sidecar e <span class="hl">multi-container</span></h1>
+<p class="intro">O site da Ana precisa de três coisas além do servidor: um coletor que leia o arquivo de log
+e mande para o servidor central, um exportador de métricas e um proxy para falar com o banco que fica fora
+do cluster. A tentação é criar três pods e apontar um para o outro por IP. O caminho certo é outro: colocar
+os auxiliares <em>dentro</em> do mesmo pod, dividindo rede e disco. É o padrão que o mundo chama de
+<strong>sidecar</strong> — e ele tem regras próprias, vantagens claras e um preço que vale conhecer antes de
+usar.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que dois containers no mesmo pod compartilham — e o que continua separado.</li>
+  <li>Como declarar o segundo container e ler <code>READY 2/2</code>.</li>
+  <li>Por que <code>localhost</code> funciona entre eles e por que as portas não podem repetir.</li>
+  <li>Os padrões sidecar, adapter e ambassador, com exemplos da padaria.</li>
+  <li>Como ver o log de cada container com <code>kubectl logs -c</code>.</li>
+  <li>O preço do casamento: ciclo de vida compartilhado e recursos por container.</li>
+</ul>
+</div>
+
+<h2>1. A cena: três auxiliares para um servidor</h2>
+
+<p>O servidor do cardápio é um programa Node que escreve log em <code>/var/log/cardapio.log</code> e responde
+HTTP na 8080. O time da Ana quer mandar esse log para o servidor central da loja, publicar métricas de acesso
+e sair para o banco externo por um proxy com credencial. Cada uma dessas necessidades tem uma ferramenta
+pronta, e nenhuma delas é parte do site.</p>
+
+<p>A primeira ideia foi criar um pod para cada ferramenta. Funcionou mal por três motivos: o coletor precisa
+ler um arquivo que está no disco do site (e disco de pod não é compartilhado entre pods), o proxy precisa
+saber quando o site sobe e desce (e pods separados não têm essa sincronia) e cada pod novo ganha um IP
+diferente, o que transforma configuração em caça ao endereço.</p>
+
+<p>A solução é antiga e simples: se os processos precisam estar sempre juntos, coloque-os no mesmo pod. O
+Kubernetes permite mais de um container em <code>spec.containers</code>, e o pod vira uma caixinha com
+vizinhos que nascem, vivem e morrem juntos. O container auxiliar ganhou o apelido de
+<em>sidecar</em> — o carrinho lateral da moto, que anda junto e leva a carga extra.</p>
+
+<h2>2. O que dois containers no mesmo pod dividem</h2>
+
+<p>A regra é curta e vale para tudo: containers do mesmo pod compartilham <strong>rede</strong> e podem
+compartilhar <strong>volumes</strong>, mas têm <strong>sistemas de arquivos separados</strong>. Cada um tem a
+sua imagem, o seu processo, o seu consumo de CPU e memória. O que eles dividem é o endereço de rede e o
+tempo de vida.</p>
+
+<p>Rede compartilhada quer dizer três coisas concretas: um único IP para o pod, um único espaço de portas (se
+o site escuta na 8080, o coletor não pode) e <code>localhost</code> funcionando entre eles. Essa última é a
+joia da coroa: o proxy pode escutar em <code>127.0.0.1:5432</code> e o site configura o banco como
+<code>localhost:5432</code>, sem Service, sem DNS, sem nome para decorar.</p>
+
+<dl class="anatomy">
+<dt>sidecar</dt>
+<dd>Container auxiliar que roda ao lado do principal, no mesmo pod, compartilhando rede e volume.</dd>
+<dt>multi-container</dt>
+<dd>Pod com mais de um item em <code>spec.containers</code>. Todos sobem juntos e são contados no
+<code>READY</code>.</dd>
+<dt>localhost</dt>
+<dd>O "aqui mesmo" dentro do pod. Entre containers do mesmo pod, é o caminho mais curto e o mais
+estável.</dd>
+<dt>emptyDir</dt>
+<dd>Volume temporário do pod, montado em quantos containers você quiser. É a ponte entre o app e o
+sidecar.</dd>
+<dt>ciclo de vida</dt>
+<dd>O pod é o dono do tempo: containers do mesmo pod nascem juntos e o pod só termina quando todos
+terminam.</dd>
+<dt>kubectl logs -c</dt>
+<dd>Escolhe de qual container ler o log. Em pod com dois containers, sem <code>-c</code> você lê o
+primeiro.</dd>
+</dl>
+
+<p>O sistema de arquivos separado é a parte que engana. Um arquivo escrito em <code>/tmp</code> pelo site
+<em>não</em> aparece em <code>/tmp</code> do coletor — são duas imagens, dois discos. Para compartilhar, é
+preciso um volume declarado no <code>spec</code> e montado nos dois containers, no mesmo
+<code>mountPath</code>. Sem isso, o coletor abre um diretório vazio e você jura que o site não está
+escrevendo.</p>
+
+<h2>3. Os três padrões que você vai encontrar</h2>
+
+<p>A literatura dá nomes diferentes ao papel do container auxiliar. Não é decoração: o nome diz quem inicia a
+conversa e para onde o tráfego vai.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Padrão</th><th>O que o auxiliar faz</th><th>Exemplo na padaria</th></tr>
+</thead>
+<tbody>
+<tr><td>sidecar</td><td>estende o principal: coleta log, publica métrica, serve arquivo estático</td><td>coletor que lê <code>/var/log/cardapio.log</code></td></tr>
+<tr><td>adapter</td><td>traduz a saída do principal para outro formato</td><td>exportador que transforma o log em métrica Prometheus</td></tr>
+<tr><td>ambassador</td><td>representa o principal ao falar com o mundo de fora</td><td>proxy que sai para o banco externo com a credencial</td></tr>
+<tr><td>init container</td><td>roda antes e termina (não é sidecar)</td><td>esperar o banco responder — aula anterior</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare que o init container não está no mesmo grupo: ele roda antes e termina. O sidecar roda junto e não
+termina. Essa é a diferença de projeto que decide onde cada coisa entra no manifesto.</p>
+
+<p>Nos três padrões, a vantagem é a mesma: o auxiliar está sempre no mesmo lugar que o principal, com o mesmo
+ciclo de vida e o mesmo endereço. A desvantagem também é comum, e você vai vê-la na seção 7 — o que é bom
+para a rede é ruim para o isolamento.</p>
+
+<h2>4. Declarando o segundo container</h2>
+
+<p>É literalmente mais um item na lista <code>spec.containers</code>. Cada item precisa de
+<code>name</code> e <code>image</code>, e o nome precisa ser único dentro do pod. A caixa abaixo tem o
+auxiliar sem nome — o cluster recusa o pod inteiro, com o caminho exato do campo que faltou.</p>
+
+<div class="tryk8s" data-goal="texto:2/2;;campo:Pod/cardapio|spec.containers.1.name=log">
+  <p class="try-task">O segundo container está sem nome. Dê a ele o nome <code>log</code> e rode: o pod
+  passa a mostrar <code>2/2</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+    - image: nginx:1.29</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.containers[1].name: Required value
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+    - name: log
+      image: nginx:1.29</pre>
+</div>
+
+<p>Depois de rodar, a tabela mostra <code>2/2</code> na coluna <code>READY</code>. Isso é a mesma conta da
+aula de init containers, agora do outro lado: <code>READY</code> conta containers de
+<code>spec.containers</code>, e com dois itens o total é dois. Um pod <code>1/2</code> quer dizer que um dos
+dois não está pronto — e o <code>describe</code> mostra qual.</p>
+
+<p>Erro de digitação no nome também aparece aqui, e a mensagem é
+<code>spec.containers[1].name: Required value</code>. Note o índice: trata-se do segundo item da lista, na
+ordem em que você escreveu. Quando o pod tem vários containers, ler o índice da mensagem é meio caminho para
+achar o problema.</p>
+
+<h2>5. Um IP, portas diferentes</h2>
+
+<p>Como a rede é compartilhada, dois containers no mesmo pod <strong>não podem escutar na mesma porta</strong>.
+Se o site está na 8080, o auxiliar precisa escolher outra — 9090, 9113, 15000, o que for. Tentar repetir
+causa falha de bind dentro do container, e o sintoma é um <code>CrashLoopBackOff</code> com "address already
+in use" no log.</p>
+
+<p>Para a aplicação, o auxiliar é <code>localhost</code>. Para o mundo de fora, os dois estão no mesmo IP do
+pod e cada um na sua porta. É por isso que um Service aponta para o pod (não para o container) e escolhe uma
+porta: quem decide qual processo responde é o número.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Recurso</th><th>Mesmo pod</th><th>Pods diferentes</th></tr>
+</thead>
+<tbody>
+<tr><td>rede e IP</td><td>um só, compartilhado</td><td>um IP por pod</td></tr>
+<tr><td>porta</td><td>não pode repetir</td><td>pode repetir, cada pod é um mundo</td></tr>
+<tr><td>como se acham</td><td><code>localhost</code></td><td>Service, DNS, nome do serviço</td></tr>
+<tr><td>volume</td><td><code>emptyDir</code> montado nos dois</td><td>precisa de PVC ou cópia</td></tr>
+<tr><td>ciclo de vida</td><td>junto: um pod, um destino</td><td>independentes</td></tr>
+<tr><td>escala</td><td>escalam juntos (1 réplica = 1 par)</td><td>escalam separados</td></tr>
+<tr><td>cpu e memória</td><td>um bloco de recursos por container, somados para o agendador</td><td>um bloco por pod</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Consequência para quem publica: um Service aponta para <em>uma</em> porta do pod. Se você precisa
+expor o site (8080) e também o endpoint de métricas (9090), são dois Services — ou um Service com duas
+portas nomeadas, o que é permitido e comum. O Service não escolhe container, escolhe número de porta; quem
+responde é o processo que estiver escutando ali.</p>
+
+<p>A linha da escala merece atenção: se o coletor precisa de uma instância por site, o sidecar é perfeito; se
+ele pode servir dez sites, o sidecar é desperdício — você teria dez coletores. Escolher o padrão é escolher
+como o sistema cresce.</p>
+
+<h2>6. O volume que liga os dois</h2>
+
+<p>Agora o caso da Ana: o site escreve o log em <code>/var/log/cardapio.log</code> e o coletor precisa ler.
+São dois containers, dois discos — então entra um <code>emptyDir</code> no <code>spec.volumes</code> e um
+<code>volumeMounts</code> em cada container, apontando para o mesmo <code>mountPath</code>.</p>
+
+<div class="tryk8s" data-goal="texto:2/2;;campo:Pod/cardapio|spec.containers.1.volumeMounts.0.mountPath=/dados;;campo:Pod/cardapio|spec.containers.1.ports.0.containerPort=9090">
+  <p class="try-task">O volume existe, mas só o site o monta, e o auxiliar não declara porta. Monte
+  <code>dados</code> em <code>/dados</code> também no container <code>log</code> e dê a ele a porta
+  <code>9090</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+    - name: log
+      image: nginx:1.29
+  volumes:
+    - name: dados
+      emptyDir: {}</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   2/2     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+    - name: log
+      image: nginx:1.29
+      ports:
+        - containerPort: 9090
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      emptyDir: {}</pre>
+</div>
+
+<p>O <code>mountPath</code> pode ser diferente nos dois lados — o site pode escrever em
+<code>/var/log</code> e o coletor ler do mesmo volume em <code>/dados</code>. O que precisa ser igual é o
+<code>name</code> do volume: é ele que diz qual volume montar. Confundir os dois é o erro mais comum: trocar
+o <code>mountPath</code> não compartilha nada, porque cada container tem o seu caminho.</p>
+
+<p>O <code>emptyDir</code> nasce vazio quando o pod nasce e morre quando o pod morre. Para log de vida curta
+é ótimo; para dado que precisa sobreviver a uma recriação de pod, não serve — aí entra um volume persistente,
+assunto de outro nível do guia.</p>
+
+<h2>7. Logs e diagnóstico com dois containers</h2>
+
+<p>Cada container tem o seu log, e o <code>kubectl logs</code> precisa saber qual você quer. Sem
+<code>-c</code>, ele assume o primeiro da lista. Com o nome errado, a resposta é curta e direta.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:GET /cardapio 200 12ms">
+  <p class="try-task">O container criado pelo <code>kubectl run</code> tem o nome do pod, não
+  <code>web</code>. Conserte o <code>-c</code> e veja o log do site.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl logs cardapio -c web</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl logs cardapio -c web
+error: container web is not valid for pod cardapio
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl logs cardapio -c cardapio</pre>
+</div>
+
+<p><code>error: container web is not valid for pod cardapio</code> é a mensagem do cluster quando o nome não
+existe naquele pod. Ela não diz que o container morreu: diz que você pediu um nome que o pod não tem. Para
+descobrir os nomes, <code>kubectl describe pod</code> lista cada container com o seu bloco — e num pod com
+sidecar, são dois blocos.</p>
+
+<pre class="term">Containers:
+  web:
+    Image:          cardapio:1.0
+    Port:           8080/TCP
+    State:          Running
+      Started:      Fri, 27 Nov 2026 15:50:25 +0000
+    Ready:          True
+    Restart Count:  0
+  log:
+    Image:          nginx:1.29
+    Port:           9090/TCP
+    State:          Running
+      Started:      Fri, 27 Nov 2026 15:50:25 +0000
+    Ready:          True
+    Restart Count:  2</pre>
+
+<p>Essa é a transcrição de um describe real de pod com dois containers. Repare que os dois estão
+<code>Ready: True</code> e o <code>Restart Count</code> é independente: o coletor reiniciou duas vezes, o
+site nenhuma. Estado é por container; destino é do pod.</p>
+
+<pre class="term">$ kubectl logs cardapio -c web
+Servindo o cardapio na porta 8080
+Precos carregados de /config/cardapio.json
+GET /cardapio 200 12ms
+GET /saude 200 1ms
+
+$ kubectl logs cardapio -c log
+10.244.1.1 - - [27/Nov/2026:15:52:01 +0000] "GET /cardapio HTTP/1.1" 200 615 "-" "Mozilla/5.0"</pre>
+
+<p>Dois logs, duas perspectivas: o site conta o que fez; o coletor conta o que viu passar. Numa investigação,
+comparar os dois responde perguntas que um sozinho não responde — "o pedido chegou ao site?" e "saiu log para
+o servidor central?". É o tipo de vantagem que só existe porque os dois estão no mesmo pod.</p>
+
+<h2>8. O preço do casamento</h2>
+
+<p>Pod com sidecar é casamento, não coleguismo. Três consequências para ter em mente antes de adotar.</p>
+
+<p>A primeira: <strong>o pod só fica pronto quando todos ficam</strong>. Se o coletor travar, o pod aparece
+como <code>1/2</code>, e o Service para de mandar tráfego para o site — mesmo com o site saudável. Um
+auxiliar instável derruba a disponibilidade do principal. É a razão de tanta gente colocar sonda de
+prontidão no sidecar com cuidado.</p>
+
+<p>A segunda: <strong>o pod só termina quando todos terminam</strong>. Ao apagar o pod, o Kubernetes manda
+SIGTERM para todos e espera o <code>terminationGracePeriodSeconds</code>; se o auxiliar não sair nesse tempo,
+vem o SIGKILL. Um sidecar mal comportado transforma cada deploy em espera de trinta segundos.</p>
+
+<p>A terceira: <strong>os recursos são por container</strong>, e o agendador soma. Um sidecar de 200m de CPU
+que você esqueceu de configurar pode ser o motivo de o pod não caber em nó nenhum — e a classe de QoS cai
+para <code>Burstable</code> se um dos dois não tiver request igual ao limit. A regra da aula de recursos vale
+por container, sempre.</p>
+
+<p>Existe ainda a opção moderna: desde 1.28/1.29 dá para declarar o auxiliar em
+<code>spec.initContainers</code> com <code>restartPolicy: Always</code>. Ele sobe antes da aplicação, como
+init, e continua rodando, como sidecar — o melhor dos dois mundos para proxy de rede e agente de log, porque
+garante ordem de início. Se você encontrar isso num manifesto por aí, já sabe o que é.</p>
+
+<p>Quando um pod multi-container começa a reiniciar, o primeiro passo é descobrir <em>qual</em>
+container está com problema: o <code>describe</code> mostra <code>Restart Count</code> por container, e a
+diferença entre eles já elimina metade das hipóteses. Depois, <code>kubectl logs -c nome --previous</code>
+traz a última execução daquele container — o log do vizinho saudável não ajuda em nada e só confunde.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o coletor que lia um diretório vazio</h3>
+<p>O time colou o coletor no pod e ele não achava o arquivo de log. Diagnóstico em dois minutos: o volume só
+estava montado no container do site. Volume compartilhado exige <code>volumeMounts</code> em cada container,
+e o <code>mountPath</code> de cada um é independente. Corrigido o segundo bloco, o log apareceu.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o sidecar que derrubou o site</h3>
+<p>Um proxy auxiliar começou a reiniciar por falta de memória. O pod ficou <code>1/2</code> e o Service
+parou de enviar tráfego: o site estava no ar, mas invisível. O conserto foi dar limite de memória ao proxy e
+uma sonda de prontidão adequada. A lição: em pod multi-container, a disponibilidade é do mais fraco.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o sidecar que virou peso na escala</h3>
+<p>A Ana queria dez réplicas do site e pôs um coletor de log em cada pod. Eram dez coletores mandando os
+mesmos dados para o servidor central, que começou a recusar. A solução foi tirar o coletor do pod e rodar um
+DaemonSet — um por nó, não um por pod. Sidecar escala junto; nem sempre isso é o que você quer.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que dois containers do mesmo pod compartilham?</p>
+<label><input type="radio" name="q1"> o sistema de arquivos, sempre</label>
+<label><input type="radio" name="q1"> a rede (um IP, um espaço de portas) e, se montado, o volume</label>
+<label><input type="radio" name="q1"> nada: cada container é isolado por completo</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O site escuta na 8080. O auxiliar pode escutar em qual
+porta?</p>
+<label><input type="radio" name="q2"> também na 8080, porque cada container tem a sua rede</label>
+<label><input type="radio" name="q2"> em qualquer porta, inclusive 8080 — o Kubernetes resolve</label>
+<label><input type="radio" name="q2"> em outra porta, como 9090, porque a rede é compartilhada</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O pod está com <code>READY 1/2</code> e o site responde
+normalmente. O que isso significa?</p>
+<label><input type="radio" name="q3"> um dos containers não está pronto, e o pod inteiro deixa de ser
+considerado pronto</label>
+<label><input type="radio" name="q3"> o pod tem dois containers e um ainda não foi criado</label>
+<label><input type="radio" name="q3"> nada: <code>1/2</code> é normal para pod com sidecar</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o volume entre o site e o coletor</h2>
+<p>Complete o container <code>log</code> para que ele leia o mesmo volume do site, em <code>/dados</code>, e
+escute na 9090.</p>
+<div class="ex-code">    - name: log
+      image: nginx:1.29
+      ports:
+        - containerPort: <input aria-label="resposta 1" data-answer="9090" placeholder="...">
+      volumeMounts:
+        - name: <input aria-label="resposta 2" data-answer="dados" placeholder="...">
+          mountPath: /dados</div>
+<p class="ex-dica">Dica: o <code>name</code> do <code>volumeMounts</code> precisa ser igual ao
+<code>name</code> do <code>spec.volumes</code>. Já o <code>mountPath</code> é o caminho dentro daquele
+container, e pode ser diferente do caminho usado pelo site.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Pod pode ter mais de um container, e eles compartilham rede, IP e portas, além dos volumes que você montar
+nos dois. O sistema de arquivos continua separado — daí a necessidade de um <code>emptyDir</code> quando o
+auxiliar precisa ler o que o principal escreve. Como a rede é uma só, <code>localhost</code> funciona entre
+eles e as portas não podem repetir.</p>
+
+<p>Os padrões têm nomes: sidecar (estende), adapter (traduz), ambassador (representa) e init container (roda
+antes e termina). Cada container tem o seu log, lido com <code>kubectl logs -c</code>, e o seu consumo de
+recursos, somado pelo agendador.</p>
+
+<p>O preço é o casamento: o pod fica pronto só quando todos ficam, termina só quando todos terminam, e escala
+sempre em par. Vale quando os processos precisam estar juntos; não vale quando um auxiliar serviria dez pods
+— nesse caso, a peça é um DaemonSet, e o caminho do guia segue. Com esta aula, o grupo de manifestos e pods
+se fecha: daqui em diante a Ana entra em configuração, começando por ConfigMap.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Containers do mesmo pod: rede compartilhada, disco separado, ciclo de vida único.</li>
+  <li><code>localhost</code> funciona entre eles; portas iguais causam conflito.</li>
+  <li><code>READY 2/2</code> conta containers; <code>1/2</code> deixa o pod fora do Service.</li>
+  <li><code>emptyDir</code> + <code>volumeMounts</code> nos dois containers = arquivo compartilhado.</li>
+  <li><code>kubectl logs pod -c nome</code>; sem <code>-c</code>, o primeiro container responde.</li>
+  <li>Recursos são por container, e o agendador soma; um sidecar esquecido pesa no pod inteiro.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

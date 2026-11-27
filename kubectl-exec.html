@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kubectl exec | Guia Kubernetes</title>
+<meta name="description" content="O kubectl exec sem mistério: rodar um comando dentro do container, o papel do --, listar arquivos, ler configuração e ver variáveis de ambiente.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>kubectl <span class="hl">exec</span></h1>
+<p class="intro">A Ana descobriu que o preço do pão de queijo estava errado no site. O valor certo está no
+arquivo de configuração, ela tem certeza — mas o arquivo não está na máquina dela, está dentro do container,
+no cluster. Até agora ela só leu de fora: <code>get</code>, <code>describe</code> e <code>logs</code> contam
+o que o cluster e o programa falam. O <code>kubectl exec</code> é o primeiro comando que <em>age</em>: ele
+roda um programa dentro do container que já está rodando. Nesta aula a Ana usa esse poder com cuidado e
+aprende onde ele não serve.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o <code>exec</code> faz — e onde ele realmente roda.</li>
+  <li>A gramática do comando e por que existe o <code>--</code> no meio.</li>
+  <li>Listar arquivos e ler configuração dentro do container.</li>
+  <li>Ver as variáveis de ambiente que o processo recebeu.</li>
+  <li>Por que o shell interativo não abre no painel e o que fazer no lugar.</li>
+  <li>Quando usar <code>exec</code> e quando a resposta está em <code>logs</code> ou
+  <code>describe</code>.</li>
+  <li>Os riscos de mexer num container que está atendendo cliente.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o arquivo que existe só lá dentro</h2>
+
+<p>O cardápio do site lê os preços de um arquivo: <code>/config/cardapio.json</code>. A Ana ajustou o preço
+no arquivo da máquina dela, aplicou não se lembra o quê, e o site continuou com o valor antigo. Antes de
+mexer em qualquer coisa, ela quer responder a uma pergunta objetiva: <em>o que está escrito no arquivo
+dentro do container?</em></p>
+
+<p>Nenhum dos comandos que ela já conhece responde isso. O <code>get</code> mostra estado, o
+<code>describe</code> mostra o objeto e os eventos, o <code>logs</code> mostra o que o programa escreveu. O
+conteúdo de um arquivo, a lista de diretórios, o valor de uma variável de ambiente no processo — tudo isso
+está <em>dentro</em> do container, e para chegar lá existe um comando só: <code>kubectl exec</code>.</p>
+
+<p>Vale entender o que ele faz de verdade, porque a palavra “entrar” engana. O <code>exec</code> não abre
+uma máquina nova nem um terminal no nó: ele pede ao kubelet que rode um processo <em>extra</em> dentro do
+container que já existe, no mesmo sistema de arquivos, com as mesmas variáveis de ambiente. É como pedir
+para alguém que já está na sala de aula ler um papel em voz alta, em vez de mandar outra pessoa.</p>
+
+<p>Quem já mexeu com Docker vai perguntar pela diferença: <code>docker exec</code> entra no container da
+máquina local, e isso exige saber em qual nó o pod está, ter acesso àquele nó e conhecer o identificador do
+container. No Kubernetes você não precisa de nada disso — o <code>kubectl exec</code> pede ao cluster, e o
+cluster se vira para achar o container. O preço é uma camada a mais de permissões: quem pode executar coisas
+dentro de um pod pode ler quase tudo o que o pod lê, e é por isso que ambientes sérios controlam esse verbo
+com cuidado.</p>
+
+<h2>2. Onde o comando roda</h2>
+
+<p>Três coisas caracterizam esse processo extra. Primeira: ele roda no mesmo container, então vê os arquivos
+que o programa vê — é por isso que serve para conferir configuração e caminhos. Segunda: ele não é o
+programa principal; termina quando o comando termina, e não mantém nada ligado. Terceira: ele precisa que o
+container esteja rodando. Em pod <code>Pending</code> não há container para receber o comando, e o kubectl
+responde com o estado em vez de executar.</p>
+
+<p>Por baixo, o caminho é sempre o mesmo: o kubectl fala com o servidor da API, o servidor repassa o pedido
+ao kubelet do nó onde o pod está, o kubelet pede ao runtime do container que crie o processo, e a saída volta
+pelo mesmo caminho até a sua tela. São quatro saltos, e cada um pode falhar por um motivo próprio — pod em
+outro nó, kubelet fora do ar, container já terminado. Entender que existe esse caminho ajuda a interpretar
+erros que parecem do seu comando mas são de transporte.</p>
+
+<p>Isso explica por que o <code>exec</code> é a ferramenta certa para <em>investigar</em> e a ferramenta
+errada para <em>consertar</em>. Investigar: ver o arquivo, listar o diretório, checar uma variável. Consertar
+editando o arquivo por dentro: funciona até o container reiniciar, e aí tudo volta ao que a imagem diz. O
+conserto de verdade se faz no manifesto, não no container.</p>
+
+<dl class="anatomy">
+<dt>exec</dt>
+<dd>Comando do kubectl que roda um processo extra dentro de um container que já está em execução.</dd>
+<dt><code>--</code></dt>
+<dd>Marcador que diz ao kubectl “daqui para a frente é o comando, não são opções minhas”. Sem ele, um
+<code>-l</code> ou <code>--</code> do seu comando seria interpretado pelo kubectl.</dd>
+<dt>container</dt>
+<dd>O alvo do <code>exec</code>. Em pod com mais de um container, use <code>-c nome</code>, como no
+<code>logs</code>.</dd>
+<dt>imagem</dt>
+<dd>O sistema de arquivos que o container vê. É por isso que um comando pode não existir: a imagem mínima
+traz pouca ferramenta.</dd>
+<dt>efêmero</dt>
+<dd>Que não dura. Tudo o que você faz por <code>exec</code> dentro do container é apagado quando ele é
+recriado.</dd>
+</dl>
+
+<h2>3. A gramática e o <code>--</code></h2>
+
+<p>O comando tem três partes: o verbo <code>exec</code>, o nome do pod e, depois de <code>--</code>, o que
+rodar. A caixa abaixo cria o pod do cardápio e lista o diretório de trabalho do container.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:package.json">
+  <p class="try-task">A caixa só mostra a tabela do <code>get</code>. Use o <code>exec</code> para listar o
+  conteúdo do diretório do container: a resposta tem de trazer <code>package.json</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl exec cardapio -- ls</pre>
+</div>
+
+<pre class="term">ana@notebook:~$ kubectl exec cardapio -- ls
+app
+config
+node_modules
+package.json</pre>
+
+<p>A resposta é a saída do <code>ls</code> rodando dentro do container: <code>app</code>,
+<code>config</code>, <code>node_modules</code> e <code>package.json</code>. Repare que ela não tem nada de
+kubectl — não existe prefixo, cabeçalho nem explicação. Depois do <code>--</code>, o kubectl é só um
+mensageiro: manda o comando, recebe a saída e imprime. Se o comando der erro, o erro que você vê é do
+programa, com as palavras dele.</p>
+
+<p>O <code>--</code> parece enfeite até o dia em que importa. Se você rodar
+<code>kubectl exec cardapio ls -l</code>, o <code>-l</code> pode ser lido como opção do kubectl (de
+<em>label</em>) e não como opção do <code>ls</code>. Com o marcador,
+<code>kubectl exec cardapio -- ls -l</code>, não há dúvida: tudo depois dele é o comando. O hábito bom é
+escrever o <code>--</code> sempre, mesmo quando “funciona sem”.</p>
+
+<h2>4. Ler um arquivo de configuração</h2>
+
+<p>Agora a pergunta original da Ana: o que está escrito no arquivo de preços. O comando é o mesmo, trocando
+o programa: <code>cat</code> com o caminho completo. Caminho relativo também funciona — o container começa no
+diretório de trabalho da imagem.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:de queijo">
+  <p class="try-task">Leia o arquivo de preços do container com <code>cat /config/cardapio.json</code>. O
+  painel tem de mostrar o JSON com os pães, incluindo <code>de queijo</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl get pod cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pod cardapio
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl exec cardapio -- cat /config/cardapio.json</pre>
+</div>
+
+<p>Saída: <code>{"paes":["francês","de queijo"]}</code> — um JSON de uma linha, que é exatamente o que o
+programa lê ao subir. Três leituras possíveis desse resultado. Se o arquivo tem os dois pães e o preço
+certo, o problema não é configuração: é código. Se tem outro conteúdo, o volume ou o ConfigMap que monta
+esse arquivo está desatualizado. E se o <code>cat</code> responder
+<code>No such file or directory</code>, o arquivo não está montado no caminho que o programa espera — e o
+erro é do <code>cat</code>, em inglês, com o caminho que você digitou.</p>
+
+<p>Um erro frequente nessa etapa é confundir o caminho do arquivo no seu projeto com o caminho dentro do
+container. No seu notebook, o arquivo está em <code>./config/cardapio.json</code>; dentro do container ele
+pode estar em <code>/config/cardapio.json</code>, em <code>/app/config/cardapio.json</code> ou em nenhum
+lugar. O caminho que vale é o do container, e quem o define é o manifesto: o <code>mountPath</code> do
+volume, o <code>WORKDIR</code> da imagem ou simplesmente o lugar onde o programa procura. O
+<code>exec ... -- ls</code> em cada nível é a forma mais rápida de descobrir onde você está.</p>
+
+<p>Vale guardar a diferença em relação ao <code>logs</code>: o log mostra o que o programa <em>disse</em>
+sobre o arquivo (“Precos carregados de /config/cardapio.json”); o <code>exec</code> mostra o arquivo em si.
+Quando os dois discordam, um dos dois está vendo outra coisa — em geral, o programa leu um arquivo de outro
+lugar.</p>
+
+<h2>5. Ver as variáveis de ambiente</h2>
+
+<p>Terceira investigação clássica: o programa diz que não encontrou a variável <code>PORTA</code>. Antes de
+abrir o manifesto, dá para conferir o que o processo realmente recebeu, com o comando <code>env</code>.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:PORTA=8080">
+  <p class="try-task">Mostre as variáveis de ambiente do container com <code>env</code>. A resposta tem de
+  trazer <code>PORTA=8080</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl describe pod cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl describe pod cardapio
+Name:            cardapio
+Namespace:       default
+Priority:        0
+Service Account: default
+Node:            guia-control-plane/192.0.2.28
+Start Time:      Fri, 27 Nov 2026 15:50:25 +0000
+Labels:          run=cardapio
+Annotations:     &lt;none&gt;
+Status:          Running
+IP:              10.244.3.71
+IPs:             IP:  10.244.3.71
+Controlled By:   &lt;none&gt;
+
+Containers:
+  cardapio:
+    Image:          cardapio:1.0
+    Port:           80/TCP
+    State:          Running
+      Started:      Fri, 27 Nov 2026 15:50:25 +0000
+    Ready:          True
+    Restart Count:  0
+    Environment:    &lt;none&gt;
+    Mounts:         &lt;none&gt;
+Conditions:
+  Type              Status
+  PodScheduled      True
+  Initialized       True
+  Ready             True
+  ContainersReady   True
+Volumes:
+  kube-api-access-t6csd:
+    Type:      Projected (a volume that contains injected data from multiple sources)
+QoS Class:                   BestEffort
+Node-Selectors:              &lt;none&gt;
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason    Age   From                Message
+  Normal   Created   20s   default-scheduler   created by ana
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl exec cardapio -- env</pre>
+</div>
+
+<p>A saída tem três linhas: <code>PATH</code>, <code>NODE_ENV=production</code> e
+<code>PORTA=8080</code>. Elas vêm da imagem e do manifesto, somadas — o container herda o que a imagem
+define e recebe por cima o que o pod declara. É por isso que uma variável “que está no manifesto” pode
+chegar diferente: alguém pôs o valor errado, ou o pod que está rodando é de uma versão anterior do
+manifesto.</p>
+
+<p>Compare com o <code>describe</code>: a seção <code>Environment</code> mostra o que o manifesto
+<em>declara</em>; o <code>env</code> mostra o que o processo <em>recebeu</em>. Na maioria dos casos é igual.
+Quando não é, um dos dois está desatualizado — e é justamente esse descompasso que explica metade dos “mas
+eu mudei a configuração!”.</p>
+
+<h2>6. O shell que não abre</h2>
+
+<p>Quem já usou Docker espera o próximo passo: abrir um shell interativo com
+<code>kubectl exec -it cardapio -- sh</code>. No cluster de verdade, isso abre um prompt dentro do container
+e você navega como num terminal comum. No painel deste guia, não: não há terminal interativo para o
+<code>exec</code>, e o motor responde explicando.</p>
+
+<p>As duas letrinhas do <code>-it</code> explicam o que falta: o <code>-i</code> mantém a entrada aberta
+(o que você digita vai para o container) e o <code>-t</code> aloca um terminal de verdade, com cores e
+cursor. Sem as duas, um <code>sh</code> até começa, mas não há como conversar com ele — o comando abre e
+morre. É por isso que o shell é a única forma de <code>exec</code> que realmente precisa das duas letras, e
+por isso que o painel, sem terminal, recusa o pedido em vez de fingir.</p>
+
+<pre class="term">ana@notebook:~$ kubectl exec cardapio -- sh
+error: o shell interativo não roda no painel — use `kubectl exec &lt;pod&gt; -- &lt;comando&gt;`.</pre>
+
+<p>A mensagem é do simulador, não do Kubernetes, e é honesta: sem interação, o caminho é rodar um comando de
+cada vez. Na prática, isso ensina há mais do que atrapalha. Quem entra no shell tende a ficar explorando com
+<code>ls</code>, <code>cd</code>, <code>cat</code> até achar o que queria — e esquece que, num incidente com
+trinta pods, você precisa de comandos objetivos, que dá para copiar e repetir. O
+<code>exec ... -- cat arquivo</code> é auditável; o shell improvisado não é.</p>
+
+<p>Existe também o limite da imagem enxuta. Muitas imagens de produção são construídas sem shell, sem
+<code>curl</code> e sem <code>ps</code>, justamente para reduzir o que um invasor pode fazer. Nesses casos o
+<code>sh</code> responde “not found” mesmo no cluster real — e o caminho é o
+<code>kubectl debug</code>, com um container temporário, assunto de outra aula. O painel desta página
+responde a <code>ls</code>, <code>cat</code> e <code>env</code>; outros comandos voltam vazios.</p>
+
+<h2>7. Exec, logs e describe: quem responde o quê</h2>
+
+<p>Este é o quadro que evita a tentativa e erro. Cada comando responde uma pergunta diferente, e escolher o
+certo economiza metade do tempo de investigação:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Comando</th><th>Pergunta que responde</th><th>Exemplo de resposta</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kubectl get</code></td><td>existe? está pronto?</td><td><code>Running</code>, <code>1/1</code></td></tr>
+<tr><td><code>kubectl describe</code></td><td>o cluster conseguiu fazer o que precisava?</td><td>eventos, condições, motivo do <code>Pending</code></td></tr>
+<tr><td><code>kubectl logs</code></td><td>o programa contou algum problema?</td><td>linhas escritas pelo processo</td></tr>
+<tr><td><code>kubectl exec</code></td><td>o que tem <em>dentro</em> do container?</td><td>arquivos, variáveis, saída de um comando</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma última comparação útil: o <code>logs</code> é passivo, ele só mostra o que já foi escrito; o
+<code>exec</code> é ativo, ele cria um processo novo no momento em que você digita. Isso quer dizer que
+efeitos colaterais são possíveis — um comando que escreve arquivo, que apaga temporário, que chama uma API.
+Enquanto a pergunta for “o que tem aqui?”, você está lendo; quando virar “vou ajustar aqui”, você está
+mudando um ambiente que pode ser o de produção.</p>
+
+<p>A ordem de uso também é esta. O <code>exec</code> é o último porque é o mais invasivo: ele cria um
+processo no container que está atendendo cliente, consome CPU e pode, em caso de azar, atrapalhar o
+programa. Em produção, ninguém deveria começar por ele. Comece pelo <code>get</code>, desça para o
+<code>describe</code> e o <code>logs</code>, e só então entre no container — com um comando específico e uma
+pergunta clara na cabeça.</p>
+
+<h2>8. O que dá para descobrir e o que não dá</h2>
+
+<p>Com um comando por vez, o <code>exec</code> responde bastante coisa. A tabela é a lista do que costuma
+valer a pena, com o que o painel faz e o que fica para o cluster real:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Comando</th><th>No painel?</th></tr>
+</thead>
+<tbody>
+<tr><td>quais arquivos existem aqui?</td><td><code>exec pod -- ls</code></td><td>sim</td></tr>
+<tr><td>o que tem neste arquivo?</td><td><code>exec pod -- cat /caminho</code></td><td>sim</td></tr>
+<tr><td>quais variáveis o processo recebeu?</td><td><code>exec pod -- env</code></td><td>sim</td></tr>
+<tr><td>quais processos estão rodando?</td><td><code>exec pod -- ps aux</code></td><td>não: use o cluster real</td></tr>
+<tr><td>com quem este container está falando?</td><td><code>exec pod -- curl http://outro-servico</code></td><td>não: sem rede no painel</td></tr>
+<tr><td>navegar pelo container</td><td><code>exec -it pod -- sh</code></td><td>não: o painel não abre shell</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Há uma questão de rastro, também. Cada <code>exec</code> é um evento no cluster, e ambientes com
+auditoria registram quem executou o quê e quando. Isso não é burocracia: num incidente em que o preço mudou
+sem ninguém assumir, o registro do <code>exec</code> mostra se alguém entrou no container. O comando é
+poderoso e deixa marca — o que é bom, desde que você esteja fazendo a coisa certa.</p>
+
+<p>Um alerta que vale mais que qualquer comando: <strong>o que você faz por <code>exec</code> não
+persiste</strong>. Se a Ana editar o arquivo de preços com um editor dentro do container, o valor muda na
+hora e volta ao original no próximo reinício — que pode acontecer em um minuto, sem aviso. O conserto de
+verdade é no ConfigMap e no manifesto, seguido de um pod novo. O <code>exec</code> serve para ver; quando ele
+vira ferramenta de conserto, o problema volta e ninguém sabe por quê.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o preço que voltava</h3>
+<p>A Ana achou o arquivo dentro do container, viu o preço antigo e corrigiu ali mesmo com um editor. O site
+mostrou o preço certo por dez minutos; depois o pod reiniciou (o nó estava sendo atualizado) e o valor
+voltou. O conserto definitivo foi editar o ConfigMap que monta o arquivo e recriar o pod. O
+<code>exec</code> tinha dado o diagnóstico certo e a ilusão de conserto.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a variável que não chegava</h3>
+<p>O programa dizia que a variável <code>PORTA</code> não existia. O <code>describe</code> mostrava
+<code>Environment: PORTA: 8080</code>, e mesmo assim o erro continuava. Um
+<code>kubectl exec cardapio -- env</code> mostrou que o processo em execução tinha a variável
+<code>PORT</code>, sem o A — o manifesto tinha sido corrigido depois, mas o pod em execução era antigo.
+Recriar o pod resolveu.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o arquivo que não estava lá</h3>
+<p>O log dizia que não conseguia abrir <code>/config/cardapio.json</code>. Um
+<code>exec cardapio -- ls /config</code> mostrou o diretório vazio: o volume não tinha sido montado, porque o
+nome do ConfigMap no manifesto estava com um hífen a mais. Uma linha de <code>ls</code> apontou o defeito que
+o <code>describe</code> mostrava só indiretamente, na seção <code>Volumes</code>.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o <code>kubectl exec</code> faz?</p>
+<label><input type="radio" name="q1"> cria um pod novo só para rodar o comando</label>
+<label><input type="radio" name="q1"> roda um processo extra dentro de um container que já está rodando</label>
+<label><input type="radio" name="q1"> abre o manifesto do pod no editor</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Para que serve o <code>--</code> no comando?</p>
+<label><input type="radio" name="q2"> para separar o nome do pod do nome do container</label>
+<label><input type="radio" name="q2"> para indicar que o comando roda como administrador</label>
+<label><input type="radio" name="q2"> para marcar onde acabam as opções do kubectl e começa o comando</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. A Ana conserta o arquivo dentro do container. O que
+acontece?</p>
+<label><input type="radio" name="q3"> vale até o container ser recriado; depois volta ao original</label>
+<label><input type="radio" name="q3"> fica gravado no ConfigMap automaticamente</label>
+<label><input type="radio" name="q3"> o Deployment atualiza o manifesto sozinho</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: ler um arquivo dentro do pod</h2>
+
+<p>Complete o comando para ver o conteúdo de <code>/config/cardapio.json</code> dentro do pod
+<code>cardapio</code>:</p>
+
+<div class="ex-code">kubectl exec cardapio <input aria-label="resposta 1" data-answer="--" placeholder="..."> cat /config/cardapio.json</div>
+
+<p class="ex-dica">Dica: são dois hífens, e eles marcam o ponto em que o kubectl para de interpretar opções e
+passa a palavra para o comando. Sem eles, um <code>-l</code> do <code>ls</code> seria lido como filtro de
+etiqueta.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O <code>exec</code> roda um processo dentro de um container que já existe: mesmo sistema de arquivos,
+mesmas variáveis, mesma rede. A forma é <code>kubectl exec pod -- comando</code>, com o <code>--</code>
+sempre que houver dúvida. <code>-c</code> escolhe o container e <code>-n</code> escolhe o namespace, como no
+<code>logs</code>.</p>
+
+<p>Ele serve para ver: arquivos com <code>ls</code> e <code>cat</code>, ambiente com <code>env</code>. Não
+serve para consertar, porque nada do que você faz ali sobrevive ao próximo container; não abre shell no
+painel; e não substitui <code>logs</code> e <code>describe</code>, que respondem perguntas diferentes. Na
+próxima aula a Ana aprende o comando que desfaz: <code>kubectl delete</code>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl exec pod -- comando</code> roda dentro do container que já está de pé.</li>
+  <li>O <code>--</code> separa opções do kubectl do comando de verdade.</li>
+  <li><code>ls</code>, <code>cat</code> e <code>env</code> respondem as dúvidas mais comuns.</li>
+  <li>O que você muda por <code>exec</code> é apagado quando o container é recriado.</li>
+  <li>O shell interativo não existe no painel; use um comando por vez.</li>
+  <li>Antes do <code>exec</code>, esgote <code>get</code>, <code>describe</code> e <code>logs</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

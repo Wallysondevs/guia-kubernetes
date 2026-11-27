@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instalar kubectl e kind | Guia Kubernetes</title>
+<meta name="description" content="Como instalar o kubectl e o kind do zero: pré-requisitos, comandos por sistema, como conferir se funcionou, onde ficam as configurações e o conserto dos tropeços comuns.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Instalar <span class="hl">kubectl e kind</span></h1>
+<p class="intro">A Ana decidiu que vale a pena: o site da padaria vai rodar em Kubernetes. Agora falta o passo
+menos glamouroso e mais decisivo — instalar as ferramentas. Ela abre o terminal, digita <code>kubectl</code>
+e recebe <code>command not found</code>. Nesta aula ela instala o <strong>kubectl</strong> (o controle
+remoto) e o <strong>kind</strong> (o cluster de mentira dentro da sua máquina), confere cada um com um
+comando, aprende onde as configurações ficam e vê os tropeços clássicos com o conserto de cada um. Tudo com
+comandos reais, do jeito que se faz no Linux, no macOS e no Windows.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Para que serve cada ferramenta e por que são duas.</li>
+  <li>O pré-requisito que ninguém conta: o Docker.</li>
+  <li>Instalar o <code>kubectl</code> e o <code>kind</code> em Linux, macOS e Windows.</li>
+  <li>Conferir a instalação sem precisar de cluster.</li>
+  <li>Onde ficam o binário (PATH) e a configuração (<code>~/.kube/config</code>).</li>
+  <li>Os cinco erros de instalação mais comuns e o conserto de cada um.</li>
+</ul>
+</div>
+
+<h2>1. A cena: <code>command not found</code></h2>
+
+<p>“Instale o kubectl e o kind” — era o que dizia o tutorial que a Ana achou. Ela copiou a linha do
+<code>curl</code>, colou no terminal, viu um monte de números passando e depois nada. Abriu o terminal de
+novo e digitou só <code>kubectl</code>, para ver o que acontecia. A resposta foi seca:</p>
+
+<pre class="term">ana@notebook:~$ kubectl
+bash: kubectl: command not found</pre>
+
+<p>Aquele <code>command not found</code> é a primeira parede de todo mundo. Ele não quer dizer “quebrou”:
+quer dizer “o shell procurou um programa chamado <code>kubectl</code> nas pastas onde ele sabe procurar e
+não achou nada”. Ou o arquivo não foi baixado, ou foi baixado no lugar errado, ou não tem permissão de
+execução, ou a pasta onde ele está não entra na busca do shell.</p>
+
+<p>São quatro causas diferentes para o mesmo aviso, e é justamente por isso que instalar é uma etapa que
+assusta. A boa notícia: instalar é a única parte do Kubernetes que se faz uma vez e esquece. E cada passo
+pode ser conferido com um comando que responde sim ou não. É o que vamos fazer aqui, na ordem em que a Ana
+fez.</p>
+
+<h2>2. Duas ferramentas, dois papéis</h2>
+
+<p>Antes de baixar nada, entenda o que cada peça faz — porque a confusão entre elas gera metade dos erros.
+O <strong>kubectl</strong> é um programa que conversa com um cluster. Ele não roda nada, não guarda nada,
+não é um servidor: ele monta um pedido, manda para a API do cluster e imprime a resposta. Se o cluster não
+existe ou não está no ar, o <code>kubectl</code> existe do mesmo jeito, e você pode até perguntar a versão
+dele sem rede nenhuma.</p>
+
+<p>O <strong>kind</strong> é o contrário: ele cria um cluster inteiro dentro da sua máquina, usando containers
+Docker como se fossem máquinas. É ferramenta de estudo e de teste. O nome é uma sigla de <em>Kubernetes in
+Docker</em>. Com ele você sobe um cluster em um ou dois minutos, apaga quando quiser e não paga nuvem
+nenhuma.</p>
+
+<p>E o <strong>Docker</strong> é o motor que o kind usa. Sem Docker (ou outro runtime equivalente) rodando, o
+kind não tem onde montar o cluster e falha com uma mensagem sobre o daemon. Por isso a ordem de instalação é
+Docker, depois kubectl, depois kind — e não a ordem alfabética do tutorial.</p>
+
+<dl class="anatomy">
+<dt>kubectl</dt>
+<dd>Cliente de linha de comando: conversa com a API do cluster e imprime a resposta.</dd>
+<dt>kind</dt>
+<dd>Cria clusters Kubernetes locais usando containers Docker como nós.</dd>
+<dt>Docker</dt>
+<dd>Motor de containers. O kind depende dele para existir.</dd>
+<dt>kubeconfig</dt>
+<dd>Arquivo <code>~/.kube/config</code> com endereços de clusters, credenciais e o contexto atual.</dd>
+<dt>contexto</dt>
+<dd>Combinação “cluster + usuário + namespace” que o kubectl usa por padrão.</dd>
+<dt>PATH</dt>
+<dd>Lista de pastas onde o shell procura programas. Se o binário não está numa delas, é “command not found”.</dd>
+</dl>
+
+<h2>3. O pré-requisito que ninguém avisa: o Docker</h2>
+
+<p>O kind precisa de um runtime de containers. No Linux, Docker Engine; no macOS e no Windows, o Docker
+Desktop, que já traz uma máquina virtual com o motor dentro. Sem isso, o comando mais importante do kind
+termina com uma mensagem sobre não conseguir falar com o daemon.</p>
+
+<p>A conferência é simples e vale fazer antes de qualquer download:</p>
+
+<pre class="term">ana@notebook:~$ docker --version
+Docker version 27.4.1, build 0b9d7b4f
+
+ana@notebook:~$ docker run --rm hello-world
+Unable to find image 'hello-world:latest' locally
+latest: Pulling from library/hello-world
+...
+Hello from Docker!
+This message shows that your installation appears to be working correctly.</pre>
+
+<p>Repare que são duas perguntas diferentes. A primeira (<code>docker --version</code>) diz que o programa
+está instalado. A segunda (<code>docker run</code>) diz que o <em>motor</em> está funcionando — e é essa que
+importa. Dá para ter o programa instalado e o motor parado, o que produz o erro clássico
+<code>Cannot connect to the Docker daemon</code>. No Linux, o conserto costuma ser
+<code>sudo systemctl start docker</code> e, para não precisar de <code>sudo</code> a cada comando, colocar o
+seu usuário no grupo <code>docker</code>. No macOS e no Windows, é abrir o Docker Desktop e esperar o
+ícone parar de girar.</p>
+
+<p>Um detalhe de segurança que vale saber desde já: entrar no grupo <code>docker</code> equivale a ter poder
+de administrador na máquina, porque dá para montar pastas do sistema dentro de um container. Em máquina de
+estudo, tudo bem. Em servidor de produção, prefira outras saídas.</p>
+
+<h2>4. Instalando o kubectl</h2>
+
+<p>O kubectl é um único arquivo executável. Não tem instalador, não tem dependência, não tem “próximo,
+próximo, concluir”: você baixa o arquivo da versão certa, dá permissão de execução e coloca numa pasta que
+esteja no PATH. No Linux, com a arquitetura x86-64 (a mais comum), é isto:</p>
+
+<pre class="term">ana@notebook:~$ curl -LO "https://dl.k8s.io/release/v1.37.3/bin/linux/amd64/kubectl"
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100 55.9M  100 55.9M    0     0  18.4M      0  0:00:03  0:00:03 --:--:-- 18.4M
+
+ana@notebook:~$ chmod +x kubectl
+ana@notebook:~$ sudo mv kubectl /usr/local/bin/kubectl
+ana@notebook:~$ kubectl version --client
+Client Version: v1.37.3
+Kustomize Version: v5.8.1</pre>
+
+<p>Três linhas, três ideias. O <code>curl -LO</code> baixa o arquivo com o nome original (o <code>-O</code>
+maiúsculo é o que preserva o nome). O <code>chmod +x</code> marca o arquivo como executável — sem isso o
+shell responde <code>Permission denied</code>. E o <code>sudo mv</code> leva o arquivo para
+<code>/usr/local/bin</code>, que é uma pasta de programas do sistema e já está no PATH de praticamente toda
+distribuição.</p>
+
+<p>Quer outra versão? Troque o número no caminho. Quer a última estável sem pensar? Use a composição que a
+documentação oficial sugere, com <code>$(curl -L -s https://dl.k8s.io/release/stable.txt)</code> no lugar de
+<code>v1.37.3</code>. Em máquina ARM (Apple Silicon, Raspberry Pi, alguns notebooks), troque
+<code>amd64</code> por <code>arm64</code> — e esse é o erro de download mais comum: baixar a arquitetura
+errada e receber <code>exec format error</code> ao rodar.</p>
+
+<p>No macOS, o caminho mais curto é o Homebrew, que já cuida de arquitetura e PATH:</p>
+
+<pre class="term">ana@notebook:~$ brew install kubectl
+==&gt; Downloading https://formulae.brew.sh/api/formula/kubectl.json
+==&gt; Fetching kubectl--1.37.3.bottle.tar.gz
+==&gt; Pouring kubectl--1.37.3.bottle.tar.gz
+==&gt; Caveats
+The kubernetes-cli formula is keg-only, which means it was not symlinked into /opt/homebrew.
+==&gt; Summary
+/opt/homebrew/Cellar/kubectl/1.37.3: 3 files, 57.2MB
+
+ana@notebook:~$ kubectl version --client
+Client Version: v1.37.3
+Kustomize Version: v5.8.1</pre>
+
+<p>No Windows, o caminho natural é <code>winget install -e --id Kubernetes.kubectl</code> ou o Chocolatey com
+<code>choco install kubernetes-cli</code>. Em qualquer sistema, o teste final é o mesmo:
+<code>kubectl version --client</code> precisa imprimir <code>Client Version</code> e a versão. Se imprimiu,
+o binário está instalado e executável.</p>
+
+<h2>5. Instalando o kind</h2>
+
+<p>O kind também é um único executável, e a lógica é idêntica: baixar, dar permissão, mover para o PATH. A
+diferença é que o kind não é um cliente de cluster — ele é um programa que conversa com o Docker para criar
+nós. A instalação no Linux:</p>
+
+<pre class="term">ana@notebook:~$ curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.30.0/kind-linux-amd64
+100  9.4M  100  9.4M    0     0  12.1M      0  0:00:00  0:00:00 --:--:-- 12.1M
+
+ana@notebook:~$ chmod +x ./kind
+ana@notebook:~$ sudo mv ./kind /usr/local/bin/kind
+ana@notebook:~$ kind --version
+kind version 0.30.0</pre>
+
+<p>Aquele <code>kind version 0.30.0</code> é a prova de que o binário está no PATH e roda. Se a sua máquina
+for ARM, o arquivo é <code>kind-linux-arm64</code>. No macOS, <code>brew install kind</code> resolve; no
+Windows, <code>winget install Kubernetes.kind</code> ou <code>choco install kind</code>.</p>
+
+<p>Uma alternativa para quem já programa em Go é <code>go install sigs.k8s.io/kind@latest</code>, que compila
+e coloca o binário em <code>~/go/bin</code> — pasta que, em algumas instalações, não está no PATH. É a causa
+número um de “instalei e continua dando command not found”.</p>
+
+<h2>6. Conferindo se o cliente responde</h2>
+
+<p>Com o binário no lugar, a primeira pergunta a fazer é se ele responde. E existe um detalhe importante: o
+<code>kubectl</code> mostra a versão do <em>cliente</em> mesmo sem cluster nenhum. Isso separa dois problemas
+que costumam se misturar na cabeça do iniciante — “minha instalação está quebrada?” e “meu cluster está
+quebrado?”.</p>
+
+<div class="tryk8s" data-modo="terminal" data-get="nodes" data-goal="texto:Client Version;;texto:v1.37.3">
+  <p class="try-task">As duas primeiras linhas são os erros de quem trata o kubectl como programa comum:
+  bandeira antes do verbo e um verbo <code>install</code> que não existe. Rode para ver as mensagens e
+  depois escreva a forma certa: <code>kubectl version --client</code>.</p>
+<pre class="yaml">kubectl --version
+kubectl install --client
+kubectl get nodes</pre>
+<pre class="out">
+ana@notebook:~$ kubectl --version
+error: unknown command "--version" for "kubectl"
+
+ana@notebook:~$ kubectl install --client
+error: unknown command "install" for "kubectl"
+
+ana@notebook:~$ kubectl get nodes
+NAME                 STATUS   ROLES           AGE   VERSION
+guia-control-plane   Ready    control-plane   8m    v1.37.3
+guia-worker          Ready    &lt;none&gt;          4m    v1.37.3
+guia-worker2         Ready    &lt;none&gt;          4m    v1.37.3
+</pre>
+<pre class="solucao">kubectl version --client
+kubectl get nodes</pre>
+</div>
+
+<p>A primeira mensagem, <code>error: unknown command "--version" for "kubectl"</code>, é a mesma que a Ana
+levou meia hora para entender: no <code>kubectl</code>, o primeiro pedaço depois do nome é um
+<em>verbo</em> (version, get, delete, create). Bandeira vem depois do verbo, nunca antes. A segunda,
+<code>unknown command "install"</code>, lembra que o <code>kubectl</code> não instala nada nele mesmo:
+instalação de ferramenta é trabalho do sistema operacional.</p>
+
+<p>Depois do conserto, a saída tem duas linhas: <code>Client Version: v1.37.3</code> e
+<code>Kustomize Version: v5.8.1</code>. A segunda existe porque o <code>kubectl</code> embute o
+<code>kustomize</code> (ferramenta de montagem de manifestos, Nível 3). Não é erro; é só o pacote que vem
+junto.</p>
+
+<p>Se você rodar <code>kubectl version</code> sem <code>--client</code> num cluster de verdade, aparece
+também uma linha <code>Server Version: v1.37.3</code> — a versão de quem está do outro lado. O painel deste
+guia mostra a versão do cliente, porque ele não tem um servidor de API real na outra ponta; na sua máquina,
+com o cluster da próxima aula no ar, a linha do servidor aparece.</p>
+
+<h2>7. Onde as coisas ficam: PATH e kubeconfig</h2>
+
+<p>Duas pastas explicam quase todos os mistérios de instalação. A primeira é o PATH, a lista de pastas onde
+o shell procura programas. <code>echo $PATH</code> mostra a sua. Se você baixou o binário na pasta de
+downloads e rodou <code>./kubectl</code>, funcionou porque o <code>./</code> mandou o shell olhar na pasta
+atual; sem o <code>./</code>, o shell procura no PATH e não acha.</p>
+
+<p>A segunda pasta é a de configuração. Quando o kubectl precisa saber com qual cluster falar, ele lê o
+arquivo <code>~/.kube/config</code>. Esse arquivo guarda endereços, certificados e uma lista de
+<em>contextos</em> — combinações de cluster, usuário e namespace — com uma marcada como atual. O kind escreve
+nesse arquivo quando cria um cluster, e é por isso que, depois do kind, o kubectl “já sabe” onde está o
+cluster.</p>
+
+<div class="tryk8s" data-modo="terminal" data-get="nodes" data-goal="texto:CURRENT;;texto:kind-guia;;texto:current-context">
+  <p class="try-task">A primeira linha tem o verbo no singular e o kubectl não reconhece. Corrija para
+  <code>get-contexts</code> e veja a lista de contextos, o contexto atual e o arquivo que o kubectl lê.</p>
+<pre class="yaml">kubectl config get-context
+kubectl config current-context
+kubectl config view</pre>
+<pre class="out">
+ana@notebook:~$ kubectl config get-context
+kubectl config: use current-context, get-contexts ou view
+
+ana@notebook:~$ kubectl config current-context
+kind-guia
+
+ana@notebook:~$ kubectl config view
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://127.0.0.1:6443
+  name: kind-guia
+contexts:
+- context:
+    cluster: kind-guia
+    user: kind-guia
+    namespace: default
+  name: kind-guia
+current-context: kind-guia
+</pre>
+<pre class="solucao">kubectl config get-contexts
+kubectl config current-context
+kubectl config view</pre>
+</div>
+
+<p>A lista tem uma coluna <code>CURRENT</code> com um asterisco: é o contexto em uso. O nome
+<code>kind-guia</code> não é escolha nossa — o kind batiza o contexto com o prefixo <code>kind-</code> mais
+o nome do cluster. Já o <code>config view</code> imprime o arquivo inteiro: o <code>server</code>
+(<code>https://127.0.0.1:6443</code>) é o endereço da API do cluster, e <code>current-context</code> diz
+qual bloco o kubectl usa quando você não passa <code>--context</code>.</p>
+
+<p>Esse arquivo é a peça que você vai copiar de um lado para outro na vida real: com ele, um pipeline de
+integração consegue falar com um cluster remoto sem ninguém digitar senha. E é também um arquivo sensível:
+quem tem o kubeconfig de produção tem acesso a produção. Nunca comite esse arquivo, nunca cole o conteúdo em
+chat, nunca deixe em pasta compartilhada.</p>
+
+<h2>8. As duas ferramentas se encontram</h2>
+
+<p>Instalar as duas e não provar que conversam é como comprar telefone e nunca discar. O teste final é
+curto: o kind lista os clusters que existem na máquina, e o kubectl fala com um deles. Se os dois
+responderem, a instalação está completa.</p>
+
+<div class="tryk8s" data-modo="terminal" data-get="nodes" data-goal="texto:guia;;texto:Ready;;texto:control-plane">
+  <p class="try-task">O painel já tem um cluster criado (na sua máquina, a próxima aula ensina a criar).
+  Acrescente a linha do <code>kubectl</code> para ver os nós desse cluster respondendo.</p>
+<pre class="yaml">kind get clusters</pre>
+<pre class="out">
+ana@notebook:~$ kind get clusters
+guia
+</pre>
+<pre class="solucao">kind get clusters
+kubectl get nodes</pre>
+</div>
+
+<p>O <code>kind get clusters</code> imprime <code>guia</code>: o nome do cluster na visão do kind. O
+<code>kubectl get nodes</code> imprime três linhas com <code>STATUS Ready</code> — os nós do cluster. Nomes
+diferentes, papéis diferentes: o kind administra a “caixa” (o cluster), o kubectl olha o que existe dentro
+dela.</p>
+
+<p>Se o <code>kind get clusters</code> responde e o <code>kubectl get nodes</code> reclama de conexão, o
+problema não é instalação: é contexto. Basta olhar o <code>current-context</code> e confirmar que ele aponta
+para o cluster certo. Esse diagnóstico em dois passos — “o binário responde?” e “o contexto aponta para
+onde?” — resolve a maior parte dos chamados de suporte de quem está começando.</p>
+
+<h2>9. Os tropeços clássicos (e o conserto)</h2>
+
+<p>Instalação dá errado por poucos motivos, sempre os mesmos. Vale conhecer os cinco antes de se deparar com
+eles, porque todos têm conserto simples e todos já custaram uma tarde de alguém.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>Causa</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bash: kubectl: command not found</code></td><td>binário fora do PATH ou não baixado</td>
+<td>mover para <code>/usr/local/bin</code> ou acrescentar a pasta ao PATH</td></tr>
+<tr><td><code>Permission denied</code></td><td>falta permissão de execução</td><td><code>chmod +x kubectl</code></td></tr>
+<tr><td><code>exec format error</code></td><td>arquitetura errada (amd64 em ARM, ou o contrário)</td>
+<td>baixar de novo com <code>arm64</code></td></tr>
+<tr><td><code>Cannot connect to the Docker daemon</code></td><td>Docker instalado, motor parado</td>
+<td>iniciar o Docker Desktop ou <code>sudo systemctl start docker</code></td></tr>
+<tr><td><code>sudo: kubectl: command not found</code></td><td>o <code>sudo</code> reseta o PATH</td>
+<td>usar caminho absoluto: <code>sudo /usr/local/bin/kubectl</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O último é o mais traiçoeiro, porque contradiz a experiência: funciona sem <code>sudo</code>, falha com
+ele. O motivo é que o <code>sudo</code> monta um ambiente novo, com o PATH do administrador, e a sua pasta
+pessoal de binários some. A solução é caminho absoluto — ou, melhor ainda, não usar <code>sudo</code> para
+comandos do dia a dia.</p>
+
+<p>A tabela abaixo resume o que cada ferramenta faz, com o comando que prova que ela está viva. É a lista
+que vale colar num bloco de notas quando você montar uma máquina nova.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Ferramenta</th><th>Para que serve</th><th>Prova de vida</th><th>Precisa de cluster?</th></tr>
+</thead>
+<tbody>
+<tr><td>Docker</td><td>rodar containers; base do kind</td><td><code>docker run --rm hello-world</code></td><td>não</td></tr>
+<tr><td><code>kubectl</code></td><td>conversar com a API do cluster</td><td><code>kubectl version --client</code></td><td>não, para a versão</td></tr>
+<tr><td><code>kind</code></td><td>criar clusters locais</td><td><code>kind get clusters</code></td><td>não</td></tr>
+<tr><td><code>kubeconfig</code></td><td>guardar contextos e credenciais</td><td><code>kubectl config view</code></td><td>não</td></tr>
+<tr><td>cluster</td><td>onde os pods rodam</td><td><code>kubectl get nodes</code></td><td>sim</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="cenario">
+<h3>Cenário 1: a versão do tutorial</h3>
+<p>A Ana seguiu um vídeo de dois anos atrás e instalou o kubectl 1.29 num cluster 1.37. Funcionou para quase
+tudo, mas um comando novo reclamou de versão. Regra prática: o kubectl pode ser até uma versão menor ou maior
+que o cluster; mais que isso começa a dar diferença de recurso. Quando o cluster é local e criado por você,
+simplesmente instale a mesma versão — e atualize com um download, sem drama.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o kind que funcionava até fechar o notebook</h3>
+<p>Na segunda-feira, o <code>kind get clusters</code> respondeu <code>No kind clusters found</code> e ela
+achou que tinha perdido tudo. Não perdeu: os nós de um cluster kind são containers Docker, e containers
+param quando a máquina reinicia (ou quando o Docker Desktop fecha). O cluster continua registrado no kind e
+volta a subir quando o motor está no ar; se não voltar, é recriar — leva um minuto, e a receita está no
+manifesto.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o PATH que só existia na aba aberta</h3>
+<p>Ela acrescentou a pasta ao PATH com <code>export PATH=$PATH:~/bin</code>, funcionou, e no dia seguinte o
+comando sumiu de novo. O <code>export</code> vale só para aquela sessão do terminal. Para valer sempre, a
+linha precisa entrar no arquivo de inicialização do shell (<code>~/.bashrc</code> ou
+<code>~/.zshrc</code>) — e, honestamente, mover o binário para <code>/usr/local/bin</code> é mais simples e
+não depende de arquivo nenhum.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual ferramenta cria o cluster dentro da sua máquina?</p>
+<label><input type="radio" name="i1"> o <code>kubectl</code>, com <code>kubectl create cluster</code></label>
+<label><input type="radio" name="i1"> o <code>kind</code>, com <code>kind create cluster</code></label>
+<label><input type="radio" name="i1"> o Docker, com <code>docker cluster up</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. <code>kubectl version --client</code> funciona sem cluster
+no ar. O que isso prova?</p>
+<label><input type="radio" name="i2"> que o cluster está saudável</label>
+<label><input type="radio" name="i2"> que o kubeconfig está correto</label>
+<label><input type="radio" name="i2"> que o binário está instalado e executável; nada sobre o cluster</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Onde o kubectl guarda os contextos e endereços de
+cluster?</p>
+<label><input type="radio" name="i3"> em <code>~/.kube/config</code></label>
+<label><input type="radio" name="i3"> dentro do binário <code>kubectl</code></label>
+<label><input type="radio" name="i3"> no Docker Desktop</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a bandeira que dispensa o cluster</h2>
+<p>Você quer ver a versão do <code>kubectl</code> numa máquina sem cluster nenhum. Complete o comando com a
+bandeira que manda o kubectl não procurar o servidor:</p>
+<div class="ex-code">kubectl version <input aria-label="resposta 1" data-answer="--client" placeholder="..."></div>
+<p class="ex-dica">Dica: em inglês, “cliente” se escreve <em>client</em>, e a bandeira tem dois hífens.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>São duas ferramentas com papéis opostos: o <code>kubectl</code> é o controle remoto que conversa com um
+cluster; o <code>kind</code> é quem cria o cluster local, usando Docker como base. Por isso a ordem é
+Docker, kubectl, kind — e por isso o Docker precisa estar com o motor no ar, não só instalado.</p>
+
+<p>Instalar é sempre o mesmo ritual: baixar o executável certo para a sua arquitetura, dar permissão com
+<code>chmod +x</code> e colocar numa pasta do PATH, normalmente <code>/usr/local/bin</code>. O teste é
+duplo: <code>kubectl version --client</code> prova o binário, sem precisar de cluster; <code>kind get
+clusters</code> prova que o kind fala com o Docker; <code>kubectl get nodes</code> prova que os dois se
+encontraram. As configurações ficam em <code>~/.kube/config</code>, que é útil e sensível ao mesmo tempo.</p>
+
+<p>Com as ferramentas instaladas, falta a parte boa: criar o primeiro cluster de verdade, ver as mensagens
+aparecendo uma a uma e descobrir o que já vem instalado dentro dele. É a próxima aula.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl</code> conversa; <code>kind</code> cria; Docker é o motor embaixo.</li>
+  <li>Comando do kubectl é verbo primeiro: <code>kubectl version --client</code>, nunca
+  <code>kubectl --version</code>.</li>
+  <li>Binário precisa estar no PATH e ter <code>chmod +x</code>.</li>
+  <li><code>command not found</code> é PATH; <code>Permission denied</code> é permissão.</li>
+  <li>Arquitetura errada dá <code>exec format error</code>: baixe <code>arm64</code> ou <code>amd64</code>
+  conforme a máquina.</li>
+  <li>Contextos ficam em <code>~/.kube/config</code>; o kind escreve nele sozinho.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kubectl delete | Guia Kubernetes</title>
+<meta name="description" content="O kubectl delete na prática: apagar um pod pelo nome, conferir antes e depois, escolher o namespace certo e saber o que vai junto com cada objeto.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>kubectl <span class="hl">delete</span></h1>
+<p class="intro">Sexta-feira a Ana fez testes no cluster: criou um pod para ver a imagem nova, outro para
+testar uma porta, um terceiro que ela nem lembra por quê. Domingo o nó ficou sem memória e um pod de verdade
+foi despejado. Os três de teste continuavam lá, esquecidos, ocupando espaço. Nesta aula ela aprende o
+<code>kubectl delete</code> — o único comando do trio que <em>desfaz</em> — e, mais importante, aprende a
+conferir antes de apagar, porque neste lugar não existe lixeira.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Apagar um objeto pelo nome e conferir que ele sumiu.</li>
+  <li>O roteiro de segurança: <code>get</code> antes, <code>delete</code>, <code>get</code> depois.</li>
+  <li>Por que o namespace errado faz o <code>delete</code> responder “não achei”.</li>
+  <li>O que vai junto quando você apaga um objeto que tem dono ou filhos.</li>
+  <li>As formas de apagar e o que o painel desta página não faz.</li>
+  <li>Quando apagar é a resposta errada — e o que fazer no lugar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: os pods esquecidos de sexta</h2>
+
+<p>O cluster da padaria roda num notebook com três nós pequenos. Cada pod que existe pede CPU e memória,
+mesmo quando não faz nada: o agendador reserva o pedido, e o nó fica sem espaço. Os três pods de teste da
+Ana não processavam requisição nenhuma, mas ocupavam a vaga — e foi por isso que o pod do cardápio foi
+despejado no domingo.</p>
+
+<p>O <code>kubectl delete</code> é o comando que resolve isso: apaga o objeto do cluster. É o único dos
+comandos desta parte do guia que muda o mundo de forma destrutiva, e é o único que não tem “desfazer”. Não
+existe <code>kubectl undo</code>; o que existe é aplicar o manifesto de novo e esperar o cluster recriar.
+Para um pod de teste, isso é trivial. Para um Service que estava no ar, é um incidente.</p>
+
+<p>A comparação com o sistema de arquivos continua valendo: se o <code>get</code> é o <code>ls</code>, o
+<code>delete</code> é o <code>rm</code> — e, como o <code>rm</code>, ele apaga o que você mandar apagar, sem
+perguntar “tem certeza?”. O cuidado tem de vir de você.</p>
+
+<p>Há uma segunda razão para os pods esquecidos incomodarem: eles mentem na contagem. Quando a Ana olha
+<code>get pods --show-labels</code> e vê seis linhas, ela não sabe quais são de verdade e quais são restos de
+teste. Num incidente, essa dúvida custa minutos. Manter o cluster limpo é parte do trabalho, como manter a
+bancada da padaria sem sobra de farinha.</p>
+
+<h2>2. A forma do comando</h2>
+
+<p>O verbo é <code>delete</code>, o alvo é o tipo e o nome. Duas grafias funcionam e fazem a mesma coisa:
+<code>kubectl delete pod cardapio</code> e <code>kubectl delete pod/cardapio</code>. A segunda é a que o
+próprio kubectl usa nas mensagens, e é a forma que aparece no <code>get pods -o name</code> — copiar dali
+evita erro de digitação.</p>
+
+<p>A resposta é curta, no mesmo estilo das outras: <code>pod/cardapio deleted</code>. Repare que ela
+confirma o pedido, não o resultado: o objeto foi marcado para remoção e, na prática, já saiu. Um
+<code>get</code> logo depois mostra a lista sem ele. E, se o nome não existir, a resposta é o
+<code>NotFound</code> que você já conhece:</p>
+
+<pre class="term">ana@notebook:~$ kubectl delete pod brioche
+Error from server (NotFound): pods "brioche" not found</pre>
+
+<p>Duas leituras dessa mensagem. A primeira: nada foi apagado, porque nada com esse nome existia — o comando
+é seguro nesse sentido, ele não apaga “parecido”. A segunda: o <code>NotFound</code> no <code>delete</code>
+quase sempre significa que o objeto já não estava lá (alguém apagou antes, o pod foi recriado com outro
+nome, ou você está olhando o namespace errado). Nenhum desses casos é desastre; é só um comando que não
+encontrou o alvo.</p>
+
+<dl class="anatomy">
+<dt>delete</dt>
+<dd>Verbo do kubectl que remove um objeto do cluster. A resposta confirma o pedido, não o resultado.</dd>
+<dt>NotFound</dt>
+<dd>Erro do servidor quando o nome procurado não existe no namespace consultado. No
+<code>delete</code>, significa que nada foi apagado.</dd>
+<dt>dono</dt>
+<dd>O objeto que criou outro — Deployment cria ReplicaSet, que cria pod. Aparece no
+<code>describe</code>, em <code>Controlled By</code>.</dd>
+<dt>cascata</dt>
+<dd>A remoção dos filhos junto com o dono. Quem executa é o coletor de lixo do cluster.</dd>
+<dt>estado desejado</dt>
+<dd>O que o manifesto pede. Apagar à mão cria diferença que o controlador desfaz na próxima
+reconciliação.</dd>
+</dl>
+
+<h2>3. Apagar e conferir</h2>
+
+<p>O roteiro que a Ana passou a seguir tem três passos: ver, apagar, ver de novo. A caixa começa no primeiro
+passo; falta apagar e conferir que a lista ficou vazia.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:pod/cardapio deleted;;texto:No resources found">
+  <p class="try-task">Crie o pod, apague-o com <code>kubectl delete pod cardapio</code> e liste de novo para
+  confirmar que não sobrou nada. O painel tem de mostrar <code>pod/cardapio deleted</code> e
+  <code>No resources found</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl delete pod cardapio
+kubectl get pods</pre>
+</div>
+
+<pre class="term">ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+ana@notebook:~$ kubectl delete pod cardapio
+pod/cardapio deleted
+ana@notebook:~$ kubectl get pods
+No resources found in default namespace.</pre>
+
+<p>O terceiro passo não é ritual: é ele que transforma “mandei apagar” em “está apagado”. Em cluster grande e
+movimentado, outra pessoa pode ter recriado o objeto no meio do caminho, ou o Deployment pode ter produzido
+um pod novo. A conferência responde a pergunta certa — <em>o que existe agora?</em> — em vez de confiar no
+que o comando disse.</p>
+
+<p>Repare também que o <code>delete</code> aceita o mesmo <code>--namespace</code> do resto. Isso importa
+mais do que parece: apagar no namespace errado dá <code>NotFound</code> e você fica achando que o pod não
+existe, quando ele está lá, inteiro, do outro lado. É a seção seguinte.</p>
+
+<h2>4. O namespace certo</h2>
+
+<p>Como todo comando do kubectl, o <code>delete</code> olha o namespace <code>default</code> quando você não
+diz nada. Se o objeto estiver em outro, a resposta é <code>NotFound</code> — a mesma de um nome errado, o que
+atrapalha o diagnóstico. A caixa mostra o caso: o pod foi criado no namespace <code>padaria</code>.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:pod/cardapio deleted">
+  <p class="try-task">O pod está no namespace <code>padaria</code>, e o <code>delete</code> procura no
+  <code>default</code>. Acrescente <code>-n padaria</code> para conseguir apagar — o painel tem de mostrar
+  <code>pod/cardapio deleted</code>.</p>
+<pre class="yaml">kubectl create namespace padaria
+kubectl run cardapio --image=cardapio:1.0 -n padaria
+kubectl delete pod cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create namespace padaria
+namespace/padaria created
+
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0 -n padaria
+pod/cardapio created
+
+ana@notebook:~$ kubectl delete pod cardapio
+Error from server (NotFound): pods "cardapio" not found
+</pre>
+<pre class="solucao">kubectl create namespace padaria
+kubectl run cardapio --image=cardapio:1.0 -n padaria
+kubectl delete pod cardapio -n padaria</pre>
+</div>
+
+<p>Um detalhe que parece detalhe e não é: quando você apaga com <code>-n padaria</code>, confira também com
+<code>-n padaria</code>. Um <code>get pods</code> sem flag mostra o <code>default</code> vazio, e a conclusão
+“apagou tudo” é falsa. O hábito de colar a mesma flag nos três comandos do roteiro evita esse tipo de
+conclusão errada.</p>
+
+<p>Para quem apaga muito no mesmo namespace, existe um atalho que evita o erro: fixar a variável
+<code>NS</code> no terminal e usá-la em todos os comandos — <code>kubectl delete pod cardapio -n $NS</code>,
+<code>kubectl get pods -n $NS</code>. O erro de digitação passa a acontecer uma vez, na definição da variável,
+e não em cada comando. Em script, é a mesma ideia com uma constante no topo do arquivo. O que não vale é
+confiar na memória para lembrar em qual namespace você está.</p>
+
+<h2>5. O que vai junto</h2>
+
+<p>Apagar pod é simples. Apagar <em>donos</em> é onde as pessoas se machucam, porque cada tipo de objeto
+carrega filhos. A tabela é o mapa:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Você apaga</th><th>O que costuma ir junto</th><th>O que fica</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pod</code></td><td>nada — só ele</td><td>o resto do cluster</td></tr>
+<tr><td><code>deployment</code></td><td>os ReplicaSets e os pods dele</td><td>o Service, que passa a não ter endpoints</td></tr>
+<tr><td><code>service</code></td><td>o ponto de acesso</td><td>os pods, rodando e sem visita</td></tr>
+<tr><td><code>namespace</code></td><td>todos os objetos daquele namespace</td><td>o que é do cluster: nós, namespaces, volumes persistentes</td></tr>
+<tr><td><code>configmap</code></td><td>nada imediato</td><td>pods que já o montaram continuam com o conteúdo antigo até recriar</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A primeira linha explica por que existe tanto pod órfão por aí: apagar um pod parece inofensivo e é. A
+segunda linha explica o susto: apagar o Deployment derruba o site inteiro, porque os pods que serviam o site
+eram dele. E a quarta explica o clássico “apaguei o namespace de teste e levei o banco junto”.</p>
+
+<p>Há um caso intermediário que confunde: apagar um pod que faz parte de um Deployment com estratégia de
+rolling update. O Deployment não recria “o mesmo pod”; ele compara o número de réplicas e cria um novo, com
+nome novo, no nó que tiver espaço. Para quem está olhando a lista, parece que o pod voltou. Para quem está
+olhando o cluster, houve um pod a menos por alguns segundos — e, se aquele era o único, houve indisponibilidade
+por alguns segundos. É por isso que mexer em pods de um Deployment em produção é diferente de mexer em pod
+solto de teste.</p>
+
+<p>Uma observação honesta sobre o painel desta página: ele remove exatamente o objeto que você nomeia e não
+simula a remoção em cascata. Se você apagar o Deployment na caixa, os pods podem continuar listados ali. No
+cluster de verdade, o coletor de lixo do Kubernetes apaga os filhos em seguida — é o controlador que
+“recolhe” o que ficou sem dono. A lição da tabela vale para os dois; só a demonstração visual é que fica
+incompleta no simulador.</p>
+
+<h2>6. As outras formas de apagar</h2>
+
+<p>Nomear um objeto é a forma segura. Existem outras, cada uma com um custo maior de risco. A tabela diz o
+que cada uma faz e o que o painel responde:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Forma</th><th>O que faz</th><th>No painel</th></tr>
+</thead>
+<tbody>
+<tr><td><code>delete pod nome</code></td><td>apaga um objeto</td><td>funciona</td></tr>
+<tr><td><code>delete pod/nome</code></td><td>o mesmo, com a grafia das mensagens</td><td>funciona</td></tr>
+<tr><td><code>delete -f arquivo.yaml</code></td><td>apaga o que o arquivo descreve</td><td>não: o painel não carrega arquivo</td></tr>
+<tr><td><code>delete pods --all</code></td><td>apaga todos do tipo no namespace</td><td>não: use um por um aqui</td></tr>
+<tr><td><code>delete pods -l app=cardapio</code></td><td>apaga por etiqueta</td><td>não: idem</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>-f</code> é a forma que combina com o resto do guia: você descreve o que quer no arquivo e o
+kubectl age sobre ele. É mais seguro do que digitar nome à mão, porque o arquivo está no repositório e
+passou por revisão. O <code>--all</code> e o <code>-l</code> são ferramentas de limpeza em massa — úteis num
+namespace de teste descartável, perigosas em qualquer lugar onde exista algo que você não escreveu. Antes de
+um <code>--all</code>, rode o mesmo filtro com <code>get</code> e leia a lista: se aparecer algo que você não
+esperava, não era para apagar.</p>
+
+<p>Um recurso que não está no painel e vale conhecer: <code>kubectl delete pod teste --dry-run=client -o
+yaml</code> mostra o que <em>seria</em> apagado, sem apagar. É validação de intenção, do lado do cliente, e
+serve para conferir o alvo quando você montou o comando com um filtro complicado. O painel desta página não
+implementa <code>--dry-run</code>; no seu cluster, ele é o equivalente ao “olhar antes de puxar o gatilho” e
+custa uma linha.</p>
+
+<h2>7. Pensar antes: o delete não tem lixeira</h2>
+
+<p>Três perguntas antes de qualquer <code>delete</code> em ambiente que importa. A primeira: <em>isso tem
+dono?</em> Se tem, apagar agora não resolve — o dono recria. Um pod de Deployment apagado volta em segundos,
+com nome novo; se o objetivo é reduzir o número de pods, o caminho é mudar as réplicas no Deployment, não
+apagar pods. A segunda: <em>alguém está usando?</em> Um Service apontando para os pods apagados responde erro
+para todo mundo que estiver navegando, inclusive o cliente no balcão.</p>
+
+<p>A terceira pergunta é a que separa quem tem experiência de quem está começando: <em>qual é o estado
+desejado?</em> O Kubernetes trabalha por diferença entre o que você descreve e o que existe. Se o objeto está
+ali, é porque algum manifesto ou algum comando o criou. Apagar à mão cria uma diferença que volta na próxima
+aplicação do manifesto — e aí você apaga de novo, e o ciclo continua. O conserto de verdade é tirar o objeto
+do manifesto, ou reduzir a réplica, ou corrigir o manifesto. O <code>delete</code> é para o que não é
+gerenciado por ninguém: o pod de teste, o serviço esquecido, o objeto criado à mão num momento de
+pressa.</p>
+
+<p>Existe também o cuidado com o que <em>não</em> é recriado. Apagar um objeto criado à mão é irreversível
+se você não tem o manifesto anotado em algum lugar. Antes de apagar o que não está no repositório, o hábito é
+salvar a descrição: <code>kubectl get pod teste -o yaml &gt; teste.yaml</code> — o arquivo fica com o objeto
+inteiro e serve para recriar depois. Custa um comando e salva uma tarde. E vale para Service, ConfigMap e
+qualquer coisa que ninguém lembrou de versionar.</p>
+
+<h2>8. Quem volta sozinho</h2>
+
+<p>Essa é a surpresa mais comum de quem começa. A Ana apagou um pod do cardápio e, dez segundos depois, lá
+estava ele de novo — com outro nome, do mesmo Deployment. Não é bug: é o controlador fazendo o trabalho dele.
+O Deployment guarda o número de réplicas desejado e compara com o que existe; faltando um, ele cria. Enquanto
+o Deployment existir, apagar pods é enxugar gelo.</p>
+
+<p>Pod solto, criado com <code>kubectl run</code>, não tem dono e não volta. É por isso que a caixa da seção
+3 usa um pod solto: ali o <code>delete</code> faz exatamente o que parece que faz. A distinção entre “tem
+dono” e “não tem dono” está no <code>describe</code>, na linha <code>Controlled By</code> — vale conferir
+antes de apagar, porque ela decide se você vai ver o objeto sumir ou renascer.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:deployment.apps/cardapio deleted;;texto:No resources found">
+  <p class="try-task">O cluster já tem o Deployment <code>cardapio</code> com duas réplicas. Apague o
+  Deployment (não os pods) e liste de novo para confirmar: o painel tem de mostrar
+  <code>deployment.apps/cardapio deleted</code> e <code>No resources found</code>.</p>
+<pre class="yaml">kubectl get deployments</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">kubectl delete deployment cardapio
+kubectl get deployments</pre>
+</div>
+
+<p>Aqui a leitura é o que importa: o <code>get deployments</code> ficou vazio, e é isso que significa “o
+Deployment não existe mais”. Se você quisesse derrubar o site, este seria o comando. Se quisesse só reduzir,
+o caminho seria <code>kubectl scale deployment cardapio --replicas=1</code>, que muda o estado desejado em vez
+de brigar com ele.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a limpeza de segunda</h3>
+<p>Os três pods de teste da sexta continuavam no cluster no domingo. A Ana listou com
+<code>get pods --show-labels</code>, confirmou que eram os de teste (etiqueta <code>run=teste</code>), apagou
+um por um com <code>delete pod</code> e conferiu com <code>get pods</code> no fim. Levou dois minutos e
+devolveu memória ao nó — que é exatamente o tipo de tarefa em que o <code>delete</code> é a resposta
+certa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod que não ficava apagado</h3>
+<p>Ela apagou um pod do Deployment e ele voltou com outro nome. Apagou de novo, voltou de novo. O
+<code>describe</code> mostrou <code>Controlled By: ReplicaSet/cardapio-7d9f8</code>: havia um dono. A solução
+não era apagar mais rápido, e sim <code>kubectl scale deployment cardapio --replicas=1</code> — mexer no
+pedido, não na consequência.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o namespace que levou tudo</h3>
+<p>Num cluster de testes, alguém apagou o namespace <code>homolog</code> para “limpar”. Levou junto o banco de
+dados de homologação que o time usava para testar migração, e a recuperação levou um dia. A regra que ficou:
+namespace é a unidade mais perigosa do <code>delete</code>, porque ele não pede confirmação e não mostra o que
+vai junto. Antes de apagar um, listar o que existe dentro com <code>get all</code> equivalente, tipo por
+tipo.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual é a resposta de um <code>delete</code> bem-sucedido?</p>
+<label><input type="radio" name="q1"> <code>pod/cardapio created</code></label>
+<label><input type="radio" name="q1"> <code>pod/cardapio deleted</code></label>
+<label><input type="radio" name="q1"> <code>No resources found</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Você apagou um pod de um Deployment e ele voltou com outro
+nome. Por quê?</p>
+<label><input type="radio" name="q2"> o cluster desfez o comando por segurança</label>
+<label><input type="radio" name="q2"> o <code>delete</code> só apaga objetos que não estão em uso</label>
+<label><input type="radio" name="q2"> o Deployment quer um número de réplicas e recriou o que faltava</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. <code>Error from server (NotFound)</code> no
+<code>delete</code> quer dizer:</p>
+<label><input type="radio" name="q3"> nenhum objeto com aquele nome foi encontrado no namespace consultado</label>
+<label><input type="radio" name="q3"> o objeto foi apagado com sucesso</label>
+<label><input type="radio" name="q3"> o comando apagou o namespace inteiro</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: apagar um pod pelo nome</h2>
+
+<p>Complete o comando que apaga o pod <code>teste</code> no namespace <code>default</code>:</p>
+
+<div class="ex-code">kubectl <input aria-label="resposta 1" data-answer="delete" placeholder="..."> pod teste</div>
+
+<p class="ex-dica">Dica: é o verbo que desfaz, e ele aceita a forma <code>tipo nome</code> ou
+<code>tipo/nome</code>. Antes de rodar, confira com <code>kubectl get pod teste</code> que é mesmo esse o
+objeto.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>kubectl delete tipo nome</code> apaga um objeto; a resposta é <code>tipo/nome deleted</code>. O
+roteiro seguro tem três passos — <code>get</code> antes, <code>delete</code>, <code>get</code> depois — e o
+mesmo <code>-n</code> nos três. <code>NotFound</code> significa que o objeto não está no namespace
+consultado, não que o comando falhou em apagar.</p>
+
+<p>O que vai junto depende do que tem dono: apagar Deployment leva ReplicaSets e pods; apagar namespace leva
+tudo de dentro; apagar pod solto não leva nada. E o contrário também vale: objeto com dono volta sozinho, o
+que faz de <code>delete</code> a ferramenta errada para reduzir réplicas — para isso existe
+<code>scale</code>. Na próxima aula a Ana conhece as pastas do cluster, os namespaces, que ela já usou sem
+cerimônia várias vezes.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl delete pod cardapio</code> responde <code>pod/cardapio deleted</code>.</li>
+  <li>Confirme com <code>get</code> antes e depois; use o mesmo <code>-n</code> nos dois.</li>
+  <li><code>NotFound</code> = nome errado, namespace errado ou já não existia.</li>
+  <li>Deployment leva os pods dele; namespace leva todos os objetos de dentro.</li>
+  <li>Pod com dono volta com nome novo: para reduzir, use <code>scale</code>.</li>
+  <li>Não existe desfazer: o conserto é aplicar o manifesto de novo.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

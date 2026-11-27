@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Annotations | Guia Kubernetes</title>
+<meta name="description" content="Annotations na prática: onde ficam no manifesto, como criar, trocar e remover com kubectl annotate, como ler com -o yaml e para que servem — sem selecionar nada.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>As <span class="hl">Annotations</span></h1>
+<p class="intro">A Ana já sabe etiquetar: label é o adesivo que agrupa e que o seletor usa para achar quem
+entra no grupo. Só que a vida dela não cabe num adesivo curto. Ela precisa registrar <em>quem</em> trocou a
+imagem do cardápio, <em>quando</em>, <em>por quê</em>, qual é o ticket do suporte e qual comando o time usa
+para recarregar a configuração. Nada disso serve para selecionar coisa nenhuma — é informação para gente e
+para ferramentas. Nesta aula a Ana conhece a annotation: a mesma chave e valor da label, guardada no mesmo
+lugar, com uma função completamente diferente.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que uma annotation guarda e por que ela não seleciona nada.</li>
+  <li>Onde ela mora no manifesto, ao lado das labels.</li>
+  <li>Criar, trocar e remover com <code>kubectl annotate</code>.</li>
+  <li>Ler as annotations do objeto com <code>-o yaml</code> e com o <code>describe</code>.</li>
+  <li>As annotations que o próprio Kubernetes e as ferramentas escrevem.</li>
+  <li>As regras de tamanho, prefixo e o que nunca guardar ali.</li>
+  <li>Quando anotar em vez de etiquetar — e por que confundir os dois estraga os dois.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o bilhete que ninguém escreveu</h2>
+
+<p>Numa terça-feira o cardápio do site da Ana começou a mostrar preço errado. Ela foi ao cluster, rodou
+<code>kubectl describe deployment cardapio</code> e viu que a imagem era <code>cardapio:1.1</code> — não a
+<code>1.0</code> que ela tinha aplicado. Alguém trocou. Quem? Quando? Para quê? O cluster não tinha a menor
+ideia: para ele, o objeto simplesmente era assim. A Ana passou a tarde inteira perguntando no grupo do time
+até descobrir que a mudança tinha sido feita às pressas numa sexta, para testar um preço promocional, e que
+ninguém tinha voltado atrás.</p>
+
+<p>O que faltou ali não foi monitoramento nem log. Faltou um <em>bilhete</em> colado no objeto dizendo o que
+estava acontecendo. O Kubernetes tem exatamente esse lugar, e ele se chama <strong>annotation</strong>:
+um espaço de chave e valor, dentro do <code>metadata</code>, onde você escreve o que quiser sobre aquele
+objeto. Não serve para o cluster decidir nada. Serve para quem lê.</p>
+
+<p>Pense na diferença entre a etiqueta da prateleira e o bilhete dentro da caixa. A etiqueta da prateleira
+(<em>label</em>) é curta, padronizada, e é por ela que o funcionário acha o produto: “pães”, “doces”,
+“salgados”. O bilhete dentro da caixa (a <em>annotation</em>) pode ser longo, livre, e conta a história do
+produto: “lote de 12/11, fornada das 5h, receita ajustada pela Ana porque o forno novo assa mais rápido”.
+Ninguém procura o produto pelo bilhete. Mas quando o produto dá problema, o bilhete é a primeira coisa que
+se lê.</p>
+
+<h2>2. O que é uma annotation, na prática</h2>
+
+<p>Antes de escrever YAML, vale fixar o vocabulário. Os cinco termos abaixo aparecem em toda a documentação
+oficial e nas saídas do kubectl, e é fácil confundir um com o outro no começo.</p>
+
+<dl class="anatomy">
+<dt>annotation</dt>
+<dd>Par de chave e valor guardado em <code>metadata.annotations</code>. Texto livre, sem limite curto de
+tamanho, usado para informação — nunca para seleção.</dd>
+<dt>label</dt>
+<dd>Par de chave e valor guardado em <code>metadata.labels</code>. Curto, com regras de formato rígidas, e
+é o que seletores, Services e <code>-l</code> usam para escolher objetos.</dd>
+<dt>metadata</dt>
+<dd>A seção de identidade do objeto: nome, namespace, labels e annotations. É onde as duas convivem, em
+listas separadas.</dd>
+<dt>chave qualificada</dt>
+<dd>Chave com prefixo de domínio, no formato <code>exemplo.com/nome</code>. O prefixo evita que duas
+ferramentas escolham a mesma chave e se atropelem.</dd>
+<dt>valor</dt>
+<dd>O que você escreve depois dos dois-pontos. Nas annotations é uma string livre: pode ter espaço,
+vírgula, acento e até JSON.</dd>
+</dl>
+
+<p>Repare no que a lista <em>não</em> diz: em nenhum momento a annotation participa de uma decisão do
+cluster. Ela não entra em seletor, não é usada pelo <code>kubectl get -l</code>, não muda o
+<code>READY</code> de um pod e não faz nada subir ou descer. É um campo de texto com um nome bonito. A força
+dele vem de ser <em>guardado junto com o objeto</em>: quem pega o manifesto pega a informação, e a
+informação viaja com o objeto pelo cluster inteiro.</p>
+
+<h2>3. Onde a annotation mora no manifesto</h2>
+
+<p>Ela fica dentro de <code>metadata</code>, no mesmo nível das <code>labels</code>, e a indentação é a de
+sempre: dois espaços por nível, chave e valor separados por dois-pontos e um espaço. A única diferença em
+relação à label é o nome da seção. Abaixo, um pod do cardápio com as duas coisas:</p>
+
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+  annotations:
+    dono: ana
+    revisao: "3"
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+
+<p>O <code>app: cardapio</code> é label: o Service vai usar exatamente esse par para achar o pod. O
+<code>dono: ana</code> é annotation: nenhum Service, nenhum seletor e nenhum comando de filtro olha para
+ele. É só informação. E o <code>revisao: "3"</code> está entre aspas de propósito — annotations são
+strings, e sem as aspas o YAML entrega o número <code>3</code>, que o cluster converte para texto com má
+vontade e às vezes com erro de validação.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>label</th><th>annotation</th></tr>
+</thead>
+<tbody>
+<tr><td>seção do manifesto</td><td><code>metadata.labels</code></td><td><code>metadata.annotations</code></td></tr>
+<tr><td>para que serve</td><td>agrupar e selecionar</td><td>informar, identificar a origem, configurar ferramenta</td></tr>
+<tr><td>entra em seletor?</td><td>sim — é a base de Service, Deployment e <code>-l</code></td><td>não, nunca</td></tr>
+<tr><td>tamanho do valor</td><td>63 caracteres, com formato rígido</td><td>texto livre, até o limite total de 256 KiB por objeto</td></tr>
+<tr><td>quem lê</td><td>o cluster decide; o humano confere</td><td>o humano, o kubectl e ferramentas de terceiros</td></tr>
+<tr><td>exemplo</td><td><code>tier: web</code></td><td><code>dono: ana</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa tabela responde à pergunta que mais aparece na prática: “posso usar annotation em vez de label para
+o Service achar o pod?”. Não. O seletor do Service só lê labels; uma annotation com
+<code>app: cardapio</code> é invisível para ele, e o Service fica sem endpoint sem produzir erro nenhum. O
+contrário também é ruim: transformar informação longa em label esbarra no limite de 63 caracteres e nas
+regras de formato, que recusam espaço, acento e maiúscula.</p>
+
+<h2>4. Criar annotation num objeto que já existe</h2>
+
+<p>Nem toda annotation nasce no manifesto. Muitas vezes o objeto já está rodando e você quer deixar um
+bilhete nele — o ticket do suporte, o nome de quem mexeu, a data da última revisão. O comando é
+<code>kubectl annotate</code>, e ele tem a mesma gramática do <code>label</code>: tipo, barra, nome, e o par
+chave=valor.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="campo:Pod/cardapio|metadata.annotations.dono=ana;;texto:annotated;;texto:Running">
+  <p class="try-task">A caixa tenta anotar o pod antes de ele existir e lê o erro. Inverta a ordem: crie o
+  pod, anote com <code>dono=ana</code> e termine mostrando o objeto inteiro com
+  <code>kubectl get pod cardapio -o yaml</code>.</p>
+<pre class="yaml">kubectl annotate pod/cardapio dono=ana
+kubectl run cardapio --image=cardapio:1.0
+kubectl get pod cardapio -o yaml</pre>
+<pre class="out">
+ana@notebook:~$ kubectl annotate pod/cardapio dono=ana
+Error from server (NotFound): "pod/cardapio" not found
+
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pod cardapio -o yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      name: cardapio
+      ports:
+        - containerPort: 80
+          protocol: TCP
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.3.71
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl annotate pod/cardapio dono=ana
+kubectl get pod cardapio -o yaml</pre>
+</div>
+
+<p>A primeira resposta é a lição de ordem: <code>Error from server (NotFound): "pod/cardapio" not
+found</code>. O <code>annotate</code> não cria nada; ele <em>modifica</em> um objeto que precisa existir.
+Depois de criar o pod, a mesma linha responde <code>pod/cardapio annotated</code> — no mesmo formato de
+<code>label</code>, <code>delete</code> e <code>set</code>: tipo, barra, nome e o particípio do verbo.</p>
+
+<p>E por que terminar com <code>-o yaml</code>? Porque a tabela do <code>get pods</code> não tem coluna de
+annotations. A saída padrão mostra <code>NAME</code>, <code>READY</code>, <code>STATUS</code>,
+<code>RESTARTS</code> e <code>AGE</code>; a annotation não cabe ali e não é o propósito dela. O objeto
+completo só aparece quando você pede o objeto: <code>-o yaml</code> (ou <code>-o json</code>, na aula de
+saída do kubectl). Dentro dele, a annotation está em <code>metadata.annotations</code>, exatamente onde foi
+escrita.</p>
+
+<h2>5. Anotar pelo manifesto, e o valor que é texto</h2>
+
+<p>O caminho declarativo — escrever no YAML e aplicar — é o que deixa rastro no repositório. A caixa abaixo
+tem um pod com a annotation de revisão errada e sem o dono. O conserto é no arquivo, não no comando.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cardapio|metadata.annotations.dono=ana;;campo:Pod/cardapio|metadata.annotations.revisao=3;;texto:Running">
+  <p class="try-task">Complete o bloco <code>annotations</code> com <code>dono: ana</code> e corrija a
+  revisão para <code>"3"</code> (com aspas: annotation é texto). Depois rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+  annotations:
+    revisao: "2"
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+  annotations:
+    dono: ana
+    revisao: "3"
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+</div>
+
+<p>Duas ordens, sem vírgula: dentro de <code>annotations</code> a ordem das chaves não importa, e o
+<code>apply</code> não vai reclamar se você escrever <code>dono</code> antes ou depois de
+<code>revisao</code>. O que importa é a indentação: as duas chaves ficam com quatro espaços, um nível abaixo
+de <code>annotations</code>. Errar isso é o mesmo erro de YAML da aula de anatomia — a chave vira filha da
+chave anterior e o objeto sai torto.</p>
+
+<p>Sobre as aspas: o Kubernetes guarda annotation como string, sempre. Se você escrever
+<code>revisao: 3</code> sem aspas, o YAML entrega um número e o cluster converte para <code>"3"</code> na
+maioria dos casos — mas nem sempre, e a depuração desse “nem sempre” custa caro. Escreva entre aspas todo
+valor que pareça número, booleano (<code>"true"</code>) ou data (<code>"2026-11-27"</code>). É o mesmo
+cuidado que se toma com versão de imagem e com chave de ConfigMap.</p>
+
+<h2>6. Ler as annotations de verdade</h2>
+
+<p>No dia a dia, a leitura mais confiável é <code>-o yaml</code>: ele mostra o objeto como o cluster guarda,
+com as annotations no topo do <code>metadata</code>. O <code>describe</code> também as mostra, numa linha
+própria, e é o que a maioria das pessoas usa quando está com pressa. A transcrição abaixo é de um cluster
+real, com o pod <code>cardapio</code> já anotado:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe pod cardapio
+Name:             cardapio
+Namespace:        padaria
+Priority:         0
+Service Account:  default
+Node:             guia-worker/192.0.2.29
+Start Time:       Fri, 27 Nov 2026 15:50:25 +0000
+Labels:           app=cardapio
+Annotations:      dono: ana
+                  cardapio-revisao: "3"
+Status:           Running</pre>
+
+<p>Num Deployment — o objeto que a Ana usa para manter o site no ar — o caminho é o mesmo, e a caixa abaixo
+mostra o bilhete duplo: o dono e o ticket do suporte. Repare que cada <code>annotate</code> mexe em uma
+chave, e que o <code>get -o yaml</code> no fim mostra as duas dentro do <code>metadata</code>.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="campo:Deployment/cardapio|metadata.annotations.dono=ana;;campo:Deployment/cardapio|metadata.annotations.ticket=42;;texto:annotations:">
+  <p class="try-task">Crie o Deployment <code>cardapio</code> com a imagem <code>cardapio:1.0</code>, anote
+  <code>dono=ana</code> e depois <code>ticket=42</code>, e termine mostrando o objeto com
+  <code>-o yaml</code>.</p>
+<pre class="yaml">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl annotate deployment/cardapio dono=ana
+kubectl get deployment cardapio -o yaml</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create deployment cardapio --image=cardapio:1.0
+deployment.apps/cardapio created
+
+ana@notebook:~$ kubectl annotate deployment/cardapio dono=ana
+deployment.apps/cardapio annotated
+
+ana@notebook:~$ kubectl get deployment cardapio -o yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    dono: ana
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: cardapio
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - image: cardapio:1.0
+          imagePullPolicy: IfNotPresent
+          name: cardapio
+          ports:
+            - containerPort: 80
+              protocol: TCP
+          resources:
+            limits: {}
+            requests: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+status:
+  availableReplicas: 1
+  conditions:
+    - reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+  readyReplicas: 1
+  replicas: 1
+  unavailableReplicas: 0
+  updatedReplicas: 1
+</pre>
+<pre class="solucao">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl annotate deployment/cardapio dono=ana
+kubectl annotate deployment/cardapio ticket=42
+kubectl get deployment cardapio -o yaml</pre>
+</div>
+
+<p>A saída útil começa em <code>metadata:</code>, e no painel ela traz uma chave só — <code>dono: ana</code>
+—, porque o <code>ticket</code> ainda não foi anotado. Acrescente a linha do <code>ticket=42</code> e o bloco
+passa a ter as duas, com o valor entre aspas (<code>ticket: "42"</code>): o comando recebeu texto e o cluster
+guardou texto, mesmo que o número parecesse número. Abaixo das annotations vêm o <code>labels</code> com o
+<code>app: cardapio</code> que o <code>create deployment</code> colocou sozinho e o <code>name</code>. O
+resto do arquivo é o <code>spec</code> que você já conhece. É por isso que a leitura de bilhete em objeto de
+verdade costuma ser “abre o yaml e olha as primeiras vinte linhas”: ele fica sempre no topo.</p>
+
+<p>Repare no alinhamento: a primeira annotation vem na mesma linha do rótulo
+<code>Annotations:</code>, e as seguintes continuam na coluna de baixo, uma por linha, no formato
+<code>chave: valor</code>. Quando não existe nenhuma, a linha aparece como
+<code>Annotations:     &lt;none&gt;</code> (no painel deste guia, o sinal é o mesmo
+<code>&lt;none&gt;</code> na saída do <code>describe</code>). E quando o valor é longo — um JSON de
+configuração, por exemplo — o kubectl quebra em várias linhas e a leitura fica difícil: nesse caso,
+<code>-o yaml</code> ou <code>-o json</code> com um filtro é o caminho.</p>
+
+<p>A segunda metade da leitura é saber <em>o que</em> você está vendo. Um objeto anotado por três
+ferramentas diferentes tem annotations de três donos, e é normal: cada prefixo é uma delas. Se você vir
+<code>deployment.kubernetes.io/revision</code>, quem escreveu foi o controlador de Deployment, não uma
+pessoa. Se vir <code>kubectl.kubernetes.io/last-applied-configuration</code>, foi o <code>apply</code>
+guardando o último manifesto que aplicou. Nenhuma das duas deve ser editada à mão: elas são o caderno de
+anotações do próprio cluster.</p>
+
+<h2>7. Regras, limites e o que não guardar ali</h2>
+
+<p>A chave de uma annotation segue o formato de nome de label: até 63 caracteres, minúsculas, números,
+hífen, sublinhado e ponto, começando e terminando por letra ou número. Opcionalmente com prefixo de domínio
+(<code>padaria.test/ticket</code>), que é a recomendação quando a annotation é de uma ferramenta e não sua.
+O valor é livre — qualquer string UTF-8 —, e é por isso que ele é tão útil para guardar JSON, URL, comando e
+mensagem de commit.</p>
+
+<p>O limite que existe é o do conjunto: <strong>256 KiB por objeto</strong>, somando todas as annotations. É
+muito para bilhetes e pouco para arquivos. Guardar um PDF, um dump de banco ou o conteúdo de um ConfigMap
+inteiro ali é abuso: o objeto passa a ser carregado inteiro em toda listagem, e o cluster fica lento. Se o
+conteúdo é grande, o lugar dele é um ConfigMap ou um volume.</p>
+
+<p>Trocar e remover seguem a regra do <code>label</code>: a mesma chave com outro valor exige
+<code>--overwrite</code>, e a chave com um hífen no fim remove a annotation. A transcrição abaixo é de um
+cluster real, com o Deployment do cardápio:</p>
+
+<pre class="term">ana@notebook:~$ kubectl annotate deployment/cardapio change-cause="ajuste de preco"
+deployment.apps/cardapio annotated
+
+ana@notebook:~$ kubectl annotate deployment/cardapio change-cause="volta do preco"
+error: 'change-cause' already has a value (ajuste de preco), and --overwrite is false
+
+ana@notebook:~$ kubectl annotate deployment/cardapio change-cause="volta do preco" --overwrite
+deployment.apps/cardapio annotated
+
+ana@notebook:~$ kubectl annotate deployment/cardapio change-cause-
+deployment.apps/cardapio annotated</pre>
+
+<p>A frase do meio é a que mais aparece: <code>already has a value (…), and --overwrite is false</code>.
+Ela não é sobre permissão nem sobre o objeto ter sumido — é o kubectl se recusando a sobrescrever um bilhete
+que alguém escreveu, sem que você tenha pedido licença. Com <code>--overwrite</code>, passa. No painel deste
+guia a escrita é aplicada direto, sem essa checagem; a regra de verdade é a da transcrição, e é ela que você
+vai encontrar no cluster do trabalho.</p>
+
+<p>Duas coisas nunca devem morar em annotation. A primeira é segredo: senha, token e chave de API ficam em
+<code>Secret</code>, e ainda assim com cuidado (Secret não é cifrado por padrão, só codificado em base64). A
+segunda é dado que o cluster precisa usar para decidir algo — isso é label, seletor, campo do
+<code>spec</code> ou anotação <em>lida por um controlador específico</em>, e nesse último caso a lição é
+outra: a ferramenta manda, você só obedece ao formato dela.</p>
+
+<h2>8. As annotations que já vêm de fábrica</h2>
+
+<p>Quando você começa a olhar objetos de um cluster em uso, encontra annotations que nunca escreveu. Elas
+são o jeito padrão de o ecossistema guardar configuração sem inventar campo novo no <code>spec</code>. As
+quatro mais comuns no dia a dia da Ana:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Annotation</th><th>Quem escreve</th><th>Para que serve</th></tr>
+</thead>
+<tbody>
+<tr><td><code>deployment.kubernetes.io/revision</code></td><td>o controlador de Deployment</td><td>numerar cada versão do molde; é o que o <code>rollout history</code> mostra</td></tr>
+<tr><td><code>kubectl.kubernetes.io/last-applied-configuration</code></td><td>o <code>kubectl apply</code></td><td>guardar o último manifesto aplicado, para o apply saber o que remover</td></tr>
+<tr><td><code>kubectl.kubernetes.io/restartedAt</code></td><td><code>kubectl rollout restart</code></td><td>forçar a troca dos pods mudando algo no molde</td></tr>
+<tr><td><code>nginx.ingress.kubernetes.io/rewrite-target</code></td><td>você, lendo o manual do Ingress</td><td>mudar o comportamento do controlador de Ingress sem tocar no <code>spec</code></td></tr>
+<tr><td><code>prometheus.io/scrape</code></td><td>você, no manifesto do pod</td><td>avisar o monitoramento para coletar métricas daquele pod</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas dessas linhas merecem comentário. A <code>last-applied-configuration</code> é a razão de o
+<code>apply</code> conseguir apagar um campo que você tirou do arquivo: ele compara o manifesto novo com o
+que está guardado na annotation e calcula a diferença. Se alguém editar o objeto por fora — com
+<code>kubectl edit</code>, por exemplo — a annotation fica desatualizada e o próximo apply pode desfazer a
+edição. Não é bug: é o contrato do modelo declarativo, e é o assunto da aula de <code>edit</code> e
+<code>patch</code>.</p>
+
+<p>A <code>nginx.ingress.kubernetes.io/rewrite-target</code> é o exemplo clássico de annotation de
+ferramenta. O Kubernetes não sabe o que ela significa; o controlador de Ingress sabe. Por isso o prefixo:
+<code>nginx.ingress.kubernetes.io/</code> diz “esta chave é minha, não mexa”. Quando você instala uma
+ferramenta nova, o manual dela vem com as annotations que ela lê — e é exatamente aí que a annotation mostra
+seu valor: configuração que viaja junto com o objeto, versionada no mesmo arquivo.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a sexta-feira sem bilhete</h3>
+<p>Alguém trocou a imagem do Deployment para testar um preço e esqueceu de voltar. Três dias depois, ninguém
+sabia por que a imagem era outra. O conserto não foi técnico, foi de hábito: toda mudança de manifesto passou
+a levar uma annotation <code>motivo</code> com uma frase e o ticket, e o <code>describe</code> passou a
+contar a história sozinho. A pergunta “por que está assim?” deixou de custar uma tarde.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a annotation que o time achou que selecionava</h3>
+<p>O Service parou de achar os pods e o time colocou <code>app: cardapio</code> em
+<code>metadata.annotations</code>, achando que resolvia. Não resolveu — e não ia resolver nunca, porque
+seletor não lê annotation. O culpado estava na label, com uma letra trocada. A lição: se o problema é “quem
+entra no grupo”, o campo é <code>labels</code>; annotation só informa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o deploy que parou de reiniciar</h3>
+<p>Uma ferramenta de deploy automático usava a annotation <code>deploy.padaria.test/versao</code> para
+decidir se precisava reaplicar. Alguém apagou a annotation “porque estava sujando o manifesto”, e a
+ferramenta passou a achar que nada tinha mudado — nenhum deploy saiu por dois dias. Annotation de ferramenta
+é contrato: se não souber quem lê, não apague.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Para que serve uma annotation?</p>
+<label><input type="radio" name="q1"> para o Service encontrar os pods certos</label>
+<label><input type="radio" name="q1"> para guardar informação sobre o objeto, lida por pessoas e por
+ferramentas</label>
+<label><input type="radio" name="q1"> para mudar o <code>STATUS</code> do pod</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Onde a annotation fica no manifesto?</p>
+<label><input type="radio" name="q2"> em <code>spec.annotations</code></label>
+<label><input type="radio" name="q2"> em <code>metadata.labels</code></label>
+<label><input type="radio" name="q2"> em <code>metadata.annotations</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que <code>kubectl annotate pod/x dono-</code> faz?</p>
+<label><input type="radio" name="q3"> remove a annotation <code>dono</code></label>
+<label><input type="radio" name="q3"> cria a annotation <code>dono</code> com valor vazio</label>
+<label><input type="radio" name="q3"> apaga o pod</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o bilhete do cardápio</h2>
+<p>O pod <code>cardapio</code> precisa de duas annotations: <code>dono</code> com o valor
+<code>ana</code> e <code>revisao</code> com o valor <code>3</code>. Complete o nome da seção do manifesto
+onde as duas entram:</p>
+<div class="ex-code">metadata.<input aria-label="resposta 1" data-answer="annotations" placeholder="...">
+  dono: ana
+  revisao: "3"</div>
+<p class="ex-dica">Dica: <code>metadata</code> tem duas listas de chave e valor. <code>labels</code>
+seleciona; <code>annotations</code> informa. As duas aceitam <code>chave: valor</code>, mas só a primeira
+aparece no <code>--show-labels</code> e no seletor do Service.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Annotation é o bilhete colado no objeto: chave e valor em <code>metadata.annotations</code>, texto livre,
+sem participar de seleção nenhuma. Ela existe para contar o que o cluster não conta — quem mexeu, por quê,
+qual o ticket, qual a versão, o que a ferramenta tal deve fazer. Label classifica; annotation documenta.</p>
+
+<p>No dia a dia, três caminhos: escrever no manifesto e aplicar (o que fica no repositório),
+<code>kubectl annotate tipo/nome chave=valor</code> para o objeto que já existe, e <code>chave-</code> para
+remover. O comando responde <code>annotated</code>; se o objeto não existir, responde
+<code>Error from server (NotFound)</code>, e se a chave já tiver outro valor, exige
+<code>--overwrite</code>. Para ler, <code>-o yaml</code> mostra o objeto inteiro e o <code>describe</code>
+mostra a linha <code>Annotations:</code>.</p>
+
+<p>Três cuidados fecham o assunto: valor é sempre texto (aspas em número, data e booleano), o conjunto todo
+cabe em 256 KiB por objeto, e segredo não mora aqui. E as annotations que você não escreveu — revisão,
+último apply, restart — são do cluster e das ferramentas: leia, entenda, não apague. Na próxima aula a Ana
+sai do objeto e organiza o cluster inteiro: <a href="namespaces-na-pratica.html">namespaces na
+prática</a>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+<li><code>metadata.annotations</code> guarda informação; <code>metadata.labels</code> seleciona. Não são
+intercambiáveis.</li>
+<li><code>kubectl annotate pod/cardapio dono=ana</code> cria ou troca; <code>dono-</code> remove;
+exige <code>--overwrite</code> quando a chave já tem outro valor.</li>
+<li>O objeto precisa existir: <code>annotate</code> modifica, não cria.</li>
+<li>Leia com <code>kubectl get … -o yaml</code> (ou a linha <code>Annotations:</code> do
+<code>describe</code>).</li>
+<li>Valor é string: use aspas em <code>"3"</code>, <code>"true"</code> e <code>"2026-11-27"</code>.</li>
+<li>256 KiB por objeto, no total. Conteúdo grande vai para ConfigMap.</li>
+<li>Nunca segredo. E nunca apague annotation de ferramenta sem saber quem a lê.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

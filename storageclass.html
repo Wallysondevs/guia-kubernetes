@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StorageClass | Guia Kubernetes</title>
+<meta name="description" content="StorageClass na prática: o provisioner que cria PersistentVolumes sob demanda, o PVC que escolhe a classe, WaitForFirstConsumer e uma classe por tipo de disco.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">StorageClass</span></h1>
+<p class="intro">A Ana passou a semana criando PersistentVolume à mão: um para o banco, um para os
+relatórios, um para o cache. Cada projeto novo era um manifesto novo, uma capacidade escolhida a dedo e um
+nome para não esquecer. Quando o time dela cresceu, ficou claro que aquilo não escalava — e que o Kubernetes
+já tinha a peça que faz esse trabalho: a <strong>StorageClass</strong>, a receita que o cluster usa para
+fabricar um PersistentVolume no instante em que alguém pede um. Nesta aula a Ana escreve a receita, aponta o
+claim para ela e entende por que o disco só nasce quando é preciso.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é uma StorageClass e por que ela substitui o PV criado à mão.</li>
+  <li>As quatro linhas que definem uma classe: provisioner, parameters, reclaimPolicy e volumeBindingMode.</li>
+  <li>Como o PVC escolhe a classe e o que acontece quando ele não escolhe nenhuma.</li>
+  <li>A diferença entre provisionamento imediato e “quando o primeiro pod aparecer”.</li>
+  <li>O que é a classe padrão do cluster e por que declarar a sua é mais seguro.</li>
+  <li>Como organizar classes por tipo de disco — rápido, frio, compartilhado.</li>
+  <li>O que <code>allowVolumeExpansion</code> permite e o que ele não faz.</li>
+  <li>Onde o painel para e o que só acontece num cluster de verdade.</li>
+</ul>
+</div>
+
+<h2>1. A cena: um PV por projeto, à mão</h2>
+
+<p>Na aula anterior a Ana aprendeu a criar o par PV e PVC à mão. Funciona, e é assim que se aprende. O
+problema aparece na terceira semana: cada vez que alguém precisa de disco, alguém precisa também saber em
+qual servidor há espaço, criar o PV com o tamanho certo, escolher um nome e combinar com o PVC. São duas
+pessoas e um bilhete para cada projeto.</p>
+
+<p>A StorageClass inverte isso. Em vez de oferecer volumes prontos, o cluster recebe uma <em>receita</em>:
+“quando alguém pedir um disco com esta classe, chame este provisionador, com estes parâmetros”. O PVC deixa
+de procurar um PV que já existe e passa a pedir um que será criado para ele, do tamanho que ele pediu. O
+administrador escreve a receita uma vez; o time escreve o pedido quantas vezes precisar.</p>
+
+<p>Não é magia: por trás da classe existe um programa — o provisionador — que fala com o sistema de
+armazenamento de verdade. Em nuvem, ele cria um disco e o anexa; em cluster local, ele cria uma pasta no nó;
+em um servidor NFS, ele cria um diretório novo. A classe só diz <em>qual</em> provisionador chamar e
+<em>com quais</em> parâmetros. Quem executa é o provisionador.</p>
+
+<h2>2. A receita e os seus ingredientes</h2>
+
+<p>Uma StorageClass tem quatro informações que importam no dia a dia. O <strong>provisioner</strong> diz quem
+fabrica o volume — é o único campo obrigatório. Os <strong>parameters</strong> são repassados para esse
+provisionador, e cada um inventa os seus: tipo de disco, IOPS, sistema de arquivos. O
+<strong>reclaimPolicy</strong> decide o destino do volume quando o claim é apagado. E o
+<strong>volumeBindingMode</strong> decide <em>quando</em> o volume é criado.</p>
+
+<dl class="anatomy">
+<dt>StorageClass (SC)</dt>
+<dd>A receita de provisionamento. Não tem namespace: é do cluster, como o PV. Um PVC a referencia pelo
+nome.</dd>
+<dt>provisioner</dt>
+<dd>O driver que cria o volume: <code>rancher.io/local-path</code> em cluster local,
+<code>csi.aws.amazon.com</code> na AWS, <code>kubernetes.io/nfs</code> em NFS.</dd>
+<dt>parameters</dt>
+<dd>Opções passadas ao provisionador, como <code>type: ssd</code> ou <code>replication: 3</code>. Livres por
+driver.</dd>
+<dt>reclaimPolicy</dt>
+<dd><code>Delete</code> (padrão): apaga o volume junto com o claim. <code>Retain</code>: deixa o volume e os
+dados para trás.</dd>
+<dt>volumeBindingMode</dt>
+<dd><code>Immediate</code> cria o volume já; <code>WaitForFirstConsumer</code> espera o pod ser agendado,
+para criar o disco perto dele.</dd>
+<dt>allowVolumeExpansion</dt>
+<dd>Quando <code>true</code>, permite aumentar o tamanho do PVC depois. Depende do driver saber crescer.</dd>
+<dt>classe padrão</dt>
+<dd>A marcada com a anotação <code>storageclass.kubernetes.io/is-default-class: "true"</code>. É usada quando
+o PVC não diz nada.</dd>
+</dl>
+
+<p>Repare que a classe não guarda tamanho. “Quanto” é sempre do pedido, porque quem sabe de quanto precisa é
+quem vai usar. A classe guarda o <em>tipo</em>: as garantias, a velocidade, o comportamento na hora de criar e
+na hora de apagar. É a diferença entre o cardápio e o pedido — o cardápio lista o que a cozinha sabe fazer, e
+o pedido diz quantas porções.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>PV criado à mão</th><th>Com StorageClass</th></tr>
+</thead>
+<tbody>
+<tr><td>quem cria o volume</td><td>você, antes do claim</td><td>o provisionador, depois do claim</td></tr>
+<tr><td>quem escolhe o tamanho</td><td>você, no PV e no PVC, combinando</td><td>o PVC, sozinho</td></tr>
+<tr><td>quanto tempo leva</td><td>o tempo de escrever e aplicar o manifesto</td><td>segundos</td></tr>
+<tr><td>o que pode dar errado</td><td>capacidade ou modo que não casam, nome repetido</td><td>classe inexistente,
+provisionador parado, modo em espera</td></tr>
+<tr><td>serve para</td><td>disco que já existe: NFS da empresa, disco recuperado</td><td>volume novo sob
+demanda</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>3. A primeira classe</h2>
+
+<p>Vamos escrever a receita. A caixa começa com uma classe sem provisionador, com a política padrão de apagar
+tudo e com criação imediata. A missão é completar as três decisões que importam: quem cria, o que acontece no
+fim e quando criar.</p>
+
+<div class="tryk8s" data-get="sc" data-goal="objeto:StorageClass/padaria-ssd;;campo:StorageClass/padaria-ssd|provisioner=rancher.io/local-path;;campo:StorageClass/padaria-ssd|reclaimPolicy=Retain;;campo:StorageClass/padaria-ssd|volumeBindingMode=WaitForFirstConsumer">
+  <p class="try-task">Acrescente <code>provisioner: rancher.io/local-path</code>,
+  <code>reclaimPolicy: Retain</code> e <code>volumeBindingMode: WaitForFirstConsumer</code> à classe e rode.</p>
+<pre class="yaml">apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: padaria-ssd
+parameters:
+  type: ssd</pre>
+<pre class="out">
+storageclass.storage.k8s.io/padaria-ssd created
+
+NAME          AGE
+padaria-ssd   1m
+</pre>
+  <pre class="solucao">apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: padaria-ssd
+provisioner: rancher.io/local-path
+parameters:
+  type: ssd
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer</pre>
+</div>
+
+<p>Cada linha tem uma consequência. O <code>provisioner</code> é o telefone que o cluster disca quando alguém
+pede um volume desta classe — sem ele, o pedido nunca é atendido. O <code>reclaimPolicy: Retain</code> é a
+decisão de não apagar dados por acidente: quando o PVC morre, o volume fica lá, ocupando espaço e esperando
+uma pessoa decidir. O <code>WaitForFirstConsumer</code> é o ajuste que faz o disco nascer perto do pod que vai
+usá-lo, em vez de nascer em qualquer lugar.</p>
+
+<p>Num cluster de verdade, <code>provisioner</code> é campo obrigatório: o servidor recusa a classe sem ele
+com a mensagem <code>provisioner: Required value</code>. O painel aceita a classe incompleta e mostra o objeto
+criado — por isso, aqui, quem prova que a missão foi cumprida é o campo, não o erro. Não é um detalhe do
+guia: é o lembrete de que validação de servidor e validação de painel contam histórias diferentes, e o
+manifesto bom é o que passaria nos dois.</p>
+
+<p>Sobre o nome: <code>padaria-ssd</code> é escolha livre, com as mesmas regras de nome de sempre —
+minúsculas, hífen no meio. Times costumam nomear por característica (<code>rapido</code>,
+<code>frio</code>, <code>compartilhado</code>) e não por tecnologia (<code>aws-gp3-us-east-1</code>), porque o
+nome aparece no manifesto da aplicação e a tecnologia muda. Uma classe chamada <code>rapido</code> pode passar
+de SSD local para disco de nuvem sem que nenhum PVC seja editado.</p>
+
+<h2>4. O PVC escolhe a classe</h2>
+
+<p>Com a receita pronta, o pedido fica curto: tamanho, modo de acesso e o nome da classe. A caixa tem a
+classe e o claim no mesmo arquivo; o claim está sem <code>storageClassName</code> e sem tamanho. A missão é
+completar os dois campos.</p>
+
+<div class="tryk8s" data-get="pvc" data-goal="objeto:StorageClass/padaria-ssd;;campo:PersistentVolumeClaim/dados-padaria|spec.storageClassName=padaria-ssd;;campo:PersistentVolumeClaim/dados-padaria|spec.resources.requests.storage=1Gi">
+  <p class="try-task">Peça <code>1Gi</code> em <code>spec.resources.requests.storage</code> e escolha a classe
+  com <code>storageClassName: padaria-ssd</code>. Rode e leia o <code>STATUS</code> do claim.</p>
+<pre class="yaml">apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: padaria-ssd
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-padaria
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Mi</pre>
+<pre class="out">
+storageclass.storage.k8s.io/padaria-ssd created
+persistentvolumeclaim/dados-padaria created
+
+NAME            STATUS    VOLUME         CAPACITY   ACCESS MODES   STORAGECLASS   AGE   VOLUMEMODE
+dados-padaria   Pending   pvc-549tjl7v              RWO                           1m    Filesystem
+</pre>
+  <pre class="solucao">apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: padaria-ssd
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-padaria
+spec:
+  storageClassName: padaria-ssd
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi</pre>
+</div>
+
+<p>O painel mostra o claim criado e a tabela do <code>get pvc</code> com <code>STORAGECLASS</code> preenchida e
+<code>STATUS</code> em <code>Pending</code>. Esse <code>Pending</code> é esperado aqui e vale entender por quê:
+o motor guarda o objeto e sabe qual classe ele pediu, mas não tem o provisionador rodando para fabricar o
+volume. Quem faz o <code>Pending</code> virar <code>Bound</code> é o controlador da classe, num cluster de
+verdade — e ele leva menos de um segundo.</p>
+
+<p>Se o PVC citasse uma classe que não existe, o sintoma seria o mesmo por um tempo e depois viraria erro:
+o controlador não encontra a classe e registra um evento no claim. É o tipo de erro que passa despercebido
+porque o <code>apply</code> não reclama — o PVC é um pedido, e pedido válido não garante pedido atendido.
+Sempre confira o <code>STATUS</code> depois de aplicar um claim.</p>
+
+<h2>5. O que o provisionador faz por baixo</h2>
+
+<p>Vale ver o outro lado, o do cluster real. Esta é uma transcrição de um cluster local de três nós, do tipo
+que se cria com <code>kind</code>, onde a instalação já deixa uma classe padrão:</p>
+
+<pre class="term">$ kubectl get storageclass
+NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+standard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false                  12d
+padaria-ssd          rancher.io/local-path   Retain          WaitForFirstConsumer   true                   3m</pre>
+
+<p>Duas classes, dois comportamentos. A <code>standard</code> apaga o volume quando o claim morre e não
+permite crescer; a <code>padaria-ssd</code> guarda o volume e permite aumentar. O provisionador é o mesmo —
+as decisões diferentes são só de política. Isso mostra uma coisa importante: a classe não é “o disco”, é o
+<em>contrato</em> sobre o disco.</p>
+
+<p>Quando um PVC com a classe <code>standard</code> é criado, o provisionador faz três coisas em sequência:
+cria um objeto PersistentVolume com nome derivado do claim, cria o armazenamento de verdade por trás, e
+amarra os dois. O resultado é este, também de um cluster de prova:</p>
+
+<pre class="term">$ kubectl get pvc
+NAME            STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+dados-padaria   Bound    pvc-3f2a1c8e-9b41-4c7d-8f2a-5d6e7f8a9b0c   1Gi        RWO            standard       18s
+
+$ kubectl get pv
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                   STORAGECLASS   AGE
+pvc-3f2a1c8e-9b41-4c7d-8f2a-5d6e7f8a9b0c   1Gi        RWO            Delete           Bound    default/dados-padaria   standard       18s</pre>
+
+<p>O nome do PV é o nome do PVC com um prefixo e um identificador único. Ninguém escolheu esse nome: o
+provisionador inventou. É por isso que, com classe, você nunca escreve <code>volumeName</code> no claim — a
+reserva manual que você viu na aula anterior é para o caso sem provisionador, quando o PV já existe e você
+quer garantir qual é.</p>
+
+<h2>6. Imediato ou quando o pod aparecer</h2>
+
+<p>O <code>volumeBindingMode</code> parece um detalhe e é a diferença entre um volume que nasce no lugar certo
+e um que nasce longe. Com <code>Immediate</code>, o volume é criado assim que o PVC é criado — e o cluster
+escolhe um lugar qualquer que tenha espaço. Com <code>WaitForFirstConsumer</code>, nada é criado até existir
+um pod usando aquele claim; aí o agendador escolhe o nó do pod e o volume nasce ali.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>Immediate</code></th><th><code>WaitForFirstConsumer</code></th></tr>
+</thead>
+<tbody>
+<tr><td>quando o volume nasce</td><td>junto com o PVC</td><td>junto com o primeiro pod que usa o claim</td></tr>
+<tr><td>quem decide o lugar</td><td>o provisionador, sem saber do pod</td><td>o agendador, depois de escolher o
+nó</td></tr>
+<tr><td>sintoma de PVC <code>Pending</code></td><td>provisionador com problema</td><td>normal: ainda não há
+pod usando</td></tr>
+<tr><td>serve para</td><td>discos de rede, que funcionam de qualquer nó</td><td>disco local, zonal ou qualquer
+coisa presa a um nó</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A última linha é o motivo de a classe padrão do <code>kind</code> usar <code>WaitForFirstConsumer</code>:
+o provisionador dela cria uma pasta no nó, e uma pasta do nó só existe naquele nó. Se o volume nascesse antes,
+em outro nó, o pod ficaria preso. Em nuvem acontece o mesmo com discos zonais — um disco criado na zona A não
+pode ser montado por um pod na zona B.</p>
+
+<p>Há um efeito colateral que confunde: com <code>WaitForFirstConsumer</code>, um PVC sozinho fica
+<code>Pending</code> e isso é o comportamento correto. Muita gente aplica o claim, vê <code>Pending</code> e
+começa a procurar defeito. O sinal de que está tudo bem é o evento do PVC dizendo que ele está esperando o
+primeiro consumidor. O sinal de problema é quando o pod existe, está agendado, e o claim continua esperando.</p>
+
+<h2>7. A classe padrão e por que declarar a sua</h2>
+
+<p>Quem não diz nada no PVC recebe a classe padrão do cluster, se existir uma. É cômodo e é uma armadilha:
+o manifesto passa a depender de uma configuração que não está nele. No dia em que o cluster é recriado, ou que
+outra classe é marcada como padrão, o mesmo claim passa a pedir outro tipo de disco — e ninguém mexeu no
+arquivo.</p>
+
+<p>A recomendação é declarar sempre. Um PVC com <code>storageClassName: padaria-ssd</code> é explícito em
+qualquer cluster, e se a classe não existir o erro aparece na hora, em vez de virar um disco diferente do
+esperado. Times que trabalham com vários ambientes (teste, homologação, produção) costumam usar o mesmo nome de
+classe nos três justamente para que o manifesto não precise de variação — o que muda é a classe por trás.</p>
+
+<p>Existe um terceiro caso, fácil de esquecer: <code>storageClassName: ""</code> (texto vazio, de propósito).
+Ele diz “não quero provisionamento dinâmico, vou usar um PV que já existe”. É a forma correta de fazer o
+encaixe manual da aula anterior sem que o cluster tente fabricar um volume por conta própria. Sem as aspas
+vazias, o cluster pode provisionar um disco novo e você fica com dois.</p>
+
+<h2>8. Uma classe por tipo de disco</h2>
+
+<p>Com o tempo, a padaria passou a ter dois tipos de dado: o banco, que precisa de velocidade, e os relatórios
+mensais, que ninguém consulta depois de uma semana. Duas classes resolvem, e cada claim escolhe a sua. A caixa
+tem as duas classes prontas e dois claims — a missão é apontar cada claim para a classe certa.</p>
+
+<div class="tryk8s" data-get="pvc" data-goal="campo:PersistentVolumeClaim/dados-rapidos|spec.storageClassName=padaria-ssd;;campo:PersistentVolumeClaim/dados-frios|spec.storageClassName=padaria-hdd;;conta:pvc=2">
+  <p class="try-task">Aponte o claim <code>dados-rapidos</code> para <code>padaria-ssd</code> e o claim
+  <code>dados-frios</code> para <code>padaria-hdd</code>, em <code>storageClassName</code>. Rode e confira a
+  coluna <code>STORAGECLASS</code> da tabela.</p>
+<pre class="yaml">apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: padaria-ssd
+provisioner: rancher.io/local-path
+parameters:
+  type: ssd
+reclaimPolicy: Retain
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: padaria-hdd
+provisioner: rancher.io/local-path
+parameters:
+  type: hdd
+reclaimPolicy: Delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-rapidos
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-frios
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi</pre>
+<pre class="out">
+storageclass.storage.k8s.io/padaria-ssd created
+storageclass.storage.k8s.io/padaria-hdd created
+persistentvolumeclaim/dados-rapidos created
+persistentvolumeclaim/dados-frios created
+
+NAME            STATUS    VOLUME         CAPACITY   ACCESS MODES   STORAGECLASS   AGE   VOLUMEMODE
+dados-frios     Pending   pvc-lwbv7pv6              RWO                           2m    Filesystem
+dados-rapidos   Pending   pvc-6rh9l9fg              RWO                           1m    Filesystem
+</pre>
+  <pre class="solucao">apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: padaria-ssd
+provisioner: rancher.io/local-path
+parameters:
+  type: ssd
+reclaimPolicy: Retain
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: padaria-hdd
+provisioner: rancher.io/local-path
+parameters:
+  type: hdd
+reclaimPolicy: Delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-rapidos
+spec:
+  storageClassName: padaria-ssd
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dados-frios
+spec:
+  storageClassName: padaria-hdd
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi</pre>
+</div>
+
+<p>A tabela do painel mostra os dois claims com as classes certas e o tamanho de cada um. Repare que a classe
+não aparece no tamanho: <code>5Gi</code> na rápida, <code>20Gi</code> na fria, ambas na mesma família de
+provisionador. Quem decide o tamanho é o pedido; quem decide o comportamento é a classe. Separar essas duas
+coisas é o que permite ao time pedir mais espaço sem renegociar o tipo de disco.</p>
+
+<p>Sobre crescimento: <code>allowVolumeExpansion: true</code> na classe permite aumentar o
+<code>storage</code> de um PVC existente com um <code>apply</code>. Diminuir não é permitido — o Kubernetes não
+encolhe volume, e um pedido de redução é recusado. O aumento também depende do driver: alguns só crescem
+depois de reiniciar o pod, outros não crescem de jeito nenhum. A regra prática é planejar com folga e tratar
+expansão como exceção, não como rotina.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o cluster novo que apagou os dados</h3>
+<p>A Ana recriou o cluster de teste com as mesmas classes e os mesmos manifestos, e os relatórios sumiram. A
+classe <code>padaria-hdd</code> tinha <code>reclaimPolicy: Delete</code>, e o provisionador apagou o volume
+junto com o PVC quando o ambiente foi derrubado. Não foi o Kubernetes que errou: foi a política. Dado que
+importa pede <code>Retain</code>, e o custo é alguém ter de limpar os volumes órfãos de vez em quando.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o PVC preso em Pending com pod rodando</h3>
+<p>O claim usava <code>WaitForFirstConsumer</code>, o pod estava agendado, e o claim continuava
+<code>Pending</code>. O evento dizia que nenhum nó satisfazia a requisição de CPU do pod — e, sem pod
+agendado, o volume nunca era criado. A lição: nesse modo, o problema do claim pode estar no pod. Olhar os dois
+juntos economiza meia hora.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a classe que ninguém declarou</h3>
+<p>Um PVC sem <code>storageClassName</code> foi aplicado num cluster onde a classe padrão tinha sido removida.
+O claim ficou <code>Pending</code> para sempre, e o evento falava de “no storage class”. O conserto foi
+declarar a classe no manifesto. Desde então o time da Ana trata <code>storageClassName</code> como campo
+obrigatório na revisão de código, mesmo quando o cluster tem padrão.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. Quem cria o PersistentVolume quando existe uma
+StorageClass?</p>
+<label><input type="radio" name="q1"> o PVC, que vira PV depois de um tempo</label>
+<label><input type="radio" name="q1"> o kubelet do nó onde o pod caiu</label>
+<label><input type="radio" name="q1"> o provisionador indicado pela classe, quando o claim é atendido</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O que <code>volumeBindingMode: WaitForFirstConsumer</code>
+muda?</p>
+<label><input type="radio" name="q2"> o volume só é criado depois que um pod usando o claim é agendado</label>
+<label><input type="radio" name="q2"> o pod só pode ser criado depois que o volume é montado</label>
+<label><input type="radio" name="q2"> o claim fica sem classe até o primeiro acesso</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. O que <code>reclaimPolicy: Retain</code> faz?</p>
+<label><input type="radio" name="q3"> apaga o volume quando o PVC é apagado</label>
+<label><input type="radio" name="q3"> mantém o volume e os dados depois que o PVC é apagado</label>
+<label><input type="radio" name="q3"> impede que o PVC seja apagado enquanto houver pod usando</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a classe da vitrine</h2>
+<p>Complete a StorageClass com o campo obrigatório que diz quem fabrica o volume:</p>
+<div class="ex-code">apiVersion: storage.k8s.io/v1<br>
+kind: StorageClass<br>
+metadata:<br>
+&nbsp;&nbsp;name: padaria-ssd<br>
+<input aria-label="resposta 1" data-answer="provisioner" placeholder="...">: rancher.io/local-path<br>
+reclaimPolicy: Retain</div>
+<p class="ex-dica">Dica: é o campo que aponta para o driver, no mesmo nível de <code>reclaimPolicy</code> — não
+dentro de <code>parameters</code>. Sem ele, o servidor recusa a classe com <code>Required value</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>StorageClass é a receita de provisionamento: um provisioner que cria volumes, parâmetros que ele entende,
+uma política de reciclagem e um modo de criação. O PVC aponta para a classe pelo nome e continua pedindo
+tamanho e modo de acesso. Com isso, o time da aplicação escreve um manifesto curto e o cluster fabrica o disco
+na hora — em vez de alguém criar PVs à mão e casar com claims por bilhete.</p>
+
+<p>As duas decisões que mais mudam o comportamento são o <code>reclaimPolicy</code> e o
+<code>volumeBindingMode</code>. O primeiro decide se o dado sobrevive ao claim; o segundo decide se o volume
+nasce antes ou depois do pod, e é o que faz disco local e disco zonal funcionarem. A classe padrão é
+conveniente e perigosa: declarar a classe no PVC custa uma linha e evita descobrir, meses depois, que o mesmo
+manifesto pediu outro tipo de disco.</p>
+
+<p>E fica o limite desta página, dito sem rodeio: o painel guarda a classe, mostra o PVC apontando para ela e
+para em <code>Pending</code>, porque não há provisionador rodando ali. O <code>Bound</code>, o PV com nome
+derivado do claim e o disco criado de verdade são coisas de cluster real — as transcrições desta aula mostram
+como ficam. Na próxima, a Ana usa tudo isso junto num workload que precisa de identidade e de um disco por
+réplica: o StatefulSet.</p>
+
+<div class="note">
+<h3>Para lembrar</h3>
+<ul>
+<li>StorageClass é receita, não disco: provisioner + parâmetros + políticas.</li>
+<li><code>provisioner</code> é obrigatório no cluster real.</li>
+<li>O PVC escolhe a classe em <code>spec.storageClassName</code>; o tamanho continua sendo do PVC.</li>
+<li><code>Immediate</code> cria já; <code>WaitForFirstConsumer</code> espera o pod ser agendado.</li>
+<li><code>Pending</code> com <code>WaitForFirstConsumer</code> e sem pod é normal.</li>
+<li><code>Delete</code> apaga o volume com o claim; <code>Retain</code> guarda os dados.</li>
+<li>Declarar a classe sempre é mais seguro do que depender da padrão.</li>
+<li><code>storageClassName: ""</code> significa “sem provisionamento, uso um PV existente”.</li>
+<li><code>allowVolumeExpansion</code> permite crescer, nunca encolher.</li>
+<li>No painel o provisionador não existe: <code>Pending</code> ali é o esperado.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

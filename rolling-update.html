@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rolling update | Guia Kubernetes</title>
+<meta name="description" content="Rolling update na prática: publicar uma imagem nova com kubectl set image, acompanhar com rollout status, entender o que dispara um rollout e o que fazer quando ele trava.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Rolling <span class="hl">update</span></h1>
+<p class="intro">A versão 2.0 do site da Ana está pronta: cardápio novo, carrinho mais rápido, um desconto
+de domingo. Falta o passo que assusta — colocar no ar. No ano passado ela apagou o pod antigo e subiu o
+novo; durante quatro minutos o site respondeu erro, e quatro minutos de domingo são muitas vendas
+perdidas. Nesta aula ela aprende o jeito do Kubernetes: trocar as cópias <em>uma de cada vez</em>, sem
+fechar a padaria. O nome disso é rolling update.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um rollout e por que ele é diferente de apagar e recriar.</li>
+  <li>Publicar uma imagem nova com <code>kubectl set image</code>, sem editar arquivo.</li>
+  <li>Descobrir o que dispara um rollout — e o que não dispara.</li>
+  <li>Acompanhar com <code>kubectl rollout status</code> até a última réplica.</li>
+  <li>Ler os sinais de um rollout em andamento no <code>get</code> e no <code>describe</code>.</li>
+  <li>Reconhecer um rollout travado: pods novos que nunca ficam prontos.</li>
+</ul>
+</div>
+
+<h2>1. A cena: publicar sem fechar a padaria</h2>
+
+<p>Existem dois jeitos de trocar a vitrine de uma loja aberta. O primeiro é fechar as portas, arrancar a
+vitrine velha, montar a nova e abrir de novo — simples, rápido e catastrófico num domingo. O segundo é
+trocar uma peça por vez, de madrugada, com a loja funcionando: enquanto uma parte está sendo montada, a
+outra continua atendendo. O Kubernetes faz o segundo, e chama isso de atualização gradual.</p>
+
+<p>A ideia por trás é simples: as réplicas são substituíveis, então não é preciso derrubar todas. O
+controlador cria pods com o modelo novo, espera que fiquem prontos, e só então apaga os antigos. Se os
+novos não ficarem prontos, ele para no meio do caminho e mantém os antigos no ar. O site nunca fica sem
+nenhuma cópia — e é essa garantia que a Ana quer comprar.</p>
+
+<p>O preço é que a atualização deixa de ser instantânea. Ela leva o tempo de subir pods, e durante esse
+tempo convivem duas versões. Isso tem consequência de projeto: o banco de dados precisa aceitar as duas,
+as duas precisam responder o mesmo formato de API, e uma compra começada na versão velha tem de terminar
+na nova. Quem ignora isso descobre o problema no pior momento — no meio do deploy.</p>
+
+<h2>2. O vocabulário do rollout</h2>
+
+<p>Três palavras aparecem em toda conversa sobre publicação e é bom separá-las agora. O
+<strong>rollout</strong> é o processo de levar o Deployment de um modelo para outro. A
+<strong>revisão</strong> é o número que o Deployment guarda de cada modelo já aplicado. E o
+<strong>ReplicaSet antigo</strong> é o que fica para trás, com zero réplicas, guardado para um rollback
+rápido.</p>
+
+<dl class="anatomy">
+<dt>rollout</dt>
+<dd>A troca gradual dos pods de um modelo antigo pelos de um modelo novo, feita pelo controlador do
+Deployment.</dd>
+<dt>revisão</dt>
+<dd>Um número inteiro que sobe a cada mudança no modelo de pod. Aparece em
+<code>deployment.kubernetes.io/revision</code> e no <code>rollout history</code>.</dd>
+<dt>maxSurge</dt>
+<dd>Quantos pods <em>a mais</em> que o desejado podem existir durante a troca. <code>25%</code> com duas
+réplicas permite um pod extra.</dd>
+<dt>maxUnavailable</dt>
+<dd>Quantos pods podem faltar durante a troca. <code>0</code> significa “nunca menos que o desejado”, o
+que exige um pod extra antes de apagar o antigo.</dd>
+<dt>rollout status</dt>
+<dd>O comando que acompanha o rollout até o fim, imprimindo o progresso ou a mensagem de sucesso.</dd>
+</dl>
+
+<p>Os dois últimos termos vivem em <code>spec.strategy.rollingUpdate</code> e têm uma aula própria,
+logo depois desta. Por enquanto, guarde a intuição: eles são os dois botões que dizem <em>quão rápido</em>
+a troca acontece e <em>quanta falta</em> o serviço pode sentir no meio. Sem eles, o padrão do Kubernetes é
+25% para cima e 25% para baixo.</p>
+
+<h2>3. kubectl set image: publicar sem editar o arquivo</h2>
+
+<p>O caminho mais direto para publicar uma imagem nova é o <code>kubectl set image</code>. Ele recebe o
+Deployment, o nome do container e a imagem nova, no formato <code>container=imagem</code>. Não é
+declarativo como o <code>apply</code>: é uma alteração pontual, ótima para um hotfix e péssima como
+registro do que está no ar. A caixa abaixo publica a 2.0 no cluster da padaria.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:image updated;;campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:2.0;;texto:successfully rolled out">
+  <p class="try-task">Publique a imagem <code>cardapio:2.0</code> no container <code>web</code>, acompanhe
+  o rollout e confira a imagem no <code>describe</code>.</p>
+<pre class="yaml">kubectl get deployments
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl set image deployment/cardapio web=cardapio:2.0
+kubectl rollout status deployment/cardapio
+kubectl describe deployment cardapio</pre>
+</div>
+
+<p>A resposta tem três atos. Primeiro <code>deployment.apps/cardapio image updated</code>: o Deployment
+aceitou o modelo novo. Depois <code>deployment "cardapio" successfully rolled out</code>: o controlador
+chegou ao fim. No <code>describe</code>, a linha <code>Image:</code> mostra <code>cardapio:2.0</code> e a
+anotação de revisão subiu para <code>"2"</code> — a prova de que o Kubernetes registrou a mudança como uma
+geração nova, não como um ajuste qualquer.</p>
+
+<p>O detalhe do formato <code>web=cardapio:2.0</code> pega muita gente. O lado esquerdo é o
+<em>nome do container</em> dentro do pod, não o nome do Deployment. Se você errar, a resposta é
+<code>error: unable to find container named "site"</code>. Em pods com um container só, o nome costuma ser
+<code>web</code> ou o nome do serviço; confira no <code>describe</code>, na seção
+<code>Containers</code>.</p>
+
+<h2>4. O que dispara um rollout (e o que não dispara)</h2>
+
+<p>Nem toda mudança no Deployment vira uma geração nova. O critério é o <code>template</code>: se a
+mudança está dentro do modelo de pod, o Kubernetes precisa substituir os pods e cria uma revisão. Se está
+fora — o número de réplicas, as etiquetas do próprio Deployment, uma anotação —, ele ajusta o objeto e
+nada é recriado. A caixa abaixo compara os dois casos no mesmo cluster.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="campo:Deployment/cardapio|spec.replicas=3;;campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:2.0;;texto:scaled">
+  <p class="try-task">Escale para três réplicas, olhe o histórico (continua uma revisão) e depois publique
+  a <code>cardapio:2.0</code>: o histórico passa a ter duas.</p>
+<pre class="yaml">kubectl scale deployment/cardapio --replicas=3
+kubectl rollout history deployment/cardapio
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl scale deployment/cardapio --replicas=3
+deployment.apps/cardapio scaled
+
+ana@notebook:~$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-2h4sk   1/1     Running   0          3m
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl scale deployment/cardapio --replicas=3
+kubectl rollout history deployment/cardapio
+kubectl set image deployment/cardapio web=cardapio:2.0
+kubectl rollout history deployment/cardapio</pre>
+</div>
+
+<p>Depois do <code>scale</code>, o histórico continua mostrando uma linha: escalar não muda o modelo, só
+a conta. Depois do <code>set image</code>, aparece a segunda. É uma distinção que economiza sustos —
+quem vê a revisão subir sem ter mudado a imagem deve procurar o que mudou no template: uma variável de
+ambiente, um limite de memória, a porta do container.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mudança</th><th>Está no template?</th><th>Dispara rollout?</th></tr>
+</thead>
+<tbody>
+<tr><td>imagem do container</td><td>sim</td><td>sim: revisão nova e pods substituídos</td></tr>
+<tr><td><code>env</code>, <code>command</code>, <code>args</code></td><td>sim</td><td>sim</td></tr>
+<tr><td>porta, limites e pedidos de recurso</td><td>sim</td><td>sim</td></tr>
+<tr><td><code>spec.replicas</code></td><td>não</td><td>não: só a contagem de pods muda</td></tr>
+<tr><td><code>metadata.labels</code> do Deployment</td><td>não</td><td>não: é etiqueta do objeto, não do
+pod</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Existe uma armadilha no fim dessa tabela. As etiquetas do pod ficam em
+<code>spec.template.metadata.labels</code>, e essas disparam rollout — mas mudá-las quebra o
+<code>selector</code> se você não mudar os dois lados. Já as etiquetas em <code>metadata.labels</code>, no
+topo do arquivo, são do Deployment e não têm efeito nenhum sobre os pods. Duas linhas parecidas, dois
+comportamentos opostos.</p>
+
+<h2>5. rollout status: esperar até o fim</h2>
+
+<p>Publicar é fácil; saber se terminou é o que separa um deploy tranquilo de uma noite em claro. O
+<code>kubectl rollout status</code> fica acompanhando até o último pod novo ficar pronto e então imprime
+uma linha de sucesso. Se o rollout travar, ele continua imprimindo o progresso e o comando não volta —
+o que, num terminal de verdade, é um aviso: algo não está subindo.</p>
+
+<pre class="term">$ kubectl set image deployment/cardapio web=cardapio:2.0
+deployment.apps/cardapio image updated
+
+$ kubectl rollout status deployment/cardapio
+deployment "cardapio" successfully rolled out
+
+$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m</pre>
+
+<p>Essa é a saída que a caixa devolve, copiada do painel. Em produção, o mesmo comando pode demorar
+minutos e imprimir linhas de progresso antes da última — algo como “Waiting for deployment … rollout to
+finish” com a contagem de réplicas atualizadas. A frase de sucesso só aparece quando todas as réplicas
+novas estão prontas. Por isso ele é o comando certo para o fim de um pipeline: se o deploy travar, o
+comando não termina, e o pipeline falha em vez de fingir que deu certo.</p>
+
+<p>Uma ressalva prática: o <code>rollout status</code> tem um tempo limite padrão e desiste depois de um
+tempo sem progresso. Quando ele desiste, não significa que o rollout foi cancelado — significa que o
+kubectl parou de esperar. O Deployment continua tentando, e a investigação começa no
+<code>get pods</code>.</p>
+
+<h2>6. O que o painel faz (e o que ele não faz)</h2>
+
+<p>Vale ser explícito, porque esta é a aula em que a diferença mais aparece. O painel roda o controlador:
+ele atualiza o Deployment, calcula a revisão nova, responde o <code>rollout status</code> e mostra o
+histórico. O que ele não roda é o kubelet, o pedaço que cria e destrói containers. Por isso os pods que
+ele lista depois de um <code>set image</code> continuam sendo os do ReplicaSet que já existia.</p>
+
+<p>Num cluster de verdade, mudar o template cria um ReplicaSet novo — nome diferente, mesmo sufixo de
+antes mais um resumo do modelo novo. Os pods antigos vão saindo um a um e os novos entrando, e durante
+alguns segundos o <code>get pods</code> mostra sufixos das duas gerações convivendo. O
+<code>describe</code> então lista o antigo em <code>OldReplicaSets</code> e o atual em
+<code>NewReplicaSet</code>. É esse teatro que os dois botões de estratégia comandam.</p>
+
+<p>O que você pode aprender aqui é a metade do controlador: o objeto que muda, a revisão que sobe, o
+comando que espera, a mensagem de sucesso. É a metade que resolve 90% dos problemas de deploy, porque é
+ela que diz <em>se</em> terminou. A outra metade se aprende olhando um cluster de verdade — e o guia
+mostra essas passagens como transcrição, sempre identificadas.</p>
+
+<h2>7. O rollout que trava</h2>
+
+<p>Um rollout trava quando os pods novos não ficam prontos. O motivo mais comum é falta de recurso: o
+modelo novo pede mais memória ou mais CPU do que o cluster tem livre, e os pods ficam em
+<code>Pending</code>. O controlador não apaga os antigos, porque isso deixaria o serviço sem cópias — ele
+simplesmente espera, e o Deployment fica no meio do caminho. A caixa abaixo reproduz o caso.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|status.readyReplicas=3;;conta:pods=3">
+  <p class="try-task">Rode e veja os três pods sem lugar. Depois baixe a memória pedida para
+  <code>1Gi</code> e rode de novo: o rollout termina.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          resources:
+            requests:
+              memory: "5Gi"</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-52qpnw7szc-ml2v4   0/1     Pending   0          10m
+cardapio-52qpnw7szc-vcfxb   0/1     Pending   0          6m
+cardapio-52qpnw7szc-vlhhg   0/1     Pending   0          8m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          resources:
+            requests:
+              memory: "1Gi"</pre>
+</div>
+
+<p>O painel devolve a lista de pods com os três em <code>Pending</code> e <code>READY 0/1</code>. O
+<code>get deployments</code> mostraria <code>0/3</code>, e o <code>rollout status</code> nunca chegaria ao
+fim. É o retrato de um deploy parado no meio — e a diferença entre “parado” e “quebrado” é justamente que
+os pods antigos continuariam atendendo, se este fosse um cluster de verdade.</p>
+
+<pre class="term">NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-52qpnw7szc-ml2v4   0/1     Pending   0          10m
+cardapio-52qpnw7szc-vcfxb   0/1     Pending   0          6m
+cardapio-52qpnw7szc-vlhhg   0/1     Pending   0          8m</pre>
+
+<p>Essa lista é a que a caixa devolve para o caso acima, copiada do painel. O sufixo igual nas três linhas
+confirma que são do mesmo modelo novo; o que falta não é imagem, é lugar. Num cluster real, o
+<code>describe</code> do pod traria o evento <code>FailedScheduling</code> com o motivo — memória
+insuficiente, no caso. Baixar o pedido para <code>1Gi</code> libera o agendamento e o rollout termina.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sinal</th><th>Onde você vê</th><th>O que significa</th></tr>
+</thead>
+<tbody>
+<tr><td><code>UP-TO-DATE</code> menor que <code>READY</code></td><td><code>get deployments</code></td>
+<td>há pods antigos ainda no ar; a troca não terminou</td></tr>
+<tr><td><code>READY 0/3</code> com pods <code>Pending</code></td><td><code>get pods</code></td><td>o
+modelo novo não acha lugar; o rollout está travado</td></tr>
+<tr><td><code>Progressing</code> em <code>Conditions</code></td><td><code>describe deployment</code></td>
+<td>o controlador está trabalhando, ainda sem <code>Available</code></td></tr>
+<tr><td>dois sufixos de ReplicaSet</td><td><code>get pods</code></td><td>duas gerações convivendo durante a
+troca — o normal de um rolling update</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. Publicar pelo manifesto, como o time faz</h2>
+
+<p>O <code>set image</code> é ótimo para um teste, mas o jeito que sobrevive ao tempo é editar o arquivo e
+aplicar. O <code>apply</code> compara o que você mandou com o que existe e responde
+<code>configured</code> quando o objeto já existia. A diferença de comportamento em relação ao
+<code>set image</code> é pequena — os dois mudam o template e disparam uma geração nova —, mas a diferença
+de processo é enorme: o arquivo fica no repositório, passa por revisão e conta a história do que está no
+ar.</p>
+
+<p>Há um cuidado que só aparece quando o time cresce: se você usar <code>set image</code> num cluster e o
+manifesto continuar dizendo a versão antiga, o próximo <code>apply</code> desfaz o hotfix sem avisar. Não
+é vingança do Kubernetes; é o arquivo mandando, como deve ser. A regra prática é escolher um dos dois
+caminhos e ser consistente — e, se o hotfix foi feito na mão, atualizar o arquivo logo depois.</p>
+
+<p>Independente do caminho, o fim é o mesmo: <code>kubectl rollout status</code> até a linha de sucesso,
+<code>kubectl get deployments</code> para conferir os números e <code>kubectl get pods</code> para ver a
+idade das réplicas. Se algo soar estranho, <code>kubectl rollout history</code> mostra quantas gerações
+existem, e o <code>describe</code> conta qual ReplicaSet está no comando. Três comandos, um minuto de
+leitura, e você sabe exatamente o que está no ar.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o deploy que ninguém viu acontecer</h3>
+<p>A Ana publicou a 2.0 às 6h, com o site recebendo pedido de café da manhã. Nenhum cliente percebeu: as
+duas réplicas foram trocadas uma de cada vez, e sempre havia uma respondendo. O preço apareceu no
+servidor de banco: durante três minutos, as duas versões gravaram pedidos, e o relatório do dia somou
+tudo em dobro. Atualização gradual não elimina o trabalho de pensar na compatibilidade dos dados.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a imagem errada publicada às pressas</h3>
+<p>Um <code>set image</code> com a tag <code>cardapio:2.O</code> (letra O no lugar do zero) fez o rollout
+travar: os pods novos não baixam a imagem e ficam em <code>ErrImagePull</code>. O Deployment continua com
+as réplicas antigas no ar, o site não cai, e o <code>rollout status</code> nunca termina. É o tipo de
+erro que o painel não calcula — ele não roda container —, mas que num cluster real aparece no
+<code>describe pod</code> em segundos.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a versão nova que consome o dobro</h3>
+<p>A 2.0 do site passou a usar cache em memória e cada pod foi de 200Mi para 900Mi. O rolling update
+funcionou; o problema veio depois, quando os nós começaram a ficar sem memória e a despejar pods. Rollout
+saudável não quer dizer versão saudável: os números de recurso precisam ser revistos junto com o código,
+e é o que a Ana aprendeu na semana seguinte.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que um rolling update garante?</p>
+<label><input type="radio" name="q1"> que a versão nova entra em todos os pods ao mesmo tempo</label>
+<label><input type="radio" name="q1"> que o site fica fora do ar durante a troca</label>
+<label><input type="radio" name="q1"> que a troca acontece aos poucos, mantendo pods prontos durante o
+processo</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Qual mudança <em>não</em> dispara um rollout?</p>
+<label><input type="radio" name="q2"> mudar <code>spec.replicas</code> de 2 para 3</label>
+<label><input type="radio" name="q2"> mudar a imagem do container</label>
+<label><input type="radio" name="q2"> acrescentar uma variável de ambiente no container</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. O <code>rollout status</code> não termina e o
+<code>get pods</code> mostra pods novos em <code>Pending</code>. Qual é o próximo passo?</p>
+<label><input type="radio" name="q3"> apagar o Deployment e criar de novo</label>
+<label><input type="radio" name="q3"> ler o evento do pod com <code>describe</code> e ajustar recursos ou
+restrições</label>
+<label><input type="radio" name="q3"> rodar <code>rollout status</code> de novo até funcionar</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: acompanhar a publicação</h2>
+<p>A Ana publicou a imagem nova e quer esperar até o fim antes de avisar o time. Complete o comando que
+acompanha o rollout do Deployment <code>cardapio</code> e responda: qual campo do manifesto guarda o
+modelo de pod que é trocado?</p>
+<div class="ex-code">kubectl rollout <input aria-label="resposta 1" data-answer="status" placeholder="...">
+deployment/cardapio</div>
+<p class="ex-dica">Dica: o verbo é <code>rollout</code> e o subcomando que espera é o que também aparece
+na meta da caixa 1. O modelo trocado é o mesmo campo do exercício da aula de Deployment.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Rolling update é a troca gradual: pods novos entram, ficam prontos, e só então os antigos saem. Quem
+comanda é o controlador do Deployment, e os dois botões que regulam o ritmo são
+<code>maxSurge</code> e <code>maxUnavailable</code>. Publicar pode ser um comando
+(<code>kubectl set image deployment/cardapio web=cardapio:2.0</code>) ou um arquivo aplicado com
+<code>apply</code>.</p>
+
+<p>Só o que está dentro do <code>template</code> dispara uma geração nova. Escalar, mudar etiquetas do
+Deployment ou anotar o objeto não cria revisão. Para saber se terminou, <code>kubectl rollout status</code>;
+para saber o que existe, <code>get deployments</code> e <code>get pods</code>; para saber a história,
+<code>rollout history</code>.</p>
+
+<p>E quando trava? Quase sempre é o pod novo que não fica pronto: falta de recurso, imagem errada, uma
+restrição de nó. O <code>describe</code> diz o motivo em uma linha. Na próxima aula a Ana aprende o
+caminho de volta — o rollback —, que é o que transforma um deploy travado em um susto de cinco minutos.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl set image deployment/nome container=imagem</code> publica uma imagem nova.</li>
+  <li>Rollout é do <code>template</code>: réplicas e etiquetas do Deployment não criam revisão.</li>
+  <li><code>kubectl rollout status deployment/nome</code> espera o fim e falha se travar.</li>
+  <li>Rollout travado = pods novos sem ficar prontos; leia o evento antes de mexer em qualquer coisa.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

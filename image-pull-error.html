@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ImagePullBackOff | Guia Kubernetes</title>
+<meta name="description" content="ImagePullBackOff: por que o pod fica parado antes de rodar, como ler o evento Failed to pull image, as três causas de sempre e o imagePullSecrets do registro privado.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">ImagePullBackOff</span></h1>
+<p class="intro">A Ana atualizou o cardápio, subiu a imagem <code>cardapio:1.1</code> com o preço novo e
+aplicou o manifesto. O pod apareceu — mas com o status <code>ImagePullBackOff</code>, uma palavra comprida
+que parece erro de programação e não é. O cluster tentou baixar a imagem, não conseguiu, e está tentando de
+novo com uma espera cada vez maior. Nesta aula você aprende a ler o motivo exato dessa falha, a corrigir as
+três causas que respondem por quase todos os casos, e a montar o manifesto do registro privado da padaria.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que <code>ErrImagePull</code> e <code>ImagePullBackOff</code> querem dizer, e por que um vira o
+  outro.</li>
+  <li>Quem baixa a imagem e em que momento do caminho do pod isso acontece.</li>
+  <li>Como ler o evento <code>Failed to pull image</code> e separar nome errado de credencial faltando.</li>
+  <li>Como o <code>imagePullSecrets</code> resolve registro privado — no Pod e no template do
+  Deployment.</li>
+  <li>Por que a tag <code>latest</code> engana, e o que o <code>imagePullPolicy</code> faz de verdade.</li>
+  <li>Como conferir qual imagem está rodando dentro de um pod, com <code>describe</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a imagem que não desce</h2>
+
+<p>O caminho de um pod tem três estações. Primeiro o agendador escolhe o nó (é a aula de
+<code>Pending</code>). Depois o kubelet daquele nó baixa a imagem do registro e liga o container. Por último
+o container roda e, se tudo der certo, o pod fica <code>Running</code> com <code>READY 1/1</code>. O
+<code>ImagePullBackOff</code> mora na estação do meio: o nó já foi escolhido, o pod já tem endereço e
+identidade, mas a imagem não chegou.</p>
+
+<p>O nome tem duas partes. <strong>ImagePull</strong> é “puxar a imagem”, o ato de baixar do registro — o
+lugar onde as imagens ficam guardadas. <strong>BackOff</strong> é “recuar, esperar”: em vez de tentar de novo
+em looping apertado, o kubelet espera dez segundos, depois vinte, depois quarenta, até um limite. É uma
+educação do cluster: se o registro está fora do ar, não adianta bater nele cem vezes por segundo.</p>
+
+<p>Antes desse nome comprido, o pod costuma passar alguns segundos em <code>ErrImagePull</code> — a
+primeira tentativa falhou. Depois vem <code>ImagePullBackOff</code>, que é o mesmo problema, agora com
+espera. Ver os dois na mesma sessão de <code>kubectl get pods</code> é o normal, e não significa que piorou:
+significa que o cluster está fazendo a coisa certa.</p>
+
+<p>Numa transcrição de cluster real, os dois aparecem na mesma sessão, com meio minuto de diferença:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS         RESTARTS   AGE
+cardapio-6f7c9d8b5-2xk4p    0/1     ErrImagePull   0          11s
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS             RESTARTS   AGE
+cardapio-6f7c9d8b5-2xk4p    0/1     ImagePullBackOff   0          46s</pre>
+
+<p>O <code>READY</code> continua <code>0/1</code> e o <code>RESTARTS</code> continua zero: nenhum container
+chegou a rodar, então não há reinício para contar. Isso separa o <code>ImagePullBackOff</code> do
+<code>CrashLoopBackOff</code>, em que o container roda, morre e é reiniciado — e o número de
+<code>RESTARTS</code> sobe.</p>
+
+<p>O ponto que mais confunde quem está começando: <code>ImagePullBackOff</code> quase nunca é problema do
+seu código. É problema de <em>endereço de imagem</em> ou de <em>permissão</em>. Você não vai consertar isso
+mexendo no programa, e sim no manifesto — no campo <code>image</code> ou no segredo do registro.</p>
+
+<h2>2. As peças do caminho da imagem</h2>
+
+<p>Três nomes explicam o resto: imagem, registro e kubelet. A imagem é o pacote com o seu programa e as
+dependências. O registro é o servidor que guarda imagens — o Docker Hub, o registry da própria empresa, o
+serviço de nuvem. E o kubelet é o agente que roda em cada nó e faz o trabalho de baixar e ligar. O pod só
+pede; quem executa é o kubelet do nó escolhido.</p>
+
+<dl class="anatomy">
+<dt>imagem</dt>
+<dd>O pacote imutável com o programa. O endereço tem três partes: registro, repositório e tag —
+<code>registry.padaria.local/cardapio:1.0</code>.</dd>
+<dt>tag</dt>
+<dd>O rótulo da versão depois dos dois-pontos. <code>:1.0</code>, <code>:1.1</code>, <code>:latest</code>.
+Sem tag, o Kubernetes assume <code>latest</code>.</dd>
+<dt>registro</dt>
+<dd>O servidor onde as imagens ficam. Pode ser público (Docker Hub) ou privado (o da padaria, em
+<code>registry.padaria.local</code>).</dd>
+<dt>kubelet</dt>
+<dd>O agente do nó. É ele que baixa a imagem, cria o container e reporta o estado ao cluster.</dd>
+<dt>ErrImagePull</dt>
+<dd>A primeira falha ao baixar a imagem. Aparece por alguns segundos, antes do backoff.</dd>
+<dt>ImagePullBackOff</dt>
+<dd>O mesmo erro com espera crescente entre tentativas. O pod fica <code>0/1</code> e nunca chega a
+rodar.</dd>
+<dt>imagePullSecrets</dt>
+<dd>Lista de segredos com credencial de registro que o kubelet usa ao baixar a imagem. Sem ela, registro
+privado responde “não autorizado”.</dd>
+<dt>imagePullPolicy</dt>
+<dd>Quando baixar: <code>Always</code> sempre, <code>IfNotPresent</code> só se não estiver no nó,
+<code>Never</code> nunca.</dd>
+</dl>
+
+<p>Repare que o endereço da imagem é uma frase inteira, e cada pedaço pode estar errado. O repositório pode
+não existir (<code>cardapioo</code>), a tag pode não existir (<code>:1.1</code> quando a publicada é
+<code>:1.0</code>), o registro pode estar escrito errado (<code>registro.padaria.local</code> em vez de
+<code>registry.padaria.local</code>), ou o registro pode exigir login. Quatro erros de digitação possíveis,
+um único status na tela.</p>
+
+<h2>3. A caixa: o campo que ficou vazio</h2>
+
+<p>Existe uma falha que parece <code>ImagePullBackOff</code> e não é: o manifesto sem imagem. Acontece
+muito com quem está começando e traduz o YAML de cabeça — escreve <code>imagem</code> em português, o
+Kubernetes ignora o campo desconhecido, e o campo obrigatório <code>image</code> fica vazio. A API recusa o
+objeto na hora, antes de qualquer tentativa de baixar.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/cardapio|spec.containers.0.image=cardapio:1.0">
+  <p class="try-task">O manifesto escreveu <code>imagem</code> em vez de <code>image</code>. Rode e leia o
+  erro; depois corrija o nome do campo e veja o pod nascer em <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      imagem: cardapio:1.0</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.containers[0].image: Required value
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>O painel responde <code>The Pod "cardapio" is invalid: spec.containers[0].image: Required value</code>.
+Traduzindo: “o pod é inválido; o campo <code>image</code> do primeiro container é obrigatório”. Note que a
+mensagem não reclama de <code>imagem</code> — o Kubernetes não sabe que você quis dizer imagem; ele só sabe
+que falta o campo com o nome certo.</p>
+
+<p>Essa distinção vale ouro no diagnóstico. <strong>Erro de validação</strong> aparece na resposta do
+<code>apply</code>, o objeto nem é criado, e o <code>get pods</code> não mostra nada. <strong>Falha de
+pull</strong> aparece depois: o objeto existe, o pod aparece na tabela e o status conta a história. Se você
+não vê o pod em lugar nenhum, o problema está no YAML. Se vê o pod com status esquisito, o problema está no
+cluster ou na imagem.</p>
+
+<p>Vale conhecer o irmão desse erro: <code>image: "1.0"</code> — a tag sem o nome do repositório. O campo
+não está vazio, então a validação passa; o kubelet tenta baixar uma imagem chamada <code>1.0</code> do
+registro padrão e falha. O status final é o mesmo <code>ImagePullBackOff</code>, com uma mensagem diferente.
+A regra é sempre olhar o endereço inteiro antes de desconfiar do registro.</p>
+
+<h2>4. O que o evento diz</h2>
+
+<p>Com o pod criado e a imagem certa, a falha de pull deixa rastro. O lugar é o mesmo de sempre: os eventos
+do <code>kubectl describe pod</code>. Esta é uma transcrição de cluster real, de um pod que apontava para
+uma imagem que não existia no registro:</p>
+
+<pre class="term">Events:
+  Type     Reason     Age                  From      Message
+  ----     ------     ----                 ----      -------
+  Normal   Scheduled  3m12s                default-scheduler  Successfully assigned default/cardapio-6f7c9d8b5-2xk4p to guia-worker
+  Normal   Pulling    3m10s                kubelet            Pulling image "registry.padaria.local/cardapio:1.1"
+  Warning  Failed     3m5s                 kubelet            Failed to pull image "registry.padaria.local/cardapio:1.1": failed to resolve reference "registry.padaria.local/cardapio:1.1": registry.padaria.local/cardapio:1.1: not found
+  Warning  Failed     3m5s                 kubelet            Error: ErrImagePull
+  Normal   BackOff    2m40s (x4 over 3m)   kubelet            Back-off pulling image "registry.padaria.local/cardapio:1.1"
+  Warning  Failed     2m40s (x4 over 3m)   kubelet            Error: ImagePullBackOff</pre>
+
+<p>Leia como uma linha do tempo, de cima para baixo. O agendador achou um nó (<code>Scheduled</code>), o
+kubelet começou a baixar (<code>Pulling</code>), a referência não foi encontrada (<code>Failed</code>),
+seguiu o <code>ErrImagePull</code> e começou o recuo (<code>BackOff</code>). O <code>(x4 over 3m)</code> é
+quantas vezes aquilo se repetiu naquele período — a prova de que o cluster está tentando, e não travado.</p>
+
+<p>A frase mais útil é a terceira: <code>failed to resolve reference ... not found</code>. “Não achei essa
+referência” aponta diretamente para nome ou tag. Outras frases comuns, e o que cada uma quer dizer:
+<code>unauthorized</code> ou <code>403 Forbidden</code> é credencial faltando ou errada;
+<code>no such host</code> é o registro fora do ar ou o nome do registro errado;
+<code>manifest unknown</code> é a tag que não existe; <code>toomanyrequests</code> é limite de download do
+Docker Hub. Cada uma pede um conserto diferente, e todas aparecem nesse mesmo lugar.</p>
+
+<p>Se a imagem é privada, o evento fala de autorização: <code>Failed to pull image ...: authorization
+failed</code> ou <code>pull access denied</code>. Nesse caso não há erro de digitação — o registro está
+respondendo e dizendo “não sem credencial”. É o assunto da próxima caixa.</p>
+
+<h2>5. A caixa: o registro privado da padaria</h2>
+
+<p>A imagem do cardápio não fica no Docker Hub: fica no registro da padaria, que exige login. Um manifesto
+que só aponta o endereço funciona no seu notebook (onde você já fez <code>docker login</code>) e falha no
+cluster, porque o kubelet não tem a sua sessão. O que ele tem é o que estiver no manifesto: uma lista de
+segredos do tipo <code>docker-registry</code> em <code>imagePullSecrets</code>.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cardapio|spec.imagePullSecrets.0.name=registry-padaria">
+  <p class="try-task">Acrescente ao <code>spec</code> o <code>imagePullSecrets</code> apontando para o
+  segredo <code>registry-padaria</code> e rode. O painel não baixa imagem — ele confere o manifesto, e a
+  meta confere se o segredo entrou no lugar certo.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: registry.padaria.local/cardapio:1.0</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  imagePullSecrets:
+    - name: registry-padaria
+  containers:
+    - name: web
+      image: registry.padaria.local/cardapio:1.0</pre>
+</div>
+
+<p>Duas linhas mudam tudo: <code>imagePullSecrets</code>, uma lista (por isso o hífen), e <code>name</code>
+apontando para o segredo. O segredo em si é um objeto à parte, criado uma vez no namespace. O jeito
+tradicional é o comando; o jeito guardável é o manifesto, com o conteúdo em base64:</p>
+
+<pre class="file" data-file="registry-padaria.yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: registry-padaria
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: eyJhdXRocyI6eyJyZWdpc3RyeS5wYWRhcmlhLmxvY2FsIjp7InVzZXJuYW1lIjoiYW5hIiwicGFzc3dvcmQiOiJzZW5oYS1kZS10ZXN0ZSIsImF1dGgiOiJZVzVoT25ObGJtaGgifX19</pre>
+
+<p>O campo <code>.dockerconfigjson</code> guarda o mesmo arquivo que o Docker escreve quando você faz login,
+codificado em base64. O comando <code>kubectl create secret docker-registry registry-padaria --docker-server=
+registry.padaria.local --docker-username=ana --docker-password=...</code> monta esse objeto para você, e é o
+caminho que a maioria usa. O manifesto só é melhor quando o segredo precisa ser versionado — e, nesse caso,
+o conteúdo não deve ser uma senha de verdade no repositório.</p>
+
+<p>Um detalhe importante: o segredo mora num namespace. Se o pod está em <code>padaria</code> e o segredo em
+<code>default</code>, o kubelet não o encontra, e a mensagem volta a falar de autorização. Nos exemplos deste
+guia tudo fica em <code>default</code>, mas no dia em que você criar namespaces, lembre de criar o segredo
+no mesmo lugar do pod — e, se for usar o mesmo segredo em vários namespaces, de copiá-lo para cada um.</p>
+
+<h2>6. A caixa: qual imagem está rodando de verdade?</h2>
+
+<p>Um pod pode estar <code>Running</code> e mesmo assim ser a imagem errada: você aplicou <code>1.1</code>,
+o Deployment não recriou nada, e a tela continua servindo o preço velho. Conferir a imagem que está dentro
+do pod é parte do diagnóstico de qualquer problema de “não atualizou”.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Image: cardapio:1.0">
+  <p class="try-task">A primeira linha cria o pod; a segunda mostra a tabela, que não diz qual imagem está
+  lá dentro. Troque a segunda por <code>kubectl describe pod cardapio</code> e rode: procure a linha
+  <code>Image:</code> na saída.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl describe pod cardapio</pre>
+</div>
+
+<p>O <code>describe</code> mostra a seção <code>Containers</code> com <code>Image: cardapio:1.0</code>,
+<code>State: Running</code> e <code>Restart Count: 0</code>. Em clusters reais aparece também
+<code>Image ID</code>, com o hash da imagem baixada — a prova definitiva de qual camada está rodando. Quando
+alguém jura que aplicou a versão nova, é aí que se confere.</p>
+
+<p>Se a imagem estiver errada num Deployment, o caminho é corrigir o YAML e aplicar de novo:
+<code>kubectl apply -f cardapio.yaml</code>. O Deployment compara o template com o que existe e cria pods
+novos com a imagem nova; os antigos vão saindo. Como o pod de um Deployment tem nome comprido e muda a cada
+versão, você acompanha pelo <code>kubectl rollout status deployment/cardapio</code>, e não pelo nome do
+pod.</p>
+
+<h2>7. As três causas que respondem por quase tudo</h2>
+
+<p>Depois de ler alguns eventos, o padrão fica claro. A tabela abaixo é a que a Ana colou no caderno: causa,
+frase no evento e conserto.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Causa</th><th>Frase no evento</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td>nome ou tag errados</td><td><code>failed to resolve reference ... not found</code> ou
+<code>manifest unknown</code></td><td>corrigir o <code>image</code> e aplicar de novo</td></tr>
+<tr><td>registro privado sem credencial</td><td><code>unauthorized</code>, <code>pull access denied</code>,
+<code>403</code></td><td>criar o segredo e pôr em <code>imagePullSecrets</code></td></tr>
+<tr><td>registro fora do ar ou nome errado</td><td><code>no such host</code>, <code>connection
+refused</code>, <code>timeout</code></td><td>conferir o endereço e a rede do nó</td></tr>
+<tr><td>limite de download</td><td><code>toomanyrequests</code></td><td>autenticar no registro ou usar um
+espelho</td></tr>
+<tr><td>arquitetura diferente</td><td><code>no match for platform in manifest</code></td><td>publicar a
+imagem para a arquitetura do nó</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>As duas primeiras linhas cobrem a maior parte dos casos de gente começando. A terceira costuma aparecer
+em cluster de empresa, quando o registro interno está em manutenção ou o nó não tem rota até ele — e aí não
+há nada para consertar no manifesto. A quarta acontece muito no Docker Hub, com imagem pública popular. A
+quinta é a pegadinha de quem desenvolve no notebook com processador de uma arquitetura e sobe o cluster em
+máquina de outra.</p>
+
+<p>Há também o caso do <code>ImagePullBackOff</code> que se resolve sozinho: o registro estava momentaneamente
+fora e voltou. O backoff continua tentando, e quando a imagem desce o pod entra em <code>Running</code> sem
+você fazer nada. Por isso o primeiro reflexo não deve ser apagar o pod: olhe o <code>AGE</code> e o número de
+tentativas antes de mexer.</p>
+
+<h2>8. Tag, latest e imagePullPolicy</h2>
+
+<p>Duas escolhas do manifesto mudam o comportamento do download e são fonte de susto. A primeira é a tag. A
+segunda é a política de download. Elas se combinam, e a combinação padrão é a que mais confunde.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Valor</th><th>O que acontece</th></tr>
+</thead>
+<tbody>
+<tr><td><code>image</code></td><td><code>cardapio:1.0</code></td><td>versão fixa; o nó reaproveita a imagem
+que já tem</td></tr>
+<tr><td><code>image</code></td><td><code>cardapio</code> (sem tag)</td><td>vira <code>:latest</code>; sempre
+que possível o cluster tenta baixar de novo</td></tr>
+<tr><td><code>imagePullPolicy</code></td><td><code>IfNotPresent</code> (padrão com tag fixa)</td><td>baixa só
+se não houver cópia no nó</td></tr>
+<tr><td><code>imagePullPolicy</code></td><td><code>Always</code> (padrão com <code>latest</code>)</td><td>baixa
+a cada início de container</td></tr>
+<tr><td><code>imagePullPolicy</code></td><td><code>Never</code></td><td>nunca baixa; falha se não estiver no
+nó</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A armadilha do <code>latest</code> é essa: como o nome não diz qual versão é, o cluster não pode confiar na
+cópia local e tenta baixar sempre. Se o registro estiver fora do ar naquele momento, um pod que já funcionava
+passa a falhar ao reiniciar. Com tag fixa (<code>:1.0</code>) e <code>IfNotPresent</code>, o nó usa a cópia
+que tem e o pod sobe mesmo sem rede. Em produção, tag fixa é a regra; <code>latest</code> é conveniência de
+teste.</p>
+
+<p>Só que tag não é hash. Nada impede alguém de publicar <code>cardapio:1.0</code> de novo com conteúdo
+diferente — a tag é um rótulo, não uma garantia. Se o nó já tem a cópia antiga e a política é
+<code>IfNotPresent</code>, ele continua rodando a antiga. Para forçar, use <code>imagePullPolicy: Always</code>
+com tag fixa, ou (melhor) publique com um identificador imutável, como o hash do commit:
+<code>cardapio:a3f9c21</code>.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: funcionava no notebook</h3>
+<p>A Ana testou a imagem no notebook, com <code>docker run</code>, e funcionou. No cluster, deu
+<code>ImagePullBackOff</code> com <code>pull access denied</code>. O motivo: no notebook ela estava logada no
+registro privado; no cluster, ninguém estava. O conserto foi criar o segredo <code>registry-padaria</code> e
+apontá-lo em <code>imagePullSecrets</code>. O programa nunca teve problema — a credencial, sim.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a tag que o colega não publicou</h3>
+<p>O manifesto pedia <code>cardapio:1.1</code>, mas o pipeline que constrói a imagem ainda não tinha rodado
+para essa versão. O evento dizia <code>manifest unknown</code>, e a Ana passou meia hora conferindo o
+<code>imagePullSecrets</code> antes de olhar o registro. A lição: <code>not found</code> e
+<code>manifest unknown</code> falam de nome; <code>unauthorized</code> fala de credencial. São consertos
+diferentes.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o pod que se consertou sozinho</h3>
+<p>Numa manhã, três pods do cardápio ficaram em <code>ImagePullBackOff</code> por vinte minutos e voltaram
+sozinhos. O registro da empresa tinha caído e voltado; o backoff continuou tentando até conseguir. Ninguém
+apagou nada e ninguém refez deploy. Se a Ana tivesse apagado os pods no desespero, teria perdido o histórico
+dos eventos, que é justamente a prova do que aconteceu.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que <code>ImagePullBackOff</code> quer dizer?</p>
+<label><input type="radio" name="q1"> o programa subiu e morreu no boot</label>
+<label><input type="radio" name="q1"> o pod não coube em nenhum nó</label>
+<label><input type="radio" name="q1"> o nó não conseguiu baixar a imagem e está tentando de novo com
+espera</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O evento diz <code>unauthorized</code>. Qual é o
+conserto?</p>
+<label><input type="radio" name="q2"> criar o segredo do registro e apontar em
+<code>imagePullSecrets</code></label>
+<label><input type="radio" name="q2"> trocar a tag da imagem para <code>latest</code></label>
+<label><input type="radio" name="q2"> aumentar o <code>requests.memory</code></label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. O manifesto não tem o campo <code>image</code>. O que
+acontece?</p>
+<label><input type="radio" name="q3"> o pod fica em <code>ImagePullBackOff</code></label>
+<label><input type="radio" name="q3"> o <code>apply</code> recusa o objeto com <code>Required
+value</code></label>
+<label><input type="radio" name="q3"> o cluster baixa <code>latest</code> por conta própria</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: aponte o segredo do registro</h2>
+<p>Complete o campo do <code>spec</code> que diz ao kubelet qual segredo usar para baixar a imagem do
+registro privado da padaria.</p>
+<div class="ex-code">spec:
+  <input aria-label="resposta 1" data-answer="imagePullSecrets" placeholder="...">:
+    - name: registry-padaria
+  containers:
+    - name: web
+      image: registry.padaria.local/cardapio:1.0</div>
+<p class="ex-dica">Dica: é uma lista de nomes de segredos do tipo <code>docker-registry</code>; fica no
+<code>spec</code> do pod, ao lado de <code>containers</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>ImagePullBackOff</code> é falha ao baixar a imagem, com espera crescente entre tentativas. O pod já
+tem nó; o que falta é a imagem chegar. O motivo exato está nos eventos do <code>describe</code>, numa linha
+<code>Failed to pull image</code> seguida de <code>ErrImagePull</code> e <code>ImagePullBackOff</code>.</p>
+
+<p>As causas se dividem em nome e permissão. Nome errado, tag que não existe e registro escrito errado dão
+<code>not found</code> e <code>manifest unknown</code>; registro privado sem credencial dá
+<code>unauthorized</code>, e o conserto é o segredo em <code>imagePullSecrets</code>. Um campo
+<code>image</code> vazio nem chega a virar pod: o <code>apply</code> recusa com <code>Required value</code>.</p>
+
+<p>Na próxima aula o pod já sobe — e morre. O status vira <code>CrashLoopBackOff</code> e a pergunta muda de
+lugar: não é mais “por que a imagem não veio?”, e sim “por que o programa está saindo?”. É lá que entram os
+logs e o código de saída.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>ErrImagePull</code> é a primeira falha; <code>ImagePullBackOff</code> é a mesma falha com
+  espera.</li>
+  <li>O motivo está nos eventos do <code>kubectl describe pod</code>, na linha <code>Failed to pull
+  image</code>.</li>
+  <li><code>not found</code> e <code>manifest unknown</code> = nome ou tag; <code>unauthorized</code> =
+  credencial.</li>
+  <li>Registro privado pede segredo <code>docker-registry</code> e <code>imagePullSecrets</code> no
+  <code>spec</code>.</li>
+  <li>Sem <code>image</code>, o <code>apply</code> recusa o objeto: é erro de validação, não de pull.</li>
+  <li>Tag fixa com <code>IfNotPresent</code> sobrevive a registro fora do ar; <code>latest</code> não.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

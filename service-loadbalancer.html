@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service LoadBalancer | Guia Kubernetes</title>
+<meta name="description" content="Service LoadBalancer na prática: pedir um IP público ao provedor, entender a coluna EXTERNAL-IP, ver o NodePort que existe por baixo e decidir quando cada serviço merece um.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Service <span class="hl">LoadBalancer</span></h1>
+<p class="intro">O NodePort resolveu o teste, mas o endereço que ficou para o cliente era
+<code>http://192.0.2.21:31655</code> — um IP de nó e uma porta de cinco dígitos. Na semana em que aquele nó
+foi drenado, o site saiu do ar para quem estava fora, mesmo com os pods rodando em outro nó. Nesta aula a Ana
+conhece o tipo <strong>LoadBalancer</strong>: o Service que pede ao provedor um endereço público estável, com
+a porta certa e um nome que ela pode mandar no grupo da família.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o tipo LoadBalancer pede ao cluster e quem atende esse pedido.</li>
+  <li>O que a coluna <code>EXTERNAL-IP</code> mostra — e por que ela pode ficar em
+  <code>&lt;pending&gt;</code>.</li>
+  <li>Que todo LoadBalancer é, por baixo, um NodePort com um IP público na frente.</li>
+  <li>Um IP por serviço exposto: o que isso custa e por que o Ingress existe.</li>
+  <li>Como conferir o endereço no <code>describe</code> e o que fazer em cluster sem provedor de nuvem.</li>
+  <li>Os tropeços: tipo sem provedor, firewall, health check e o endereço que muda.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o endereço que não dá para passar no grupo</h2>
+
+<p>Com o NodePort, o site da Ana ficou acessível — mas o endereço tinha três problemas. Era um IP de nó, que
+morre se o nó sair. Tinha uma porta alta e aleatória, que ninguém decora. E não dava para apontar um nome
+bonito para ele sem manter uma lista de IPs atualizada à mão. Para o padeiro testar, servia; para o cliente
+usar, não.</p>
+
+<p>O tipo <strong>LoadBalancer</strong> existe para transformar esse endereço em algo apresentável. A ideia é
+uma delegação: em vez de você escolher o nó e a porta, o Service pede — ao componente do cluster que conversa
+com o provedor — um endereço externo estável, que aponte para todos os nós ao mesmo tempo. Em nuvem, esse
+pedido vira um balanceador de verdade: um IP público, com a porta 80, que distribui as conexões entre os nós
+e, por consequência, entre os pods.</p>
+
+<p>É o tipo mais próximo de “só funciona” do Kubernetes, e também o mais dependente de onde o cluster está. Num
+cluster de nuvem, criar um Service LoadBalancer é questão de segundos e de alguns centavos por hora. Num
+cluster na sua máquina, sem provedor, o pedido fica sem resposta e o endereço nunca aparece — o que costuma
+ser a primeira decepção de quem estuda em casa.</p>
+
+<h2>2. O que é um LoadBalancer, na prática</h2>
+
+<p>O manifesto muda em uma linha: <code>type: LoadBalancer</code>. O que acontece por baixo é mais
+interessante. O cluster cria o ClusterIP (para o tráfego interno continuar funcionando), cria o NodePort (a
+porta em cada nó) e publica um pedido de <em>endereço externo</em>. Quem responde a esse pedido é o controlador
+do provedor — na nuvem, o serviço de balanceamento; num cluster caseiro, alguma ferramenta que faça esse
+papel.</p>
+
+<dl class="anatomy">
+<dt>type: LoadBalancer</dt>
+<dd>O tipo que pede um endereço externo. Inclui ClusterIP e NodePort: o Service passa a ter os três
+endereços.</dd>
+<dt>EXTERNAL-IP</dt>
+<dd>A coluna onde o endereço público aparece. Fica em <code>&lt;pending&gt;</code> enquanto ninguém
+atendeu ao pedido.</dd>
+<dt>provisionamento</dt>
+<dd>O trabalho de criar o balanceador fora do cluster e apontá-lo para os nós. Feito pelo provedor, não
+pelo Kubernetes.</dd>
+<dt>LoadBalancer Ingress</dt>
+<dd>A linha do <code>describe</code> que mostra o endereço entregue ao Service — o mesmo valor da
+coluna.</dd>
+<dt>health check</dt>
+<dd>A verificação que o balanceador faz nos nós para saber quem está vivo. Nó fora da resposta sai da
+rotação.</dd>
+</dl>
+
+<p>Repare na consequência prática: o cliente agora fala com <code>http://192.0.2.60</code> — sem porta, sem
+saber de nó, sem saber de pod. O balanceador recebe a conexão, escolhe um nó saudável, e o nó encaminha para um
+pod do Service. Se um nó cair, o balanceador para de mandar tráfego para ele. É a tolerância a falha que o
+NodePort não dava do lado de fora.</p>
+
+<p>E repare também no custo escondido: cada Service desse tipo costuma virar um balanceador separado, com um
+IP público separado. Cinco serviços expostos, cinco endereços, cinco cobranças. É por isso que aplicações com
+muitas rotas acabam migrando para o Ingress — um único ponto de entrada que decide, pelo nome do domínio, para
+qual Service mandar.</p>
+
+<h2>3. O manifesto do tipo LoadBalancer</h2>
+
+<p>A caixa abaixo transforma o Service do site em público. Note que o campo <code>nodePort</code> não aparece:
+o cluster escolhe uma porta livre para você, porque ela não é mais o endereço que o cliente usa — ela é
+detalhe interno do balanceador.</p>
+
+<div class="tryk8s" data-get="services" data-goal="campo:Service/cardapio|spec.type=LoadBalancer;;texto:192.0.2.">
+  <p class="try-task">Publique o site: mudar o tipo do Service para <code>LoadBalancer</code> e rodar. A
+  coluna <code>EXTERNAL-IP</code> tem de sair de <code>&lt;none&gt;</code> e mostrar um endereço.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+pod/web created
+service/cardapio created
+
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        80/TCP    2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: LoadBalancer
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>O painel do código inicial mostra <code>TYPE</code> em <code>ClusterIP</code> e
+<code>EXTERNAL-IP</code> em <code>&lt;none&gt;</code>. Depois da missão, o tipo vira
+<code>LoadBalancer</code> e a coluna ganha um endereço — no painel, <code>192.0.2.60</code>, um IP de
+documentação, do mesmo jeito que os nós usam <code>192.0.2.x</code>. Num cluster de nuvem, seria o IP público
+de verdade, entregue pelo provedor.</p>
+
+<p>Duas leituras importantes dessa tabela. A primeira: <code>CLUSTER-IP</code> continua preenchido. O Service
+não deixou de ser interno — quem está dentro do cluster pode continuar chamando
+<code>cardapio</code> na porta 80, sem passar pelo balanceador. A segunda: <code>PORT(S)</code> mostra
+<code>80/TCP</code>, e não a porta alta do nó. O cliente fala na 80; a porta do nó existe, mas é assunto
+interno.</p>
+
+<h2>4. O endereço que demora a aparecer</h2>
+
+<p>Entre o <code>apply</code> e o endereço aparecer existe um trabalho de fora do cluster: o provedor precisa
+criar o balanceador, reservar um IP, configurar as regras e apontar tudo para os nós do cluster. Isso leva de
+segundos a alguns minutos, e durante esse tempo a coluna fica em <code>&lt;pending&gt;</code>.</p>
+
+<p><code>&lt;pending&gt;</code> por um minuto é normal. <code>&lt;pending&gt;</code> por meia hora é sintoma.
+As causas se resumem a três: o cluster não tem provedor configurado (é o caso do cluster na sua máquina), o
+provedor recusou o pedido (cota, permissão, faixa de IPs esgotada), ou o controlador está fora do ar. O lugar
+de olhar é o <code>describe</code> do Service — os eventos no fim contam o que o controlador tentou — e os logs
+do controlador do provedor, quando você tem acesso a eles.</p>
+
+<p>Vale diferenciar os dois tempos. O objeto é criado na hora: o <code>apply</code> responde
+<code>service/cardapio created</code> e o Service já existe, com ClusterIP e NodePort. O que demora é o
+endereço de fora, porque ele não é criado pelo Kubernetes — é criado por um sistema que vive fora do cluster e
+que precisa conversar com a API para saber o que fazer. Essa separação explica por que apagar e recriar o
+Service costuma trocar o IP: o balanceador antigo é destruído e outro é pedido.</p>
+
+<p>No painel deste guia, o endereço aparece imediatamente: o motor modela um provedor que sempre atende. Isso é
+uma simplificação útil para estudar o manifesto, e vale dizer em voz alta: num cluster sem provedor, o seu
+Service LoadBalancer ficaria em <code>&lt;pending&gt;</code> para sempre, e o tráfego não sairia do lugar. Não
+é bug do Kubernetes; é falta de quem atenda o pedido.</p>
+
+<h2>5. Vendo o endereço no describe</h2>
+
+<p>O <code>kubectl describe service</code> mostra uma linha exclusiva desse tipo, depois do bloco de portas:
+<code>LoadBalancer Ingress</code>, com o endereço entregue. É a mesma informação da tabela, no lugar onde você
+também vê os endpoints e o seletor — o que faz do <code>describe</code> o comando único para conferir um Service
+público.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:service/cardapio exposed;;texto:LoadBalancer Ingress;;campo:Service/cardapio|spec.type=LoadBalancer">
+  <p class="try-task">Publique o site com <code>kubectl expose</code>, usando as portas 80 e 8080 e o tipo
+  <code>LoadBalancer</code>. Depois descreva o Service e encontre a linha do endereço.</p>
+<pre class="yaml">kubectl expose deployment cardapio --port=80 --target-port=8080
+kubectl describe service cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl expose deployment cardapio --port=80 --target-port=8080
+service/cardapio exposed
+
+ana@notebook:~$ kubectl describe service cardapio
+Name:             cardapio
+Namespace:        default
+Labels:           &lt;none&gt;
+Annotations:      &lt;none&gt;
+Selector:         app=cardapio
+Type:             ClusterIP
+IP Family Policy: SingleStack
+IP Families:      IPv4
+IP:               10.96.147.79
+IPs:              10.96.147.79
+Port:             80/TCP
+TargetPort:       8080/TCP
+Endpoints:        10.244.111.241:8080,10.244.56.236:8080
+Session Affinity: None
+Events:  &lt;none&gt;
+</pre>
+  <pre class="solucao">kubectl expose deployment cardapio --port=80 --target-port=8080 --type=LoadBalancer
+kubectl describe service cardapio</pre>
+</div>
+
+<p>O painel do código inicial mostra o Service criado como <code>ClusterIP</code>: o <code>describe</code> traz
+seletor, IP, porta, <code>TargetPort</code>, <code>Endpoints</code> e nenhuma linha de ingress. Depois da
+missão, aparece <code>LoadBalancer Ingress: 192.0.2.60</code>, e o tipo muda para <code>LoadBalancer</code>. É
+esse valor que vai para o DNS da padaria, num registro do tipo A.</p>
+
+<p>Um detalhe de vocabulário que ajuda a ler documentação: “ingress” aqui não tem relação com o objeto
+<code>Ingress</code>. A linha significa “entrada do balanceador” — o endereço por onde o tráfego entra. O
+objeto Ingress é outro recurso, que faz roteamento por nome de domínio e conversa com os Services por baixo.
+Dois conceitos, uma palavra, e uma confusão que aparece em toda conversa sobre o assunto.</p>
+
+<h2>6. Por baixo, um NodePort — e um por serviço</h2>
+
+<p>Como o LoadBalancer é construído sobre o NodePort, os dois convivem no mesmo objeto. Se você declarar
+<code>nodePort</code>, ele é respeitado; se não, o cluster escolhe. A caixa abaixo mostra o outro lado dessa
+história: cada Service público ganha o <strong>seu</strong> endereço, e o segundo já custa o segundo
+balanceador.</p>
+
+<div class="tryk8s" data-get="services" data-goal="campo:Service/admin|spec.type=LoadBalancer;;campo:Service/admin|spec.ports.0.nodePort=30080;;conta:services=2;;texto:192.0.2.">
+  <p class="try-task">O site já está publicado; falta o painel de administração. Crie o Service
+  <code>admin</code>, do tipo <code>LoadBalancer</code>, escutando na 80 e entregando na 8080 com a porta de nó
+  <code>30080</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: LoadBalancer
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+pod/web created
+service/cardapio created
+
+NAME       TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio   LoadBalancer   10.96.147.79   192.0.2.60    80/TCP    2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: LoadBalancer
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin
+spec:
+  type: LoadBalancer
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080</pre>
+</div>
+
+<p>O painel do código inicial mostra um único Service na tabela. Depois, dois: <code>cardapio</code> e
+<code>admin</code>, cada um com o seu <code>EXTERNAL-IP</code> e o <code>admin</code> com
+<code>80:30080/TCP</code> na coluna de portas. São dois endereços públicos para o mesmo conjunto de pods —
+útil para separar o site do painel, e caro do jeito que parece: dois balanceadores.</p>
+
+<p>Com dois Services públicos, a tabela passa a ter duas linhas de endereço — e é isso que a Ana queria
+ver para decidir:</p>
+
+<pre class="term">NAME       TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+admin      LoadBalancer   10.96.187.157   192.0.2.70    80:30080/TCP   2m
+cardapio   LoadBalancer   10.96.147.79    192.0.2.60    80/TCP         3m</pre>
+
+<p>A transcrição acima é a resposta do painel para os dois Services do site: endereços externos diferentes,
+portas de nó diferentes (uma declarada, outra sorteada), e o mesmo conjunto de pods atendendo aos dois. Cada
+linha dessas é um balanceador cobrado à parte — o que explica por que o time da Ana acabou migrando para um
+único ponto de entrada.</p>
+
+<pre class="term">NAME      TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+interno   ClusterIP      10.96.43.182    &lt;none&gt;        80/TCP         3m
+no-no     NodePort       10.96.63.94     &lt;none&gt;        80:30080/TCP   1m
+publico   LoadBalancer   10.96.194.102   192.0.2.117   80/TCP         7m</pre>
+
+<p>A transcrição acima é a resposta do painel para três Services apontando para os mesmos pods, um de cada
+tipo. A comparação é o melhor resumo da família: o interno não tem endereço externo; o NodePort tem uma porta
+alta no nó; o LoadBalancer tem um endereço público e nenhuma porta aparente. Todos os três entregam no mesmo
+lugar — a diferença está em quem consegue chegar.</p>
+
+<h2>7. Cluster sem provedor de nuvem</h2>
+
+<p>Se o cluster está numa máquina sua, ninguém vai criar balanceador nenhum: o pedido fica pendente. Para
+estudar e para rodar em servidor próprio, existem controladores que fazem esse papel dentro do cluster — o mais
+conhecido é o MetalLB, que reserva uma faixa de IPs da sua rede e a entrega aos Services públicos, anunciando
+esses endereços na rede local. Com ele, um Service LoadBalancer passa a ter <code>EXTERNAL-IP</code> em
+segundos, num cluster de três máquinas.</p>
+
+<p>Há uma alternativa quando você não quer instalar nada: trocar o tipo por NodePort e usar o endereço do nó.
+Foi o que a Ana fez na aula passada, e funciona — só não é o endereço que se manda para o cliente. E há uma
+terceira, cada vez mais comum: deixar os Services como ClusterIP e expor tudo por um Ingress, que ganha um
+único endereço externo e roteia por nome. Nesse desenho, o LoadBalancer aparece uma vez só, no controlador do
+Ingress.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sem provedor de nuvem</th><th>Como funciona</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td>ficar no NodePort</td><td>endereço é <code>http://IP-DO-NÓ:nodePort</code></td><td>teste e acesso
+interno; não serve como endereço de cliente</td></tr>
+<tr><td>controlador local (MetalLB)</td><td>reserva uma faixa da sua rede e entrega aos Services do tipo
+LoadBalancer</td><td>cluster próprio, com IPs que a rede conhece</td></tr>
+<tr><td>Ingress com um LoadBalancer só</td><td>um endereço externo na frente de vários Services
+ClusterIP</td><td>várias rotas ou domínios no mesmo cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um ajuste que vale conhecer antes de o tráfego crescer: <code>externalTrafficPolicy</code>. No valor
+padrão, qualquer nó pode receber a conexão e encaminhar para um pod de outro nó — bom para disponibilidade,
+ruim para o IP de origem, que se perde no caminho. No valor <code>Local</code>, o nó só encaminha para pods
+dele mesmo: o IP do cliente chega inteiro, mas um nó sem pod não responde. É escolha de configuração, e a
+diferença aparece nos logs da aplicação e nas regras de firewall.</p>
+
+<h2>8. Os tropeços do LoadBalancer</h2>
+
+<p>O primeiro é o <code>&lt;pending&gt;</code> eterno, quase sempre por falta de provedor. O segundo é o
+firewall do provedor: o balanceador existe, o IP aparece, e a porta 80 não está liberada no grupo de
+segurança — o cliente vê tempo esgotado. O terceiro é o health check mal configurado, que marca todos os nós
+como fora e deixa o endereço sem resposta mesmo com tudo verde no <code>get services</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Onde olhar</th><th>Causa provável</th></tr>
+</thead>
+<tbody>
+<tr><td><code>EXTERNAL-IP</code> em <code>&lt;pending&gt;</code></td><td>eventos do
+<code>describe service</code></td><td>cluster sem provedor, cota estourada ou controlador fora</td></tr>
+<tr><td>IP aparece, conexão expira</td><td>regras de firewall do provedor</td><td>porta não liberada ou
+health check reprovando os nós</td></tr>
+<tr><td>responde na 80 e não na 443</td><td><code>spec.ports</code></td><td>a porta 443 não está declarada (e
+TLS tem aula própria)</td></tr>
+<tr><td>IP de origem sempre igual</td><td><code>externalTrafficPolicy</code></td><td>tráfego passando de nó
+para nó antes de chegar ao pod</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a conta do fim do mês</h3>
+<p>A Ana publicou o site, o painel, a API de pedidos e o serviço de relatórios, cada um como LoadBalancer.
+Funcionou por dois meses, até a fatura mostrar quatro balanceadores ligados dia e noite — inclusive o de
+relatórios, usado uma vez por semana. A correção foi deixar um único ponto de entrada (Ingress) e manter os
+demais como ClusterIP.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o endereço que o cliente guardou</h3>
+<p>O IP público entrou no panfleto da padaria. Seis meses depois, o time recriou o Service para mudar a porta
+de destino, e o IP mudou — porque o balanceador é recriado junto. Os panfletos ficaram errados da noite para o
+dia. A lição: o cliente deve conhecer um nome DNS, e o registro aponta para o endereço; assim a troca de IP não
+aparece para ninguém.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o cluster do escritório</h3>
+<p>Na filial, o cluster roda em três máquinas sem provedor de nuvem. Todo Service LoadBalancer ficava em
+<code>&lt;pending&gt;</code>. A solução foi instalar um controlador de balanceamento local, reservar uma faixa
+de IPs da rede interna e apontar o DNS da padaria para o endereço que ele entrega. O manifesto não mudou uma
+linha: continuou <code>type: LoadBalancer</code>.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que o tipo LoadBalancer acrescenta ao Service?</p>
+<label><input type="radio" name="q1"> um IP fixo para cada pod</label>
+<label><input type="radio" name="q1"> uma cópia do site em outro cluster</label>
+<label><input type="radio" name="q1"> um endereço externo estável, entregue por um provedor ou
+controlador</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. <code>EXTERNAL-IP</code> em <code>&lt;pending&gt;</code>
+por muito tempo significa:</p>
+<label><input type="radio" name="q2"> que ninguém atendeu ao pedido de endereço externo</label>
+<label><input type="radio" name="q2"> que os pods estão com problema</label>
+<label><input type="radio" name="q2"> que o seletor não casa</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Por baixo, um Service LoadBalancer também é…</p>
+<label><input type="radio" name="q3"> um Service do tipo ExternalName</label>
+<label><input type="radio" name="q3"> um ClusterIP com um NodePort, mais o endereço externo</label>
+<label><input type="radio" name="q3"> um pod especial chamado load-balancer</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o tipo do Service público</h2>
+<p>Complete o manifesto para o site da padaria ganhar um endereço externo:</p>
+<div class="ex-code">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  <input aria-label="resposta 1" data-answer="type: LoadBalancer|type:LoadBalancer" placeholder="...">
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</div>
+<p class="ex-dica">Dica: é o campo que muda o comportamento do Service; sem ele, o padrão é ClusterIP.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>LoadBalancer é o tipo de Service que pede um endereço externo estável. O Kubernetes cria o ClusterIP e o
+NodePort e publica um pedido; quem cria o balanceador de verdade é o provedor (ou um controlador que faça esse
+papel, como o MetalLB). Enquanto ninguém atende, a coluna <code>EXTERNAL-IP</code> fica em
+<code>&lt;pending&gt;</code>.</p>
+
+<p>No cliente, a diferença é grande: em vez de <code>http://192.0.2.21:31655</code>, ele usa
+<code>http://192.0.2.60</code> — sem porta, sem nó, com o balanceador cuidando de tirar da rotação quem não
+responde. No <code>describe</code>, o endereço aparece na linha <code>LoadBalancer Ingress</code>.</p>
+
+<p>O custo é por serviço: cada Service público vira um balanceador, com o seu IP. Para uma aplicação com
+muitas rotas, o desenho melhor é um único ponto de entrada — o Ingress — com os serviços internos como
+ClusterIP. E o endereço que o cliente guarda deve ser sempre um nome DNS, nunca o IP.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>type: LoadBalancer</code> pede um endereço externo; por baixo há ClusterIP e NodePort.</li>
+  <li><code>&lt;pending&gt;</code> é pedido sem resposta: falta provedor, cota ou controlador.</li>
+  <li>O cliente usa o IP público na porta do Service, sem porta alta e sem nó.</li>
+  <li><code>LoadBalancer Ingress</code> no <code>describe</code> é o endereço entregue.</li>
+  <li>Cada Service público custa um balanceador: prefira um Ingress na frente de vários serviços.</li>
+  <li>Aponte um nome DNS para o endereço; o IP muda quando o Service é recriado.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

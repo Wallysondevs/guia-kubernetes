@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liveness probe | Guia Kubernetes</title>
+<meta name="description" content="Liveness probe no Kubernetes: como o kubelet descobre que o container travou, os tipos httpGet, tcpSocket e exec, os tempos que decidem o reinício e como não criar um loop.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Liveness probe</span></h1>
+<p class="intro">O cardápio da padaria da Ana travou numa quinta-feira: o processo continuava de pé, o
+Service continuava mandando tráfego, e toda requisição ficava pendurada. Não havia erro, não havia reinício,
+não havia log — porque o programa não tinha morrido; ele só tinha parado de responder. A Ana reiniciou o pod à
+mão e tudo voltou, mas ela não queria repetir isso às três da manhã. Quem só reinicia processo morto não
+resolve processo travado: é para isso que existe a liveness probe, uma pergunta periódica que o kubelet faz ao
+container e que, quando a resposta é “não”, termina em reinício.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que a liveness probe pergunta e o que ela faz quando a resposta é ruim.</li>
+  <li>Os três tipos de verificação: <code>httpGet</code>, <code>tcpSocket</code> e <code>exec</code>.</li>
+  <li>Os tempos que decidem quando o container é considerado morto.</li>
+  <li>Por que uma liveness mal escolhida transforma lentidão em reinício.</li>
+  <li>Como ler <code>Liveness</code>, <code>Restart Count</code> e os eventos no <code>describe</code>.</li>
+  <li>Quando a resposta certa é <em>não</em> ter liveness — e usar readiness no lugar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o processo que não morre</h2>
+
+<p>O cardápio é um servidor HTTP pequeno. Numa quinta-feira, uma consulta pesada ao banco travou uma trava
+interna e o processo ficou parado, esperando para sempre. O container continuou <code>Running</code>, o pod
+continuou <code>1/1</code>, o Service continuou mandando requisições. Cada cliente esperava até desistir. A Ana
+reiniciou o pod à mão e tudo voltou — mas ela não estava acordada às três da manhã do dia seguinte.</p>
+
+<p>O Kubernetes só reinicia container que <em>sai</em>. Se o processo está travado, para o cluster ele está
+vivo: o estado é <code>Running</code>, não há código de saída, não há evento. É uma limitação importante da
+analogia com “manter o site no ar”: o cluster mantém o processo, não a função.</p>
+
+<p>A liveness probe fecha essa lacuna. Você declara uma verificação simples — uma URL, uma porta ou um
+comando — e o kubelet a repete de tempos em tempos. Se ela falhar vezes seguidas, o kubelet mata o container e
+o reinicia, conforme a política do pod. O processo travado passa a ter quem o derrube, e o cliente deixa de
+esperar.</p>
+
+<h2>2. Vivo, pronto e iniciando: três perguntas diferentes</h2>
+
+<p>Antes do YAML, vale separar três perguntas que parecem a mesma e não são. “Está vivo?” é a liveness: se a
+resposta for não, o container é reiniciado. “Pode receber tráfego?” é a readiness: se a resposta for não, o pod
+sai dos endpoints e o Service para de mandar requisições, sem reiniciar nada. “Já terminou de iniciar?” é a
+startup: enquanto ela não passa, as outras duas nem são avaliadas.</p>
+
+<dl class="anatomy">
+<dt>livenessProbe</dt>
+<dd>A verificação de vida. Falhou o limite de vezes, o kubelet mata e reinicia o container.</dd>
+<dt>httpGet</dt>
+<dd>Faz uma requisição HTTP no pod e considera sucesso quando o código é 200 a 399.</dd>
+<dt>tcpSocket</dt>
+<dd>Tenta abrir uma conexão TCP na porta. Sucesso é a conexão abrir — não importa o que vem depois.</dd>
+<dt>exec</dt>
+<dd>Roda um comando dentro do container. Sucesso é sair com código zero.</dd>
+<dt>periodSeconds</dt>
+<dd>De quanto em quanto tempo a verificação roda. Padrão: 10 segundos.</dd>
+<dt>failureThreshold</dt>
+<dd>Quantas falhas seguidas antes de agir. Padrão: 3.</dd>
+<dt>initialDelaySeconds</dt>
+<dd>Quanto esperar depois do início do container antes da primeira verificação.</dd>
+<dt>timeoutSeconds</dt>
+<dd>Quanto esperar pela resposta antes de contar falha. Padrão: 1 segundo.</dd>
+<dt>restartPolicy</dt>
+<dd>A regra de reinício do pod. Com <code>Never</code>, o container não volta depois de morto pela probe.</dd>
+</dl>
+
+<p>Repare que a liveness não olha para o conteúdo da resposta: um <code>500</code> conta como falha, um
+<code>200</code> com a página de erro dentro conta como sucesso. Ela é uma pergunta grosseira, de propósito —
+“o processo ainda responde?” — e não um teste funcional. Quem tenta fazer dela um teste de qualidade acaba
+criando reinícios por qualquer coisa.</p>
+
+<h2>3. A caixa: a verificação no caminho errado</h2>
+
+<p>O erro mais comum é apontar a probe para um caminho que não existe. O servidor da padaria expõe
+<code>/saude</code>; o manifesto pede <code>/health</code>. O <code>apply</code> aceita, o pod sobe, e a partir
+do primeiro período o kubelet começa a receber 404 — que conta como falha, como qualquer código fora de
+200–399.</p>
+
+<div class="tryk8s" data-get="pod cardapio -o yaml" data-goal="campo:Pod/cardapio|spec.containers.0.livenessProbe.httpGet.path=/saude">
+  <p class="try-task">A probe pede <code>/health</code>, mas o programa responde em <code>/saude</code>.
+  Corrija o caminho e rode: o painel mostra o pod em YAML, com a probe no lugar certo.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 10</pre>
+<pre class="out">
+pod/cardapio created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      name: web
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.3.71
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 10</pre>
+</div>
+
+<p>O painel não executa a verificação: ele aplica o manifesto e mostra o objeto em YAML, onde a probe aparece
+inteira. O comportamento — 404, falha, reinício — é o que as transcrições desta aula mostram, sempre
+identificadas. Vale a distinção: o manifesto é conferível em segundos; o efeito da probe depende do programa
+estar rodando de verdade.</p>
+
+<p>Na prática, o <code>/health</code> errado produz um sintoma bem específico: o pod fica
+<code>Running</code>, começa a reiniciar de tempos em tempos, e o log do programa não tem erro nenhum — porque
+o programa está bem, quem o mata é o kubelet. É a assinatura de uma probe mal apontada, e ela confunde porque
+o log parece inocente.</p>
+
+<h2>4. A caixa: o campo com o nome errado</h2>
+
+<p>O segundo erro é pior porque é silencioso. Escrever <code>livenessProb</code> — sem o “e” final — não gera
+erro: o Kubernetes ignora campos que não conhece e cria o pod sem verificação nenhuma. O resultado é um pod
+que parece protegido e não é.</p>
+
+<div class="tryk8s" data-get="pod cardapio -o yaml" data-goal="campo:Pod/cardapio|spec.containers.0.livenessProbe.httpGet.path=/saude">
+  <p class="try-task">O campo está escrito <code>livenessProb</code> e por isso é ignorado. Corrija o nome para
+  <code>livenessProbe</code> e rode: a probe tem de aparecer no YAML do pod.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      livenessProb:
+        httpGet:
+          path: /saude
+          port: 8080</pre>
+<pre class="out">
+pod/cardapio created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      livenessProb:
+        httpGet:
+          path: /saude
+          port: 8080
+      name: web
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.3.71
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /saude
+          port: 8080</pre>
+</div>
+
+<p>Antes da correção, o YAML do painel mostra o container só com imagem e portas — nenhum rastro da probe. É a
+melhor forma de conferir que ela existe: <code>kubectl get pod nome -o yaml</code> e procure por
+<code>livenessProbe</code>. Se não estiver lá, o campo está errado, e nenhum aviso vai te contar.</p>
+
+<p>Esse comportamento não é descuido do Kubernetes: a API aceita campos extras para permitir evolução e
+anotações de ferramentas. O efeito colateral é que erro de digitação em campo conhecido vira omissão
+silenciosa. Vale a regra: sempre que um campo parecer “não fazer efeito”, confira no objeto aplicado, não no
+arquivo da sua pasta.</p>
+
+<h2>5. A caixa: a porta que ninguém escuta</h2>
+
+<p>A terceira variação do mesmo problema é a porta. O container escuta em 8080, a probe bate em 8081. A conexão
+é recusada na hora, a falha conta, e depois de três tentativas o kubelet mata um container perfeitamente
+saudável. A caixa tem esse caso.</p>
+
+<div class="tryk8s" data-get="pod cardapio -o yaml" data-goal="campo:Pod/cardapio|spec.containers.0.livenessProbe.httpGet.port=8080">
+  <p class="try-task">A probe bate na porta 8081 e o programa escuta em 8080. Corrija a porta da probe e
+  rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /saude
+          port: 8081
+        initialDelaySeconds: 5</pre>
+<pre class="out">
+pod/cardapio created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      livenessProbe:
+        httpGet:
+          path: /saude
+          port: 8081
+        initialDelaySeconds: 5
+      name: web
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.3.71
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        initialDelaySeconds: 5</pre>
+</div>
+
+<p>Quando o container tem mais de uma porta, dá para usar o nome em vez do número: <code>port: http</code>,
+apontando para o <code>name</code> do <code>containerPort</code>. Fica mais resistente a mudança de número, e
+o erro de digitação passa a ser de nome — que também falha, mas é mais fácil de ver no manifesto.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tipo</th><th>Sucesso quando</th><th>Bom para</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>httpGet</code></td><td>a resposta tem código 200–399</td><td>serviços HTTP, o caso da
+maioria</td><td>404 e 500 contam como falha, mesmo que o programa esteja bem</td></tr>
+<tr><td><code>tcpSocket</code></td><td>a conexão TCP abre</td><td>bancos, filas e protocolos não
+HTTP</td><td>prova só que a porta escuta; processo travado com socket aberto passa</td></tr>
+<tr><td><code>exec</code></td><td>o comando sai com código 0</td><td>programas sem porta de rede ou que
+escrevem um arquivo de saúde</td><td>cada checagem cria um processo dentro do container</td></tr>
+<tr><td><code>grpc</code></td><td>o serviço de saúde gRPC responde</td><td>serviços gRPC com o protocolo de
+saúde padrão</td><td>exige implementação do lado do programa</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma dica de escolha: se o programa é HTTP, prefira <code>httpGet</code>, porque ele exercita o mesmo caminho
+que o cliente usa. <code>tcpSocket</code> só prova que a porta aceita conexão; um servidor travado mas com o
+socket aberto passa nesse teste. <code>exec</code> é útil quando o programa não fala HTTP nem tem porta de
+rede — mas cuidado: cada verificação cria um processo dentro do container.</p>
+
+<h2>6. Os tempos que decidem a morte</h2>
+
+<p>A probe não age na primeira falha. O kubelet espera <code>failureThreshold</code> falhas seguidas, e cada
+tentativa respeita <code>timeoutSeconds</code> e o intervalo de <code>periodSeconds</code>. Com os valores
+padrão, um container pode levar até trinta segundos para ser declarado morto — tempo em que o cliente espera.
+A tabela abaixo é o que cada campo faz e o que ele custa.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Padrão</th><th>Efeito de aumentar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>initialDelaySeconds</code></td><td>0</td><td>dá mais tempo para o programa subir antes da
+primeira checagem</td></tr>
+<tr><td><code>periodSeconds</code></td><td>10</td><td>detecta a falha mais devagar, e gasta menos</td></tr>
+<tr><td><code>timeoutSeconds</code></td><td>1</td><td>tolera respostas lentas sem contar falha</td></tr>
+<tr><td><code>failureThreshold</code></td><td>3</td><td>exige mais falhas seguidas para agir</td></tr>
+<tr><td><code>successThreshold</code></td><td>1</td><td>só faz sentido em readiness; em liveness, mantenha
+1</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A conta que importa: tempo até a ação é, no pior caso, <code>(failureThreshold × (periodSeconds +
+timeoutSeconds))</code>. Com os padrões, três tentativas de até onze segundos cada — cerca de trinta e três
+segundos. Diminuir o período acelera a detecção e aumenta o custo; aumentar o limite evita falso positivo e
+atrasa o socorro. Não existe valor universal: existe o valor que o seu programa comporta.</p>
+
+<p>O erro clássico de produção é usar <code>initialDelaySeconds</code> pequeno numa aplicação que demora a
+subir. O programa leva quarenta segundos carregando cache, a probe começa aos cinco, falha três vezes em quinze
+segundos, e o kubelet mata o container — que reinicia do zero e precisa de mais quarenta. O resultado é um loop
+de reinício que nunca deixa o programa terminar de iniciar. É o <code>CrashLoopBackOff</code> causado por
+probe, e o conserto costuma ser <code>startupProbe</code> ou um atraso maior.</p>
+
+<h2>7. O que aparece no describe</h2>
+
+<p>Quando a liveness age, o cluster registra. O lugar é o de sempre: o <code>describe</code> do pod. Esta é uma
+transcrição de cluster real, de um container que travou e foi reiniciado pela probe:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe pod cardapio
+Name:         cardapio
+Namespace:    default
+Node:         guia-worker/192.0.2.21
+Status:       Running
+IP:           10.244.3.71
+
+Containers:
+  web:
+    Image:          cardapio:1.0
+    Port:           8080/TCP
+    State:          Running
+      Started:      Fri, 27 Nov 2026 09:41:03 +0000
+    Last State:     Terminated
+      Reason:       Error
+      Exit Code:    137
+    Ready:          True
+    Restart Count:  2
+    Liveness:       http-get http://:8080/saude delay=5s timeout=1s period=10s #success=1 #failure=3
+
+Events:
+  Type     Reason     Age   From     Message
+  ----     ------     ----  ----     -------
+  Warning  Unhealthy  2m    kubelet  Liveness probe failed: Get "http://10.244.3.71:8080/saude": context deadline exceeded
+  Normal   Killing    2m    kubelet  Container web failed liveness probe, will be restarted</pre>
+
+<p>Três informações resolvem o caso. A linha <code>Liveness</code> mostra a probe como o kubelet a entendeu:
+caminho, porta, atraso, timeout, período e limites. O evento <code>Unhealthy</code> traz o erro exato da
+verificação — aqui, um timeout. E <code>Restart Count: 2</code> confirma que a morte foi provocada, não
+espontânea.</p>
+
+<p>O <code>Exit Code: 137</code> é a assinatura de morte por sinal: 128 + 9, o <code>SIGKILL</code> que o
+kubelet manda depois de pedir educadamente. Você vai ver 137 também em <code>OOMKilled</code>, e a diferença
+está no bloco <code>Reason</code>: <code>OOMKilled</code> quando foi memória, <code>Error</code> quando foi
+probe ou falha do processo.</p>
+
+<p>Esta segunda transcrição mostra o mesmo caso pelo ângulo da tabela, que é como a Ana percebeu o problema:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS      AGE
+cardapio-5cbfb4c44d-4jjxx   1/1     Running   0             6h
+cardapio-6d7f9c8b5-2xk4p    1/1     Running   4 (3m ago)    22m</pre>
+
+<p>O primeiro pod tem seis horas e zero reinícios. O segundo tem vinte e dois minutos e quatro reinícios, o
+último há três minutos. Um <code>RESTARTS</code> que sobe com <code>READY 1/1</code> é a marca de um container
+que funciona e é morto periodicamente — probe, limite de memória ou desligamento forçado. Se o pod ficasse
+<code>0/1</code>, a suspeita mudaria para readiness.</p>
+
+<h2>8. Quando não ter liveness</h2>
+
+<p>Ter liveness não é sinal de maturidade. Em muitos casos ela causa mais estrago do que ajuda, porque
+transforma qualquer lentidão em reinício — e reinício nunca conserta dependência lenta. Se o banco demora, o
+programa reinicia, e a fila de reinícios aumenta sem resolver nada.</p>
+
+<p>A regra prática: a liveness deve verificar apenas o que o reinício conserta. Processo travado, memória
+corrompida, estado interno inconsistente — reiniciar ajuda. Dependência externa fora do ar, fila cheia, cache
+frio — reiniciar não ajuda, e a ferramenta certa é a readiness, que tira o pod do tráfego sem matá-lo.</p>
+
+<p>Outro cuidado: nunca coloque na liveness uma verificação que dependa de outro serviço. Se a probe chama o
+banco, uma queda do banco reinicia todos os pods do cardápio ao mesmo tempo — e quando o banco volta, o cluster
+está no meio de um ciclo de reinícios que pode levar minutos para se estabilizar. A liveness deve olhar só para
+dentro do processo.</p>
+
+<p>E existe o caso de não ter probe nenhuma, que é legítimo em serviço simples que nunca trava. Nesse caso, o
+cluster ainda reinicia o container quando o processo sai — o <code>restartPolicy</code> continua valendo. A
+probe só acrescenta a detecção de travamento, e cada acréscimo tem preço.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o loop de reinício que a probe criou</h3>
+<p>Uma versão nova do cardápio passou a carregar o catálogo inteiro na memória ao iniciar, e isso levou
+cinquenta segundos. A liveness esperava cinco e dava três falhas em quinze. O pod reiniciava antes de terminar
+de subir, para sempre. O conserto foi uma <code>startupProbe</code> com limite de dois minutos: enquanto ela não
+passa, a liveness não é avaliada, e o programa ganha tempo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o 500 que reiniciava um serviço saudável</h3>
+<p>A probe apontava para <code>/cardapio</code>, que consultava o banco. Quando o banco ficou lento, a página
+passou a responder 500 em dois segundos, e o kubelet interpretou como “morto”. Todos os pods reiniciaram juntos.
+O conserto foi apontar a probe para <code>/saude</code>, que só responde sobre o processo, e tirar a dependência
+do banco da conta.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o travamento que ninguém viu</h3>
+<p>Antes de configurar probe, o cardápio travou por seis horas numa madrugada e o cliente reclamou de manhã.
+Nenhum reinício, nenhum evento, log parado na última requisição. Depois da liveness com
+<code>timeoutSeconds: 2</code>, o mesmo travamento hipotético seria detectado em menos de um minuto, e o pod
+volveria sozinho antes de o primeiro cliente reclamar.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que a liveness probe faz quando falha o limite de
+vezes?</p>
+<label><input type="radio" name="q1"> tira o pod dos endpoints do Service</label>
+<label><input type="radio" name="q1"> mata o container e o reinicia conforme a política do pod</label>
+<label><input type="radio" name="q1"> apaga o pod e cria outro com nome novo</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual código HTTP conta como sucesso numa
+<code>httpGet</code>?</p>
+<label><input type="radio" name="q2"> somente 200</label>
+<label><input type="radio" name="q2"> 200 e 500, desde que responda</label>
+<label><input type="radio" name="q2"> de 200 a 399</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Onde ver a configuração que o kubelet entendeu e o motivo da
+última morte?</p>
+<label><input type="radio" name="q3"> no <code>describe</code> do pod, linhas <code>Liveness</code> e
+<code>Events</code></label>
+<label><input type="radio" name="q3"> no <code>kubectl get pods</code>, coluna <code>AGE</code></label>
+<label><input type="radio" name="q3"> no <code>kubectl get services</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: diga em que porta a probe bate</h2>
+<p>O programa escuta em 8080. Complete a porta da verificação de vida.</p>
+<div class="ex-code">livenessProbe:
+  httpGet:
+    path: /saude
+    <input aria-label="resposta 1" data-answer="port" placeholder="...">: 8080
+  initialDelaySeconds: 5</div>
+<p class="ex-dica">Dica: é o número da porta do container, dentro do bloco <code>httpGet</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>A liveness probe responde a uma pergunta só: “o processo ainda está vivo?”. Ela não testa qualidade, não
+testa dependência, não testa conteúdo. Falhou <code>failureThreshold</code> vezes seguidas, o kubelet mata o
+container e o reinicia — o que resolve travamento e não resolve lentidão alheia.</p>
+
+<p>Os três tipos são <code>httpGet</code>, <code>tcpSocket</code> e <code>exec</code>, e cada um responde por um
+caminho diferente. Os cinco tempos decidem quanto o cliente espera: atraso inicial, período, timeout, limite de
+falhas e limite de sucessos. E o <code>describe</code> mostra tudo: a probe como o kubelet a entendeu, o evento
+<code>Unhealthy</code> com o erro exato e o <code>Restart Count</code> que denuncia a morte provocada.</p>
+
+<p>Na próxima aula o assunto é a irmã dela, a readiness probe: a verificação que não mata ninguém, mas decide
+quem recebe tráfego — e que resolve justamente os casos em que reiniciar não adianta.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Liveness falhou → container morto e reiniciado; conta em <code>RESTARTS</code>.</li>
+  <li><code>httpGet</code> aceita 200–399; <code>tcpSocket</code> só abre conexão; <code>exec</code> espera
+  código zero.</li>
+  <li>Campo com nome errado (<code>livenessProb</code>) é ignorado sem aviso.</li>
+  <li>Probe na porta ou no caminho errado mata um container saudável.</li>
+  <li>Tempo até agir ≈ <code>failureThreshold × (periodSeconds + timeoutSeconds)</code>.</li>
+  <li>Não coloque dependência externa na liveness; para isso existe a readiness.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

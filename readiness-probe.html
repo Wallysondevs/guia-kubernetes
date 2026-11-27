@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Readiness probe | Guia Kubernetes</title>
+<meta name="description" content="Readiness probe: como o Kubernetes decide se um pod pode receber tráfego, por que o pod sai dos endpoints sem reiniciar e como configurar a verificação sem derrubar o site.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Readiness probe</span></h1>
+<p class="intro">Na primeira semana com o cardápio novo no ar, a Ana viu um erro que não fazia sentido: a cada
+publicação, alguns clientes recebiam “502 Bad Gateway” por uns quinze segundos, e depois tudo voltava ao
+normal. O pod estava <code>Running</code>, o log não tinha erro — só que o processo ainda estava carregando o
+catálogo quando o Service começou a mandar pedidos para ele. A readiness probe existe para responder uma
+pergunta só: este pod já pode receber tráfego? Enquanto a resposta for não, o pod fica de fora da lista de
+destinos, sem ser reiniciado.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>A diferença entre “está vivo” e “está pronto”, e o efeito de cada uma.</li>
+  <li>Como o pod sai e volta da lista de endpoints do Service.</li>
+  <li>Os três tipos de verificação e os campos que controlam quando o pod é considerado pronto.</li>
+  <li>O erro de validação que aparece quando um tempo é escrito como texto.</li>
+  <li>Como a readiness segura um rolling update até o pod novo estar de pé.</li>
+  <li>O que ler no <code>describe</code> e nos eventos quando o pod fica <code>0/1</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o pod que recebe pedido antes de estar pronto</h2>
+
+<p>O cardápio leva alguns segundos para subir: abre a conexão com o banco, carrega o catálogo, monta o cache de
+preços. Nesse intervalo, o processo já escuta na porta 8080 — mas qualquer requisição que chegue antes do fim
+do carregamento volta com erro ou fica pendurada até o cliente desistir.</p>
+
+<p>Para o Kubernetes, o pod está pronto no instante em que o container começa a rodar. Não existe “pronto” sem
+você declarar o que isso significa. Então o pod entra na lista de destinos do Service imediatamente, e o
+balanceador manda pedidos de verdade para um processo que ainda está se preparando. É exatamente esse o
+<code>502</code> que a Ana viu.</p>
+
+<p>A readiness probe resolve com uma verificação periódica: o kubelet pergunta “está pronto?” e, enquanto a
+resposta for não, o pod fica fora dos endpoints. Quando a resposta passa a ser sim, o pod entra. Se depois
+voltar a falhar — banco lento, cache frio, fila cheia — o pod sai de novo, sem reinício, sem perder o
+processo.</p>
+
+<h2>2. Vivo e pronto: duas perguntas, dois efeitos</h2>
+
+<p>A confusão mais comum é achar que readiness e liveness são a mesma coisa com nomes diferentes. Não são. Uma
+pergunta se o processo pode ser morto; a outra, se pode receber cliente. Os efeitos são opostos: a liveness
+reinicia, a readiness isola.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>Liveness</th><th>Readiness</th></tr>
+</thead>
+<tbody>
+<tr><td>Pergunta</td><td>o processo ainda está vivo?</td><td>pode receber tráfego agora?</td></tr>
+<tr><td>Quando falha</td><td>container morto e reiniciado</td><td>pod sai dos endpoints do Service</td></tr>
+<tr><td>Efeito em <code>RESTARTS</code></td><td>sobe a cada falha</td><td>não muda</td></tr>
+<tr><td>Efeito no <code>READY</code></td><td>pode ficar <code>1/1</code> entre reinícios</td><td>vira
+<code>0/1</code> enquanto falha</td></tr>
+<tr><td>Conserta o quê</td><td>travamento e estado inconsistente</td><td>falta de preparo e dependência
+lenta</td></tr>
+<tr><td>Pode depender do banco?</td><td>não — reiniciaria todo mundo junto</td><td>sim, com
+cuidado</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A última linha é a que mais rende discussão. Colocar o banco na liveness é perigoso: se o banco cai, todos
+os pods reiniciam ao mesmo tempo e o cluster entra num ciclo. Na readiness é aceitável, porque o efeito é só
+tirar o pod do tráfego — e isso é até desejável enquanto o banco não responde. Cuidado apenas com o caso
+extremo: se todos os pods falharem a readiness juntos, o Service fica sem destino nenhum e o cliente recebe
+erro de conexão em vez de uma página de espera.</p>
+
+<dl class="anatomy">
+<dt>readinessProbe</dt>
+<dd>A verificação de prontidão. Enquanto falha, o pod não entra na lista de destinos do Service.</dd>
+<dt>httpGet</dt>
+<dd>Requisição HTTP no pod. Sucesso é código 200 a 399 — inclusive 404 não conta como pronto.</dd>
+<dt>tcpSocket</dt>
+<dd>Tenta abrir uma conexão TCP na porta. Bom para bancos e protocolos que não falam HTTP.</dd>
+<dt>exec</dt>
+<dd>Roda um comando dentro do container. Sucesso é sair com código zero.</dd>
+<dt>successThreshold</dt>
+<dd>Quantos sucessos seguidos para o pod ser considerado pronto. Padrão: 1. Só faz sentido
+aqui.</dd>
+<dt>failureThreshold</dt>
+<dd>Quantas falhas seguidas para o pod sair dos endpoints. Padrão: 3.</dd>
+<dt>periodSeconds</dt>
+<dd>Intervalo entre verificações. Padrão: 10 segundos.</dd>
+<dt>endpoints</dt>
+<dd>A lista de IPs e portas que o Service usa como destino. Só entra pod com <code>Ready</code>
+verdadeiro.</dd>
+</dl>
+
+<p>Uma consequência prática de <code>successThreshold</code> existir só na readiness: ali você pode exigir
+duas ou três respostas boas seguidas antes de liberar tráfego, o que evita entrar e sair da lista por causa de
+uma resposta isolada. Na liveness esse campo tem de ser 1, porque exigir sucessos para “continuar vivo” não
+faz sentido.</p>
+
+<h2>3. A caixa: o tempo escrito como texto</h2>
+
+<p>O primeiro erro é de digitação e a API pega na hora. Tempos em Kubernetes são números inteiros de segundos.
+Escrever <code>"5"</code>, entre aspas, transforma o valor em texto e o manifesto é recusado — com uma
+mensagem clara, o que é uma sorte.</p>
+
+<div class="tryk8s" data-get="pod cardapio -o yaml" data-goal="campo:Pod/cardapio|spec.containers.0.readinessProbe.initialDelaySeconds=5">
+  <p class="try-task">O <code>initialDelaySeconds</code> está entre aspas. Tire as aspas e rode: o pod tem de
+  ser criado, com o número no lugar do texto.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        initialDelaySeconds: "5"
+        periodSeconds: 5</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.containers[0].readinessProbe.initialDelaySeconds: Invalid value: must be an integer
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 5</pre>
+</div>
+
+<p>A mensagem aponta o caminho completo do campo:
+<code>The Pod "cardapio" is invalid: spec.containers[0].readinessProbe.initialDelaySeconds: Invalid value: must
+be an integer</code>. Ela é longa de propósito: em manifesto com várias camadas, o caminho é o que diz onde
+está o problema. Aprender a ler esse caminho vale mais do que decorar mensagens.</p>
+
+<p>O mesmo vale para <code>periodSeconds</code>, <code>timeoutSeconds</code>,
+<code>failureThreshold</code> e <code>successThreshold</code>. Todos são inteiros. Já os campos de caminho,
+porta e comando aceitam texto e número, e a confusão ali não gera erro — gera comportamento estranho, como
+veremos adiante.</p>
+
+<h2>4. A caixa: a readiness no Deployment</h2>
+
+<p>Na vida real a probe não fica num pod solto: ela vive no <code>template</code> do Deployment, e todo pod
+criado a partir dali herda a verificação. Esta caixa tem duas réplicas e a probe no caminho errado,
+<code>/health</code>. Corrija para <code>/saude</code> e rode.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="pronto:Deployment/cardapio=2;;campo:Deployment/cardapio|spec.template.spec.containers.0.readinessProbe.httpGet.path=/saude">
+  <p class="try-task">O Deployment tem de ficar com duas réplicas prontas e a probe apontando para
+  <code>/saude</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-pdqgfvvcw6-l9s46   1/1     Running   0          1m
+cardapio-pdqgfvvcw6-trrpk   1/1     Running   0          8m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /saude
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5</pre>
+</div>
+
+<p>O manifesto com <code>/health</code> é aceito, os pods sobem, e cada um leva um <code>404</code> a cada
+cinco segundos. O painel mostra os dois pods em <code>Running</code> porque ele aplica manifesto, não executa
+container — o efeito da probe é o que as transcrições desta aula mostram. Vale notar a diferença entre
+“aplicado” e “funcionando”: o cluster só descobre que a probe está errada quando o programa responde.</p>
+
+<p>Com a probe certa, os pods entram na lista de destinos e o serviço começa a receber pedidos. Se você
+publicar uma versão nova, o Deployment não considera o pod novo disponível antes de ele ficar pronto — e é
+isso que impede o <code>502</code> da primeira seção. Um pod que nunca fica pronto trava o rollout; um pod que
+demora apenas atrasa.</p>
+
+<h2>5. A caixa: a porta que ninguém escuta</h2>
+
+<p>Nem todo serviço fala HTTP. O banco de preços da padaria, por exemplo, só aceita conexão TCP. Para ele, a
+verificação natural é <code>tcpSocket</code> — e o erro clássico é a porta. O container escuta em 8080, a probe
+tenta 8081 e o pod fica eternamente fora do ar.</p>
+
+<div class="tryk8s" data-get="pod cardapio -o yaml" data-goal="campo:Pod/cardapio|spec.containers.0.readinessProbe.tcpSocket.port=8080">
+  <p class="try-task">A verificação TCP está na porta errada. Corrija para 8080 e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+          name: http
+      readinessProbe:
+        tcpSocket:
+          port: 8081
+        periodSeconds: 5
+        failureThreshold: 3</pre>
+<pre class="out">
+pod/cardapio created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      name: web
+      ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+      readinessProbe:
+        failureThreshold: 3
+        periodSeconds: 5
+        tcpSocket:
+          port: 8081
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.3.71
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+          name: http
+      readinessProbe:
+        tcpSocket:
+          port: 8080
+        periodSeconds: 5
+        failureThreshold: 3</pre>
+</div>
+
+<p>Como o <code>containerPort</code> tem <code>name: http</code>, dá para escrever <code>port: http</code> na
+probe em vez do número. Aí, quando a porta do programa mudar, o manifesto continua correto — e o erro de
+digitação passa a ser de nome, que é mais visível. Um detalhe importante: <code>tcpSocket</code> só prova que
+a porta aceita conexão. Um servidor travado com o socket aberto passa nesse teste; por isso, quando o programa
+é HTTP, prefira <code>httpGet</code>.</p>
+
+<h2>6. O caminho do pod até o endpoints</h2>
+
+<p>Vale entender o mecanismo, porque ele explica a maioria dos sintomas. O Service não olha para pods: ele
+olha para labels. O controlador de endpoints monta a lista de IPs de todos os pods que casam com o
+<code>selector</code> e estão <code>Ready</code>. Pod <code>0/1</code> não entra nessa lista, e o kube-proxy
+nos nós não cria regra para ele.</p>
+
+<p>Consequência direta: se a readiness falha, o cliente não recebe erro do pod — ele simplesmente não é
+escolhido. Se <em>todos</em> os pods falham, o Service fica sem destino e a conexão é recusada. É diferente de
+receber um <code>500</code>: o pod nem é consultado.</p>
+
+<p>A primeira transcrição mostra um pod novo que ainda não está pronto. É uma transcrição de cluster real,
+num momento em que o catálogo demorava a carregar:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-7b9c6f5d4d-8xl2q   1/1     Running   0          26m
+cardapio-7b9c6f5d4d-kd4wm   0/1     Running   0          9s
+
+ana@notebook:~$ kubectl get endpoints cardapio
+NAME       ENDPOINTS         AGE
+cardapio   10.244.3.71:8080  26m</pre>
+
+<p>Dois pods, um destino. O pod com nove segundos está em <code>0/1</code> — o container roda, mas a probe
+ainda não passou — e por isso não aparece em <code>ENDPOINTS</code>. Repare que <code>RESTARTS</code> é zero:
+a readiness não matou nada. Poucos segundos depois, quando a verificação passa, o segundo IP entra na lista e o
+pod vira <code>1/1</code>.</p>
+
+<p>Essa é a diferença de comportamento que mais confunde quem vem de liveness: aqui, o pod “ruim” continua
+vivo, ocupando memória e CPU, apenas sem tráfego. Se ele nunca ficar pronto, o Deployment segura a
+publicação — e o <code>rollout status</code> fica esperando, sem avançar.</p>
+
+<p>Há um detalhe que só aparece em produção: o balanceamento não é instantâneo. Quando a readiness falha, o
+pod sai da lista, mas as conexões já abertas continuam indo para ele até fecharem. É por isso que uma
+verificação de prontidão não substitui um encerramento educado — no desligamento, o pod precisa de alguns
+segundos entre falhar a probe e receber o <code>SIGTERM</code>, para dar tempo de o balanceador parar de
+mandar pedidos. Esse intervalo é o <code>terminationGracePeriodSeconds</code> do pod.</p>
+
+<h2>7. O que aparece no describe</h2>
+
+<p>Quando a readiness falha, o <code>describe</code> mostra tudo o que você precisa. Esta é outra transcrição
+de cluster real, do mesmo caso, vista pelo pod que não ficou pronto:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe pod cardapio-7b9c6f5d4d-kd4wm
+Name:         cardapio-7b9c6f5d4d-kd4wm
+Namespace:    default
+Node:         guia-worker2/192.0.2.22
+Status:       Running
+IP:           10.244.1.19
+
+Containers:
+  web:
+    Image:          cardapio:1.0
+    Port:           8080/TCP
+    State:          Running
+      Started:      Fri, 27 Nov 2026 10:02:44 +0000
+    Ready:          False
+    Restart Count:  0
+    Readiness:      http-get http://:8080/saude delay=5s timeout=1s period=5s #success=1 #failure=3
+
+Conditions:
+  Type              Status
+  Initialized       True
+  Ready             False
+  ContainersReady   False
+
+Events:
+  Type     Reason     Age   From     Message
+  ----     ------     ----  ----     -------
+  Warning  Unhealthy  12s   kubelet  Readiness probe failed: HTTP probe failed with statuscode: 500</pre>
+
+<p>Quatro detalhes entregam o diagnóstico. <code>Ready: False</code> e <code>Restart Count: 0</code> juntos
+dizem “não está pronto e não foi reiniciado” — a assinatura da readiness. A condição <code>Ready</code> em
+<code>False</code> é o que tira o pod dos endpoints. E o evento <code>Unhealthy</code> traz o motivo exato:
+aqui, um <code>500</code>, provavelmente do banco que ainda não respondia.</p>
+
+<p>Compare com o caso de liveness: lá o <code>Restart Count</code> subia e o motivo era
+<code>context deadline exceeded</code> seguido de <code>Killing</code>. Aqui não há <code>Killing</code>
+nenhum. Ler essa diferença em dois segundos é o que separa “o pod está quebrado” de “o pod está esperando
+algo”.</p>
+
+<p>Se o problema for no Deployment inteiro, o caminho é o <code>rollout status</code>: ele fica em
+<code>Waiting for deployment "cardapio" rollout to finish: 1 out of 2 new replicas have been
+updated...</code> justamente porque o pod novo nunca fica pronto. É a readiness segurando a publicação, e é o
+comportamento desejado.</p>
+
+<h2>8. Ajustando os tempos sem criar confusão</h2>
+
+<p>A tabela abaixo resume o efeito de cada campo na prática. Note que o custo de errar aqui é diferente do
+custo na liveness: um tempo curto demais deixa o pod fora do ar por mais tempo; um tempo curto demais na
+liveness mata container saudável.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Padrão</th><th>Quando ajustar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>initialDelaySeconds</code></td><td>0</td><td>quando o programa sempre leva alguns segundos para
+responder; alternativa é a <code>startupProbe</code></td></tr>
+<tr><td><code>periodSeconds</code></td><td>10</td><td>diminua para publicar mais rápido; aumente para gastar
+menos</td></tr>
+<tr><td><code>timeoutSeconds</code></td><td>1</td><td>aumente se a verificação consulta algo lento por
+natureza</td></tr>
+<tr><td><code>failureThreshold</code></td><td>3</td><td>aumente para tolerar oscilação sem tirar o pod do
+tráfego</td></tr>
+<tr><td><code>successThreshold</code></td><td>1</td><td>aumente para exigir estabilidade antes de liberar
+tráfego</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um padrão que funciona bem na padaria: <code>periodSeconds: 5</code>, <code>failureThreshold: 3</code> e
+<code>successThreshold: 2</code>. O pod sai do tráfego depois de quinze segundos de falha e volta depois de
+duas respostas boas seguidas — rápido o bastante para publicar, estável o bastante para não oscilar.</p>
+
+<p>E o cuidado que evita o pior sintoma: não coloque na readiness uma verificação mais lenta que o próprio
+<code>timeoutSeconds</code>. Uma consulta que leva dois segundos com timeout de um segundo falha sempre, e o
+pod nunca entra no ar, mesmo estando perfeito. Se a verificação precisa consultar o banco, dê a ela um caminho
+barato — uma consulta <code>SELECT 1</code>, não um relatório.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a publicação que não terminava</h3>
+<p>A Ana publicou uma versão que apontava a readiness para <code>/status</code>, caminho que a aplicação
+respondia apenas depois de carregar o catálogo — e o catálogo levava dois minutos. O <code>rollout status</code>
+ficou esperando para sempre e o pod novo nunca entrou. O conserto foi usar <code>/saude</code>, que responde
+desde o primeiro segundo, e mover a espera do catálogo para uma <code>startupProbe</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod que saía do ar a cada pico</h3>
+<p>A verificação consultava o banco e tinha <code>timeoutSeconds: 1</code>. Nos picos, a consulta passava de
+um segundo e os três pods saíam dos endpoints ao mesmo tempo: o site ficava sem destino por alguns segundos.
+Aumentar o timeout para três e o <code>failureThreshold</code> para quatro resolveu sem mexer no código.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a manutenção planejada</h3>
+<p>Para tirar um pod do ar de propósito, basta fazer a readiness falhar: o pod sai dos endpoints em segundos,
+sem reiniciar, e o cliente nem percebe. Foi assim que a Ana testou uma migração de banco — primeiro drenou o
+tráfego com a probe, depois mexeu no schema, e só então devolveu o pod à lista.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="1"><p class="mc-q">1. O que acontece quando a readiness de um pod falha?</p>
+<label><input type="radio" name="q1"> o pod sai dos endpoints do Service, sem reiniciar</label>
+<label><input type="radio" name="q1"> o container é morto e reiniciado</label>
+<label><input type="radio" name="q1"> o pod é apagado e outro é criado</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">2. Um pod aparece como <code>0/1 Running</code>. O que isso
+indica?</p>
+<label><input type="radio" name="q2"> o container morreu e está reiniciando</label>
+<label><input type="radio" name="q2"> o container roda, mas a readiness ainda não passou</label>
+<label><input type="radio" name="q2"> o pod está em outro nó e por isso não conta</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">3. Qual campo só faz sentido na readiness e deve ser 1 na
+liveness?</p>
+<label><input type="radio" name="q3"> <code>periodSeconds</code></label>
+<label><input type="radio" name="q3"> <code>initialDelaySeconds</code></label>
+<label><input type="radio" name="q3"> <code>successThreshold</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: complete a verificação de prontidão</h2>
+<p>O campo que declara a verificação de prontidão dentro do container está faltando. Escreva o nome dele.</p>
+<div class="ex-code">containers:
+  - name: web
+    image: cardapio:1.0
+    <input aria-label="resposta 1" data-answer="readinessProbe" placeholder="...">:
+      httpGet:
+        path: /saude
+        port: 8080
+      periodSeconds: 5</div>
+<p class="ex-dica">Dica: é o irmão de <code>livenessProbe</code>, com “readiness” no começo.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>A readiness probe responde “pode receber tráfego agora?”. Enquanto a resposta é não, o pod fica fora dos
+endpoints do Service — nada de reinício, nada de processo morto. É a ferramenta certa para preparo inicial,
+dependência lenta e manutenção planejada.</p>
+
+<p>Os três tipos são <code>httpGet</code>, <code>tcpSocket</code> e <code>exec</code>, e os campos de tempo
+funcionam como na liveness, com uma diferença: <code>successThreshold</code> pode ser maior que um aqui, e
+isso permite exigir estabilidade antes de liberar o pod. A imagem do pod em <code>0/1 Running</code> com
+<code>Restart Count: 0</code> é a assinatura do caso, e o evento <code>Unhealthy</code> traz o motivo.</p>
+
+<p>Na próxima aula entram as duas juntas num único manifesto, com as contas de tempo e o
+<code>startupProbe</code> — a terceira sonda, que existe justamente para o programa que demora a subir e não
+deveria ser reiniciado nem receber tráfego enquanto isso.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Readiness falhou → pod fora dos endpoints, sem reinício e sem subir <code>RESTARTS</code>.</li>
+  <li><code>0/1 Running</code> com zero reinícios é readiness, não crash.</li>
+  <li>Tempos são inteiros: <code>"5"</code> entre aspas gera erro de validação com o caminho do campo.</li>
+  <li>A probe vive no <code>template</code> do Deployment e vale para todos os pods dele.</li>
+  <li><code>successThreshold</code> só faz sentido na readiness.</li>
+  <li>Readiness pode olhar o banco; liveness não deve.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

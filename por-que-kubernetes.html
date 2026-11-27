@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Por que Kubernetes | Guia Kubernetes</title>
+<meta name="description" content="Por que usar Kubernetes: as três dores que ele resolve (ficar de olho, escalar e repetir a receita), o que ele não resolve e o preço em complexidade que você paga.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Por que <span class="hl">Kubernetes</span></h1>
+<p class="intro">A Ana já sabe o que é um cluster, um nó e um pod. Falta a pergunta que todo mundo faz antes
+de investir tempo nisso: <em>por quê?</em> Instalar Kubernetes não é barato — tem curva, tem YAML, tem um
+monte de peças. Nesta aula ela vê as três dores concretas que o Kubernetes resolve (a madrugada, a promoção
+e a receita que só existe na cabeça), o que ele não resolve de jeito nenhum e o preço que se paga por ele.
+E, no painel, vê um controlador trabalhando de verdade: um comando, três pods; um pod apagado que ninguém
+recria.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>As três dores que justificam o Kubernetes — com exemplo de padaria.</li>
+  <li>O que é um controlador e o que ele faz o dia inteiro.</li>
+  <li>Como escalar sem editar nada à mão.</li>
+  <li>Por que o manifesto é a “receita guardada”.</li>
+  <li>O que o Kubernetes não resolve: código com bug e dados com estado.</li>
+  <li>Quando <em>não</em> usar — e o que dá para fazer antes dele.</li>
+</ul>
+</div>
+
+<h2>1. A cena: domingo, sete da manhã, site fora</h2>
+
+<p>O site da padaria vendia encomenda de bolo. No domingo de manhã, dia de mais pedido, o programa travou às
+quatro. A Ana acordou às sete, viu o telefone com seis mensagens de cliente e reiniciou o programa: dois
+minutos e estava no ar. O prejuízo não foi o programa — foi a madrugada inteira fora do ar, e o susto de
+descobrir <em>por acaso</em>.</p>
+
+<p>Ela tentou o remédio caseiro: um alarme no celular para conferir a página a cada duas horas. Funcionou por
+uma semana. Depois veio o dia em que o programa travou às três e ela estava dormindo com o celular no
+silencioso. O problema não é falta de cuidado: é que fiscalizar serviço com olho humano não escala — nem
+para uma pessoa, nem para uma padaria, nem para empresa nenhuma.</p>
+
+<p>O Kubernetes responde a essa dor com uma ideia que já apareceu nas aulas anteriores: ele fica de olho.
+Você descreve o que deve existir, ele compara com o que existe e conserta. Quem faz esse trabalho tem nome:
+<strong>controlador</strong>. E o tipo de conserto que ele faz — sem ninguém pedir, sem ninguém olhar — é o
+que o mercado chama de <em>self-healing</em>, cura automática.</p>
+
+<h2>2. As três dores</h2>
+
+<p>Vale separar as dores, porque cada uma tem uma resposta diferente dentro do Kubernetes. A primeira é a
+madrugada: algo cai e ninguém percebe. A segunda é o pico: o site que aguenta dez pessoas deixa de aguentar
+duzentas no Dia dos Pais. A terceira é a memória: a receita de como o site foi montado vive na cabeça de
+quem montou, e no dia em que precisa refazer, ninguém lembra.</p>
+
+<p>As três têm a mesma raiz: <strong>estado desejado escrito</strong>. Se o desejo está num arquivo, ele pode
+ser vigiado (dor 1), copiado em quantidade (dor 2) e repetido depois (dor 3). Sem esse arquivo, tudo depende
+de memória e de sorte. Com ele, o cluster tem o que comparar — e comparar é a única coisa que um computador
+faz melhor do que a gente.</p>
+
+<dl class="anatomy">
+<dt>controlador</dt>
+<dd>O programa que compara o estado desejado com o real e age. Roda em laço, sem parar.</dd>
+<dt>réplica</dt>
+<dd>Uma cópia do pod. Três réplicas são três pods iguais, com nomes diferentes.</dd>
+<dt>ReplicaSet</dt>
+<dd>O controlador que garante “existem N pods com esta etiqueta”. É criado pelo Deployment.</dd>
+<dt>self-healing</dt>
+<dd>Recriar sozinho o que caiu, sem ninguém pedir.</dd>
+<dt>escala</dt>
+<dd>Mudar a quantidade de réplicas. Pode ser manual (um número) ou automática (HPA, no Nível 2).</dd>
+<dt>declarativo</dt>
+<dd>Descrever o resultado; o caminho até ele é problema do cluster.</dd>
+</dl>
+
+<h2>3. Dor 1: alguém que fica de olho</h2>
+
+<p>Quando você cria um <strong>Deployment</strong> com três réplicas, três coisas nascem em cadeia: o
+Deployment (o pedido), um ReplicaSet (o contador) e três pods (as cópias). O Deployment não cria pod
+diretamente — ele cria o ReplicaSet, e o ReplicaSet é quem mantém a contagem. É essa divisão que faz o
+sistema funcionar quando algo muda: o Deployment cuida de “qual versão da imagem”, o ReplicaSet cuida de
+“quantas cópias”.</p>
+
+<p>Se um dos três pods morre, o ReplicaSet percebe em segundos que tem dois onde deveriam existir três, e
+cria o terceiro. Se um nó inteiro desaparece, os pods dele são marcados como perdidos e o ReplicaSet cria
+substitutos nos nós que restaram. Ninguém precisa acordar às quatro da manhã: o laço de reconciliação não
+dorme.</p>
+
+<p>Dá para ver a cadeia inteira com três comandos. O primeiro mostra o pedido, o segundo mostra o contador e
+o terceiro mostra as cópias. A transcrição abaixo é de um cluster real, com a mesma sequência desta aula:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   3/3     3            3           2m
+
+ana@notebook:~$ kubectl get replicasets
+NAME                  DESIRED   CURRENT   READY   AGE
+cardapio-pvx6crj8rr   3         3         3       2m
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-pvx6crj8rr-64bgk   1/1     Running   0          3m
+cardapio-pvx6crj8rr-tdrql   1/1     Running   0          1m
+cardapio-pvx6crj8rr-w5m2v   1/1     Running   0          1m</pre>
+
+<p>Leia de baixo para cima se quiser entender a hierarquia: os três pods terminam com o mesmo prefixo, que é
+o nome do ReplicaSet que os criou, e esse prefixo começa com o nome do Deployment. Não é enfeite — o nome
+conta de onde a peça veio. As colunas <code>DESIRED</code> e <code>CURRENT</code> do ReplicaSet são
+exatamente a comparação de que falei: quantos eu quero, quantos eu tenho.</p>
+
+<p>Essa é a diferença mais concreta entre “rodar com <code>node servidor.js</code>” e “rodar com
+Kubernetes”. No primeiro caso, o programa é um processo que você segura com a mão. No segundo, é uma
+descrição que o cluster persegue. Você deixa de ser bombeiro e passa a ser quem escreve o que deve
+existir.</p>
+
+<h2>4. Dor 2: a promoção do Dia dos Pais</h2>
+
+<p>Na semana do Dia dos Pais, o site da Ana recebe dez vezes mais visitas. Com um processo só, ele engasga.
+A solução manual seria abrir mais terminais, rodar o mesmo programa de novo, torcer para os clientes caírem
+em algum deles — e lembrar de fechar tudo depois. Com Kubernetes, a solução é um número.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="campo:Deployment/cardapio|spec.replicas=3;;conta:pods=3">
+  <p class="try-task">O site foi criado com uma cópia só. Troque <code>--replicas=1</code> por
+  <code>--replicas=3</code> na linha do <code>create deployment</code> e rode: o cluster tem de criar os
+  outros dois pods sozinho.</p>
+<pre class="yaml">kubectl create deployment cardapio --image=cardapio:1.0 --replicas=1
+kubectl get deployments
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create deployment cardapio --image=cardapio:1.0 --replicas=1
+deployment.apps/cardapio created
+
+ana@notebook:~$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   1/1     1            1           2m
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-pvx6crj8rr-w5m2v   1/1     Running   0          1m
+</pre>
+<pre class="solucao">kubectl create deployment cardapio --image=cardapio:1.0 --replicas=3
+kubectl get deployments
+kubectl get pods</pre>
+</div>
+
+<p>Repare no que você <em>não</em> fez: não criou pod, não escolheu nó, não configurou porta. Pediu três
+cópias e o cluster montou a cadeia — Deployment, ReplicaSet, três pods. A tabela do Deployment mostra
+<code>READY 3/3</code>, e a de pods mostra três nomes compridos, dois deles criados depois do primeiro.</p>
+
+<p>O mesmo número serve para encolher. Trocar para <code>--replicas=1</code> apaga dois pods, e o cluster
+escolhe quais. Isso significa que pod, para o Kubernetes, é gado e não bicho de estimação: não se conserta,
+não se dá nome carinhoso, não se guarda estado dentro. Quem precisa de identidade estável e disco próprio
+tem outro objeto (StatefulSet, no Nível 2) e outro nível de cuidado.</p>
+
+<h2>5. Dor 3: a receita que só existe na cabeça</h2>
+
+<p>A terceira dor é silenciosa e cara. Quando a Ana montou o site, ela fez uma sequência de coisas:
+instalou a versão tal do Node, criou uma pasta, configurou uma variável de ambiente, abriu uma porta. No dia
+em que o notebook morreu, ela não lembrava de metade. Reconstruir levou um dia inteiro, com erros no meio.</p>
+
+<p>Com manifesto, a sequência vira texto. O arquivo diz a imagem, as portas, as variáveis, a quantidade de
+cópias. Reconstruir é aplicar o arquivo em outro cluster. E o mais importante: o arquivo pode ser revisado,
+comparado e guardado junto com o código do site — do mesmo jeito que se guarda o código.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="objeto:Deployment/cardapio;;conta:pods=1">
+  <p class="try-task">O manifesto está com a etiqueta do molde diferente da etiqueta do seletor, e o cluster
+  recusa. Rode para ler a mensagem; depois iguale as duas para <code>app: cardapio</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: vitrine
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value: {"app":"vitrine"}: `selector` does not match template `labels`
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>O erro do início é uma validação, e vale ler com calma:
+<code>The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value:
+{"app":"vitrine"}: selector does not match template labels</code>. Em português: “o seletor não casa com as
+etiquetas do molde”. O Deployment se apresenta ao cluster dizendo “eu cuido dos pods com a etiqueta
+<code>app: cardapio</code>”, mas o molde dele cria pods com <code>app: vitrine</code>. Se fosse aceito, o
+controlador criaria pods que ele mesmo não reconheceria como seus — e criaria mais, e mais, num vaivém
+infinito. O cluster prefere recusar na porta.</p>
+
+<p>É por isso que “a receita” não é só um registro: é um contrato que o cluster verifica antes de aceitar.
+Manifesto com etiqueta errada não entra. Manifesto com imagem que não existe entra e falha depois — mas a
+mensagem de falha fica registrada no pod, para quem for investigar.</p>
+
+<h2>6. O pod sem dono</h2>
+
+<p>Para sentir o valor do controlador, vale ver o outro lado. Um pod criado direto — com
+<code>kubectl run</code> — não tem dono: nenhum controlador cuida dele. Se ele morre, morreu. A caixa abaixo
+mostra isso acontecendo: a missão é apagar o pod e verificar que ninguém o recria.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:pod/forno deleted;;conta:pods=0">
+  <p class="try-task">Acrescente as duas linhas finais: apague o pod <code>forno</code> e liste os pods de
+  novo. O painel tem de mostrar <code>pod/forno deleted</code> e nenhum pod na lista.</p>
+<pre class="yaml">kubectl run forno --image=forno:1.0
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run forno --image=forno:1.0
+pod/forno created
+
+ana@notebook:~$ kubectl get pods
+NAME    READY   STATUS    RESTARTS   AGE
+forno   1/1     Running   0          5m
+</pre>
+<pre class="solucao">kubectl run forno --image=forno:1.0
+kubectl get pods
+kubectl delete pod forno
+kubectl get pods</pre>
+</div>
+
+<p>A última resposta é <code>No resources found in default namespace</code> — a lista ficou vazia e vai
+continuar vazia. Transcrição de um cluster real, com a mesma sequência da caixa:</p>
+
+<pre class="term">ana@notebook:~$ kubectl run forno --image=forno:1.0
+pod/forno created
+
+ana@notebook:~$ kubectl get pods
+NAME    READY   STATUS    RESTARTS   AGE
+forno   1/1     Running   0          5m
+
+ana@notebook:~$ kubectl delete pod forno
+pod/forno deleted
+
+ana@notebook:~$ kubectl get pods
+No resources found in default namespace.</pre>
+
+<p>Compare com o que aconteceria se esse pod fosse filho de um Deployment: o ReplicaSet veria a falta e
+criaria outro em segundos, com nome novo. A diferença não está no pod; está em quem olha por ele. E repare
+que o <code>delete</code> responde no mesmo instante — ele não espera o container desligar com calma. Se o
+programa estivesse no meio de um pedido, aquele pedido se perderia. É por isso que “apagar pod” nunca é
+estratégia de atualização: para trocar versão existe <code>rollout</code>, que sobe o novo antes de derrubar
+o velho.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Situação</th><th>Pod solto</th><th>Pod de Deployment</th></tr>
+</thead>
+<tbody>
+<tr><td>o container morre</td><td>o kubelet reinicia no mesmo pod, somando <code>RESTARTS</code></td><td>idem</td></tr>
+<tr><td>o pod é apagado</td><td>nada acontece: pod não volta</td><td>o ReplicaSet cria outro na hora</td></tr>
+<tr><td>o nó cai</td><td>o pod se perde junto</td><td>o substituto nasce em outro nó</td></tr>
+<tr><td>quero três cópias</td><td>três comandos e três nomes para lembrar</td><td>um número no manifesto</td></tr>
+<tr><td>atualizar a imagem</td><td>apagar e criar na mão, com queda</td><td><code>rollout</code> troca aos poucos
+(nível 2)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>7. O que o Kubernetes não resolve</h2>
+
+<p>Agora a parte que ninguém conta com o mesmo entusiasmo. Kubernetes não conserta código. Se o programa tem
+um bug que estoura memória, o cluster vai reiniciar o container para sempre, e o serviço vai falhar do
+mesmo jeito — só que agora você tem <code>CrashLoopBackOff</code> no meio do caminho para atrapalhar a
+leitura. O bug continua sendo seu.</p>
+
+<p>Também não resolve dado com estado, pelo menos não de graça. Banco de dados em cluster exige disco
+persistente, ordem de subida, identidade estável e backup — coisas que existem, mas que são outro nível de
+responsabilidade. Muita empresa séria roda o banco fora do Kubernetes e o site dentro. É uma escolha
+legítima.</p>
+
+<p>E não substitui o resto do caminho: construir a imagem, guardar num registro, revisar código, testar,
+publicar. Kubernetes é a última milha — onde o programa roda —, não a fábrica inteira.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Problema</th><th>Kubernetes resolve?</th><th>Quem resolve</th></tr>
+</thead>
+<tbody>
+<tr><td>“caiu e ninguém viu”</td><td>sim: controlador recria e reporta</td><td>Deployment + ReplicaSet</td></tr>
+<tr><td>“não aguento o pico”</td><td>sim: mais réplicas, manuais ou automáticas</td><td>escala e HPA</td></tr>
+<tr><td>“não lembro como montei”</td><td>sim: manifesto é a receita</td><td>YAML no repositório</td></tr>
+<tr><td>“meu código tem bug”</td><td>não</td><td>você, com testes e revisão</td></tr>
+<tr><td>“meu banco corrompeu”</td><td>não sozinho</td><td>backup, operação e StatefulSet com cuidado</td></tr>
+<tr><td>“meu deploy é manual e errado”</td><td>não</td><td>pipeline de CI/CD</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. O preço (e quando não vale)</h2>
+
+<p>Tudo isso tem custo. Kubernetes é um sistema distribuído com muitas peças: quando algo dá errado, o
+motivo pode estar no manifesto, na imagem, no nó, na rede, na permissão. A curva de aprendizado é real, e a
+quantidade de YAML cresce com o projeto. Times pequenos costumam gastar mais tempo cuidando do cluster do
+que do site.</p>
+
+<p>Para uma padaria com um site de três páginas, a resposta honesta é: talvez não valha. Uma máquina
+alugada com o programa rodando e um script que reinicia se cair resolve o problema por muito menos. O
+Kubernetes começa a compensar quando existe mais de um serviço, mais de uma pessoa mexendo, necessidade de
+escalar e um time que saiba operar. Saber <em>quando não usar</em> é parte de saber usar.</p>
+
+<p>Sobre o painel deste guia, uma nota honesta: ele simula o cluster, então você vê o controlador criando e
+contando pods de verdade, mas não vê o container rodando. Estados como <code>CrashLoopBackOff</code>,
+<code>ImagePullBackOff</code> e logs do programa vêm de transcrições de cluster real, sempre identificadas
+como tal. O que é cálculo — validar, agendar, criar, casar etiquetas — o painel faz.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a escala que ninguém desfez</h3>
+<p>Durante a promoção, a Ana subiu para dez réplicas e esqueceu de voltar. Duas semanas depois, o cluster
+estava rodando dez cópias de um site que recebia vinte visitas por dia. O conserto veio com o número no
+manifesto, revisado junto com o resto do código. Escala manual funciona, mas só é segura quando o valor
+desejado está escrito em algum lugar que alguém revisa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Deployment que criava pods sem parar</h3>
+<p>Ela copiou um manifesto de exemplo e trocou só o <code>metadata.name</code>. O seletor continuou com a
+etiqueta antiga, e o cluster recusou na hora. Se tivesse passado, o controlador criaria pods que não
+reconhecia, e criaria de novo, sem parar — o cluster inteiro ocupado com um engano. Foi a validação que
+salvou o dia, e é por isso que ela existe.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o pod que voltou com outro nome</h3>
+<p>Ela apagou um pod de um Deployment para “limpar” e o pod voltou em dois segundos, com nome diferente. Não
+era teimosia: era o ReplicaSet fazendo o trabalho dele. Quem quer mudar o que roda num Deployment não apaga
+pods — muda o manifesto (ou a imagem, no caso de um rollout) e deixa o controlador executar a troca.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. Qual destas dores o Kubernetes <em>não</em> resolve?</p>
+<label><input type="radio" name="q1"> o serviço cair de madrugada e ninguém perceber</label>
+<label><input type="radio" name="q1"> precisar de mais cópias durante um pico</label>
+<label><input type="radio" name="q1"> um bug no código que estoura a memória do programa</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Quem recria o pod de um Deployment quando ele é
+apagado?</p>
+<label><input type="radio" name="q2"> o ReplicaSet, porque a contagem ficou abaixo do desejado</label>
+<label><input type="radio" name="q2"> o kubelet do nó, no mesmo pod</label>
+<label><input type="radio" name="q2"> ninguém: pod não volta</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. O que acontece com um pod criado por <code>kubectl
+run</code> quando você o apaga?</p>
+<label><input type="radio" name="q3"> ele volta com outro nome</label>
+<label><input type="radio" name="q3"> ele não volta: não tem controlador cuidando dele</label>
+<label><input type="radio" name="q3"> o cluster fica em <code>Pending</code> até você recriar</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o número que escala</h2>
+<p>Para pedir quatro cópias do site num manifesto de Deployment, qual campo você muda?</p>
+<div class="ex-code">spec.<input aria-label="resposta 1" data-answer="replicas" placeholder="...">: 4</div>
+<p class="ex-dica">Dica: é o campo que mora dentro de <code>spec</code>, no mesmo nível de
+<code>selector</code> e <code>template</code>. Em inglês, “réplicas”.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Kubernetes se justifica por três dores concretas: ninguém consegue ficar de olho vinte e quatro horas,
+ninguém consegue multiplicar cópias na mão durante o pico, e ninguém reconstrói de memória um serviço que
+montou há um ano. O antídoto para as três é o mesmo: estado desejado escrito, com controladores comparando
+sem parar.</p>
+
+<p>Na prática, isso aparece como Deployment (o pedido), ReplicaSet (o contador) e pods (as cópias). Pod
+apagado de Deployment volta em segundos; pod solto não volta nunca. Escalar é mudar um número. E a receita
+guardada é um arquivo que o cluster valida antes de aceitar — seletor que não casa com o molde é recusado na
+hora.</p>
+
+<p>O que ele não faz: consertar código, cuidar de dado com estado sem operação dedicada, substituir
+pipeline. E o preço é complexidade. Para um site pequeno e uma pessoa, uma máquina simples pode ser a
+decisão certa. Na próxima aula a Ana finalmente põe a mão na massa e instala as duas ferramentas que vai usar
+o resto da vida: o <code>kubectl</code> e o <code>kind</code>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Controlador compara desejado com real e conserta, sem parar.</li>
+  <li>Deployment pede, ReplicaSet conta, pods rodam.</li>
+  <li>Pod solto não volta; pod de Deployment volta com nome novo.</li>
+  <li>Escalar é mudar <code>spec.replicas</code>.</li>
+  <li>Seletor e etiquetas do molde precisam casar, senão o cluster recusa.</li>
+  <li>Kubernetes não conserta bug nem resolve banco sozinho.</li>
+  <li>Para projeto pequeno, talvez não valha — e tudo bem.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

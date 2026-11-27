@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ConfigMap como volume | Guia Kubernetes</title>
+<meta name="description" content="ConfigMap como volume: cada chave vira um arquivo no container. Montar em /config, escolher chaves com items, permissões, atualização automática e os tropeços comuns.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>ConfigMap como <span class="hl">volume</span></h1>
+<p class="intro">Na aula passada a Ana entregou preço e horário ao pod como variáveis de ambiente. Funcionou
+para dois valores curtos. Agora o site precisa de um arquivo de verdade: quarenta linhas de JSON com o
+cardápio inteiro, lido pelo programa com <code>readFile</code>. Variável de ambiente não serve para isso —
+e é aí que entra o outro jeito de consumir um ConfigMap: montá-lo como <strong>volume</strong>, para que cada
+chave vire um arquivo dentro do container. Nesta aula a Ana monta o primeiro, escolhe quais chaves aparecem
+e descobre o que acontece com o arquivo quando o ConfigMap muda.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que configuração grande não cabe em variável de ambiente.</li>
+  <li>O que são <code>volumes</code>, <code>volumeMounts</code> e <code>mountPath</code> — e por que são
+  dois lugares no manifesto.</li>
+  <li>Como cada chave do ConfigMap vira um arquivo com o nome da chave.</li>
+  <li>Escolher e renomear chaves com <code>items</code>, montando só o que o programa precisa.</li>
+  <li>Permissões, <code>readOnly</code> e o que o volume faz com a pasta de destino.</li>
+  <li>O que acontece com o arquivo quando o ConfigMap muda (e por que isso tem aula própria depois).</li>
+</ul>
+</div>
+
+<h2>1. A cena: o JSON que não cabe numa variável</h2>
+
+<p>O cardápio do site da padaria não é um número: é uma lista com trinta e dois itens, cada um com nome,
+preço, tipo e tempo de forno. No repositório, isso vive num arquivo <code>cardapio.json</code> de quarenta
+linhas, que o programa lê no boot e guarda na memória. A Ana tentou o caminho da aula passada: colocar o JSON
+inteiro numa variável de ambiente do pod.</p>
+
+<p>Não deu. Variável de ambiente é uma linha só. Para caber, o JSON teria de virar uma linha de duzentos
+caracteres, com aspas escapadas e tudo grudado — ilegível no manifesto, impossível de revisar, e um erro de
+uma aspa derruba o pod inteiro. Pior: o programa não lê JSON de variável; ele lê de arquivo, e mudar o
+programa para ler de variável seria mudar o programa por causa da configuração.</p>
+
+<p>A solução é a outra forma de entrega: em vez de transformar as chaves em variáveis, o Kubernetes
+<em>escreve</em> as chaves como arquivos dentro do container, numa pasta que você escolhe. O programa abre
+<code>/config/cardapio.json</code> do jeito que já fazia, e nem sabe que aquele arquivo veio de um ConfigMap.
+O nome dessa operação é <strong>montar</strong> — a mesma ideia de montar um pendrive numa pasta: o conteúdo
+aparece ali dentro, como se sempre tivesse estado ali.</p>
+
+<pre class="term">ana@notebook:~/padaria$ cat config/cardapio.json
+{
+  "preco": 4.5,
+  "horario": "6h as 19h",
+  "itens": ["pao de queijo", "croissant", "sonho"]
+}</pre>
+
+<p>Esse é o arquivo que a Ana quer ver dentro do container, no notebook dela. Repare que é texto com
+chaves, aspas e quebras de linha — o tipo de conteúdo que o ConfigMap guarda bem e a variável de ambiente
+guarda mal. A pergunta desta aula é como transformar o conteúdo desse arquivo em algo legível pelo programa,
+sem embutir nada na imagem.</p>
+
+<h2>2. Montar exige duas peças no manifesto</h2>
+
+<p>Aqui está o detalhe que faz todo mundo errar na primeira vez: montar um volume exige <strong>duas
+declarações</strong>, em dois lugares diferentes do manifesto. Em <code>spec.volumes</code>, no nível do
+pod, você diz <em>de onde vem</em> o conteúdo (“um ConfigMap chamado cardapio”). Em
+<code>spec.containers[].volumeMounts</code>, no nível do container, você diz <em>onde ele aparece</em>
+(“monta na pasta /config”). As duas precisam existir e precisam combinar pelo nome.</p>
+
+<dl class="anatomy">
+<dt>volume</dt>
+<dd>A origem do conteúdo, declarada em <code>spec.volumes</code>. Aqui, um <code>configMap</code> com o
+nome do objeto. Tem um <code>name</code> escolhido por você.</dd>
+<dt>volumeMount</dt>
+<dd>A ligação entre o volume e uma pasta do container: <code>name</code> (qual volume) e
+<code>mountPath</code> (em que pasta).</dd>
+<dt><code>mountPath</code></dt>
+<dd>O caminho absoluto dentro do container, como <code>/config</code>. Se a pasta não existir, o Kubernetes
+cria.</dd>
+<dt><code>items</code></dt>
+<dd>A lista que escolhe quais chaves entram e com que nome de arquivo cada uma aparece. Sem
+<code>items</code>, entram todas.</dd>
+<dt><code>readOnly</code></dt>
+<dd>Marca a montagem como somente leitura. ConfigMap é sempre somente leitura na prática; explicitar ajuda
+quem lê.</dd>
+</dl>
+
+<p>O nome do volume (<code>name: config</code>) é interno ao pod: não precisa ser igual ao nome do
+ConfigMap, e é o que liga as duas declarações. Já o <code>configMap.name</code> é o nome do objeto no
+cluster, e é ele que precisa existir no mesmo namespace do pod. Confundir os dois é o erro número um desta
+aula — o manifesto é aceito, o pod sobe, e o arquivo simplesmente não está lá.</p>
+
+<h2>3. A primeira montagem</h2>
+
+<p>A caixa começa com o pod recebendo as chaves como variáveis e nenhum volume. A missão é acrescentar a
+montagem em <code>/config</code>, para o programa poder abrir o JSON como arquivo. Repare que o ConfigMap já
+está ali: o que falta é a ligação.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.volumes.0.configMap.name=cardapio;;campo:Pod/web|spec.containers.0.volumeMounts.0.mountPath=/config;;texto:Running">
+  <p class="try-task">Acrescente um volume do ConfigMap <code>cardapio</code> e monte-o em
+  <code>/config</code>, no container <code>web</code>. Rode e confira o pod em <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  cardapio.json: |
+    {
+      "preco": 4.5,
+      "horario": "6h as 19h"
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: MOEDA
+          value: BRL</pre>
+<pre class="out">
+configmap/cardapio created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  cardapio.json: |
+    {
+      "preco": 4.5,
+      "horario": "6h as 19h"
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: MOEDA
+          value: BRL
+      volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+  volumes:
+    - name: config
+      configMap:
+        name: cardapio</pre>
+</div>
+
+<p>O painel mostra os dois objetos criados e o pod em <code>Running</code>. A tabela não tem coluna de
+volume — e não teria como ter: o que aconteceu é dentro do container. O que dá para afirmar é o que a meta
+cobra: o volume existe, aponta para o ConfigMap certo e está montado em <code>/config</code>. A partir
+daí, o programa que roda naquele container abre <code>/config/cardapio.json</code> e encontra o texto do
+JSON.</p>
+
+<p>Note o <code>|</code> depois de <code>cardapio.json:</code>. É a marca de <em>texto literal</em> no
+YAML: tudo o que está indentado abaixo vira o valor da chave, com as quebras de linha preservadas. Sem ele,
+o JSON teria de ser uma linha só — e aí você teria o mesmo problema que a variável de ambiente, só que
+dentro do ConfigMap. É esse detalhe de YAML que torna possível guardar um arquivo inteiro numa chave.</p>
+
+<h2>4. Um arquivo por chave</h2>
+
+<p>A regra é simples e vale a pena decorar: <strong>cada chave do ConfigMap vira um arquivo com o nome da
+chave</strong>, dentro do <code>mountPath</code>. Um ConfigMap com <code>cardapio.json</code>,
+<code>horario.txt</code> e <code>versao</code> montado em <code>/config</code> produz três arquivos:
+<code>/config/cardapio.json</code>, <code>/config/horario.txt</code> e <code>/config/versao</code>. Nada de
+subpasta automática, nada de nome inventado — o nome da chave é o nome do arquivo, e o valor é o
+conteúdo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>No ConfigMap</th><th>Dentro do container</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cardapio.json: |</code> com o JSON</td><td><code>/config/cardapio.json</code> com o JSON
+inteiro</td></tr>
+<tr><td><code>horario: 6h as 19h</code></td><td><code>/config/horario</code> com o texto <code>6h as
+19h</code></td></tr>
+<tr><td><code>versao: "2026-11"</code></td><td><code>/config/versao</code> com <code>2026-11</code></td></tr>
+<tr><td>chave que não existe no ConfigMap</td><td>nada é criado — o arquivo simplesmente não está
+lá</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas consequências práticas. A primeira: se o programa espera <code>/config/cardapio.json</code> e a
+chave se chama <code>cardapio.json.bak</code>, o arquivo vai existir com outro nome e o programa não acha. A
+segunda: o volume não é uma cópia que você edita. É o ConfigMap materializado — quem escreve no arquivo está
+escrevendo na cópia do nó, e a próxima sincronização desfaz. Por isso o <code>readOnly: true</code>: ele não
+é obrigatório, mas diz em voz alta o que já é verdade.</p>
+
+<p>Um detalhe que confunde: o volume é montado pelo <em>kubelet</em>, no nó, antes do container subir. Se o
+ConfigMap não existir naquele momento, o pod fica parado tentando montar, com um evento do tipo
+<code>FailedMount</code> no <code>describe</code> — e não adianta olhar o log do programa, porque o programa
+nem começou. Criar o ConfigMap antes do pod não é preciosismo: é ordem de dependência.</p>
+
+<h2>5. Uma chave só, com outro nome</h2>
+
+<p>Montar tudo funciona quando o programa quer tudo. Mas quase sempre ele quer <em>uma parte</em>, com um
+nome específico — e é para isso que existe o <code>items</code>. Cada item diz: pegue a chave
+<code>key</code> e escreva no arquivo <code>path</code>. Com <code>items</code>, o volume passa a conter
+exatamente os arquivos listados, com os nomes que você escolheu.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.volumes.0.configMap.items.0.key=cardapio.json;;campo:Pod/web|spec.volumes.0.configMap.items.0.path=menu.json;;texto:Running">
+  <p class="try-task">O programa passou a abrir <code>/config/menu.json</code>. Faça o volume entregar
+  <strong>apenas</strong> a chave <code>cardapio.json</code>, escrita no arquivo <code>menu.json</code>, e
+  deixe a chave <code>versao</code> de fora.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  cardapio.json: |
+    {
+      "preco": 4.5
+    }
+  versao: "2026-11"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      volumeMounts:
+        - name: config
+          mountPath: /config
+  volumes:
+    - name: config
+      configMap:
+        name: cardapio</pre>
+<pre class="out">
+configmap/cardapio created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  cardapio.json: |
+    {
+      "preco": 4.5
+    }
+  versao: "2026-11"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      volumeMounts:
+        - name: config
+          mountPath: /config
+  volumes:
+    - name: config
+      configMap:
+        name: cardapio
+        items:
+          - key: cardapio.json
+            path: menu.json</pre>
+</div>
+
+<p>O painel mostra o mesmo pod em <code>Running</code> nas duas versões — o que muda está dentro do
+container. Com <code>items</code>, <code>/config</code> passa a ter um arquivo só: <code>menu.json</code>. A
+chave <code>versao</code> continua existindo no ConfigMap e continua visível no <code>get configmaps</code>,
+mas não é montada: quem não precisa, não recebe.</p>
+
+<p>Esse controle tem dois usos nobres. O primeiro é <strong>renomear</strong>: o programa espera
+<code>menu.json</code>, o ConfigMap tem <code>cardapio.json</code>, e ninguém precisa editar código por
+causa disso. O segundo é <strong>limitar</strong>: um ConfigMap com dez chaves, dos quais o container só
+deve ver uma, é um ConfigMap com nove chaves a mais expostas. <code>items</code> é a tesoura.</p>
+
+<h2>6. Pastas, permissões e o que é sobrescrito</h2>
+
+<p>O <code>mountPath</code> é uma pasta e o Kubernetes cria o que faltar. Mas atenção ao que já existe: se
+você montar em <code>/etc</code>, o conteúdo do ConfigMap <em>substitui</em> a visão daquela pasta para o
+container — o que estava lá some enquanto a montagem existir. Montar em cima de uma pasta do sistema é uma
+forma rápida de quebrar a imagem. A convenção é montar em pasta própria: <code>/config</code>,
+<code>/etc/cardapio</code>, <code>/app/config</code>.</p>
+
+<p>Para quem quer um arquivo só, sem montar a pasta inteira, existe o <code>subPath</code>: ele monta
+<em>um</em> arquivo do volume num caminho específico, sem esconder o resto do diretório. É útil e tem um
+preço: arquivo montado com <code>subPath</code> <strong>não é atualizado</strong> quando o ConfigMap muda.
+Fica com o conteúdo do momento em que o pod subiu. Se a sua configuração precisa mudar sem reiniciar, evite
+<code>subPath</code>; monte a pasta e leia o arquivo de dentro dela.</p>
+
+<p>As permissões vêm do <code>defaultMode</code>, que é <code>0644</code> (dono lê e escreve, grupo e outros
+leem). Dá para ajustar para <code>0440</code> quando o arquivo tem algo mais sensível, mas lembre que
+ConfigMap não é cofre: permissão restrita dentro do container não esconde o conteúdo de quem lê o objeto no
+cluster. Para segredo de verdade, o objeto é outro — e é a <a href="secret.html">próxima aula</a>.</p>
+
+<p>Uma última: o volume é declarado no pod, então todo container daquele pod pode montá-lo, cada um no seu
+<code>mountPath</code>. Um pod com dois containers (o site e um exportador de métricas) pode montar o mesmo
+ConfigMap em <code>/config</code> num e em <code>/etc/cardapio</code> no outro, sem duplicar o objeto. O
+volume é um só; as montagens é que são por container.</p>
+
+<p>E num <strong>Deployment</strong>? A montagem não muda de nome, muda de lugar: tudo o que é do pod vive
+dentro de <code>spec.template.spec</code> — o mesmo lugar onde ficam <code>containers</code> e
+<code>replicas</code> do pod. Cada pod criado pelo Deployment nasce com a mesma montagem, porque nasce da
+mesma receita. A caixa abaixo faz essa passagem: o Deployment ainda entrega a configuração por variável e
+precisa passar a montar o arquivo.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|spec.template.spec.volumes.0.configMap.name=cardapio;;conta:pods[app=cardapio]=2;;texto:Running">
+  <p class="try-task">Leve a montagem para dentro do template do Deployment: volume do ConfigMap
+  <code>cardapio</code> e <code>volumeMounts</code> em <code>/config</code>. As duas réplicas precisam
+  subir.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  cardapio.json: |
+    {
+      "preco": 4.5
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          env:
+            - name: MOEDA
+              value: BRL</pre>
+<pre class="out">
+configmap/cardapio created
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-74824llwrp-b7p28   1/1     Running   0          9m
+cardapio-74824llwrp-g7lqs   1/1     Running   0          5m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  cardapio.json: |
+    {
+      "preco": 4.5
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          configMap:
+            name: cardapio</pre>
+</div>
+
+<p>O painel mostra os dois pods do Deployment em <code>Running</code>, e a meta confere que o volume está
+no template. Repare no caminho completo do campo:
+<code>spec.template.spec.volumes</code> — template é o molde do pod, e o molde tem o seu próprio
+<code>spec</code>. Quem procura <code>volumes</code> em <code>spec.volumes</code> do Deployment não acha e
+conclui, errado, que o Deployment não aceita volume.</p>
+
+<h2>7. O arquivo muda sozinho?</h2>
+
+<p>Esta é a pergunta que todo mundo faz, e a resposta é: <em>mais ou menos</em> — e o “mais ou menos” tem
+consequências. Quando o ConfigMap é montado como volume, o kubelet do nó mantém uma cópia local e a
+sincroniza de tempos em tempos (o padrão é cerca de um minuto, mais o cache). Quando o ConfigMap muda, o
+arquivo dentro do container muda <strong>sem reiniciar o pod</strong>. A troca é atômica: o kubelet escreve
+uma pasta nova e muda um link simbólico, para o programa nunca ler um arquivo pela metade.</p>
+
+<p>Mas há dois “poréns” grandes. O primeiro: variável de ambiente <em>não</em> se atualiza — ela é lida no
+start e pronto. Então o mesmo ConfigMap entregue por <code>env</code> e por volume se comporta de duas
+maneiras diferentes. O segundo: o arquivo novo só ajuda se o programa reler o arquivo. Um programa que lê o
+JSON no boot e guarda na memória continua servindo o preço velho, com o arquivo novo do lado. Atualizar o
+arquivo não é atualizar a aplicação.</p>
+
+<pre class="term">error: error parsing cardapio.yaml: error converting YAML to JSON: yaml: line 1: bad indentation of a mapping entry</pre>
+
+<p>A mensagem acima aparece quando o bloco do JSON não está indentado direito embaixo do <code>|</code> — o
+erro mais comum de quem cola JSON num ConfigMap. Traduzindo: “indentação ruim de uma entrada de mapa”. O
+conteúdo do bloco precisa estar <em>mais</em> indentado que a chave, sempre com espaços, nunca com tab. Se o
+YAML passar, o arquivo vai existir; se não passar, o cluster nem cria o objeto.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Entrega</th><th>Atualiza sem reiniciar?</th><th>Bom para</th></tr>
+</thead>
+<tbody>
+<tr><td><code>env</code> / <code>envFrom</code></td><td>não — lido no start</td><td>valores curtos, lidos uma
+vez</td></tr>
+<tr><td>volume (pasta)</td><td>sim, em cerca de um minuto — se o programa reler</td><td>arquivo de
+configuração, JSON, listas</td></tr>
+<tr><td>volume com <code>subPath</code></td><td>não — fica no conteúdo do start</td><td>arquivo único que não
+muda</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A aula <a href="recarregar-config.html">recarregar configuração</a> fecha esse ciclo: como avisar o
+programa, quando reiniciar o
+pod e por que às vezes o caminho mais honesto é reiniciar mesmo. Por enquanto, guarde a regra prática: se a
+configuração precisa mudar em produção sem susto, monte como arquivo e faça o programa reler; se ela muda
+raramente, variável de ambiente resolve e é mais simples.</p>
+
+<h2>8. Os tropeços desta aula</h2>
+
+<p>O primeiro é o <strong>nome que não combina</strong>. O <code>volumeMounts.name</code> precisa ser igual
+ao <code>volumes.name</code>. Se um diz <code>config</code> e o outro diz <code>cardapio</code>, o manifesto
+é aceito, o pod sobe e a pasta fica vazia — porque o container está montando um volume que não existe. O
+cluster só reclama disso em casos específicos; na dúvida, compare as duas linhas.</p>
+
+<p>O segundo é <strong>montar no lugar errado</strong>. O programa abre <code>/config/cardapio.json</code> e
+o volume está em <code>/etc/cardapio</code>. Nada quebra, nada aparece no evento, e o programa diz “arquivo
+não encontrado”. Vale conferir no manifesto qual caminho o código usa, e não o contrário.</p>
+
+<p>O terceiro é o <strong>ConfigMap ausente</strong>. Sem o objeto, o pod não sobe: fica em
+<code>ContainerCreating</code> com um evento <code>FailedMount</code> dizendo que o ConfigMap não foi
+encontrado. Se o volume é opcional de propósito, existe <code>optional: true</code> — o pod sobe sem o
+arquivo, e o programa precisa saber lidar com a ausência. Use com consciência: “opcional” costuma virar
+“esqueci de criar”.</p>
+
+<p>O quarto é o <strong>items incompleto</strong>. Ao listar duas chaves em <code>items</code>, você
+<em>exclui</em> todas as outras. Quem adiciona <code>items</code> para renomear um arquivo e esquece de
+listar os demais descobre, no dia seguinte, que metade da configuração desapareceu. <code>items</code> é
+lista fechada, não filtro.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o programa leu o arquivo velho por três dias</h3>
+<p>A Ana mudou o preço no ConfigMap, o arquivo em <code>/config</code> atualizou em um minuto, e o site
+continuou cobrando o preço antigo. O programa lia o JSON só no boot. Não era problema do volume: era do
+programa, que precisava reler o arquivo (ou de um reinício do pod para forçar a releitura). Configuração
+montada como arquivo só vale quando alguém do outro lado está olhando para o arquivo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a pasta /etc que sumiu</h3>
+<p>Alguém montou o ConfigMap em <code>/etc</code> “para ficar junto das outras configurações”. O container
+subiu sem os arquivos de <code>/etc</code> que a imagem trazia — usuários, resolução de nome, certificados — e
+o programa passou a falhar em coisas que não tinham relação nenhuma com o cardápio. Montagem de volume
+esconde o que estava na pasta. Pasta própria, sempre.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: dois containers, um ConfigMap</h3>
+<p>O pod do site ganhou um segundo container para exportar métricas. Os dois precisavam do mesmo
+<code>cardapio.json</code>, em caminhos diferentes. A solução foi um volume só, declarado no pod, e duas
+montagens — <code>/config</code> no container do site, <code>/etc/cardapio</code> no exportador. O objeto no
+cluster continua um; o que se multiplica é a montagem.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Onde se declara a <em>origem</em> do conteúdo de um
+volume?</p>
+<label><input type="radio" name="q1"> em <code>volumeMounts</code>, dentro do container</label>
+<label><input type="radio" name="q1"> em <code>spec.volumes</code>, no nível do pod</label>
+<label><input type="radio" name="q1"> no <code>data</code> do ConfigMap, com o campo
+<code>mountPath</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Um ConfigMap com as chaves <code>preco</code> e
+<code>horario</code>, montado em <code>/config</code> sem <code>items</code>, produz o quê?</p>
+<label><input type="radio" name="q2"> um arquivo <code>/config/configmap</code> com as duas chaves
+dentro</label>
+<label><input type="radio" name="q2"> duas variáveis de ambiente</label>
+<label><input type="radio" name="q2"> dois arquivos: <code>/config/preco</code> e
+<code>/config/horario</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que <code>items</code> faz?</p>
+<label><input type="radio" name="q3"> escolhe quais chaves entram no volume e com que nome de
+arquivo</label>
+<label><input type="radio" name="q3"> filtra o conteúdo de cada arquivo por linha</label>
+<label><input type="radio" name="q3"> define a permissão dos arquivos montados</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a pasta e o volume</h2>
+<p>Complete o manifesto do container para montar o volume <code>config</code> na pasta
+<code>/config</code>:</p>
+<div class="ex-code">volumeMounts:
+  - name: config
+    <input aria-label="resposta 1" data-answer="mountPath" placeholder="...">: /config</div>
+<p class="ex-dica">Dica: <code>mountPath</code> é o caminho dentro do container; <code>name</code> é o nome
+do volume declarado em <code>spec.volumes</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Montar um ConfigMap é transformar cada chave num arquivo dentro do container. Isso exige duas
+declarações: o volume em <code>spec.volumes</code>, dizendo de qual ConfigMap vem, e a montagem em
+<code>volumeMounts</code>, dizendo em que <code>mountPath</code> aparece. Os dois se ligam pelo
+<code>name</code> do volume — que não precisa ser o nome do ConfigMap, mas precisa ser igual nos dois
+lugares.</p>
+
+<p>Sem <code>items</code>, entram todas as chaves, cada uma com o nome da chave. Com <code>items</code>,
+entram só as listadas, com o <code>path</code> que você escolher — útil para renomear e para não expor o que
+o container não usa. O <code>readOnly</code> deixa a intenção explícita, e montar em pasta própria evita
+esconder arquivos da imagem.</p>
+
+<p>E o comportamento no tempo: o arquivo se atualiza sozinho quando o ConfigMap muda, em cerca de um
+minuto; a variável de ambiente, não. Mas o arquivo novo só serve se o programa reler — e é aí que a próxima
+conversa começa, depois de uma parada obrigatória no Secret.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>ConfigMap como volume: cada chave vira um arquivo com o nome da chave.</li>
+  <li>Duas peças: <code>spec.volumes</code> (origem) e <code>volumeMounts</code> (destino), ligadas pelo
+  <code>name</code>.</li>
+  <li><code>items</code> escolhe e renomeia: <code>key</code> é a chave, <code>path</code> é o
+  arquivo.</li>
+  <li>Monte em pasta própria: o volume esconde o que estava no <code>mountPath</code>.</li>
+  <li>Sem o ConfigMap, o pod não sobe — <code>FailedMount</code> no <code>describe</code>.</li>
+  <li>Arquivo atualiza sozinho; variável não. <code>subPath</code> também não.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ConfigMap imutável | Guia Kubernetes</title>
+<meta name="description" content="ConfigMap imutável no Kubernetes: immutable true, o erro field is immutable, por que o kubelet agradece e o padrão versionado cardapio-v1 e cardapio-v2.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>ConfigMap <span class="hl">imutável</span></h1>
+<p class="intro">Às seis da manhã a Ana descobriu que o preço do pão tinha mudado sozinho durante a madrugada.
+Ninguém sabia quem editou o ConfigMap, nem quando, nem por quê — o objeto não guarda histórico. Nesta aula ela
+conhece o <code>immutable: true</code>: um campo que transforma o ConfigMap em algo que ninguém edita, nem ela,
+nem o estagiário, nem o script de deploy. Aprende também o preço dessa proteção e o padrão que a contorna:
+configuração versionada, com nome novo a cada mudança.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que <code>immutable: true</code> impede — e o que ele não impede.</li>
+  <li>Onde o campo aparece no manifesto e no <code>-o yaml</code>.</li>
+  <li>Por que o kubelet e o apiserver gostam de objetos imutáveis.</li>
+  <li>O erro <code>field is immutable</code> e o que fazer quando ele aparece.</li>
+  <li>Por que não dá para “desimutar” um ConfigMap.</li>
+  <li>O padrão versionado: <code>cardapio-v1</code>, <code>cardapio-v2</code> e a troca de referência.</li>
+  <li>Como fazer o rollout na ordem certa, sem derrubar o site.</li>
+  <li>Onde o simulador deste guia para e o cluster de verdade continua.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o preço que mudou sozinho</h2>
+
+<p>O ConfigMap <code>cardapio</code> guarda o preço do pão, o horário de funcionamento e a moeda. Naquela
+madrugada, alguém rodou um <code>kubectl edit</code> e trocou <code>4.50</code> por <code>4.90</code>. O pod
+continuou com o valor antigo na memória, então nada quebrou na hora; quando o Deployment reiniciou por outro
+motivo, o site passou a cobrar o preço novo. Levou dois dias para alguém ligar o preço ao commit que não
+existia.</p>
+
+<p>O problema não é o preço: é que o ConfigMap é um objeto mutável por padrão. Qualquer pessoa com permissão de
+<code>update</code> muda qualquer chave, a qualquer hora, sem deixar rastro no objeto. O Kubernetes não guarda
+histórico de ConfigMap; o histórico vive no git, e só se alguém escreveu lá.</p>
+
+<p>O <code>immutable: true</code> é a resposta mais direta para “não quero que isso mude por acidente” — antes
+dele, o <a href="configmap.html">ConfigMap</a> é só um objeto mutável como outro qualquer. Ele não
+resolve tudo — não protege contra <code>delete</code>, não versiona, não audita — mas elimina a categoria mais
+comum de acidente: a edição pontual que ninguém combinou.</p>
+
+<p>O jeito de pensar: um ConfigMap comum é um quadro branco na parede; um imutável é um cartaz impresso. Para
+mudar o cartaz, você imprime outro e troca na parede. O antigo pode ficar guardado, e dá para saber qual está na
+parede pelo nome.</p>
+
+<h2>2. O que o campo faz</h2>
+
+<p><code>immutable</code> é um campo booleano no topo do ConfigMap, ao lado de <code>data</code> e
+<code>metadata</code>. Quando é <code>true</code> no momento da criação, o objeto nasce travado: qualquer
+tentativa de alterar <code>data</code> ou <code>binaryData</code> é recusada pelo apiserver. Não é o kubectl que
+recusa; é o servidor, então vale para todo mundo, de qualquer ferramenta.</p>
+
+<dl class="anatomy">
+<dt><code>immutable</code></dt>
+<dd>booleano no topo do ConfigMap. Definido como <code>true</code> na criação, impede alterações nos dados
+depois. Ausente ou <code>false</code>, o objeto é mutável como sempre foi.</dd>
+<dt>objeto imutável</dt>
+<dd>o ConfigMap ou Secret que já nasceu travado. O <code>metadata</code> ainda muda (labels, anotações), mas os
+dados não.</dd>
+<dt>versionamento por nome</dt>
+<dd>o padrão que substitui a edição: cada mudança gera um objeto novo, com sufixo no nome
+(<code>cardapio-v1</code>, <code>cardapio-v2</code>), e o Deployment passa a apontar para o novo.</dd>
+<dt>rollout</dt>
+<dd>quando o Deployment muda de referência, o controlador cria pods novos e derruba os antigos. É assim que a
+configuração nova chega aos containers.</dd>
+</dl>
+
+<p>O que ele <em>não</em> impede: apagar o objeto, mudar labels e anotações, criar outro objeto com o mesmo
+nome depois de apagar, e ler os dados. Imutável aqui significa “os dados não mudam”, não “o objeto é eterno”.
+Quem quiser proteger contra exclusão precisa de RBAC ou de uma política de admissão.</p>
+
+<p>E vale para Secret também: <code>immutable: true</code> funciona igual, e é ainda mais útil, porque
+credencial que muda sem aviso é pior que preço errado.</p>
+
+<h2>3. O manifesto e o <code>-o yaml</code></h2>
+
+<p>A declaração é uma linha. Compare os dois manifestos abaixo: a única diferença é <code>immutable: true</code>,
+e é ela que muda o comportamento de todo o resto da vida do objeto.</p>
+
+<pre class="file" data-file="cardapio.yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+  labels:
+    app: padaria
+immutable: true
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+  moeda: BRL</pre>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:ConfigMap/cardapio|immutable=true;;texto:created">
+  <p class="try-task">O ConfigMap nasce mutável. Acrescente <code>immutable: true</code> para que ele nasça
+  travado, e confirme que o cluster aceita.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+  labels:
+    app: padaria
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+  moeda: BRL</pre>
+<pre class="out">
+configmap/cardapio created
+
+No resources found in default namespace.
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+  labels:
+    app: padaria
+immutable: true
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+  moeda: BRL</pre>
+</div>
+
+<p>O painel confirma <code>configmap/cardapio created</code> e guarda o campo. Num cluster real, o
+<code>kubectl get configmap cardapio -o yaml</code> devolve o mesmo campo na saída — é assim que se descobre, meses
+depois, por que aquele objeto não aceita edição:</p>
+
+<pre class="term">$ kubectl get configmap cardapio -o yaml
+apiVersion: v1
+immutable: true
+kind: ConfigMap
+metadata:
+  creationTimestamp: "2024-03-11T09:14:22Z"
+  labels:
+    app: padaria
+  name: cardapio
+  namespace: padaria
+  resourceVersion: "88412"
+  uid: 4f1c2f60-9a3e-4b7a-9d61-6c0d1d6a2b11
+data:
+  horario: 6h as 19h
+  moeda: BRL
+  preco: "4.50"</pre>
+
+<p><code>immutable</code> aparece em maiúsculas minúsculas como foi escrito, no mesmo nível de
+<code>apiVersion</code>. O <code>resourceVersion</code> ali é o contador interno do objeto; com o ConfigMap
+travado, ele praticamente para de mudar, porque não há mais escrita de dados.</p>
+
+<p>Repare no <code>namespace: padaria</code>. O pod precisa estar no mesmo namespace do ConfigMap; referência
+entre namespaces não existe para <code>envFrom</code> nem para volume.</p>
+
+<h2>4. Por que isso existe</h2>
+
+<p>Há duas razões, e a segunda é a que surpreende. A primeira é humana: impedir edição acidental. A segunda é
+técnica, e é o motivo original do recurso — escala.</p>
+
+<p>Cada nó do cluster mantém uma conexão com o apiserver e observa os objetos de que precisa. Essa observação se
+chama <em>watch</em>: o kubelet pede “me avise quando este ConfigMap mudar” e fica esperando. Com milhares de
+pods e milhares de ConfigMaps, isso vira muito tráfego e muito estado guardado no servidor. Quando o objeto é
+declarado imutável, o kubelet não precisa observar nada: ele sabe que o conteúdo nunca vai mudar. O apiserver
+agradece.</p>
+
+<p>Tem um efeito colateral que confunde: ConfigMap imutável montado como volume <strong>não</strong> é
+atualizado. No ConfigMap comum, o kubelet reescreve os arquivos do volume quando o objeto muda, com atraso de
+alguns segundos ou minutos. No imutável, não há o que reescrever — o conteúdo é o mesmo para sempre. Quem
+dependia da atualização automática do volume perde essa mordomia e passa a precisar de rollout.</p>
+
+<p>Na prática, os dois efeitos se somam bem: você ganha previsibilidade (nada muda por baixo) e o cluster ganha
+folga. O custo é que a mudança vira um evento explícito, com nome novo e rollout. Para configuração de
+produção, isso costuma ser exatamente o que se quer.</p>
+
+<h2>5. O preço: o erro <code>field is immutable</code></h2>
+
+<p>O preço aparece no primeiro dia em que alguém tenta corrigir uma vírgula. O <code>kubectl apply</code> falha,
+o <code>kubectl edit</code> falha, o script de deploy falha — e a mensagem é sempre a mesma. Esta é a
+transcrição de um cluster real, ao tentar trocar o preço:</p>
+
+<pre class="term">$ kubectl apply -f cardapio.yaml
+The ConfigMap "cardapio" is invalid: data: Forbidden: field is immutable</pre>
+
+<p>Traduzindo: “o campo <code>data</code> é imutável”. O objeto continua com os valores antigos; nada foi
+alterado. Insistir não resolve, e não existe <code>--force</code> que contorne isso: a regra está no apiserver,
+não no cliente.</p>
+
+<p>E não adianta tentar voltar atrás. Se você editar o objeto para <code>immutable: false</code>, a resposta é
+parecida:</p>
+
+<p><code>The ConfigMap "cardapio" is invalid: immutable: Forbidden: field is immutable</code></p>
+
+<p>Ou seja: a decisão é tomada uma vez, na criação. Não há “destravar”; o caminho é apagar e criar de novo — o
+que, convenhamos, é uma forma de forçar a conversa. Quem apaga e recria perde o histórico de
+<code>resourceVersion</code>, mas mantém o nome.</p>
+
+<p>Para o dia a dia, o hábito que evita a frustração: antes de editar, olhe o <code>-o yaml</code>. Se
+<code>immutable: true</code> está lá, não perca tempo editando; vá direto para o padrão da próxima seção.</p>
+
+<p>Vale distinguir dois tipos de “não posso mudar”. O primeiro é permissão: falta ao seu usuário o verbo
+<code>update</code> no recurso <code>configmaps</code>, e quem responde isso é o RBAC, com
+<code>kubectl auth can-i update configmaps</code>. O segundo é o objeto: você tem permissão, o pedido chega ao
+apiserver, e ele recusa por imutabilidade. As mensagens são diferentes — <code>forbidden</code> puro no primeiro
+caso, <code>is invalid: data: Forbidden: field is immutable</code> no segundo — e confundir os dois faz perder
+tempo com o time de infraestrutura quando o problema é o manifesto.</p>
+
+<h2>6. O padrão versionado: v1, v2 e a troca de referência</h2>
+
+<p>Se não dá para editar, a mudança vira um objeto novo. O nome carrega a versão — <code>cardapio-v1</code>,
+<code>cardapio-v2</code>, ou um sufixo com o hash do conteúdo — e os dois coexistem por um tempo. O Deployment
+aponta para um deles; trocar a referência é o que espalha a configuração nova.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:ConfigMap/cardapio-v2|immutable=true;;campo:ConfigMap/cardapio-v2|data.preco=4.90;;campo:Deployment/web|spec.template.spec.containers.0.envFrom.0.configMapRef.name=cardapio-v2;;pronto:Deployment/web=1">
+  <p class="try-task">O preço subiu para <code>4.90</code>. O <code>cardapio</code> não aceita edição. Crie o
+  <code>cardapio-v2</code> imutável com o preço novo e mude o Deployment para apontar para ele.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+immutable: true
+data:
+  preco: "4.50"
+  moeda: BRL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          envFrom:
+            - configMapRef:
+                name: cardapio</pre>
+<pre class="out">
+configmap/cardapio created
+deployment.apps/web created
+
+NAME                   READY   STATUS    RESTARTS   AGE
+web-ntr7sg76cv-b65j6   1/1     Running   0          6m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+immutable: true
+data:
+  preco: "4.50"
+  moeda: BRL
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-v2
+immutable: true
+data:
+  preco: "4.90"
+  moeda: BRL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          envFrom:
+            - configMapRef:
+                name: cardapio-v2</pre>
+</div>
+
+<p>O painel cria os dois ConfigMaps, troca a referência no Deployment e mostra o pod novo em
+<code>Running</code>. Repare no que <em>não</em> mudou: a imagem é a mesma, o Deployment é o mesmo, o nome do pod
+muda porque o template mudou. É o controlador fazendo o trabalho de sempre.</p>
+
+<p>Três detalhes fazem a diferença na vida real. Primeiro, o <code>cardapio</code> antigo continua existindo:
+nada quebra para quem ainda o referencia, e o rollback é só voltar a referência. Segundo, o nome do objeto agora
+conta a história — dá para olhar o Deployment e saber qual configuração está no ar. Terceiro, apagar o antigo
+depois do rollout é uma decisão consciente, não um efeito colateral.</p>
+
+<p>O sufixo pode ser um número, uma data (<code>cardapio-20240311</code>) ou o hash do conteúdo
+(<code>cardapio-a1b2c3</code>). O hash tem a vantagem de nunca repetir e de dizer se o conteúdo é o mesmo; o
+número é mais legível. Qualquer um funciona, desde que o time combine a regra.</p>
+
+<h2>7. O rollout na ordem certa</h2>
+
+<p>A ordem importa, e a ordem errada derruba o site. O caminho seguro tem quatro passos, e cada um pode ser
+verificado antes do próximo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Passo</th><th>Comando</th><th>O que conferir</th></tr>
+</thead>
+<tbody>
+<tr><td>1. criar o objeto novo</td><td><code>kubectl apply -f cardapio-v2.yaml</code></td><td><code>get configmap</code> mostra o v2</td></tr>
+<tr><td>2. trocar a referência</td><td><code>kubectl set env deploy/web --from=configmap/cardapio-v2</code> ou editar o YAML</td><td><code>rollout status</code> conclui</td></tr>
+<tr><td>3. conferir os pods</td><td><code>kubectl get pods -o wide</code></td><td>todos <code>Running</code>, sem reinício em laço</td></tr>
+<tr><td>4. apagar o antigo</td><td><code>kubectl delete configmap cardapio</code></td><td>nada mais o referencia</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O passo 4 é o que mais gente pula, e é o que evita confusão depois: dois ConfigMaps quase iguais no cluster,
+um deles sem uso, e a próxima pessoa editando o errado. Antes de apagar, confira as referências com
+<code>kubectl get deploy -o yaml | grep cardapio</code> ou com a ferramenta de busca do seu time.</p>
+
+<p>Se o pod não subir depois da troca, o <code>rollout undo</code> volta a referência anterior em um comando. É
+a vantagem de ter os dois objetos vivos: o rollback não depende de recriar nada, só de apontar de volta.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/web|spec.template.spec.containers.0.envFrom.0.configMapRef.name=cardapio;;campo:ConfigMap/cardapio-v2|immutable=true;;pronto:Deployment/web=1">
+  <p class="try-task">O <code>cardapio-v2</code> derrubou o site e o plantão precisa voltar atrás agora. Aponte o
+  Deployment de volta para o <code>cardapio</code>, sem apagar o v2 — ele vai ser investigado depois.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+immutable: true
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-v2
+immutable: true
+data:
+  preco: "4.90"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          envFrom:
+            - configMapRef:
+                name: cardapio-v2</pre>
+<pre class="out">
+configmap/cardapio created
+configmap/cardapio-v2 created
+deployment.apps/web created
+
+NAME                   READY   STATUS    RESTARTS   AGE
+web-6hlhbmbsgl-n2pjf   1/1     Running   0          1m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+immutable: true
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-v2
+immutable: true
+data:
+  preco: "4.90"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          envFrom:
+            - configMapRef:
+                name: cardapio</pre>
+</div>
+
+<p>O painel troca a referência, cria o pod novo e mantém o <code>cardapio-v2</code> guardado. Num cluster real
+isso é o <code>kubectl rollout undo deployment/web</code>: dois segundos, sem imagem nova, sem build. O v2 fica
+lá, culpado, esperando a análise.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Situação</th><th>O que fazer</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>precisa corrigir um valor</td><td>criar <code>-v2</code> e trocar a referência</td><td>o v1 é imutável</td></tr>
+<tr><td>precisa voltar atrás</td><td><code>rollout undo</code></td><td>o v1 continua existindo</td></tr>
+<tr><td>precisa de um teste rápido</td><td>ConfigMap separado, mutável, em outro namespace</td><td>não suje o de produção</td></tr>
+<tr><td>quer saber a versão no ar</td><td><code>kubectl get deploy web -o yaml</code> e ler a referência</td><td>o nome carrega a versão</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. Onde o simulador para</h2>
+
+<p>O painel deste guia guarda o campo <code>immutable</code> e mostra o objeto criado, mas não implementa a
+recusa de atualização. Se você rodar o mesmo manifesto duas vezes mudando o preço, o simulador aceita; num
+cluster de verdade, a segunda aplicação falha com <code>field is immutable</code>. A diferença é do simulador,
+não do Kubernetes, e é bom saber onde ele mente.</p>
+
+<p>O que o painel mostra de verdade: o campo gravado no objeto, o Deployment apontando para o ConfigMap certo, o
+pod criado e o <code>pronto:</code> contando pods disponíveis. O que ele não mostra: o watch do kubelet, a
+recusa do apiserver e o evento de erro. Para esses, use a transcrição acima e o seu cluster de testes.</p>
+
+<p>Uma consequência prática para quem estuda por aqui: não tente “provar” a imutabilidade pelo painel. Prove a
+estrutura (o campo está lá, a referência está certa) e confie na documentação para o comportamento. É o mesmo
+raciocínio das aulas de eviction e OOM: o painel não executa container, então o comportamento de runtime vem de
+transcrição identificada.</p>
+
+<p>Para ver a recusa com os próprios olhos, um cluster local resolve. Crie o ConfigMap imutável, tente aplicar
+uma versão com o preço diferente e leia a mensagem; depois apague, recrie com outro nome e faça o Deployment
+apontar para ele. São cinco comandos e dez minutos, e o aprendizado fica: você vê a diferença entre “o apply
+falhou” e “o pod não achou a configuração”, que é o erro da próxima aula de diagnóstico.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o estagiário e o preço</h3>
+<p>Um estagiário recebeu a tarefa de mudar o horário e rodou <code>kubectl edit</code> no ConfigMap de produção.
+Com <code>immutable: true</code>, o editor abriu, ele mudou, salvou, e o apiserver recusou. Ele veio perguntar, e
+a resposta foi o processo: criar <code>cardapio-v2</code>, abrir um pull request, trocar a referência. O erro
+virou uma aula em vez de um incidente.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o volume que parou de atualizar</h3>
+<p>Um time montava o ConfigMap como volume e contava com a atualização automática do arquivo. Ao marcar como
+imutável, o arquivo parou de mudar — porque não há mudança para propagar. O sintoma foi “a configuração nova não
+chega”, e a causa era o próprio desenho: quem quer atualização precisa de ConfigMap mutável ou de reinício
+coordenado. Optaram por reiniciar o Deployment junto com a troca de versão.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: dois ConfigMaps e a referência errada</h3>
+<p>Depois de três versões, o cluster tinha <code>cardapio</code>, <code>cardapio-v2</code> e
+<code>cardapio-v2-hotfix</code>. Um deploy novo aplicou o manifesto antigo e voltou a apontar para o
+<code>cardapio</code> original. O site passou a cobrar o preço de duas semanas atrás. A correção foi renomear o
+antigo para <code>cardapio-aposentado</code> e apagar de fato — nome que não é referenciado não deve parecer
+vivo.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que <code>immutable: true</code> impede?</p>
+<label><input type="radio" name="q1"> apagar o ConfigMap</label>
+<label><input type="radio" name="q1"> alterar os dados do ConfigMap depois de criado</label>
+<label><input type="radio" name="q1"> montar o ConfigMap como volume</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Como mudar um valor de um ConfigMap imutável?</p>
+<label><input type="radio" name="q2"> <code>kubectl edit</code> com <code>--force</code></label>
+<label><input type="radio" name="q2"> trocar <code>immutable</code> para <code>false</code> e editar</label>
+<label><input type="radio" name="q2"> criar um objeto novo com outro nome e trocar a referência no Deployment</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que o kubelet prefere ConfigMap imutável?</p>
+<label><input type="radio" name="q3"> porque não precisa observar mudanças no objeto, o que reduz carga no apiserver</label>
+<label><input type="radio" name="q3"> porque comprime melhor os dados em disco</label>
+<label><input type="radio" name="q3"> porque permite mais variáveis de ambiente por container</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o campo que trava o objeto</h2>
+<p>Complete o ConfigMap para que ele nasça imutável.</p>
+<div class="ex-code">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+<input aria-label="resposta 1" data-answer="immutable" placeholder="...">: true
+data:
+  preco: "4.50"</div>
+<p class="ex-dica">Dica: é um booleano no topo do objeto, no mesmo nível de <code>data</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>immutable: true</code> no topo do ConfigMap (ou do Secret) faz o objeto nascer travado: o apiserver
+recusa qualquer alteração em <code>data</code> e <code>binaryData</code> com
+<code>Forbidden: field is immutable</code>. A decisão é definitiva — não existe voltar para
+<code>false</code> — e o caminho é apagar e recriar, ou nunca precisar disso.</p>
+
+<p>O padrão que resolve o dia a dia é versionar pelo nome: <code>cardapio-v1</code>, <code>cardapio-v2</code>, e
+o Deployment apontando para um deles. Criar o novo, trocar a referência, conferir o rollout, apagar o antigo. O
+rollback é apontar de volta, e o nome no manifesto conta qual configuração está no ar.</p>
+
+<p>O ganho técnico é real: sem watch, menos carga no apiserver e no kubelet; volume imutável não é reescrito e
+variável continua sendo lida no start. O custo é que toda mudança vira um evento explícito — e, para
+configuração de produção, é provavelmente o que você queria desde o começo.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>immutable: true</code> na criação; depois disso, <code>data</code> não muda.</li>
+  <li>O erro é <code>The ConfigMap "x" is invalid: data: Forbidden: field is immutable</code>.</li>
+  <li>Não dá para “desimutar”: apague e crie de novo, ou versione pelo nome.</li>
+  <li>Padrão: <code>cardapio-v2</code> + troca da referência no Deployment = rollout.</li>
+  <li>Volume imutável não é atualizado; variável continua exigindo reinício.</li>
+  <li>Imutável não protege contra <code>delete</code>: isso é RBAC.</li>
+  <li>O painel do guia grava o campo, mas não simula a recusa — a transcrição mostra o cluster real.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

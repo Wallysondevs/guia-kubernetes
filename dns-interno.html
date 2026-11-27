@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DNS interno | Guia Kubernetes</title>
+<meta name="description" content="DNS interno do Kubernetes: o nome do Service vira endereço, as formas do nome (curto, com namespace, completo), o search do resolv.conf e os erros de resolução mais comuns.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>DNS <span class="hl">interno</span></h1>
+<p class="intro">A Ana já sabe que o Service dá um endereço estável ao site — mas o código do programa não
+pode ter um IP dentro: se o Service for recriado, o IP muda e o cliente quebra. A solução é chamar pelo nome,
+e é aí que entra o DNS do cluster: todo Service ganha um nome, e o Kubernetes responde por ele de dentro de
+qualquer pod. Nesta aula a Ana entende como o nome é formado, por que às vezes só o nome curto funciona, e o
+que fazer quando aparece o temido <code>no such host</code>.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Que o nome do Service é o endereço, e que o IP é detalhe.</li>
+  <li>As quatro formas do mesmo nome — curta, com namespace, com <code>svc</code> e completa.</li>
+  <li>Como o pod descobre o domínio do cluster pelo <code>/etc/resolv.conf</code>.</li>
+  <li>Por que o nome curto funciona em um namespace e falha em outro.</li>
+  <li>Quem responde: o CoreDNS e o registro do Service.</li>
+  <li>Os erros de resolução mais comuns e como diagnosticá-los em três comandos.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o IP que não devia estar no código</h2>
+
+<p>O site da padaria funciona: o front-end chama o back-end, o back-end chama o banco, tudo dentro do cluster.
+Só que a Ana escreveu o endereço do back-end no código do front-end: <code>http://10.96.147.79:80</code>. Um
+IP de Service, copiado da tabela do <code>get services</code>. Funcionou por três semanas — até o dia em que o
+time recriou o Service para mudar uma porta, e o IP mudou para <code>10.96.23.201</code>. O front-end passou a
+responder erro em todas as páginas.</p>
+
+<p>O problema não é o Service: é o IP dentro do código. Endereço de Service não é identidade, é detalhe de
+implementação — pode mudar quando o objeto é recriado. O que é estável é o <strong>nome</strong>. Todo Service
+tem um nome, e o cluster tem um DNS interno que responde por ele: quem chama <code>cardapio</code> chega no
+Service <code>cardapio</code>, não importa qual IP ele tenha naquele dia.</p>
+
+<p>É o mesmo princípio que fez a internet trocar listas de IPs por nomes de domínio nos anos oitenta. Dentro do
+cluster, o domínio existe e é servido por um DNS próprio, o <strong>CoreDNS</strong>, que roda como pods no
+namespace <code>kube-system</code>. Todo pod do cluster é configurado para consultá-lo — e é por isso que
+<code>http://cardapio</code> funciona de dentro de qualquer container, sem que ninguém tenha configurado
+nada.</p>
+
+<h2>2. O nome por dentro</h2>
+
+<p>O nome DNS de um Service é montado com quatro pedaços: o nome do objeto, o namespace, a palavra
+<code>svc</code> e o domínio do cluster. Juntando, sai algo como
+<code>cardapio.default.svc.cluster.local</code>. Cada pedaço existe por um motivo, e conhecer os quatro resolve
+quase toda dúvida de “por que esse nome não resolve?”.</p>
+
+<dl class="anatomy">
+<dt>nome do Service</dt>
+<dd>O primeiro pedaço: <code>cardapio</code>. É o que você declarou em <code>metadata.name</code> — e é por
+isso que renomear o Service muda o endereço de todo mundo.</dd>
+<dt>namespace</dt>
+<dd>O segundo pedaço: <code>default</code>. Dois Services com o mesmo nome em namespaces diferentes são dois
+nomes DNS diferentes.</dd>
+<dt><code>svc</code></dt>
+<dd>O terceiro pedaço, fixo: diz que o registro é de um Service. Pods sem Service e Endpoints têm outros
+formatos.</dd>
+<dt><code>cluster.local</code></dt>
+<dd>O domínio do cluster. É configurável, e o padrão da instalação é esse.</dd>
+<dt>CoreDNS</dt>
+<dd>O servidor DNS do cluster, que responde pelos nomes dos Services e dos pods e encaminha o resto para fora.</dd>
+<dt>search domain</dt>
+<dd>A lista de domínios que o pod completa automaticamente quando você usa um nome curto.</dd>
+</dl>
+
+<p>Repare no que não entra no nome: a porta. DNS resolve nome para endereço, não para porta — quem carrega a
+porta é o próprio cliente, no <code>http://cardapio:8080</code>. Existem registros que carregam porta (os SRV),
+mas as aplicações comuns não os usam: elas conhecem a porta da configuração.</p>
+
+<p>E repare no que o nome resolve: o <strong>ClusterIP</strong> do Service, não o IP de um pod. O DNS entrega
+o endereço virtual, e o encaminhamento para os pods acontece depois, pelas regras do kube-proxy. Isso é
+importante por dois motivos: o nome continua válido durante um rollout, e o cliente nunca vê o IP do pod — que
+muda o tempo todo.</p>
+
+<h2>3. Quem responde: o CoreDNS</h2>
+
+<p>Antes de discutir nomes, vale ver que o DNS existe. O comando <code>kubectl cluster-info</code> lista os
+serviços essenciais do cluster, e o CoreDNS é um deles. A caixa abaixo usa o cluster da padaria: primeiro ela
+mostra o DNS no ar, depois a lista de Services cujos nomes serão resolvidos.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:CoreDNS;;texto:cardapio">
+  <p class="try-task">Rode os dois comandos e encontre, na primeira resposta, o serviço de DNS do cluster; na
+  segunda, o Service que ganhou nome.</p>
+<pre class="yaml">kubectl cluster-info</pre>
+<pre class="out">
+ana@notebook:~$ kubectl cluster-info
+Kubernetes control plane is running at https://127.0.0.1:6443
+CoreDNS is running at https://127.0.0.1:6443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
+
+To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.
+</pre>
+  <pre class="solucao">kubectl cluster-info
+kubectl get services</pre>
+</div>
+
+<p>O painel do código inicial mostra só os endereços do control plane. Depois da missão, aparecem duas coisas:
+a linha <code>CoreDNS is running at …</code>, que confirma o servidor de nomes no ar, e a tabela de Services,
+com <code>cardapio</code> e o seu ClusterIP. É a combinação que faz o nome funcionar: alguém que responde e
+um registro para responder.</p>
+
+<pre class="term">Kubernetes control plane is running at https://127.0.0.1:6443
+CoreDNS is running at https://127.0.0.1:6443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy</pre>
+
+<p>A transcrição acima é a resposta do painel para o <code>cluster-info</code>. O detalhe interessante está no
+endereço do CoreDNS: ele aponta para um Service chamado <code>kube-dns</code> no namespace
+<code>kube-system</code>. Ou seja, o próprio DNS é acessado por um Service — e o nome antigo
+<code>kube-dns</code> ficou, mesmo depois de o servidor passar a ser o CoreDNS. É por isso que você vê
+<code>kube-dns</code> em tutoriais antigos e <code>coredns</code> nos novos: são a mesma função.</p>
+
+<p>O CoreDNS roda como um Deployment com duas réplicas, no namespace <code>kube-system</code>, e responde na
+porta 53 (UDP e TCP). Os pods do cluster recebem, no arquivo <code>/etc/resolv.conf</code>, o endereço desse
+Service como servidor de nomes. Se o CoreDNS estiver fora do ar, nada resolve — nem entre pods. É por isso que
+“a rede do cluster parou” costuma ser diagnosticado primeiro com um <code>get pods -n kube-system</code>.</p>
+
+<h2>4. As quatro formas do mesmo nome</h2>
+
+<p>O mesmo Service pode ser chamado de quatro maneiras, e a diferença entre elas é <em>onde</em> quem chama
+está. A mais completa sempre funciona; as mais curtas dependem do namespace de origem e da configuração de
+busca do pod.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Forma</th><th>Exemplo</th><th>Funciona de onde</th></tr>
+</thead>
+<tbody>
+<tr><td>curta</td><td><code>cardapio</code></td><td>do mesmo namespace do Service</td></tr>
+<tr><td>com namespace</td><td><code>cardapio.padaria</code></td><td>de qualquer namespace</td></tr>
+<tr><td>com <code>svc</code></td><td><code>cardapio.padaria.svc</code></td><td>de qualquer namespace; deixa
+explícito que é um Service</td></tr>
+<tr><td>completa (FQDN)</td><td><code>cardapio.padaria.svc.cluster.local</code></td><td>de qualquer lugar do
+cluster, sem depender da busca</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Por que as formas curtas funcionam? Porque o pod não pergunta só “cardapio”; ele pergunta por uma lista de
+candidatos, montada a partir do domínio de busca. O arquivo <code>/etc/resolv.conf</code> de dentro do pod tem,
+mais ou menos, esta cara:</p>
+
+<pre class="term">nameserver 10.96.0.10
+search default.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5</pre>
+
+<p>Esse é o modelo que o kubelet escreve em todo pod que sobe com a política de DNS padrão. A primeira linha
+aponta para o Service do CoreDNS (aqui, <code>10.96.0.10</code>). A segunda é a lista de busca: quando você
+pede um nome com poucos pontos, o sistema tenta primeiro <code>nome.default.svc.cluster.local</code>,
+depois <code>nome.svc.cluster.local</code>, depois <code>nome.cluster.local</code>, e só então o nome cru. A
+terceira diz quantos pontos o nome precisa ter para ser tratado como completo (<code>ndots:5</code>).</p>
+
+<p>Daí vêm duas consequências práticas. A primeira: o nome curto só funciona porque o pod está no
+<code>default</code> — se o Service estiver no namespace <code>padaria</code> e o cliente no
+<code>default</code>, a busca tenta <code>cardapio.default.svc.cluster.local</code>, que não existe, e falha.
+A segunda: nomes com muitos pontos (como um domínio da internet) vão direto para o servidor, sem passar pela
+lista — e é por isso que chamar um endereço externo não fica lento por causa do DNS interno.</p>
+
+<h2>5. O nome é o do Service</h2>
+
+<p>Como o nome DNS sai do <code>metadata.name</code>, renomear um Service muda o endereço de todo mundo que o
+chama. A caixa abaixo tem o caso clássico: o Service foi criado como <code>cardapio-svc</code>, e o programa
+— corretamente — chama <code>cardapio</code>. Não há erro de rede nem de porta; há um nome que não existe.</p>
+
+<div class="tryk8s" data-get="services" data-goal="objeto:Service/cardapio;;campo:Service/cardapio|metadata.name=cardapio;;texto:80/TCP">
+  <p class="try-task">O Service se chama <code>cardapio-svc</code> e o programa chama <code>cardapio</code>.
+  Renomeie o Service para <code>cardapio</code> e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio-svc
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+pod/web created
+service/cardapio-svc created
+
+NAME           TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio-svc   ClusterIP   10.96.22.243   &lt;none&gt;        80/TCP    7m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>O painel do código inicial mostra <code>cardapio-svc</code> na tabela; depois da missão, <code>cardapio</code>.
+Parece cosmético, e não é: o nome é o contrato. Um cliente que pede <code>cardapio</code> recebe “no such
+host” — a mensagem de erro do resolvedor para nome inexistente —, enquanto o Service
+<code>cardapio-svc</code> continua lá, saudável, atendendo a quem souber o nome dele.</p>
+
+<p>Vale conhecer o irmão desse erro: <code>could not resolve host</code>, do <code>curl</code>, e
+<code>Name or service not known</code>, do sistema. Todos dizem a mesma coisa em dialetos diferentes: o nome
+consultado não existe no DNS. Nenhum deles fala de porta, de firewall ou de pod — e é por isso que ler a
+mensagem inteira economiza tempo.</p>
+
+<h2>6. Dois serviços, dois nomes</h2>
+
+<p>Cada Service é um nome independente, e é isso que permite dividir o sistema em partes que se chamam por
+nome. Na padaria, o site precisa falar com o cardápio e com o frete; cada um é um Service, com o seu nome, e o
+código usa o nome — não o IP. A caixa abaixo começa com metade da conversa.</p>
+
+<div class="tryk8s" data-get="services" data-goal="conta:services=2;;campo:Service/frete|spec.selector.app=cardapio;;texto:frete">
+  <p class="try-task">Só existe o Service <code>cardapio</code>. Crie o Service <code>frete</code>, apontando
+  para os mesmos pods (<code>app: cardapio</code>), e rode: a tabela tem de mostrar os dois nomes.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80</pre>
+<pre class="out">
+pod/web created
+service/cardapio created
+
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        80/TCP    2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frete
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80</pre>
+</div>
+
+<p>O painel mostra um Service no código inicial e dois depois: <code>cardapio</code> e <code>frete</code>, cada
+um com o seu ClusterIP. São dois nomes para o mesmo pod — o que é perfeitamente normal e útil: nomes diferentes
+podem apontar para o mesmo conjunto, ou para conjuntos diferentes amanhã, sem que o cliente mude uma linha.</p>
+
+<p>Essa é a vantagem do nome sobre o IP, e vale dizer em voz alta: o nome é um <em>nível de indireção</em>. O
+código conhece <code>frete</code>; quem decide o que está atrás de <code>frete</code> é o manifesto do Service.
+Trocar o pod, mudar a versão, dividir em dois serviços — nada disso aparece no código do cliente. O IP, ao
+contrário, é o fim da linha: muda, e todos que o conheciam quebram.</p>
+
+<h2>7. O que o DNS interno não faz</h2>
+
+<p>Três coisas escapam do nome do Service, e cada uma gera uma confusão diferente. A primeira: o DNS não
+resolve nomes de <em>pods</em> por padrão. Pod tem IP e não tem nome DNS — a não ser em casos específicos, como
+o Service headless da próxima aula, que cria nomes por pod. Se você precisa chamar um pod específico, o caminho
+normal é o Service na frente dele.</p>
+
+<p>A segunda: o DNS interno não resolve nomes da internet por si. O CoreDNS encaminha o que não conhece para os
+servidores do nó ou do provedor, então <code>loja.test</code> acaba resolvendo — mas com o tempo de quem está
+fora, e sujeito às regras de saída do cluster. Em cluster sem saída de rede, nome externo não resolve, e o
+sintoma é o mesmo <code>no such host</code>.</p>
+
+<p>A terceira: o nome do Service só existe dentro do cluster. Fora dele, ninguém resolve
+<code>cardapio.default.svc.cluster.local</code> — é um domínio interno, como o de uma rede corporativa. Quem
+está de fora usa o endereço do LoadBalancer ou o nome publicado no Ingress.</p>
+
+<p>Existe ainda o caso do nome que aponta para fora: um Service do tipo <code>ExternalName</code> não tem
+ClusterIP nem endpoints; ele é só um apelido DNS, que responde com um CNAME para o nome externo. É útil para
+tirar um endereço externo do código sem criar um proxy — mas o preço é que não há balanceamento nem lista de
+endpoints: quem resolve recebe o nome de fora e conecta direto.</p>
+
+<h2>8. Quando o nome não resolve</h2>
+
+<p>Três comandos resolvem a maioria dos casos. <code>kubectl get services</code> confirma que o Service existe
+e com que nome. <code>kubectl describe service</code> mostra namespace e portas. E
+<code>kubectl get pods -n kube-system</code> mostra se o CoreDNS está de pé — porque, sem ele, nada resolve.
+O quarto, quando o problema é dentro do pod, é abrir um shell e consultar o nome na hora.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td><code>no such host</code> no log</td><td>nome errado, ou Service em outro namespace sem qualificar</td><td>conferir
+<code>get services</code> e usar <code>nome.namespace</code></td></tr>
+<tr><td>funciona em um namespace e não em outro</td><td>nome curto depende do namespace de quem chama</td><td>usar
+a forma com namespace ou o FQDN</td></tr>
+<tr><td>resolve e a conexão falha</td><td>porta errada ou endpoints vazios</td><td><code>get endpoints</code> e
+a porta do cliente</td></tr>
+<tr><td>nada resolve dentro do cluster</td><td>CoreDNS fora do ar</td><td><code>get pods -n
+kube-system</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um detalhe de cache que engana: o resolvedor do pod guarda respostas por alguns segundos. Se você acabou de
+criar o Service e o cliente ainda diz que o nome não existe, espere e tente de novo antes de sair
+investigando. E, se você acabou de renomear um Service, lembre que o nome antigo continua em cache nos
+clientes — a troca de nome é uma migração, não um detalhe.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o nome curto que funcionava em teste</h3>
+<p>Em teste, o front-end e a API estavam no mesmo namespace, e o código chamava <code>api</code>. Ao subir
+para produção, cada um foi para um namespace diferente, e o front-end passou a responder erro. Nada no
+manifesto tinha mudado — só o namespace de quem chamava. A correção foi usar <code>api.producao</code>, que
+funciona de qualquer lugar do cluster.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Service renomeado no meio da migração</h3>
+<p>Para padronizar, o time renomeou <code>cardapio-svc</code> para <code>cardapio</code>. Os serviços que
+chamavam pelo nome antigo pararam no instante do apply, e o erro aparecia como falha de rede no cliente. A
+saída foi criar o Service novo, apontar os clientes e só então apagar o antigo — uma migração de duas etapas,
+com os dois nomes convivendo por alguns dias.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o CoreDNS que caiu de madrugada</h3>
+<p>Uma atualização do cluster deixou o CoreDNS sem pods por alguns minutos. Tudo ficou lento e depois parou:
+nenhum serviço resolvia outro, e os logs se encheram de <code>no such host</code>. Quem já tinha o IP em cache
+continuou funcionando — o que fez o problema parecer aleatório. Desde então, o painel da padaria tem um alerta
+só para “CoreDNS com menos de duas réplicas prontas”.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O nome DNS de um Service é formado por…</p>
+<label><input type="radio" name="q1"> IP do Service e porta</label>
+<label><input type="radio" name="q1"> nome, namespace, <code>svc</code> e o domínio do cluster</label>
+<label><input type="radio" name="q1"> nome do pod e nome do Deployment</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O código chama <code>cardapio</code> e recebe <code>no such
+host</code>. Qual é a causa mais provável?</p>
+<label><input type="radio" name="q2"> o Service está sem endpoints</label>
+<label><input type="radio" name="q2"> a porta do container está fechada</label>
+<label><input type="radio" name="q2"> o Service tem outro nome, ou está em outro namespace</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Quem responde pelos nomes dentro do cluster?</p>
+<label><input type="radio" name="q3"> o CoreDNS, no namespace <code>kube-system</code></label>
+<label><input type="radio" name="q3"> o kubelet de cada nó</label>
+<label><input type="radio" name="q3"> o servidor DNS do provedor de nuvem</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o nome que funciona de qualquer namespace</h2>
+<p>Complete o nome pelo qual o Service <code>cardapio</code> do namespace <code>padaria</code> é alcançável de
+qualquer lugar do cluster (sem o domínio final):</p>
+<div class="ex-code">cardapio.<input aria-label="resposta 1" data-answer="padaria" placeholder="...">.svc.cluster.local</div>
+<p class="ex-dica">Dica: o segundo pedaço do nome é o namespace onde o Service vive.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Todo Service ganha um nome DNS montado com nome, namespace, <code>svc</code> e o domínio do cluster:
+<code>cardapio.default.svc.cluster.local</code>. O nome resolve para o ClusterIP, não para o IP de um pod — e é
+por isso que ele sobrevive a rollouts, a mudanças de réplica e a pods que nascem e morrem.</p>
+
+<p>As formas curtas funcionam por causa da lista de busca do <code>/etc/resolv.conf</code>: o pod tenta
+completar o nome com o seu namespace antes de perguntar pelo nome cru. Por isso o nome curto quebra quando o
+cliente muda de namespace — e por isso a forma com namespace (<code>cardapio.padaria</code>) é a mais segura
+em código que pode rodar em qualquer lugar.</p>
+
+<p>Quem responde é o CoreDNS, que roda em <code>kube-system</code> e aparece no <code>cluster-info</code>. Sem
+ele, nada resolve. E nomes de fora do cluster não são assunto dele: para isso existem o
+<code>ExternalName</code> e o DNS que o operador configura. A próxima aula fecha o assunto de nomes com o
+Service que abre mão do ClusterIP: o headless.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>O nome do Service é o endereço estável; o IP é detalhe que muda.</li>
+  <li>Formas: <code>nome</code>, <code>nome.ns</code>, <code>nome.ns.svc</code>,
+  <code>nome.ns.svc.cluster.local</code>.</li>
+  <li>O nome curto só funciona no mesmo namespace; em código, prefira <code>nome.ns</code>.</li>
+  <li>DNS resolve nome para IP, não para porta.</li>
+  <li>Quem responde é o CoreDNS, no <code>kube-system</code>; sem ele, nada resolve.</li>
+  <li><code>no such host</code> é nome errado ou namespace errado — não é firewall.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

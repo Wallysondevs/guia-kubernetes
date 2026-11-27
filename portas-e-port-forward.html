@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portas e port-forward | Guia Kubernetes</title>
+<meta name="description" content="containerPort, port-forward e as três portas do Kubernetes: o que o manifesto declara, o que o programa escuta e como abrir um túnel do seu notebook até o pod.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Portas e <span class="hl">port-forward</span></h1>
+<p class="intro">O site da Ana está rodando no cluster e ela quer ver com os próprios olhos. Abre o
+navegador, digita o IP do pod — e nada. O IP é interno, o nó não repassa aquela porta e o firewall do
+notebook nem sabe que o cluster existe. O caminho mais curto entre o navegador dela e o pod tem nome:
+<code>kubectl port-forward</code>. Antes dele, porém, a Ana precisa entender o campo
+<code>containerPort</code>, que não abre porta nenhuma — e é justamente por isso que ele confunde
+tanta gente.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o <code>containerPort</code> faz — e o que ele <strong>não</strong> faz.</li>
+  <li>As três portas que aparecem num projeto Kubernetes e quem usa cada uma.</li>
+  <li>A sintaxe e as regras de <code>ports</code>: número, nome e protocolo.</li>
+  <li>Como ler a porta declarada no <code>kubectl describe</code>.</li>
+  <li>Abrir um túnel com <code>kubectl port-forward</code> e testar o site no navegador.</li>
+  <li>Por que o port-forward é ferramenta de teste e não de produção.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o site está no ar, mas não na tela</h2>
+
+<p>O pod <code>cardapio</code> está em <code>Running</code>, o log mostra "Servindo o cardapio na porta
+8080" e o <code>get pods -o wide</code> deu um IP: <code>10.244.1.5</code>. A Ana copia esse IP para o
+navegador do notebook e recebe um tempo esgotado. Nada de errado com o site: o IP do pod só existe
+<em>dentro</em> da rede do cluster.</p>
+
+<p>Esse é o desenho, não um defeito. Pods nascem e morrem, ganham IP novo a cada recriação, e ninguém
+deveria depender do endereço deles. Para acesso de fora existem caminhos pensados: o
+<code>Service</code> (que dá um nome e um IP estável, assunto do Nível 2), o <code>Ingress</code> (que
+publica na internet) e, para teste rápido no seu próprio computador, o
+<code>kubectl port-forward</code>.</p>
+
+<p>Antes de abrir o túnel, uma pergunta que parece boba e decide muita coisa: <em>em que porta o programa
+escuta?</em> No caso da Ana, 8080. E em que porta o manifesto diz que ele escuta? Também 8080 — mas por
+outro motivo, que a seção 2 explica.</p>
+
+<h2>2. As três portas do mesmo projeto</h2>
+
+<p>Quem começa em Kubernetes ouve "porta 8080" em três contextos diferentes e conclui que é tudo a mesma
+coisa. Não é. Existe a porta em que o <strong>programa</strong> escuta (definida no código, com
+<code>app.listen(8080)</code> ou equivalente), a porta que você <strong>declara</strong> no manifesto do
+container e a porta que o <strong>Service</strong> publica. Cada uma tem um dono e um uso.</p>
+
+<dl class="anatomy">
+<dt>containerPort</dt>
+<dd>A porta que o seu programa usa, declarada no manifesto do pod. Serve para documentar e para o Service
+achar o alvo pelo nome.</dd>
+<dt>targetPort</dt>
+<dd>No Service: para onde o tráfego vai. Pode ser o número (<code>8080</code>) ou o nome da porta
+(<code>http</code>).</dd>
+<dt>port</dt>
+<dd>No Service: a porta que o Service expõe, a que os outros pods usam para chamar o seu site.</dd>
+<dt>port-forward</dt>
+<dd>Um túnel do seu computador até um pod ou Service. Local <code>127.0.0.1:8080</code> passa a falar com
+a porta do pod.</dd>
+<dt>localhost</dt>
+<dd>O "aqui mesmo", no seu notebook. O port-forward abre a porta em <code>localhost</code>; ninguém na
+rede enxerga.</dd>
+<dt>IP do pod</dt>
+<dd>Endereço interno, na faixa <code>10.244.x.x</code> neste cluster. Muda quando o pod é recriado.</dd>
+</dl>
+
+<p>Guarde a relação: o <code>containerPort</code> precisa ser igual à porta do programa, o
+<code>targetPort</code> do Service precisa ser igual ao <code>containerPort</code>, e o
+<code>port</code> do Service é escolha sua. Quando alguém diz "o Service não acha o site", nove entre dez
+vezes uma dessas três igualdades está quebrada.</p>
+
+<h2>3. O que o containerPort faz (e o que ele não faz)</h2>
+
+<p>Aqui está a frase que economiza horas de confusão: <strong>o <code>containerPort</code> não abre porta
+nenhuma</strong>. Ele não configura firewall, não cria proxy, não inicia listener. O container já escuta na
+porta que o programa escolheu, com ou sem manifesto. O campo é uma <em>declaração de intenção</em>, lida
+por outras peças do cluster.</p>
+
+<p>Três usos concretos: o <code>kubectl describe</code> mostra a porta no raio-x do pod (útil para quem lê
+o cluster), o Service pode apontar para a porta pelo <em>nome</em> em vez do número (o que permite trocar
+8080 por 3000 sem editar o Service) e algumas ferramentas de documentação e monitoramento leem o campo para
+descobrir o serviço.</p>
+
+<p>Consequência prática: se você declarar <code>containerPort: 80</code> e o programa escutar em 8080,
+<strong>nada quebra no pod</strong>. Ele sobe, fica <code>Running</code>, o log mostra o servidor
+funcionando — e o acesso não funciona, porque quem tentar chegar na 80 não vai achar ninguém. O erro não
+aparece em lugar nenhum; aparece só como "conexão recusada" do outro lado. É o tipo de problema que o
+manifesto pode causar e não pode denunciar.</p>
+
+<pre class="file" data-file="cardapio.yaml">spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP</pre>
+
+<p>O item de <code>ports</code> é uma lista, e cada item aceita três campos. <code>containerPort</code> é
+obrigatório quando existe o item, precisa ser um número inteiro entre 1 e 65535, e é a única informação que
+o cluster de fato usa. <code>name</code> é opcional, mas obrigatório se você quiser que um Service aponte
+para ela por nome — e segue a regra dos nomes de recurso: minúsculas, números e hífen. <code>protocol</code>
+aceita <code>TCP</code>, <code>UDP</code> ou <code>SCTP</code>, e o padrão é <code>TCP</code>.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/cardapio|spec.containers.0.ports.0.containerPort=8080">
+  <p class="try-task">O item de <code>ports</code> está sem o número da porta e o cluster recusa o pod.
+  Ponha <code>containerPort: 8080</code> e rode de novo.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - name: http
+          protocol: TCP</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.containers[0].ports[0].containerPort: Required value
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP</pre>
+</div>
+
+<p>A mensagem do cluster é direta: <code>spec.containers[0].ports[0].containerPort: Required value</code>.
+Repare no caminho — <code>containers[0]</code> é o primeiro container da lista, <code>ports[0]</code> é a
+primeira porta dele. Todo erro de validação do Kubernetes vem nesse formato, com o caminho exato do campo
+que faltou, e é por isso que ler a mensagem até o fim vale mais do que reler o YAML.</p>
+
+<h2>4. Nome e protocolo: os detalhes que voltam depois</h2>
+
+<p>O nome da porta não é enfeite. Ele existe para que o Service possa dizer
+<code>targetPort: http</code> em vez de <code>targetPort: 8080</code>, e isso tem uma consequência boa: no
+dia em que o time trocar a porta interna para 3000, basta mudar o <code>containerPort</code> e o nome
+continua valendo — o Service nem fica sabendo. É o tipo de detalhe que parece preciosismo até o primeiro
+incidente.</p>
+
+<p>Como todo nome no Kubernetes, ele tem regra: minúsculas, números e hífen, até 15 caracteres. E o
+protocolo merece atenção porque é uma lista fechada de três valores — quem escreve
+<code>protocol: HTTP</code> achando que está sendo específico recebe uma recusa na hora.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/metricas|spec.containers.0.ports.0.protocol=TCP">
+  <p class="try-task">O protocolo está como <code>http</code>, que não existe para o Kubernetes. Troque por
+  <code>TCP</code> — ou apague a linha, porque <code>TCP</code> é o padrão.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: metricas
+spec:
+  containers:
+    - name: metricas
+      image: metricas:1.0
+      ports:
+        - name: metricas
+          containerPort: 9090
+          protocol: http</pre>
+<pre class="out">
+The Pod "metricas" is invalid: spec.containers[0].ports[0].protocol: Unsupported value: "http": supported values: "SCTP", "TCP", "UDP"
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: metricas
+spec:
+  containers:
+    - name: metricas
+      image: metricas:1.0
+      ports:
+        - name: metricas
+          containerPort: 9090
+          protocol: TCP</pre>
+</div>
+
+<p>Vale notar que, apagando a linha do protocolo, o pod também sobe: o cluster preenche
+<code>TCP</code> sozinho. Os dois caminhos são corretos, e é por isso que a verificação olha o objeto
+final, não o texto que você escreveu. Manifesto não é prova de intenção; o objeto no cluster é.</p>
+
+<p>Um aviso sobre um campo vizinho, o <code>hostPort</code>: ele abre a porta <em>no nó</em>, o que traz
+todos os problemas de agendamento de volta (dois pods não podem usar a mesma porta no mesmo nó). Existe para
+casos raros de rede; no dia a dia, não use.</p>
+
+<h2>5. Lendo a porta no describe</h2>
+
+<p>Depois de aplicar, o <code>kubectl describe pod</code> mostra a porta declarada dentro do bloco do
+container. É assim num cluster de verdade (transcrição):</p>
+
+<pre class="term">Containers:
+  web:
+    Container ID:   containerd://6f1c2a9e8b7d4c3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a
+    Image:          cardapio:1.0
+    Image ID:       docker.io/library/cardapio@sha256:1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef
+    Port:           8080/TCP
+    Host Port:      0/TCP
+    State:          Running
+      Started:      Fri, 27 Nov 2026 15:50:25 +0000
+    Ready:          True
+    Restart Count:  0</pre>
+
+<p><code>Port: 8080/TCP</code> é o que você escreveu. <code>Host Port: 0/TCP</code> quer dizer "nenhuma
+porta publicada no nó" — o zero é a forma de dizer "não usei". Se você vir números esquisitos aqui, é sinal
+de <code>hostPort</code> no manifesto, e vale revisar.</p>
+
+<p>O painel do guia mostra a mesma linha, sem o <code>Host Port</code> e sem o
+<code>Image ID</code>. A diferença é de versão do formato, não de conteúdo: o que importa é que a porta
+aparece no bloco do container certo.</p>
+
+<h2>6. O túnel: kubectl port-forward</h2>
+
+<p>Com o pod rodando, a Ana abre uma segunda janela de terminal e digita:</p>
+
+<pre class="file" data-file="tunel.txt">kubectl port-forward pod/cardapio 8080 8080</pre>
+
+<p>A sintaxe é <code>kubectl port-forward TIPO/NOME porta-local porta-do-pod</code>. A primeira porta é a
+do notebook; a segunda é a que o programa escuta dentro do pod. O comando abre uma conexão com o API server,
+que faz a ponte até o nó, que faz a ponte até o container — daí o nome. No terminal, ele responde com uma
+linha de encaminhamento e fica rodando, esperando conexões.</p>
+
+<p>Enquanto a janela estiver aberta, <code>http://localhost:8080</code> no navegador é o site da padaria. A
+Ana fecha o terminal, o túnel cai. É um comando de sessão, não uma configuração do cluster: nada fica
+salvo, nada muda no manifesto, e o pod não sabe que existe alguém olhando.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Forwarding from 127.0.0.1:8080 -> 8080;;texto:Handling connection for 8080">
+  <p class="try-task">O site escuta na 8080, mas o túnel aponta para a 80 do pod e a página não carrega.
+  Conserte a segunda porta para <code>8080</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl port-forward pod/cardapio 8080 80</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl port-forward pod/cardapio 8080 80
+Forwarding from 127.0.0.1:8080 -&gt; 80
+Handling connection for 8080
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl port-forward pod/cardapio 8080 8080</pre>
+</div>
+
+<p>A resposta <code>Forwarding from 127.0.0.1:8080 -&gt; 8080</code> é a confirmação: o túnel existe e liga
+a porta local à porta do pod. A linha <code>Handling connection for 8080</code> aparece quando alguém de
+fato conecta — no mundo real, cada acesso do navegador gera uma linha dessas. Se o número da direita estiver
+errado (<code>-&gt; 80</code>, no caso da caixa), o túnel abre e a conexão é recusada: ninguém escuta na 80
+dentro do pod.</p>
+
+<p>Num terminal de verdade, a sessão fica assim (transcrição de um cluster local, com o navegador
+abrindo a página duas vezes):</p>
+
+<pre class="term">$ kubectl port-forward pod/cardapio 8080 8080
+Forwarding from 127.0.0.1:8080 -&gt; 8080
+Forwarding from [::1]:8080 -&gt; 8080
+Handling connection for 8080
+Handling connection for 8080</pre>
+
+<p>As duas linhas de <code>Forwarding</code> são o mesmo túnel ouvindo em IPv4 e em IPv6 — o kubectl abre os
+dois por padrão. As linhas de <code>Handling connection</code> aparecem uma por conexão: duas linhas, duas
+aberturas da página. O comando não termina sozinho; para encerrar, <code>Ctrl</code> + <code>C</code>.</p>
+
+<h2>7. Quando o túnel não abre</h2>
+
+<p>Três tropeços comuns, cada um com mensagem própria. O primeiro: o pod não está rodando. O port-forward
+precisa de um pod pronto, e responde com
+<code>error: unable to forward port because pod is not running. Current status=Pending</code> — não é
+problema da porta, é do pod, e o caminho é o <code>describe</code>.</p>
+
+<p>O segundo: o nome do pod. Um Deployment não cria pod chamado <code>cardapio</code>; cria
+<code>cardapio-6d8f89b786-88dn9</code>. Quem tenta <code>port-forward pod/cardapio</code> recebe
+<code>Error from server (NotFound): pods "cardapio" not found</code>. Duas saídas: usar o nome completo ou
+pedir ao Service, que é a forma que sobrevive a recriações —
+<code>kubectl port-forward service/cardapio 8080 8080</code>. O Service escolhe um pod pronto e mantém o
+túnel.</p>
+
+<p>O terceiro: a porta local ocupada, com
+<code>Unable to listen on port 8080: Listeners failed to create with the following errors: [unable to create listener: Error listen tcp4 127.0.0.1:8080: bind: address already in use]</code>.
+A solução é trocar só a porta da esquerda: <code>kubectl port-forward pod/cardapio 9080 8080</code>, e abrir
+<code>localhost:9080</code>. Repare que a da direita continua 8080 — ela é do pod, não sua.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Caminho</th><th>Alcance</th><th>Dura enquanto</th><th>Serve para</th></tr>
+</thead>
+<tbody>
+<tr><td>IP do pod</td><td>dentro do cluster</td><td>a vida do pod</td><td>depurar entre pods, nunca para pessoas</td></tr>
+<tr><td><code>port-forward</code></td><td>o seu notebook</td><td>o comando estiver aberto</td><td>testar, ver a tela, depurar</td></tr>
+<tr><td><code>Service</code></td><td>todo o cluster</td><td>a vida do Service</td><td>outros pods chamarem o seu site</td></tr>
+<tr><td><code>Ingress</code></td><td>a internet</td><td>a vida da regra</td><td>clientes de verdade acessando</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Olhando a tabela, fica claro por que o port-forward não é produção: ele depende de uma sessão sua aberta,
+não tem balanceamento, não tem TLS e cai quando você fecha o notebook. É ferramenta de oficina — excelente
+para o que serve, perigosa como solução permanente.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Comando</th><th>O que acontece</th></tr>
+</thead>
+<tbody>
+<tr><td><code>port-forward pod/cardapio 8080 8080</code></td><td>local 8080 aponta para a 8080 do pod</td></tr>
+<tr><td><code>port-forward pod/cardapio 9080 8080</code></td><td>local 9080 aponta para a 8080 do pod</td></tr>
+<tr><td><code>port-forward pod/cardapio 8080</code></td><td>usa o mesmo número dos dois lados</td></tr>
+<tr><td><code>port-forward service/cardapio 8080 8080</code></td><td>escolhe um pod pronto atrás do Service — sobrevive a recriações</td></tr>
+<tr><td><code>port-forward deployment/cardapio 8080 8080</code></td><td>escolhe um pod do Deployment</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A forma curta, com uma porta só, é a que a Ana mais usa: quando as duas pontas são iguais, não há motivo
+para repetir o número. E perceba que o primeiro argumento aceita <code>pod/</code>,
+<code>service/</code> e <code>deployment/</code> — o comando resolve o alvo antes de abrir o túnel, e é por
+isso que apontar para o Service é a escolha mais estável em ambiente que recria pod.</p>
+
+<h2>8. Testando o site sem navegador</h2>
+
+<p>Nem todo pod responde HTTP. O do banco responde no protocolo do banco, o do cache em outro, e o
+port-forward funciona igual: ele não entende o que passa pelo túnel, só encaminha bytes. Por isso ele serve
+para testar qualquer coisa que escute numa porta TCP.</p>
+
+<p>Para o site da Ana, o teste de fumaça é <code>curl localhost:8080/cardapio</code> em outra janela,
+enquanto o port-forward roda. Deve voltar o JSON do cardápio. Se voltar "connection refused", o problema
+está do lado do pod (porta errada ou programa não escutando); se voltar erro 500, o túnel está bom e o
+problema é a aplicação — e aí <code>kubectl logs</code> é o próximo passo.</p>
+
+<p>Essa separação é o valor real do exercício: o túnel prova que a rede entre você e o pod funciona. Tudo o
+que falhar depois disso é do programa, não do Kubernetes. É a mesma lógica de dividir o problema em
+camadas que o guia usa o tempo todo.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o pod Running e o navegador sem resposta</h3>
+<p>A Ana declarou <code>containerPort: 80</code> porque "site é sempre 80", mas o programa escuta na 8080.
+O pod subiu, o log estava certo e o port-forward para a 80 não abria nada. Nenhuma mensagem de erro no
+cluster — só "connection refused" no navegador. Trocar o <code>containerPort</code> para 8080 (e o alvo do
+forward) resolveu.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o túnel que morria toda hora</h3>
+<p>Ela abria o port-forward e, minutos depois, o comando terminava sozinho. O pod estava sendo recriado por
+falta de memória, e o túnel apontava para o pod antigo. A solução foi apontar para o Service
+(<code>service/cardapio</code>), que reconecta em outro pod, e — mais importante — corrigir o limite de
+memória que estava matando o container.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: dois sites, uma porta local</h3>
+<p>Com o túnel do <code>cardapio</code> aberto na 8080 e a necessidade de testar o <code>relatorio</code>,
+o comando recusou com "address already in use". A Ana abriu o segundo com
+<code>port-forward pod/relatorio 8081 8080</code> e acessou <code>localhost:8081</code>. A porta da
+esquerda é sua; a da direita é do pod, e cada túnel pode ter a sua.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o <code>containerPort</code> faz?</p>
+<label><input type="radio" name="q1"> abre a porta no firewall do nó</label>
+<label><input type="radio" name="q1"> declara a porta que o programa usa, para o describe e para o Service
+achar por nome</label>
+<label><input type="radio" name="q1"> faz o programa escutar naquela porta</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Em <code>kubectl port-forward pod/cardapio 8080 3000</code>,
+o que é <code>3000</code>?</p>
+<label><input type="radio" name="q2"> a porta que será aberta no seu notebook</label>
+<label><input type="radio" name="q2"> a porta do Service</label>
+<label><input type="radio" name="q2"> a porta dentro do pod, onde o programa escuta</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que não usar port-forward em produção?</p>
+<label><input type="radio" name="q3"> porque depende de uma sessão aberta, não balanceia e não tem
+TLS</label>
+<label><input type="radio" name="q3"> porque só funciona com pods pequenos</label>
+<label><input type="radio" name="q3"> porque ele muda a porta do container</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: declarar a porta do cardápio</h2>
+<p>Complete o bloco de portas do pod <code>cardapio</code>: o programa escuta a 8080, em TCP, e a porta
+precisa ter o nome que um Service pode usar depois.</p>
+<div class="ex-code">      ports:
+        - name: <input aria-label="resposta 1" data-answer="http" placeholder="...">
+          containerPort: <input aria-label="resposta 2" data-answer="8080" placeholder="...">
+          protocol: TCP</div>
+<p class="ex-dica">Dica: o nome vai em minúsculas, sem acento e sem sublinhado — é o que o Service usa em
+<code>targetPort</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Num projeto Kubernetes convivem três portas: a do programa (código), a do <code>containerPort</code>
+(manifesto) e a do Service (<code>port</code> e <code>targetPort</code>). O <code>containerPort</code> não
+abre nada: ele documenta e permite que o Service aponte pelo nome. Por isso um <code>containerPort</code>
+errado deixa o pod <code>Running</code> e o acesso quebrado, sem um único evento de erro.</p>
+
+<p>O item de <code>ports</code> é uma lista e exige <code>containerPort</code> numérico entre 1 e 65535;
+<code>name</code> segue a regra dos nomes (minúsculas, números e hífen) e <code>protocol</code> aceita
+apenas <code>TCP</code>, <code>UDP</code> e <code>SCTP</code>, com <code>TCP</code> como padrão.</p>
+
+<p>Para ver o site da Ana no navegador, o caminho é
+<code>kubectl port-forward pod/cardapio 8080 8080</code>: a porta da esquerda é a do seu notebook, a da
+direita é a do pod, e o túnel vive enquanto o comando viver. Falhou? Confira se o pod está
+<code>Running</code>, se o nome do pod existe (Deployment cria nome comprido) e se a porta local não está
+ocupada. Na próxima aula a Ana decide o que acontece quando o programa dentro do pod termina —
+<code>Always</code>, <code>OnFailure</code> ou <code>Never</code>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>containerPort</code> declara, não abre. Quem escuta é o programa.</li>
+  <li><code>containerPort</code> = porta do programa; <code>targetPort</code> do Service = o
+  <code>containerPort</code>.</li>
+  <li><code>kubectl port-forward pod/nome LOCAL REMOTO</code>: esquerda é seu notebook, direita é o
+  pod.</li>
+  <li>O túnel existe enquanto o comando estiver aberto — não é solução de produção.</li>
+  <li><code>Unable to listen on port</code> é porta local ocupada: troque só a da esquerda.</li>
+  <li><code>protocol</code> aceita três valores; omitir vale <code>TCP</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

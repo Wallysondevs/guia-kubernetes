@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetworkPolicy | Guia Kubernetes</title>
+<meta name="description" content="NetworkPolicy no Kubernetes: como fechar o tráfego entre pods com podSelector, policyTypes, ingress, egress e seletores de namespace, e por que sem CNI a regra não vale.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">NetworkPolicy</span></h1>
+<p class="intro">A Ana descobriu que qualquer pod do cluster conseguia abrir conexão com o banco da padaria.
+Não era falha de configuração: no Kubernetes, por padrão, todo pod fala com todo pod. O banco escuta numa
+porta, e quem tiver o endereço chega lá. Para fechar isso existe a NetworkPolicy — uma regra que diz quem pode
+entrar e quem pode sair. Nesta aula você escreve a primeira regra, entende por que ela é uma lista de
+permissões e não de proibições, e descobre o detalhe que faz muita gente perder a tarde: sem o plugin de rede
+certo, a regra é só um enfeite no banco do cluster.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Como o tráfego entre pods funciona quando não há nenhuma regra.</li>
+  <li>Por que NetworkPolicy é lista de permissão, e não de bloqueio.</li>
+  <li>O que <code>podSelector</code>, <code>policyTypes</code>, <code>ingress</code> e <code>egress</code>
+  fazem.</li>
+  <li>Como liberar apenas um pod de origem, uma porta e um namespace.</li>
+  <li>O padrão “nega tudo e libera o necessário”, inclusive o DNS.</li>
+  <li>Por que a regra pode existir e não ter efeito nenhum.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o banco aberto para o cluster inteiro</h2>
+
+<p>O banco da padaria guarda pedidos, clientes e preços. Ele roda num pod, atrás de um Service, e recebe
+conexões na porta 5432. Só o cardápio deveria falar com ele. Na prática, qualquer pod do cluster que
+soubesse o nome do Service conseguia conectar — inclusive um pod de teste que alguém subiu para brincar, e
+inclusive um pod comprometido, se um dia houver um.</p>
+
+<p>A ideia de rede do Kubernetes é generosa por padrão. Todo pod ganha um IP e pode falar com qualquer outro
+IP do cluster, sem senha de rede, sem firewall, sem perguntas. Isso é ótimo para começar: os serviços se acham,
+o DNS interno resolve, nada precisa ser liberado. É péssimo quando um dos pods não é confiável — e, num
+cluster com vários times, sempre existe um.</p>
+
+<p>A NetworkPolicy entra exatamente aí. Ela não é um firewall de perímetro, com regras de fora para dentro. É
+uma regra que mora no namespace, escolhe pods por etiqueta e decide quem pode falar com eles. Simples de
+escrever, difícil de depurar — e completamente inútil se o cluster não tiver quem a execute.</p>
+
+<h2>2. Lista de permissão, não de proibição</h2>
+
+<p>A primeira mudança mental é esta: a política não diz “proíba o banco”. Ela diz “os pods com esta etiqueta só
+aceitam tráfego vindo daqui, nesta porta”. Quando uma política seleciona um pod para tráfego de entrada, tudo
+o que não está explicitamente permitido passa a ser negado. Antes da política, tudo era permitido; depois dela,
+só a lista.</p>
+
+<p>Isso tem uma consequência prática que assusta na primeira vez: ao aplicar uma política restritiva, você não
+fecha só o que queria fechar — fecha tudo o que não listou. Se o monitoramento, o backup ou o time de suporte
+falavam com aquele pod, eles param de falar no mesmo instante. A política é uma porta que fecha, não uma
+fechadura que se ajusta.</p>
+
+<dl class="anatomy">
+<dt>NetworkPolicy</dt>
+<dd>Objeto de namespace que seleciona pods e define quem pode entrar (<code>Ingress</code>) e sair
+(<code>Egress</code>).</dd>
+<dt>podSelector</dt>
+<dd>Quais pods a política protege. Vazio (<code>{}</code>) significa todos os pods do namespace.</dd>
+<dt>policyTypes</dt>
+<dd>Quais direções a política controla: <code>Ingress</code>, <code>Egress</code> ou as duas.</dd>
+<dt>ingress / egress</dt>
+<dd>As listas de permissão. Cada item tem <code>from</code>/<code>to</code> (origem ou destino) e
+<code>ports</code>.</dd>
+<dt>from / to</dt>
+<dd>De onde (ou para onde) o tráfego pode ir: <code>podSelector</code>,
+<code>namespaceSelector</code> ou <code>ipBlock</code>.</dd>
+<dt>CNI</dt>
+<dd>O plugin de rede do cluster (Calico, Cilium, Antrea). É ele que implementa a política de verdade; o
+Kubernetes só guarda o objeto.</dd>
+<dt>default deny</dt>
+<dd>Padrão de política que seleciona todos os pods e não permite nada, para depois abrir exceções.</dd>
+<dt>ipBlock</dt>
+<dd>Faixa de IPs (CIDR) permitida. Serve para endereços fora do cluster, não para pods.</dd>
+</dl>
+
+<p>Repare no penúltimo item: o Kubernetes não implementa a política. Ele guarda o objeto, e o plugin de rede
+de cada nó traduz aquilo em regras de firewall. Sem plugin compatível, o objeto existe, aparece no
+<code>get networkpolicy</code>, e nenhum pacote é filtrado. É o motivo número um de “apliquei e não
+funcionou”.</p>
+
+<h2>3. A caixa: a direção escrita errada</h2>
+
+<p>O primeiro campo que dá erro é o <code>policyTypes</code>. Ele aceita exatamente dois valores, em inglês, e
+o erro vem na hora do <code>apply</code>. A caixa tem o plural com um “s” a mais, erro de quem traduz de
+cabeça.</p>
+
+<div class="tryk8s" data-get="networkpolicy" data-goal="texto:created;;campo:NetworkPolicy/cardapio|spec.policyTypes.0=Ingress">
+  <p class="try-task">O <code>policyTypes</code> está como <code>Ingresss</code>. Rode, leia a lista de valores
+  aceitos e corrija para <code>Ingress</code>.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cardapio
+spec:
+  podSelector:
+    matchLabels:
+      app: cardapio
+  policyTypes:
+    - Ingresss</pre>
+<pre class="out">
+The NetworkPolicy "cardapio" is invalid: spec.policyTypes: Unsupported value: "Ingresss": supported values: "Egress", "Ingress"
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cardapio
+spec:
+  podSelector:
+    matchLabels:
+      app: cardapio
+  policyTypes:
+    - Ingress</pre>
+</div>
+
+<p>A resposta é <code>spec.policyTypes: Unsupported value: "Ingresss": supported values: "Egress",
+"Ingress"</code>. Note que a ordem da mensagem é alfabética, não a ordem em que você deve pensar. A direção
+<code>Ingress</code> controla quem entra; <code>Egress</code> controla para onde os pods selecionados podem
+sair.</p>
+
+<p>Com a política aplicada como acima, o pod do cardápio passa a não aceitar nada — porque a lista
+<code>ingress</code> está ausente, e ausência significa “nenhuma permissão”. O objeto é criado sem erro e o
+pod fica isolado. Esse é o “default deny” sem querer, e é a primeira coisa a suspeitar quando, depois de
+aplicar uma política, todo o tráfego some.</p>
+
+<h2>4. A caixa: liberando só o balcão</h2>
+
+<p>Agora a política com a lista de permissão preenchida. A regra é: o cardápio aceita entrada na porta 8080,
+mas só de pods com a etiqueta <code>app: balcao</code>, no mesmo namespace. Todo o resto é negado.</p>
+
+<div class="tryk8s" data-get="networkpolicy" data-goal="texto:created;;campo:NetworkPolicy/so-balcao|spec.ingress.0.from.0.podSelector.matchLabels.app=balcao">
+  <p class="try-task">O <code>from</code> permite <code>app: cardapio</code>, o que deixa o próprio cardápio
+  entrar em si mesmo. Troque pela etiqueta <code>app: balcao</code> e rode.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: so-balcao
+spec:
+  podSelector:
+    matchLabels:
+      app: cardapio
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: cardapio
+      ports:
+        - protocol: TCP
+          port: 8080</pre>
+<pre class="out">
+networkpolicy.networking.k8s.io/so-balcao created
+
+NAME        AGE
+so-balcao   5m
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: so-balcao
+spec:
+  podSelector:
+    matchLabels:
+      app: cardapio
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: balcao
+      ports:
+        - protocol: TCP
+          port: 8080</pre>
+</div>
+
+<p>Leia a política em voz alta: “os pods com <code>app: cardapio</code> aceitam entrada de pods com
+<code>app: balcao</code>, na porta 8080, TCP; o resto é negado”. O <code>from</code> é uma lista, e cada item
+é uma alternativa — não uma condição cumulativa. Se você listar dois seletores, qualquer um dos dois passa.</p>
+
+<p>Dentro de um item de <code>from</code>, porém, os campos se somam: <code>podSelector</code> e
+<code>namespaceSelector</code> no mesmo item significam “pods com esta etiqueta naquele namespace”. Separados em
+itens diferentes, significam “pods com esta etiqueta em qualquer lugar” OU “qualquer pod naquele namespace”.
+Essa diferença de um nível de YAML muda o significado por completo, e é o erro mais comum de quem copia
+exemplo.</p>
+
+<h2>5. Namespaces, faixas de IP e o DNS</h2>
+
+<p>Em cluster com vários namespaces, o seletor de origem mais útil é o de namespace. A etiqueta
+<code>kubernetes.io/metadata.name</code> existe em todo namespace e vale o nome dele, então dá para liberar
+“qualquer pod do namespace <code>monitoracao</code>” sem precisar etiquetar pod por pod.</p>
+
+<p>Para endereços fora do cluster — o serviço de e-mail, o gateway de pagamento —, o seletor é
+<code>ipBlock</code>, com uma faixa em CIDR e, se quiser, exceções em <code>except</code>. Não use
+<code>ipBlock</code> para pods: o IP do pod muda a cada recriação, e a regra vira uma armadilha.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Seletor</th><th>Seleciona</th><th>Exemplo de uso</th></tr>
+</thead>
+<tbody>
+<tr><td><code>podSelector</code></td><td>pods do mesmo namespace, por etiqueta</td><td>só o balcão fala com o
+cardápio</td></tr>
+<tr><td><code>namespaceSelector</code></td><td>todos os pods de um namespace, por etiqueta do
+namespace</td><td>libera o time de monitoração inteiro</td></tr>
+<tr><td>os dois no mesmo item</td><td>pods com aquela etiqueta <em>naquele</em> namespace</td><td>o job de
+backup do namespace <code>dados</code></td></tr>
+<tr><td><code>ipBlock</code></td><td>faixa de IPs fora do cluster</td><td>o gateway de pagamento em
+<code>192.0.2.0/24</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um caso especial merece atenção: o DNS. Quando você escreve uma política de <code>Egress</code> que nega
+tudo, os pods selecionados deixam de resolver nomes — porque a consulta ao DNS também é tráfego de saída. O
+sintoma é traiçoeiro: a aplicação funciona por IP, mas qualquer nome falha com “no such host”, e parece
+problema de DNS do cluster. A solução é liberar a porta 53 para o namespace <code>kube-system</code>.</p>
+
+<h2>6. A caixa: negar tudo e liberar o DNS</h2>
+
+<p>O padrão que a Ana adotou na padaria é o mais seguro e o mais chato de acertar: primeiro negar todo o
+tráfego de saída do namespace, depois abrir as exceções que o serviço realmente precisa. A caixa tem a
+política de negação e a de DNS; falta a segunda.</p>
+
+<div class="tryk8s" data-get="networkpolicy" data-goal="texto:created;;campo:NetworkPolicy/libera-dns|spec.egress.0.ports.0.port=53">
+  <p class="try-task">Acrescente uma segunda política, chamada <code>libera-dns</code>, que permite saída na
+  porta 53 (UDP e TCP) para pods do namespace <code>kube-system</code>. Use <code>---</code> para separar os
+  dois documentos e <code>policyTypes: [Egress]</code> na nova.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nega-saida
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress</pre>
+<pre class="out">
+networkpolicy.networking.k8s.io/nega-saida created
+
+NAME         AGE
+nega-saida   5m
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nega-saida
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: libera-dns
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53</pre>
+</div>
+
+<p>O painel mostra as duas políticas criadas. Duas observações sobre a sintaxe. Primeiro: o
+<code>podSelector: {}</code> da política de negação seleciona todos os pods do namespace, e a ausência de
+<code>egress</code> significa nenhuma permissão — daí o nome. Segundo: a política de DNS é
+<em>aditiva</em>; ela não “desfaz” a negação, ela abre uma exceção. O resultado é a soma das duas: nada sai,
+exceto DNS.</p>
+
+<p>E por que os dois protocolos, UDP e TCP? Porque consultas DNS usam UDP na maioria das vezes e caem para TCP
+quando a resposta é grande ou quando há transferência de zona. Liberar só UDP funciona em 90% dos casos e
+falha nos outros 10% — um jeito eficiente de perder uma tarde investigando um erro intermitente.</p>
+
+<p>A etiqueta <code>kubernetes.io/metadata.name</code> é criada automaticamente em todo namespace e vale o
+próprio nome. Ela é a forma portátil de dizer “o namespace kube-system”, sem depender de alguém ter etiquetado
+nada à mão.</p>
+
+<h2>7. Quando a política não tem efeito</h2>
+
+<p>Chegamos ao detalhe que separa quem entendeu de quem só copiou. A NetworkPolicy é aplicada pelo plugin de
+rede do cluster. Kind, por exemplo, usa o kindnet por padrão, que não implementa políticas; clusters gerenciados
+costumam usar Calico ou Cilium, que implementam. Se o seu cluster não tem plugin compatível, o objeto é aceito,
+aparece no <code>get</code>, e nenhum pacote é filtrado — silêncio total.</p>
+
+<p>O teste é simples e vale a pena fazer uma vez na vida: aplique uma política que nega tudo para um pod e
+tente conectar nele. Se a conexão continuar funcionando, o problema não é a sua regra — é o cluster. Esta é uma
+transcrição de um cluster real, com CNI que implementa a política:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get networkpolicy
+NAME         POD-SELECTOR   AGE
+so-balcao    app=cardapio   4m
+
+ana@notebook:~$ kubectl describe networkpolicy so-balcao
+Name:         so-balcao
+Namespace:    default
+Created on:   2026-11-27 09:31:12 +0000
+Labels:       none
+Annotations:  none
+Spec:
+  PodSelector:     app=cardapio
+  Allowing ingress traffic:
+    To Port: 8080/TCP
+    From:
+      PodSelector: app=balcao
+  Not affecting egress traffic
+  Policy Types: Ingress</pre>
+
+<p>O <code>describe</code> traduz a política em frases: “permitindo tráfego de entrada, na porta 8080, vindo de
+pods com <code>app=balcao</code>, sem afetar a saída”. Se essa frase não corresponde ao que você queria, o erro
+está no YAML. Se corresponde e o tráfego continua passando, o erro está no plugin de rede.</p>
+
+<p>Um segundo teste, com o resultado na prática. Esta também é transcrição, de um <code>kubectl exec</code>
+tentando conectar no cardápio a partir de dois pods diferentes:</p>
+
+<pre class="term">ana@notebook:~$ kubectl exec balcao -- curl -s -o /dev/null -w "%{http_code}\n" http://cardapio:8080/saude
+200
+ana@notebook:~$ kubectl exec relatorio -- curl -s -m 3 http://cardapio:8080/saude
+curl: (28) Connection timed out after 3001 milliseconds</pre>
+
+<p>O primeiro pod tem a etiqueta liberada e recebe 200. O segundo não tem, e a conexão morre por timeout — não
+por “acesso negado”. Isso confunde: firewall que nega costuma derrubar pacote em silêncio, e o cliente só vê a
+espera. Um timeout de três segundos num serviço que responde em milissegundos é a assinatura de uma política
+bloqueando.</p>
+
+<h2>8. Erros que custam uma tarde</h2>
+
+<p>Depois de algumas políticas, os tropeços se repetem. A tabela abaixo é a que a Ana deixou no repositório,
+com o sintoma e o conserto de cada um.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td>nada entra nem sai depois do apply</td><td>política sem lista <code>ingress</code>/<code>egress</code>
+= nega tudo</td><td>escrever as permissões ou remover a política</td></tr>
+<tr><td>continua tudo liberado</td><td>CNI sem suporte, ou <code>podSelector</code> que não casa com
+ninguém</td><td>trocar o plugin ou corrigir etiquetas</td></tr>
+<tr><td>só o DNS parou</td><td>política de <code>Egress</code> sem exceção para a porta 53</td><td>liberar
+<code>kube-system</code> nas portas 53</td></tr>
+<tr><td>timeout em vez de recusa</td><td>comportamento normal de pacote descartado</td><td>ler o timeout como
+bloqueio, não como serviço fora</td></tr>
+<tr><td>funciona para um pod e não para o “igual”</td><td>etiqueta diferente, ou namespace
+diferente</td><td>comparar <code>labels</code> dos dois pods</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A primeira linha é a mais perigosa porque o efeito é imediato e amplo. Ao aplicar uma política num namespace
+com trinta pods, você pode derrubar trinta serviços de uma vez — e o <code>apply</code> não avisa. Por isso a
+ordem segura é sempre: primeiro observe o tráfego que existe, depois escreva as permissões, e só então feche o
+resto. Em cluster de produção, isso significa aplicar em um namespace de teste antes.</p>
+
+<p>A quarta linha merece ênfase porque muda o diagnóstico. Uma política que bloqueia não responde “permissão
+negada”: o pacote é descartado, e o cliente espera até o timeout. Quem procura “erro de rede” no log da
+aplicação não encontra nada, porque a conexão nunca chegou. O sinal está no tempo de resposta, não na
+mensagem.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o backup que parou de rodar</h3>
+<p>A Ana fechou o banco com uma política que só permitia o cardápio. Dois dias depois, o backup noturno
+falhou. O job de backup rodava no namespace <code>dados</code> e não estava na lista. O conserto foi adicionar
+um segundo item em <code>from</code>, com <code>namespaceSelector</code> e <code>podSelector</code> no mesmo
+bloco — a diferença de um nível de YAML que separa “pods daquele namespace” de “pods com aquela etiqueta em
+qualquer lugar”.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o cluster que ignorava tudo</h3>
+<p>Depois de escrever cinco políticas e testar com cuidado, a Ana percebeu que nada era bloqueado. O cluster
+de teste usava um CNI sem suporte a NetworkPolicy. As regras estavam corretas e o cluster as ignorava em
+silêncio. O conserto não foi no YAML: foi trocar o plugin de rede — e aí, sim, as políticas começaram a valer
+de uma vez, o que exigiu reaplicar tudo com calma.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a monitoração que “caiu sozinha”</h3>
+<p>O time de monitoração reclamou que não via mais as métricas da padaria. Nenhum erro nos logs deles, só
+timeouts. A causa era a política de entrada no cardápio, que liberava o balcão e esquecia o coletor de
+métricas, que vinha de outro namespace. Uma linha de <code>namespaceSelector</code> resolveu — depois de duas
+horas procurando problema no agente.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que acontece com o tráfego quando uma NetworkPolicy
+seleciona um pod para <code>Ingress</code> sem lista <code>ingress</code>?</p>
+<label><input type="radio" name="q1"> nada muda: sem lista, tudo continua liberado</label>
+<label><input type="radio" name="q1"> todo o tráfego de entrada para esse pod é negado</label>
+<label><input type="radio" name="q1"> só a porta 80 é liberada</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. A rede continua toda aberta depois de aplicar a política.
+Qual é a causa mais provável?</p>
+<label><input type="radio" name="q2"> o nome da política está em minúsculas</label>
+<label><input type="radio" name="q2"> faltou <code>policyTypes</code></label>
+<label><input type="radio" name="q2"> o CNI do cluster não implementa NetworkPolicy</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Depois de negar todo o <code>Egress</code>, as aplicações
+param de resolver nomes. O que liberar?</p>
+<label><input type="radio" name="q3"> a porta 53 para o namespace <code>kube-system</code></label>
+<label><input type="radio" name="q3"> a porta 443 para todos os pods</label>
+<label><input type="radio" name="q3"> nada: DNS não passa por política</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: escolha os pods protegidos</h2>
+<p>Complete o campo que seleciona os pods que esta política protege.</p>
+<div class="ex-code">spec:
+  <input aria-label="resposta 1" data-answer="podSelector" placeholder="...">:
+    matchLabels:
+      app: banco
+  policyTypes:
+    - Ingress</div>
+<p class="ex-dica">Dica: é o seletor de pods — o mesmo formato de <code>matchLabels</code> que o Service usa,
+mas avaliado pelo plugin de rede.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Sem política, todo pod fala com todo pod. A NetworkPolicy muda isso por seleção: ela escolhe pods por
+etiqueta e diz quem pode entrar e quem pode sair. É lista de permissão — o que não está listado é negado — e
+políticas diferentes se somam, então o resultado é a união das permissões.</p>
+
+<p>Os campos que importam são <code>podSelector</code>, <code>policyTypes</code>, <code>ingress</code>,
+<code>egress</code>, <code>from</code>/<code>to</code> e <code>ports</code>. Um nível de YAML muda o
+significado: <code>podSelector</code> e <code>namespaceSelector</code> no mesmo item significam “naquele
+namespace”; em itens separados, significam “ou”. E quem aplica é o CNI: sem suporte, a regra não passa de um
+objeto decorativo.</p>
+
+<p>Na próxima aula a rede volta a ser sobre portas — mas do ponto de vista do vocabulário: a diferença entre
+<code>containerPort</code>, <code>port</code>, <code>targetPort</code> e <code>nodePort</code>, os protocolos
+TCP, UDP e SCTP e as portas com nome, que amarram Service e Ingress sem números soltos.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Sem NetworkPolicy, todo pod alcança todo pod.</li>
+  <li>Política que seleciona sem listar = nega tudo.</li>
+  <li>Políticas são aditivas: valem as permissões de todas juntas.</li>
+  <li><code>podSelector</code> + <code>namespaceSelector</code> no mesmo item = naquele namespace.</li>
+  <li><code>Egress</code> sem DNS (porta 53, UDP e TCP) quebra a resolução de nomes.</li>
+  <li>Bloqueio aparece como timeout, não como “acesso negado”.</li>
+  <li>Sem CNI compatível, a política não tem efeito nenhum.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selector e affinity | Guia Kubernetes</title>
+<meta name="description" content="nodeSelector e nodeAffinity na prática: escolher o nó certo para cada pod da padaria da Ana, com matchExpressions, required e preferred, e o evento que explica o Pending.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Selector</span> e affinity</h1>
+<p class="intro">A Ana já sabe que o agendador escolhe o nó de cada pod olhando o espaço livre. Só que
+“espaço livre” não é o único critério que importa: o forno precisa do nó com mais memória, o backup
+precisa do nó com disco grande, e o site não deveria disputar CPU com nenhum dos dois. Nesta aula ela
+aprende a opinar na escolha: primeiro com o <code>nodeSelector</code>, que é uma igualdade simples, depois
+com a <code>nodeAffinity</code>, que aceita listas, negações e preferências — e a distinguir as duas
+coisas, que é onde quase todo mundo se perde.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o agendador olha antes de escolher um nó.</li>
+  <li><code>nodeSelector</code>: igualdade por etiqueta, e o que acontece quando a etiqueta não existe.</li>
+  <li><code>nodeAffinity</code> com <code>matchExpressions</code>: <code>In</code>, <code>NotIn</code>,
+  <code>Exists</code>, <code>Gt</code> e <code>Lt</code>.</li>
+  <li>A diferença entre “obrigatório” (<code>required</code>) e “se der” (<code>preferred</code>).</li>
+  <li>Ler as etiquetas de um nó e conferir onde o pod caiu com <code>-o wide</code>.</li>
+  <li>Reconhecer o evento <code>didn't match Pod's node affinity/selector</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: cada carga no seu canto</h2>
+
+<p>O cluster da Ana tem três nós e três cargas com necessidades diferentes. O site do cardápio responde
+em milissegundos e não pode competir por CPU com o forno. O forno roda quarenta minutos, come 2 GB de
+memória e aceita esperar. O backup local precisa ler o disco grande que só existe no
+<code>guia-worker2</code>. Se ela não disser nada, o agendador distribui os pods pelo espaço livre — e o
+forno pode cair no nó do site justo na hora do almoço.</p>
+
+<p>A primeira ideia é marcar os nós e escrever no pod onde ele deve rodar. É o caminho certo, e existem
+duas formas de fazer isso: uma simples e uma completa. A simples compara uma etiqueta com um valor. A
+completa aceita listas, condições e preferências, e chama-se afinidade — <em>affinity</em>, em inglês. As
+duas convivem, e o Kubernetes aceita as duas no mesmo pod.</p>
+
+<p>Antes de escrever qualquer coisa, vale entender o que o agendador faz, porque isso explica metade dos
+erros. Ele trabalha em duas fases: primeiro <em>filtra</em> os nós que servem (têm recursos, não têm taint
+que o pod não tolere, casam com o seletor de nó); depois <em>pontua</em> os que sobraram (menos pods, mais
+espaço, espalhamento pela topologia). O pod só fica em <code>Pending</code> quando a fase de filtro elimina
+todos os nós. Se a fase de pontuação escolher um nó que você não queria, o pod sobe — e é aí que entra a
+sua opinião.</p>
+
+<h2>2. <code>nodeSelector</code>: a igualdade que resolve quase tudo</h2>
+
+<p><code>nodeSelector</code> é um mapa de chave e valor dentro do <code>spec</code> do pod. O pod só é
+agendado em nó que tenha <em>todas</em> aquelas etiquetas com aqueles valores. Uma chave só, um valor só,
+sem lista, sem negação, sem “ou”. É pouco expressivo e é o que você vai usar em oitenta por cento dos
+casos, porque a maioria das decisões de agendamento é exatamente “este pod, naquele tipo de nó”.</p>
+
+<p>O detalhe que morde é o que acontece quando a etiqueta não existe. O agendador não avisa, não ignora e
+não escolhe “o mais parecido”: ele elimina o nó. Se nenhum nó tiver a etiqueta, o pod fica em
+<code>Pending</code> para sempre, com o evento <code>didn't match Pod's node affinity/selector</code>.
+Para quem está começando, esse <code>Pending</code> parece um bug do cluster; é o cluster obedecendo à
+risca uma etiqueta que ninguém criou.</p>
+
+<p>Duas etiquetas que sempre existem e que você pode usar sem medo de errar:
+<code>kubernetes.io/hostname</code>, com o nome do nó, e <code>kubernetes.io/os</code>, com
+<code>linux</code> na maioria dos clusters. Elas são o jeito mais rápido de prender um pod a um nó
+específico quando você está testando — é o que a caixa abaixo faz. Num cluster de verdade, o normal é criar
+etiquetas de capacidade, como <code>disco=ssd</code> ou <code>gpu=true</code>, e usá-las no seletor.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cardapio|status.no=guia-worker;;texto:Running" data-get="pods -o wide">
+  <p class="try-task">O pod <code>cardapio</code> pediu o nó com a etiqueta <code>disco: ssd</code>, que
+  não existe em nó nenhum — e ficou em <code>Pending</code>. Troque o seletor por uma etiqueta que existe,
+  <code>kubernetes.io/hostname: guia-worker</code>, e rode: o pod tem de subir naquele nó.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  nodeSelector:
+    disco: ssd
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE   IP       NODE     NOMINATED NODE   READINESS GATES
+cardapio   0/1     Pending   0          2m    &lt;none&gt;   &lt;none&gt;   &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: guia-worker
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+</div>
+
+<p>O painel mostra o pod em <code>Pending</code> no código inicial e em <code>Running</code> depois da
+troca; a coluna <code>NODE</code> do <code>-o wide</code> confirma o nó. A meta confere o campo
+<code>status.no</code>, que é onde o cluster anota em qual nó o pod foi parar. Ler esse campo é mais
+confiável do que olhar a tela: o <code>-o wide</code> mostra o mesmo dado, mas o campo é o que os scripts
+usam.</p>
+
+<h2>3. Quando a igualdade não basta: a afinidade</h2>
+
+<p>Imagine que a Ana queira o forno em qualquer nó com disco SSD <em>ou</em> com muita memória, mas nunca
+no nó do control-plane. Com <code>nodeSelector</code> isso é impossível: ele só sabe dizer “tem esta
+etiqueta com este valor”. Para esses casos existe <code>nodeAffinity</code>, que aceita expressões com
+operadores.</p>
+
+<p>A estrutura é mais funda e é aí que as pessoas se perdem. A afinidade de nó mora em
+<code>spec.affinity.nodeAffinity</code>, e dentro dela há duas listas: a obrigatória
+(<code>requiredDuringSchedulingIgnoredDuringExecution</code>) e a preferencial
+(<code>preferredDuringSchedulingIgnoredDuringExecution</code>). Cada uma tem os seus
+<code>nodeSelectorTerms</code>, e cada termo tem <code>matchExpressions</code> — uma lista de condições
+com <code>key</code>, <code>operator</code> e <code>values</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>nodeSelector</code></th><th><code>nodeAffinity</code> required</th><th><code>nodeAffinity</code> preferred</th></tr>
+</thead>
+<tbody>
+<tr><td>Expressividade</td><td>igualdade, várias chaves com “e”</td><td>listas, negações, comparações
+numéricas</td><td>as mesmas expressões, com peso</td></tr>
+<tr><td>Pod que não casa</td><td>fica <code>Pending</code></td><td>fica <code>Pending</code></td><td>é
+agendado em outro nó</td></tr>
+<tr><td>Quando usar</td><td>“só nos nós com SSD”</td><td>“nunca no control-plane”</td><td>“prefiro o nó
+com mais memória”</td></tr>
+<tr><td>Erro comum</td><td>etiqueta que não existe</td><td>esquecer o nível <code>nodeAffinity</code></td>
+<td>achar que preferência obriga</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Os operadores são os mesmos que você viu em labels e selectors, com dois extras numéricos. Vale ter a
+tabela na cabeça, porque o erro de sintaxe aqui é silencioso: uma expressão mal escrita não dá erro, ela
+só não casa com nó nenhum.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Operador</th><th>Significa</th><th>Exemplo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>In</code></td><td>o valor da etiqueta está na lista</td><td><code>disco In [ssd, nvme]</code></td></tr>
+<tr><td><code>NotIn</code></td><td>o valor não está na lista</td><td><code>papel NotIn [control-plane]</code></td></tr>
+<tr><td><code>Exists</code></td><td>a chave existe, qualquer valor</td><td><code>gpu Exists</code></td></tr>
+<tr><td><code>DoesNotExist</code></td><td>a chave não existe</td><td><code>preemptivel DoesNotExist</code></td></tr>
+<tr><td><code>Gt</code> / <code>Lt</code></td><td>comparação numérica (valores inteiros)</td><td><code>memoria-gb Gt 8</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas armadilhas de leitura. Primeiro: dentro de um <code>nodeSelectorTerm</code>, as expressões são
+ligadas por “e” — todas precisam casar. Para fazer um “ou”, você cria <em>vários</em>
+<code>nodeSelectorTerms</code>. Segundo: <code>Exists</code> não olha o valor; se a chave existir com
+qualquer valor, casa. Isso é ótimo para “só nos nós que têm GPU”, ruim quando você queria o valor
+específico.</p>
+
+<h2>4. Obrigatório e preferencial: a diferença que decide o Pending</h2>
+
+<p><code>requiredDuringSchedulingIgnoredDuringExecution</code> é a regra dura: se nenhum nó casar, o pod
+fica em <code>Pending</code>. <code>preferredDuringSchedulingIgnoredDuringExecution</code> é a sugestão: o
+agendador tenta, e se não houver nó que case ele agenda em outro lugar mesmo assim. A preferência tem um
+peso de 1 a 100 — quanto maior, mais força tem no desempate contra outras preferências.</p>
+
+<p>O sufixo comprido, <code>IgnoredDuringExecution</code>, aparece nos dois e quer dizer a mesma coisa:
+a regra vale na hora de <em>agendar</em>, e é ignorada depois que o pod está rodando. Se você mudar a
+etiqueta do nó com o pod lá dentro, o pod não é expulso. Isso é diferente das taints com
+<code>NoExecute</code>, que expulsam. O Kubernetes tem uma afinidade que também expulsa
+(<code>requiredDuringSchedulingRequiredDuringExecution</code>), mas ela é experimental e quase ninguém
+usa — não perca tempo com ela agora.</p>
+
+<p>Na prática, a escolha é sempre entre “posso ficar esperando” e “prefiro rodar em qualquer lugar”. O
+forno pode esperar: afinidade obrigatória. O site não pode: preferência, ou nenhuma afinidade e só
+recursos bem definidos. Um Deployment com afinidade obrigatória e uma etiqueta que não existe fica inteiro
+em <code>Pending</code>, e o rollout não anda — é um dos jeitos mais rápidos de derrubar um deploy sem
+querer.</p>
+
+<h2>5. O manifesto da afinidade, linha por linha</h2>
+
+<p>Com a estrutura na cabeça, o YAML fica legível. Repare que a afinidade é um campo do <em>pod</em>, então
+mora em <code>spec</code> (no Deployment, dentro de <code>spec.template.spec</code>), e que
+<code>nodeSelector</code> e <code>affinity</code> podem conviver: nesse caso as duas regras valem juntas,
+como um “e”.</p>
+
+<dl class="anatomy">
+<dt>spec.affinity</dt>
+<dd>O bloco de afinidade do pod. Dentro dele pode haver <code>nodeAffinity</code> (regras sobre nós) e
+<code>podAffinity</code> (regras sobre outros pods).</dd>
+<dt>nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution</dt>
+<dd>A regra obrigatória. Se nenhum nó casar com ela, o pod fica em <code>Pending</code> com evento
+<code>FailedScheduling</code>.</dd>
+<dt>nodeSelectorTerms</dt>
+<dd>Lista de termos. Entre termos diferentes a ligação é “ou”; dentro de um termo, “e”.</dd>
+<dt>matchExpressions</dt>
+<dd>As condições de um termo, cada uma com <code>key</code>, <code>operator</code> e
+<code>values</code>.</dd>
+<dt>preferredDuringSchedulingIgnoredDuringExecution</dt>
+<dd>A lista de preferências, cada uma com <code>weight</code> (1 a 100) e um
+<code>preference</code> com as expressões.</dd>
+<dt>matchFields</dt>
+<dd>Como <code>matchExpressions</code>, mas sobre campos do nó em vez de etiquetas. O uso real é
+<code>metadata.name</code>, quando você quer um nó específico pelo nome.</dd>
+</dl>
+
+<div class="tryk8s" data-goal="campo:Pod/forno|spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.0.matchExpressions.0.key=kubernetes.io/hostname;;campo:Pod/forno|spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.0.matchExpressions.0.values.0=guia-worker2;;texto:Running">
+  <p class="try-task">A afinidade do pod <code>forno</code> está no nível errado: falta o bloco
+  <code>nodeAffinity</code> entre <code>affinity</code> e <code>requiredDuringScheduling…</code>. Conserte
+  a indentação e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  affinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - guia-worker2
+  containers:
+    - name: forno
+      image: forno:1.0</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   1/1     Running   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                  - guia-worker2
+  containers:
+    - name: forno
+      image: forno:1.0</pre>
+</div>
+
+<p>Aqui a meta confere o caminho completo até a expressão: chave <code>kubernetes.io/hostname</code> e o
+primeiro valor <code>guia-worker2</code>. No código inicial o campo não existe — o YAML é válido, o pod
+até sobe, mas a regra não foi lida. É o pior tipo de erro de afinidade: silencioso. Uma dica prática para
+não cair nele é rodar <code>kubectl get pod forno -o yaml</code> depois do apply e procurar
+<code>nodeAffinity</code> na saída; se não estiver lá, o seu manifesto não disse o que você achava.</p>
+
+<p>Sobre o painel: ele não simula a decisão do agendador para afinidade — não há nó com etiqueta falsa nem
+recusa por <code>didn't match</code> do lado da afinidade. O que ele faz é guardar o objeto e mostrar o pod
+rodando. Por isso a meta é sobre o campo, e não sobre o nó escolhido. Num cluster de verdade, a regra
+acima levaria o pod ao <code>guia-worker2</code>; se o nó não existisse, o pod ficaria em
+<code>Pending</code>.</p>
+
+<h2>6. Etiquetar e conferir: o trabalho de campo</h2>
+
+<p>Tudo o que você viu depende de uma etiqueta existir no nó. Etiqueta de nó não nasce com o manifesto do
+pod: ela é criada no nó, por comando, e é por isso que a primeira coisa a fazer antes de escrever um
+seletor é <em>olhar</em> o que já existe. <code>kubectl get nodes --show-labels</code> mostra a lista
+inteira (com a coluna <code>LABELS</code> enorme), <code>kubectl describe node</code> mostra organizado, e
+<code>kubectl get nodes -L disco</code> mostra só a etiqueta que você pediu, como uma coluna.</p>
+
+<pre class="term">$ kubectl label node guia-worker disco=ssd
+node/guia-worker labeled
+
+$ kubectl get nodes -L disco
+NAME                 STATUS   ROLES           AGE   VERSION   DISCO
+guia-control-plane   Ready    control-plane   41d   v1.34.1
+guia-worker          Ready    &lt;none&gt;          41d   v1.34.1   ssd
+guia-worker2         Ready    &lt;none&gt;          41d   v1.34.1
+
+$ kubectl describe node guia-worker | grep -A3 Labels
+Labels:             beta.kubernetes.io/arch=amd64
+                    disco=ssd
+                    kubernetes.io/hostname=guia-worker</pre>
+
+<p>Para trocar o valor de uma etiqueta que já existe, o comando pede <code>--overwrite</code>; sem ele, o
+<code>kubectl</code> recusa com <code>'disco' already has a value</code>. Para remover, o mesmo comando com
+um <code>-</code> no fim (<code>kubectl label node guia-worker disco-</code>). E vale saber que etiqueta de
+nó é dado do cluster, não do seu repositório: se você recriar o cluster <code>kind</code>, as etiquetas
+somem, e o pod que dependia delas fica em <code>Pending</code> até alguém rodar o comando de novo.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/forno|spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution.0.weight=100;;campo:Pod/forno|spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution.0.preference.matchExpressions.0.key=disco;;texto:Running">
+  <p class="try-task">A preferência do <code>forno</code> está quase certa, mas o campo interno está no
+  plural e o agendador não o reconhece. Corrija o nome do campo (<code>preference</code>, no singular) e
+  rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preferences:
+            - matchExpressions:
+                - key: disco
+                  operator: In
+                  values:
+                    - ssd
+  containers:
+    - name: forno
+      image: forno:1.0</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   1/1     Running   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: disco
+                operator: In
+                values:
+                  - ssd
+  containers:
+    - name: forno
+      image: forno:1.0</pre>
+</div>
+
+<p>O <code>describe node</code> é longo, mas você já sabe onde olhar: <code>Labels</code> para as
+etiquetas, <code>Taints</code> para as marcas, e <code>Allocated resources</code> no fim, que mostra quanto
+da CPU e da memória já está reservado por requests. É a mesma leitura da <a href="pod-pending.html">aula de pod em Pending</a>, agora do
+lado do nó: antes de culpar o seletor, confira se o nó escolhido tem espaço.</p>
+
+<p>A preferência da caixa acima mostra o segundo formato da afinidade, com <code>weight</code> e
+<code>preference</code> — este último no singular, e é aí que quase todo mundo erra. O peso vai de 1 a 100;
+zero e 200 são recusados pela API. E note o que a caixa <em>não</em> prova: no painel não há etiqueta
+<code>disco</code> em nó nenhum, então o pod sobe sem preferência satisfeita, exatamente como um cluster de
+verdade faria. A meta confere o campo gravado; a escolha do nó, num cluster real, sai no
+<code>-o wide</code>.</p>
+
+<p>Se você quiser treinar a leitura do nó no painel, o comando disponível é <code>kubectl get nodes</code>;
+o <code>describe node</code> responde <code>NotFound</code> no motor desta página, então as transcrições
+acima são a sua referência de como a saída completa se parece num cluster de verdade.</p>
+
+<h2>7. O que a afinidade não resolve</h2>
+
+<p>Afinidade escolhe <em>onde</em>, e só isso. Se o pod não cabe por falta de memória, nenhuma expressão
+resolve — o evento vai dizer <code>Insufficient memory</code>, não <code>didn't match</code>, e o conserto
+é reduzir o request ou aumentar o nó. Se o nó está marcado com uma <a href="taints-e-tolerations.html">taint</a>, o seletor não ajuda: falta
+toleration. Se o nó está com <code>cordon</code>, ninguém entra até o <code>uncordon</code>. São quatro
+filtros diferentes, e o evento do <code>describe pod</code> diz qual deles reprovou.</p>
+
+<p>Também não é trabalho da afinidade de nó separar pods que se odeiam. Para “não quero este pod no mesmo
+nó daquele” existem <code>podAntiAffinity</code> e <code>topologySpreadConstraints</code>, que olham para
+os outros pods e não para as etiquetas do nó. E para “quero um pod em cada nó” existe o DaemonSet, que
+você já viu. Usar afinidade de nó para tudo é o caminho mais longo para um manifesto que ninguém entende.</p>
+
+<p>Por fim, uma questão de gosto que vira questão de manutenção: <code>nodeSelector</code> é uma linha e
+qualquer pessoa lê; <code>nodeAffinity</code> é dez linhas indentadas e assusta. Se a igualdade resolve,
+use a igualdade. A afinidade entra quando você precisa de lista, negação, comparação numérica ou
+preferência — nem antes, nem “porque é mais moderno”.</p>
+
+<h2>8. Quando o pod não acha lugar</h2>
+
+<p>O evento é o mesmo para os dois casos, e é por isso que ele confunde: <code>didn't match Pod's node
+affinity/selector</code> aparece tanto quando o <code>nodeSelector</code> não casa quanto quando a
+afinidade obrigatória não casa. A frase não distingue, mas o resto da linha ajuda: ela vem com a contagem
+de nós (“0/3 nodes are available”) e, quando há mais de um motivo, com a lista separada por vírgula.</p>
+
+<pre class="term">$ kubectl get pods
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          40s
+
+$ kubectl describe pod forno | tail -n 4
+Events:
+  Type     Reason            Age   From               Message
+  Warning  FailedScheduling  26s   default-scheduler  0/3 nodes are available: 3 node(s)
+  didn't match Pod's node affinity/selector. preemption: 0/3 nodes are available: 3 Preemption is not
+  helpful for scheduling.</pre>
+
+<p>Leia como quem lê uma receita: “0 de 3 nós disponíveis” quer dizer que nenhum passou no filtro; “3 nós
+não casaram com a afinidade/seletor” quer dizer que o motivo foi a sua regra, não recurso nem taint; e o
+resto é o aviso padrão de que preempção não ajuda — ou seja, nenhum pod foi morto para abrir espaço. O
+conserto está no manifesto ou nas etiquetas do nó, nunca no <code>kubectl</code>.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a etiqueta que sumiu no fim de semana</h3>
+<p>Na sexta a Ana marcou o <code>guia-worker2</code> com <code>disco=ssd</code> e prendeu o backup nele.
+No sábado alguém recriou o cluster para testar uma coisa e esqueceu de rodar o comando de novo. Na
+segunda, o backup estava em <code>Pending</code> e o evento dizia que nenhum nó casava. O manifesto estava
+certo; o cluster é que tinha perdido a etiqueta. Etiqueta de nó é configuração do cluster: se ela não está
+no script de criação, ela vai sumir.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Deployment inteiro em Pending</h3>
+<p>Ela escreveu uma afinidade obrigatória com o valor <code>guia-worker-2</code> — com hífen, porque o nome
+do arquivo tinha hífen. O nó se chama <code>guia-worker2</code>, sem hífen. Nenhum nó casou, as três
+réplicas ficaram em <code>Pending</code> e o <code>rollout status</code> ficou esperando para sempre. Um
+erro de digitação em afinidade obrigatória não derruba um pod: derruba a carga inteira, e o sintoma é
+“nada sobe”, não “um pod estranho”.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a preferência que ninguém viu acontecer</h3>
+<p>A Ana pôs uma preferência de peso 100 pelo nó com mais memória. Nos primeiros dias o forno caiu lá,
+como ela queria. Quando o nó ficou cheio, o agendador simplesmente escolheu outro — sem erro, sem evento,
+sem aviso. É o comportamento correto de uma preferência, e é o que a torna segura: ela melhora a escolha
+quando dá, e não bloqueia quando não dá. Se ela precisasse da garantia, teria de usar
+<code>required</code> e aceitar o <code>Pending</code>.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<p>Três perguntas para não confundir etiqueta de nó com etiqueta de pod.</p>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O pod tem <code>nodeSelector: { disco: ssd }</code> e
+nenhum nó tem essa etiqueta. O que acontece?</p>
+<label><input type="radio" name="q1"> o pod é agendado no nó mais parecido</label>
+<label><input type="radio" name="q1"> o pod fica em <code>Pending</code> com <code>didn't match Pod's node
+affinity/selector</code></label>
+<label><input type="radio" name="q1"> o <code>apply</code> recusa o manifesto</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual é a diferença entre <code>required</code> e
+<code>preferred</code> na afinidade?</p>
+<label><input type="radio" name="q2"> <code>required</code> vale para pods e <code>preferred</code> para
+Deployments</label>
+<label><input type="radio" name="q2"> <code>preferred</code> só funciona com <code>operator:
+Exists</code></label>
+<label><input type="radio" name="q2"> <code>required</code> bloqueia o agendamento; <code>preferred</code>
+só influencia a pontuação</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Onde fica o <code>nodeSelector</code> no manifesto de um
+Deployment?</p>
+<label><input type="radio" name="q3"> em <code>spec.template.spec</code>, junto de
+<code>containers</code></label>
+<label><input type="radio" name="q3"> em <code>spec.selector</code>, junto de
+<code>matchLabels</code></label>
+<label><input type="radio" name="q3"> em <code>metadata.labels</code>, junto do nome</label>
+</div>
+
+<h2>Exercício: o forno no nó com disco</h2>
+
+<p>Escreva o pod <code>forno</code>, imagem <code>forno:1.0</code>, com uma afinidade <em>obrigatória</em>
+que aceite nós com <code>disco</code> valendo <code>ssd</code> ou <code>nvme</code>. Depois responda: qual
+operador compara o valor da etiqueta com uma lista?</p>
+
+<div class="exercise">
+<div class="ex-code">matchExpressions[0].<input aria-label="resposta 1" data-answer="operator" placeholder="...">: In</div>
+<p class="ex-dica">Dica: dentro do <code>nodeSelectorTerm</code> as expressões são ligadas por “e”; para
+“ou”, use mais de um termo. O bloco começa em <code>spec.affinity.nodeAffinity</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O agendador filtra os nós e depois pontua; a sua opinião entra no filtro. <code>nodeSelector</code> é a
+forma simples: um mapa de etiquetas, todas obrigatórias, e se a etiqueta não existe o pod fica em
+<code>Pending</code> com o evento <code>didn't match Pod's node affinity/selector</code>.
+<code>nodeAffinity</code> é a forma completa, com <code>matchExpressions</code> usando
+<code>In</code>, <code>NotIn</code>, <code>Exists</code>, <code>DoesNotExist</code>, <code>Gt</code> e
+<code>Lt</code>.</p>
+
+<p>Afinidade obrigatória (<code>required…</code>) bloqueia; preferencial (<code>preferred…</code> com
+<code>weight</code>) só influencia a pontuação. As duas valem no agendamento e são ignoradas depois —
+mudar etiqueta de nó não expulsa pod. O manifesto tem três níveis (<code>affinity</code>,
+<code>nodeAffinity</code>, <code>required…</code>) e esquecer um deles é o erro silencioso mais comum.
+E nada disso resolve falta de memória, taint ou <code>cordon</code>: são filtros diferentes, com eventos
+diferentes.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>nodeSelector</code> = igualdade; <code>nodeAffinity</code> = listas, negações e
+  preferências.</li>
+  <li>Etiqueta que não existe: <code>Pending</code> e <code>didn't match Pod's node
+  affinity/selector</code>.</li>
+  <li><code>required</code> bloqueia, <code>preferred</code> só desempata (peso 1 a 100).</li>
+  <li>No Deployment, o seletor de nó fica em <code>spec.template.spec</code>.</li>
+  <li>Antes de escrever, leia as etiquetas: <code>describe node</code> ou <code>get nodes -L
+  disco</code>.</li>
+  <li>Falta de recurso, taint e <code>cordon</code> são outros filtros, com outros eventos.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

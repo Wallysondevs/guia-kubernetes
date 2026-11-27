@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DaemonSet | Guia Kubernetes</title>
+<meta name="description" content="DaemonSet na prática: um pod em cada nó, sem replicas, com nodeSelector e atualização nó a nó — o coletor de logs da padaria da Ana rodando no painel.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">DaemonSet</span></h1>
+<p class="intro">A Ana descobriu na semana passada que o site da padaria caiu de madrugada e ninguém
+soube: o log ficou só no nó onde o pod estava rodando, e aquele nó foi reiniciado. Ela quer um coletor de
+logs em <em>todos</em> os nós do cluster, sempre. Um Deployment não resolve — ele garante “duas cópias em
+algum lugar”, e “algum lugar” pode ser duas cópias no mesmo nó, deixando os outros dois sem coletor. O que
+ela precisa é de um objeto que diga “uma cópia em cada nó”, e esse objeto tem nome: DaemonSet.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que um DaemonSet garante e por que ele não tem <code>replicas</code>.</li>
+  <li>A diferença entre “N cópias em qualquer lugar” e “uma cópia em cada nó”.</li>
+  <li>O manifesto do DaemonSet: <code>selector</code>, <code>template</code> e o que o controlador
+  acrescenta sozinho.</li>
+  <li>Restringir o DaemonSet com <code>nodeSelector</code> — e o que muda quando um nó novo entra no
+  cluster.</li>
+  <li>Por que o control-plane fica de fora e o que é preciso para incluí-lo.</li>
+  <li>Como um DaemonSet é atualizado, nó por nó, com <code>maxUnavailable</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o log que sumiu com o nó</h2>
+
+<p>O cluster da Ana tem três máquinas: um <code>guia-control-plane</code>, que manda no cluster, e dois
+workers, <code>guia-worker</code> e <code>guia-worker2</code>, que rodam os pods do site. Na terça o
+worker 2 foi reiniciado para uma atualização do sistema e levou junto os logs do dia. O arquivo estava
+dentro do container, o container estava dentro do pod, o pod estava naquele nó — e nó reiniciado é disco
+apagado.</p>
+
+<p>A solução que a Ana quer é simples de dizer: um programa pequeno, o <code>coletor</code>, que lê os
+logs de todos os containers daquele nó e manda para o servidor da padaria. Para isso funcionar, ele
+precisa rodar em <em>cada</em> nó, porque cada nó tem os seus containers e os seus arquivos. Não adianta
+ter três coletores: se os três caírem no mesmo worker, os outros dois nós ficam sem coleta.</p>
+
+<p>Ela pensa em Deployment com <code>replicas: 3</code>. Funciona no primeiro dia e quebra no segundo: o
+agendador escolhe onde colocar cada pod olhando recursos livres e não tem a menor obrigação de dar um nó
+para cada réplica. Pior: quando a Ana adicionar um quarto nó ao cluster, o Deployment continuará com três
+pods, e o nó novo nasce sem coletor. Deployment conta pods; o que ela precisa é de um objeto que conte
+<em>nós</em>.</p>
+
+<h2>2. A promessa do DaemonSet: um pod por nó</h2>
+
+<p>DaemonSet é o objeto que garante um pod em cada nó que case com as regras dele. “Cada nó” é a unidade
+da conta, não o pod: se o cluster tem dois workers elegíveis, o DaemonSet cria dois pods; se a Ana
+adicionar um terceiro worker na sexta, o controlador percebe o nó novo e cria o terceiro pod sozinho, sem
+ninguém rodar <code>scale</code> nem editar manifesto. Se um nó sai do cluster, o pod dele é removido
+junto, porque não faz mais sentido.</p>
+
+<p>Repare no que essa promessa <em>não</em> diz. Ela não diz que haverá sempre dois pods: diz que haverá
+um por nó. Num cluster de dez nós, o DaemonSet tem dez pods; num cluster de um nó, tem um. O número é
+consequência do tamanho do cluster, e por isso o objeto não tem campo <code>replicas</code> — não há o que
+escolher. Quem decide o número é a lista de nós.</p>
+
+<p>É por isso que o DaemonSet é o objeto preferido dos programas que precisam ver a máquina por dentro:
+o agente de rede que dá IP a cada pod, o agente de log que lê os arquivos do nó, o exportador de métricas
+que lê <code>/proc</code>, o agente de backup que varre o disco local. Se você já instalou um cluster
+<code>kind</code>, eles já estão lá: o <code>kube-proxy</code> e o plugin de rede rodam como DaemonSet no
+namespace <code>kube-system</code>.</p>
+
+<p>Um detalhe de implementação que ajuda a entender o desenho: o pod do DaemonSet não fica “esperando o
+agendador escolher”. O controlador já sabe em qual nó o pod deve rodar, então cria o pod com uma regra de
+afinidade apontando para aquele nó (e, no passado, com <code>nodeName</code> fixo). Na prática, o pod do
+DaemonSet não é agendado: ele é <em>colocado</em>. Isso explica por que ele não aparece em
+<code>Pending</code> por falta de recurso do jeito que um pod de Deployment aparece — e também por que
+ele pode nascer num nó cheio.</p>
+
+<h2>3. DaemonSet e Deployment lado a lado</h2>
+
+<p>A confusão entre os dois é tão comum que vale uma tabela. A pergunta que separa um do outro é: “o que
+você está contando?”. Se a resposta é “quantas cópias do programa”, é Deployment. Se é “quantos nós têm
+esse programa”, é DaemonSet.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>Deployment</th><th>DaemonSet</th></tr>
+</thead>
+<tbody>
+<tr><td>O que garante</td><td>N réplicas rodando, em qualquer nó</td><td>um pod em cada nó elegível</td></tr>
+<tr><td>Campo de quantidade</td><td><code>spec.replicas</code></td><td>nenhum: vem do número de nós</td></tr>
+<tr><td>Quem escolhe o nó</td><td>o agendador, olhando recursos</td><td>o controlador, um nó por pod</td></tr>
+<tr><td>Nó novo no cluster</td><td>nada muda sozinho</td><td>nasce um pod novo nele</td></tr>
+<tr><td>Exemplo na padaria</td><td>o site do cardápio</td><td>o coletor de logs e o backup local</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O manifesto é quase igual ao do Deployment — <code>selector</code>, <code>template</code>, containers,
+recursos — e é justamente essa semelhança que engana. A diferença está no que você <em>não</em> escreve
+(o <code>replicas</code>) e no que o controlador faz depois: em vez de comparar “pods atuais” com
+“réplicas desejadas”, ele compara “nós elegíveis” com “pods existentes”.</p>
+
+<div class="tryk8s" data-goal="objeto:DaemonSet/coletor;;conta:pods=2;;texto:daemonset.apps/coletor created" data-get="pods -o wide">
+  <p class="try-task">A Ana começou com um Deployment de duas réplicas chamado <code>coletor</code>.
+  Transforme-o num DaemonSet — mesmo nome, mesma etiqueta <code>app: coletor</code> — para que haja um pod
+  em cada worker. Rode e confira na coluna <code>NODE</code> onde cada pod caiu.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coletor
+  labels:
+    app: coletor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      containers:
+        - name: coletor
+          image: coletor:1.0</pre>
+<pre class="out">
+deployment.apps/coletor created
+
+NAME                       READY   STATUS    RESTARTS   AGE   IP               NODE                 NOMINATED NODE   READINESS GATES
+coletor-q92twj4cns-2g65v   1/1     Running   0          9m    10.244.129.141   guia-control-plane   &lt;none&gt;           &lt;none&gt;
+coletor-q92twj4cns-t246g   1/1     Running   0          5m    10.244.95.219    guia-worker          &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coletor
+  labels:
+    app: coletor
+spec:
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      containers:
+        - name: coletor
+          image: coletor:1.0</pre>
+</div>
+
+<p>Duas coisas para observar no painel. Primeiro: no código inicial, os dois pods do Deployment caem em
+nós diferentes por sorte do agendador (ele espalha), mas nada garante que continuem assim — e um deles
+pode cair em qualquer nó, inclusive no <code>guia-control-plane</code>. Segundo: depois do DaemonSet, os dois pods aparecem nos dois
+workers e o control-plane fica de fora. A diferença não é estética: é a diferença entre “por acaso” e “por
+contrato”.</p>
+
+<h2>4. Sem <code>replicas</code>: as peças do manifesto</h2>
+
+<p>O DaemonSet tem <code>selector</code> e <code>template</code> como o Deployment, e a regra do seletor é
+a mesma que você já viu: as etiquetas do template precisam casar com o <code>matchLabels</code>, senão o
+<code>apply</code> recusa o manifesto. O que ele não tem é <code>replicas</code> — e tentar colocar dá
+erro de verdade, porque a API sabe que o campo não faz sentido ali.</p>
+
+<dl class="anatomy">
+<dt>spec.selector</dt>
+<dd>Como o controlador reconhece os pods que são dele. Tem de casar com
+<code>spec.template.metadata.labels</code>; é o mesmo campo (e a mesma regra) do Deployment.</dd>
+<dt>spec.template</dt>
+<dd>O molde do pod que será criado em cada nó: containers, imagem, requests, volumes. Tudo o que vale
+para um pod vale aqui.</dd>
+<dt>spec.template.spec.nodeSelector</dt>
+<dd>Restringe o DaemonSet aos nós que têm certas etiquetas. Sem ele, todos os nós elegíveis recebem um
+pod.</dd>
+<dt>spec.updateStrategy</dt>
+<dd>Como os pods são trocados quando o template muda. O padrão é <code>RollingUpdate</code> com
+<code>maxUnavailable: 1</code>: um nó por vez.</dd>
+<dt>spec.revisionHistoryLimit</dt>
+<dd>Quantas revisões antigas ficam guardadas para rollback. Padrão 10.</dd>
+<dt>status.desiredNumberScheduled</dt>
+<dd>Quantos nós o controlador considerou elegíveis. É o “replicas” deste objeto, só que calculado.</dd>
+</dl>
+
+<div class="tryk8s" data-goal="objeto:DaemonSet/coletor;;conta:pods=2;;texto:daemonset.apps/coletor created" data-get="pods -o wide">
+  <p class="try-task">Rode do jeito que está e leia o erro: o manifesto tentou dizer quantos pods o
+  DaemonSet deve ter. Tire a linha que não existe neste objeto e rode de novo.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coletor
+  labels:
+    app: coletor
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      containers:
+        - name: coletor
+          image: coletor:1.0</pre>
+<pre class="out">
+The DaemonSet "coletor" is invalid: spec.replicas: Forbidden: may not be specified for DaemonSet
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coletor
+  labels:
+    app: coletor
+spec:
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      containers:
+        - name: coletor
+          image: coletor:1.0</pre>
+</div>
+
+<p>O erro é curto e vale decorar: <code>spec.replicas: Forbidden: may not be specified for
+DaemonSet</code>. “Forbidden” aqui não é permissão de usuário; é a API dizendo que o campo não pertence
+ao objeto. Quem tenta controlar o número de pods de um DaemonSet está tentando controlar o número de nós
+do cluster pela porta dos fundos — e a porta não abre.</p>
+
+<h2>5. <code>nodeSelector</code>: nem todo nó precisa do coletor</h2>
+
+<p>Nem sempre “todos os nós” é o que você quer. A Ana tem um caso concreto: o backup local só faz sentido
+nos nós que têm o disco grande. Num cluster de verdade ela marcaria esses nós com uma etiqueta
+(<code>kubectl label node guia-worker disco=ssd</code>) e escreveria
+<code>nodeSelector: { disco: ssd }</code> no template. O DaemonSet passaria a criar pods só nos nós com a
+etiqueta, e um nó sem ela ficaria de fora sem erro nenhum.</p>
+
+<p>Esse é o mesmo <code>nodeSelector</code> que você viu na <a href="pod-pending.html">aula de pod em Pending</a>: uma igualdade simples,
+chave e valor, e o pod só entra em nó que tenha exatamente aquilo. A diferença é o efeito da ausência:
+num pod solto, a etiqueta que não existe deixa o pod em <code>Pending</code> para sempre; num DaemonSet,
+um nó sem a etiqueta simplesmente não recebe pod. Nada fica pendurado, nada reclama — o conjunto de nós
+elegíveis é que diminui.</p>
+
+<p>No cluster do guia os nós só têm uma etiqueta cada, <code>kubernetes.io/hostname</code>, com o nome do
+próprio nó. É com ela que a caixa abaixo prova a restrição: apontando o seletor para um worker específico,
+o DaemonSet deixa de cobrir o outro. Num cluster de produção você usaria uma etiqueta de capacidade, como
+<code>disco=ssd</code> ou <code>gpu=true</code>, e não o nome do nó — nome de nó muda quando a máquina é
+trocada; etiqueta de capacidade continua valendo.</p>
+
+<div class="tryk8s" data-goal="conta:pods=1;;texto:daemonset.apps/coletor created" data-get="pods -o wide">
+  <p class="try-task">A Ana decidiu começar o coletor só no <code>guia-worker</code>, para testar. Restrinja
+  o DaemonSet a esse nó com <code>nodeSelector</code> usando a etiqueta <code>kubernetes.io/hostname</code>
+  e rode: deve sobrar um pod.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coletor
+  labels:
+    app: coletor
+spec:
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      containers:
+        - name: coletor
+          image: coletor:1.0</pre>
+<pre class="out">
+daemonset.apps/coletor created
+
+NAME            READY   STATUS    RESTARTS   AGE   IP              NODE           NOMINATED NODE   READINESS GATES
+coletor-l965k   1/1     Running   0          3m    10.244.102.46   guia-worker2   &lt;none&gt;           &lt;none&gt;
+coletor-vnk2n   1/1     Running   0          7m    10.244.1.229    guia-worker    &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coletor
+  labels:
+    app: coletor
+spec:
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: guia-worker
+      containers:
+        - name: coletor
+          image: coletor:1.0</pre>
+</div>
+
+<p>O <code>nodeSelector</code> fica em <code>spec.template.spec</code>, ao lado de
+<code>containers</code> — é uma regra do pod, não do DaemonSet. Errar o nível (colocar em
+<code>spec</code>) não dá erro de validação em todas as versões, e o efeito é pior que um erro: o campo é
+ignorado e o DaemonSet cobre o cluster inteiro quando você achava que estava restrito.</p>
+
+<h2>6. O nó que fica de fora: control-plane e taints</h2>
+
+<p>No painel, o DaemonSet nunca colocou pod no <code>guia-control-plane</code>. Num cluster de verdade
+isso tem um motivo com nome: o nó do control-plane nasce com uma <em>taint</em>, uma marca que diz “não
+agende aqui quem não estiver autorizado”. A taint padrão é
+<code>node-role.kubernetes.io/control-plane:NoSchedule</code>, e o pod só entra se tiver uma
+<em>toleration</em> para ela. É o assunto da <a href="taints-e-tolerations.html">próxima aula</a>, mas o efeito você já viu: o coletor cobre os
+workers e ignora o nó do control-plane.</p>
+
+<p>Uma nota sobre o painel: ele reproduz a decisão do controlador do DaemonSet, que por padrão não usa
+nós de control-plane, mas não aplica a taint a pods comuns. É por isso que o pod do Deployment do
+primeiro exemplo aparece no <code>guia-control-plane</code> — num cluster de verdade ele ficaria de fora,
+e o seu Deployment simplesmente teria menos nós disponíveis. O comportamento que importa para esta aula
+é o do DaemonSet, e esse está fiel.</p>
+
+<p>Isso é quase sempre o certo. O control-plane roda os componentes que sustentam o cluster, e misturar
+agente de log ali costuma atrapalhar mais do que ajudar. Mas há exceções importantes: o plugin de rede e o
+<code>kube-proxy</code> precisam rodar em <em>todos</em> os nós, inclusive no control-plane, senão os pods
+dele ficam sem rede. Por isso os DaemonSets do <code>kube-system</code> vêm com tolerations escritas no
+template — e é por isso que você vê pods deles em todos os nós do cluster.</p>
+
+<pre class="term">$ kubectl get daemonsets -A
+NAMESPACE     NAME          DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR            AGE
+kube-system   kindnet       3         3         3       3            3           kubernetes.io/os=linux   41d
+kube-system   kube-proxy    3         3         3       3            3           kubernetes.io/os=linux   41d
+padaria       coletor       2         2         2       2            2           &lt;none&gt;                   9m</pre>
+
+<p>Leia as colunas com calma, porque elas são o diagnóstico do DaemonSet, e compare com as do
+Deployment:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Coluna</th><th>O que mostra</th><th>Quando acende a luz amarela</th></tr>
+</thead>
+<tbody>
+<tr><td><code>DESIRED</code></td><td>quantos nós o controlador considerou elegíveis</td><td>subiu sozinho:
+entrou nó novo no cluster</td></tr>
+<tr><td><code>CURRENT</code></td><td>quantos pods do DaemonSet existem</td><td>menor que <code>DESIRED</code>:
+falta criar pod</td></tr>
+<tr><td><code>READY</code></td><td>quantos pods passaram na prontidão</td><td>menor que
+<code>CURRENT</code>: pod existe, mas não está são</td></tr>
+<tr><td><code>UP-TO-DATE</code></td><td>quantos já usam o template atual</td><td>menor que
+<code>DESIRED</code>: atualização pela metade</td></tr>
+<tr><td><code>NODE SELECTOR</code></td><td>o seletor de nó do template</td><td><code>&lt;none&gt;</code>:
+cobre todos os nós elegíveis</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Quando <code>DESIRED</code> é maior que <code>READY</code>, algum nó está sem coletor funcionando — e é
+aí que você olha o <code>describe</code> do pod daquele nó.</p>
+
+<h2>7. Atualizar um DaemonSet: um nó por vez</h2>
+
+<p>Mudar a imagem do coletor num DaemonSet é diferente de mudar num Deployment. O Deployment troca pods
+aos poucos, com <code>maxSurge</code> e <code>maxUnavailable</code>, porque pode ter pods sobrando. O
+DaemonSet não pode ter dois pods no mesmo nó: para atualizar, ele precisa <em>derrubar</em> o pod antigo
+daquele nó e criar o novo. A estratégia padrão, <code>RollingUpdate</code> com
+<code>maxUnavailable: 1</code>, faz isso um nó por vez — o cluster perde a coleta naquele nó por alguns
+segundos, e os outros continuam.</p>
+
+<ul>
+<li><code>updateStrategy.type</code>
+ — <code>RollingUpdate</code> (padrão) troca os pods automaticamente; <code>OnDelete</code> só troca
+quando você apaga o pod antigo na mão.</li>
+<li><code>updateStrategy.rollingUpdate.maxUnavailable</code>
+ — Quantos nós podem ficar sem pod ao mesmo tempo. Padrão 1. Aumentar acelera a atualização e aumenta o
+buraco.</li>
+<li><code>updateStrategy.rollingUpdate.maxSurge</code>
+ — No DaemonSet o padrão é 0 e quase ninguém mexe: não faz sentido criar um pod extra num nó que já tem
+um.</li>
+<li><code>minReadySeconds</code>
+ — Quanto tempo o pod novo precisa ficar pronto antes de o controlador considerar aquele nó
+atualizado.</li>
+<li><code>revisionHistoryLimit</code>
+ — Quantas revisões ficam guardadas para <code>kubectl rollout undo</code>.</li>
+</ul>
+
+<p>Num cluster de verdade, a atualização se acompanha assim — e repare que o número de nós atualizados
+sobe de um em um, nunca todos de uma vez:</p>
+
+<pre class="term">$ kubectl rollout status ds/coletor
+Waiting for daemon set "coletor" rollout to finish: 1 out of 2 new pods have been updated...
+Waiting for daemon set "coletor" rollout to finish: 1 out of 2 new pods have been updated...
+daemon set "coletor" successfully rolled out
+
+$ kubectl get pods -o wide -l app=coletor
+NAME             READY   STATUS    RESTARTS   AGE   IP           NODE
+coletor-6h2xd    1/1     Running   0          2m    10.244.1.9   guia-worker
+coletor-p4w7n    1/1     Running   0          18s   10.244.2.7   guia-worker2</pre>
+
+<p>O <code>AGE</code> diferente entre os dois pods é a assinatura do rolling update: o de
+<code>guia-worker</code> foi trocado primeiro e o de <code>guia-worker2</code> depois. Se a nova imagem
+estiver quebrada, o controlador trava nesse ponto e você vê metade dos nós com a versão nova e metade com
+a antiga — um jeito desconfortável, mas seguro, de descobrir o problema sem derrubar a coleta do cluster
+inteiro.</p>
+
+<h2>8. Quando o DaemonSet não é a resposta</h2>
+
+<p>O DaemonSet responde “um por nó”. Se a sua pergunta for outra, ele é a ferramenta errada. “Rodar uma
+vez em cada nó e nunca mais” é Job com <code>parallelism</code> alto — mas atenção: Job não garante um por
+nó, garante N execuções; quem garante um por nó é o DaemonSet, que fica rodando para sempre. “Uma cópia em
+cada nó, mas só enquanto eu quiser” é DaemonSet com <code>spec.template</code> desligado por escala — na
+prática, apaga-se o DaemonSet.</p>
+
+<p>Também não é DaemonSet o que precisa de identidade fixa por pod (isso é StatefulSet) nem o que atende
+tráfego HTTP (Deployment + Service). E há um limite físico que vale conhecer: o DaemonSet cria um pod por
+nó, mas não impede que esse pod consuma o nó inteiro. Se o coletor pede 1 CPU e o nó tem 2, o pod nasce
+mesmo assim — porque o controlador do DaemonSet não consulta recursos antes de criar, ele só olha
+etiquetas e taints. Quem paga a conta é o nó, que fica sem espaço para mais nada.</p>
+
+<p>Um caso em que o DaemonSet é insubstituível e quase ninguém pensa nele: máquina nova. Quando a Ana
+adiciona o quarto nó às pressas num sábado, o DaemonSet já está lá com o coletor rodando antes de ela
+lembrar de conferir. O Deployment que ela teria escolhido continuaria com três réplicas, e o nó novo
+ficaria cego até alguém notar.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o DaemonSet com READY menor que DESIRED</h3>
+<p>O <code>get ds</code> mostra <code>DESIRED 3, READY 2</code>. Um nó está sem coletor funcionando. Pode
+ser imagem que não existe (<code>ImagePullBackOff</code>), pod que não passa na verificação de prontidão,
+ou nó que acabou de entrar e ainda está baixando a imagem. O caminho é <code>kubectl get pods -o wide -l
+app=coletor</code>, achar o pod daquele nó e <code>kubectl describe pod</code> nele. O
+<code>DESIRED</code> subiu junto com o cluster: se ele passou de 2 para 3 sem ninguém mexer no manifesto,
+foi porque um nó novo entrou.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o nó com taint que o coletor não cobre</h3>
+<p>A Ana marcou o worker 2 com uma taint para reservá-lo ao forno novo e, no dia seguinte, os logs daquele
+nó sumiram da central. O DaemonSet não falhou: ele nunca criou o pod ali, porque o nó deixou de ser
+elegível. Para voltar a cobrir, o template precisa de uma <code>toleration</code> para aquela taint — e
+não de mais réplicas. É por isso que “faltou um pod” num DaemonSet quase sempre se traduz em “aquele nó
+não casa com as regras”, e não em “o controlador está lento”.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a atualização que ficou pela metade</h3>
+<p>Ela trocou a imagem do coletor para <code>coletor:2.0</code> e o rollout parou em 1 de 3 nós: a imagem
+nova existe, mas o programa sai na hora por falta de uma variável. Com <code>maxUnavailable: 1</code>, o
+estrago fica contido em um nó e o <code>rollout undo</code> volta a versão anterior. Se ela tivesse posto
+<code>maxUnavailable: 3</code> “para ir mais rápido”, os três nós ficariam sem coleta ao mesmo tempo —
+atualização de DaemonSet é o lugar onde a pressa cobra caro.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<p>Três perguntas para separar DaemonSet de Deployment de vez.</p>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Um cluster tem três nós: um control-plane e dois
+workers. Um DaemonSet sem <code>nodeSelector</code> e sem tolerations cria quantos pods?</p>
+<label><input type="radio" name="q1"> três, um em cada nó</label>
+<label><input type="radio" name="q1"> dois, um em cada worker; o control-plane fica de fora</label>
+<label><input type="radio" name="q1"> um, com o padrão de réplicas</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que acontece quando um nó novo entra no cluster e ele
+casa com o <code>nodeSelector</code> do DaemonSet?</p>
+<label><input type="radio" name="q2"> nada, até alguém rodar <code>kubectl scale</code></label>
+<label><input type="radio" name="q2"> o DaemonSet passa a ter um pod a mais só no próximo
+<code>apply</code></label>
+<label><input type="radio" name="q2"> o controlador cria um pod novo naquele nó sozinho</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que o manifesto de um DaemonSet não aceita
+<code>spec.replicas</code>?</p>
+<label><input type="radio" name="q3"> porque a quantidade é consequência do número de nós elegíveis, não
+uma escolha</label>
+<label><input type="radio" name="q3"> porque o campo se chama <code>spec.copies</code> neste
+objeto</label>
+<label><input type="radio" name="q3"> porque réplicas só existem em objetos do namespace
+<code>kube-system</code></label>
+</div>
+
+<h2>Exercício: o coletor só nos nós com disco</h2>
+
+<p>Escreva o DaemonSet <code>coletor</code>, imagem <code>coletor:2.0</code>, etiqueta
+<code>app: coletor</code>, que só roda nos nós marcados com <code>disco: ssd</code>. Depois responda: em
+qual campo do pod fica essa restrição?</p>
+
+<div class="exercise">
+<div class="ex-code">spec.template.spec.<input aria-label="resposta 1" data-answer="nodeSelector" placeholder="...">: { disco: ssd }</div>
+<p class="ex-dica">Dica: a restrição é uma regra do <em>pod</em>, então mora no template, ao lado de
+<code>containers</code>. O controlador do DaemonSet só cria pod onde a regra casa.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>DaemonSet garante um pod em cada nó elegível — e “elegível” é o que sobra depois do
+<code>nodeSelector</code> e das taints do nó. Ele não tem <code>replicas</code>, porque a quantidade não é
+uma escolha: é o tamanho do cluster. Nó novo que casa com as regras ganha pod sozinho; nó que sai leva o
+pod junto. É o objeto dos agentes que precisam ver a máquina por dentro: rede, log, métricas, backup.</p>
+
+<p>O manifesto é quase o de um Deployment — <code>selector</code> casando com as etiquetas do
+<code>template</code> — com duas diferenças práticas: o <code>nodeSelector</code> (e as tolerations)
+moram em <code>spec.template.spec</code>, e a atualização é feita nó por nó, com
+<code>maxUnavailable: 1</code> por padrão. O <code>kubectl get ds</code> resume tudo em
+<code>DESIRED</code>, <code>CURRENT</code> e <code>READY</code>: se <code>READY</code> está atrás, algum
+nó ficou sem o agente.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>DaemonSet conta nós; Deployment conta pods.</li>
+  <li>Não existe <code>spec.replicas</code>: <code>Forbidden: may not be specified for DaemonSet</code>.</li>
+  <li><code>nodeSelector</code> e tolerations ficam no template do pod, não no <code>spec</code> do
+  DaemonSet.</li>
+  <li>Control-plane tem taint: só recebe pod com toleration.</li>
+  <li><code>DESIRED 3, READY 2</code> = um nó sem agente; comece pelo <code>get pods -o wide</code>.</li>
+  <li>Atualização padrão: <code>RollingUpdate</code>, um nó por vez.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

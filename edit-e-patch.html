@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>edit e patch | Guia Kubernetes</title>
+<meta name="description" content="kubectl edit e kubectl patch na prática: o que cada um faz por baixo, os três tipos de patch, os riscos do editor e quando o apply com o manifesto completo é a resposta certa.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>edit e <span class="hl">patch</span></h1>
+<p class="intro">A Ana já sabe aplicar um manifesto inteiro. O problema é quando só uma coisinha precisa
+mudar: uma réplica a mais, uma imagem nova, uma etiqueta que faltou. Reescrever o arquivo inteiro parece
+exagero, e é aí que aparecem os dois comandos que mudam um objeto sem reaplicá-lo — <code>kubectl edit</code>,
+que abre o YAML no seu editor, e <code>kubectl patch</code>, que manda só o pedaço que muda. Nesta aula a Ana
+usa os dois, vê onde eles mordem e aprende quando o caminho chato é o certo.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o <code>kubectl edit</code> faz por baixo: buscar, abrir, salvar e mandar a diferença.</li>
+  <li>Como é a sessão do editor e o que acontece quando você sai sem mudar nada.</li>
+  <li><code>kubectl patch</code> e os três tipos de patch: strategic, merge e json.</li>
+  <li>Os riscos: conflito de edição, apply que desfaz, campo digitado errado.</li>
+  <li>As ferramentas cirúrgicas do dia a dia: <code>set image</code> e <code>scale</code>.</li>
+  <li>Por que o manifesto completo continua sendo o caminho que não tem surpresa.</li>
+</ul>
+</div>
+
+<h2>1. A cena: onze da noite e uma etiqueta faltando</h2>
+
+<p>O monitoramento da padaria não enxergava mais o cardápio. O pod estava de pé, o Service respondia, mas o
+painel filtrava por <code>app=cardapio</code> e o Deployment estava sem a etiqueta. Consertar exigia mudar um
+objeto que já existia — e havia quatro caminhos, todos válidos, todos com um custo diferente.</p>
+
+<p>O primeiro é abrir o objeto no editor: <code>kubectl edit deployment cardapio</code> baixa o YAML, abre no
+<code>vi</code>, e quando você salva ele manda a diferença de volta ao cluster. O segundo é mandar só a
+mudança, sem abrir nada: <code>kubectl patch</code>. O terceiro é a ferramenta que já sabe o formato daquela
+mudança — <code>kubectl label</code> para etiqueta, <code>kubectl set image</code> para imagem,
+<code>kubectl scale</code> para réplicas. E o quarto é o velho <code>apply</code> com o manifesto inteiro
+corrigido.</p>
+
+<p>A analogia que ajuda: o objeto no cluster é a receita escrita no caderno da cozinha. O <code>edit</code> é
+abrir o caderno, riscar e escrever por cima; o <code>patch</code> é mandar um bilhete dizendo “troque o
+açúcar por mel”; o <code>set image</code> é trocar o rótulo de um pote específico; e o <code>apply</code> é
+reescrever a página inteira e colar por cima da antiga. Os quatro mudam a receita. Só o último deixa uma
+página nova, datada e guardada no repositório.</p>
+
+<h2>2. O que está por baixo dos dois comandos</h2>
+
+<p>Nenhum dos dois é mágica: os dois terminam no mesmo lugar, um <code>PATCH</code> enviado à API. A
+diferença está em como a diferença é calculada e em quem a escreve. O vocabulário:</p>
+
+<dl class="anatomy">
+<dt>edit</dt>
+<dd>Abre o objeto inteiro no editor de texto do seu terminal, espera você salvar e envia como patch o que
+mudou. Se você sair sem salvar, nada acontece.</dd>
+<dt>patch</dt>
+<dd>Recebe um documento pequeno com só o pedaço que muda e o tipo de mesclagem. Não abre editor e não
+depende de você.</dd>
+<dt>editor</dt>
+<dd>O programa que o <code>edit</code> chama: o <code>$EDITOR</code> da sua sessão, normalmente
+<code>vi</code>. Sem editor, o comando não abre.</dd>
+<dt>strategic merge</dt>
+<dd>O tipo de patch padrão do kubectl: mescla mapas e, em listas com chave (como containers), casa pelo
+<code>name</code> em vez de substituir a lista inteira.</dd>
+<dt>last-applied</dt>
+<dd>A annotation em que o <code>apply</code> guarda o último manifesto aplicado. É ela que permite ao
+apply saber o que você tirou do arquivo — e é ela que faz o edit ser desfeito.</dd>
+</dl>
+
+<p>Repare no ponto que decide tudo: <strong>o cluster não guarda história</strong>. Ele guarda o estado atual
+do objeto. Quem tem história é o seu repositório. Por isso uma mudança feita com <code>edit</code> ou
+<code>patch</code> existe no cluster e não existe em lugar nenhum que possa ser revisado, comparado ou
+revertido com um clique. Não é proibido — é uma dívida, e ela vence no próximo <code>apply</code>.</p>
+
+<h2>3. O ciclo do <code>edit</code>, na prática</h2>
+
+<p>O comando é curto e a sessão é longa: o <code>vi</code> abre com o objeto inteiro, precedido por um bloco
+de comentários que o kubectl ignora. A transcrição abaixo é de um cluster real, com o Deployment do
+cardápio:</p>
+
+<pre class="term">ana@notebook:~$ kubectl edit deployment cardapio
+# Please edit the object below. Lines beginning with a '#' will be ignored,
+# and an empty file will abort the edit. If an error occurs while saving this file will be
+# reopened with the relevant failures.
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  namespace: padaria
+spec:
+  replicas: 2
+  ...
+deployment.apps/cardapio edited</pre>
+
+<p>Três coisas acontecem nessa tela. Primeiro, o kubectl faz um <code>GET</code> do objeto e escreve o YAML
+num arquivo temporário. Segundo, abre esse arquivo no seu editor. Terceiro, quando você salva e sai, ele
+compara o arquivo novo com o antigo, monta o patch e envia. Se você não mudou nada, a resposta é
+<code>Edit cancelled, no changes made.</code> — o comando é educado, mas não é idempotente na sua cabeça:
+sair sem salvar é o único caso em que nada acontece.</p>
+
+<p>O que o editor <em>não</em> faz por você: validar a intenção. Ele valida o formato — se você quebrar a
+indentação, o kubectl reabre o arquivo com o erro e você conserta ali mesmo. Mas se você digitar
+<code>replicas: 20</code> querendo <code>2</code>, o cluster aceita vinte réplicas com a maior tranquilidade e
+o seu nome fica no evento. Campo válido com valor errado passa por qualquer validação.</p>
+
+<h2>4. Os riscos do editor</h2>
+
+<p>O primeiro risco é o conflito. O <code>edit</code> manda a diferença calculada sobre a versão que ele leu.
+Se alguém — ou o próprio controlador — mudou o objeto nesse meio-tempo, o cluster recusa. A mensagem é esta,
+e ela aparece mais do que se imagina em cluster com time grande:</p>
+
+<pre class="term">ana@notebook:~$ kubectl edit deployment cardapio
+error: the object has been modified; please apply your changes to the latest version and try again</pre>
+
+<p>A leitura é direta: alguém mexeu entre a sua leitura e a sua escrita, o cluster recusou a sobrescrita e
+nada foi salvo — repare que não há linha <code>edited</code> no fim. A cura é repetir o comando e refazer a
+mudança; chato, mas seguro. O segundo risco é mais silencioso: o <code>apply</code> seguinte desfaz o que o
+<code>edit</code> fez, se a mudança não estiver no arquivo. Não é vingança do kubectl; é o modelo declarativo
+funcionando. O apply compara o arquivo com o último aplicado e força o objeto a ficar igual ao arquivo.</p>
+
+<p>O terceiro risco é o hábito. Quem se acostuma a resolver tudo no <code>edit</code> passa a ter um cluster
+que ninguém consegue reproduzir: some o objeto e não há arquivo para recriá-lo igual. Em time pequeno isso
+dura meses; no dia em que alguém precisa recriar o ambiente, ninguém sabe quais foram as edições feitas “na
+mão”. A regra que a Ana adotou depois do susto: <code>edit</code> para olhar e para emergência, arquivo para
+tudo o que precisa durar.</p>
+
+<h2>5. <code>patch</code>: mandar só o pedaço que muda</h2>
+
+<p>O <code>patch</code> recebe um documento pequeno, em JSON, e o tipo de mesclagem. O padrão do kubectl é o
+<em>strategic merge</em>, que mescla mapas e casa itens de lista pelo nome. Na prática, você escreve só o
+caminho que muda:</p>
+
+<pre class="term">ana@notebook:~$ kubectl patch deployment cardapio --type=strategic -p '{"spec":{"replicas":3}}'
+deployment.apps/cardapio patched
+
+ana@notebook:~$ kubectl patch deployment cardapio --type=json -p '[{"op":"replace","path":"/spec/replicas","value":2}]'
+deployment.apps/cardapio patched</pre>
+
+<p>A resposta é sempre <code>patched</code>, mesmo quando o valor já era aquele — o comando não é um
+“verificador”, é um pedido de mudança. O patch não cria objeto: se o nome não existir, a resposta é
+<code>Error from server (NotFound)</code>, igual a qualquer outro comando que fala de um objeto específico.
+E, ao contrário do <code>edit</code>, ele não abre nada: roda em script, em pipeline, em
+<code>kubectl patch</code> dentro de um job de deploy.</p>
+
+<p>Os três tipos não são sinônimos. O <em>strategic</em> é o mais amigável e o único que entende a semântica
+do Kubernetes (listas com chave, como containers e portas). O <em>merge</em> é o JSON Merge Patch puro:
+substitui o que você mandar, sem conhecer a estrutura. O <em>json</em> é o JSON Patch: uma lista de operações
+com <code>op</code>, <code>path</code> e <code>value</code>, capaz de remover um item de lista por índice.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>--type</th><th>Como pensa</th><th>Serve quando</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>strategic</code> (padrão)</td><td>mescla por chave; lista com <code>name</code> casa pelo nome</td><td>mudar um campo de Deployment, Service, Pod</td><td>não existe para todo tipo de objeto</td></tr>
+<tr><td><code>merge</code></td><td>substitui o que veio, sem conhecer estrutura</td><td>objeto simples, campo de texto</td><td>lista inteira é trocada, não mesclada</td></tr>
+<tr><td><code>json</code></td><td>lista de operações <code>add</code>, <code>remove</code>, <code>replace</code></td><td>remover item de lista, mudar por índice</td><td>errou o índice, mudou o item errado</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>6. O patch no painel deste guia</h2>
+
+<p>O motor que roda as caixas aplica manifestos e executa comandos, mas não aplica patch: ele responde com
+uma frase explicando isso, e é importante que você veja a frase em vez de um resultado inventado. O painel é
+um simulador de respostas, não um cluster com API de escrita completa.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:1.1;;texto:image updated">
+  <p class="try-task">Rode o <code>patch</code> e leia a resposta do painel. Depois faça a mesma mudança com a
+  ferramenta cirúrgica que muda imagem de container: <code>kubectl set image
+  deployment/cardapio cardapio=cardapio:1.1</code>.</p>
+<pre class="yaml">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl patch deployment cardapio --type=strategic -p '{"spec":{"replicas":3}}'</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create deployment cardapio --image=cardapio:1.0
+deployment.apps/cardapio created
+
+ana@notebook:~$ kubectl patch deployment cardapio --type=strategic -p '{"spec":{"replicas":3}}'
+error: neste painel, patch não é aplicado — use kubectl apply -f com o manifesto completo (a aula de patch mostra a saída real).
+</pre>
+<pre class="solucao">kubectl create deployment cardapio --image=cardapio:1.0
+kubectl set image deployment/cardapio cardapio=cardapio:1.1</pre>
+</div>
+
+<p>O que a caixa ensina, além do comando: existe uma família de comandos que já conhece o formato da mudança
+e evita você escrever JSON na mão. Para imagem, <code>set image</code>; para réplica, <code>scale</code>;
+para etiqueta, <code>label</code>; para annotation, <code>annotate</code>. Todos respondem com uma frase
+curta e todos são, por baixo, um patch — a diferença é que o kubectl monta a estrutura por você.</p>
+
+<h2>7. A ferramenta certa para cada pedaço</h2>
+
+<p>No Deployment que já está no ar, o container tem nome próprio — e é por ele que o <code>set image</code>
+acha quem trocar. Errar esse nome produz um dos erros mais comuns de quem começou ontem, e o painel devolve
+exatamente a mensagem de um cluster real:</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:1.1">
+  <p class="try-task">O container do Deployment se chama <code>web</code>, não <code>cardapio</code>. Rode o
+  comando como está, leia o erro e troque a imagem usando o nome certo do container.</p>
+<pre class="yaml">kubectl set image deployment/cardapio cardapio=cardapio:1.1</pre>
+<pre class="out">
+ana@notebook:~$ kubectl set image deployment/cardapio cardapio=cardapio:1.1
+error: unable to find container named "cardapio"
+</pre>
+<pre class="solucao">kubectl set image deployment/cardapio web=cardapio:1.1</pre>
+</div>
+
+<p>A frase <code>error: unable to find container named "cardapio"</code> não diz que a imagem não existe nem
+que o Deployment sumiu. Diz que, <em>dentro do molde do pod</em>, não há container com aquele nome. O formato
+do comando é <code>tipo/nome container=imagem</code>, e os dois nomes são diferentes de propósito: o
+Deployment é o pacote; o container é o programa dentro dele. Nome de container, aliás, tem regra de formato
+igual à de nome de objeto: minúsculas, números e hífen.</p>
+
+<h2>8. O caminho sem surpresa: o manifesto completo</h2>
+
+<p>O <code>apply</code> não é o mais rápido, mas é o único que deixa o cluster igual ao arquivo. Se a mudança
+importa, ela vai para o YAML, o YAML vai para o repositório, e o <code>apply</code> faz o resto. A caixa
+abaixo aplica o manifesto completo num Deployment que já existe: repare que a resposta é
+<code>configured</code>, e não <code>created</code>.</p>
+
+<div class="tryk8s" data-cenario="padaria" data-goal="campo:Deployment/cardapio|spec.replicas=3;;campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:1.1;;pronto:Deployment/cardapio=3">
+  <p class="try-task">O Deployment do cardápio está no ar com duas réplicas e a imagem <code>1.0</code>.
+  Mude o manifesto para três réplicas e a imagem <code>1.1</code> e aplique — o painel tem de mostrar três
+  pods prontos.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+deployment.apps/cardapio configured
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.1</pre>
+</div>
+
+<p>O <code>configured</code> é a palavra que conta a história: o objeto já existia, e o cluster ajustou o que
+estava diferente. O <code>created</code> aparece só na primeira vez. É por isso que o mesmo
+<code>apply</code> pode rodar mil vezes sem medo: aplicar o mesmo arquivo de novo responde
+<code>unchanged</code>.</p>
+
+<p>Agora a comparação que fecha o assunto, com o custo de cada caminho:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Caminho</th><th>O que muda</th><th>Fica registrado?</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kubectl edit</code></td><td>o objeto inteiro, à mão</td><td>não: só no histórico do shell</td><td>olhar o objeto, emergência de madrugada</td></tr>
+<tr><td><code>kubectl patch</code></td><td>só o campo do documento</td><td>só se o patch estiver num arquivo do repositório</td><td>automação e correção pontual</td></tr>
+<tr><td><code>set image</code>, <code>scale</code>, <code>label</code></td><td>um campo conhecido</td><td>só se virar script versionado</td><td>mudança rápida e previsível</td></tr>
+<tr><td><code>kubectl apply -f</code></td><td>o que o arquivo pede, inclusive remoções</td><td>sim: o arquivo é a fonte da verdade</td><td>tudo o que precisa durar e ser reproduzido</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>E o efeito colateral que mais aparece: você faz um <code>edit</code>, o time roda o <code>apply</code> do
+pipeline meia hora depois, e a sua mudança some. Não houve erro em lugar nenhum — o arquivo mandou, e o
+cluster obedeceu. Se a mudança é boa, ela pertence ao arquivo.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o patch que ninguém achou depois</h3>
+<p>Alguém subiu as réplicas de 2 para 5 com <code>kubectl scale</code> durante um pico. No dia seguinte o
+pipeline reaplicou o manifesto com <code>replicas: 2</code> e o cluster voltou para dois pods — no meio do
+horário de maior movimento. A correção não foi desfazer o scale: foi mudar o número no arquivo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o edit que abriu o caderno errado</h3>
+<p>Com dois terminais abertos, a Ana editou o Deployment de <code>teste</code> achando que estava em
+<code>producao</code>. O <code>edit</code> obedece ao namespace corrente sem avisar. Desde então ela digita
+<code>-n producao</code> em todo <code>edit</code>, mesmo quando o contexto já está no namespace certo: uma
+flag explícita custa quatro teclas e evita meia hora de confusão.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o erro de digitação que passou</h3>
+<p>Num <code>patch</code> de emergência, <code>replicas</code> virou <code>repicas</code>. A API recusou com
+<code>unknown field</code> e nada mudou — sorte. No <code>edit</code>, o mesmo typo teria sido recusado
+também, mas um valor válido e errado (três em vez de dois) passaria sem reclamação. Validação de formato não
+é validação de intenção.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o <code>kubectl edit</code> faz quando você salva o
+arquivo?</p>
+<label><input type="radio" name="q1"> apaga o objeto e recria do zero</label>
+<label><input type="radio" name="q1"> calcula a diferença e envia um patch com ela</label>
+<label><input type="radio" name="q1"> guarda o arquivo no ConfigMap do cluster</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. <code>kubectl patch deployment/x --type=json -p
+'[{"op":"replace","path":"/spec/replicas","value":4}]'</code>:</p>
+<label><input type="radio" name="q2"> abre o editor no campo de réplicas</label>
+<label><input type="radio" name="q2"> recria o Deployment com quatro réplicas</label>
+<label><input type="radio" name="q2"> troca o valor do campo indicado pelo caminho</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que uma mudança feita com <code>edit</code> pode
+desaparecer no dia seguinte?</p>
+<label><input type="radio" name="q3"> porque o <code>apply</code> do pipeline força o objeto a ficar igual ao
+arquivo</label>
+<label><input type="radio" name="q3"> porque o cluster apaga edições depois de 24 horas</label>
+<label><input type="radio" name="q3"> porque o <code>edit</code> não é salvo de verdade</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: trocar a imagem sem abrir editor</h2>
+<p>O Deployment <code>cardapio</code> tem um container chamado <code>web</code>. Complete o comando que troca
+só a imagem desse container para <code>cardapio:1.1</code>, sem tocar no resto do manifesto:</p>
+<div class="ex-code">kubectl set image deployment/cardapio <input aria-label="resposta 1" data-answer="web=cardapio:1.1" placeholder="..."></div>
+<p class="ex-dica">Dica: o formato é <code>container=imagem</code>. O nome à esquerda é o do container dentro
+do molde do pod (<code>spec.template.spec.containers[].name</code>), não o nome do Deployment. Errar esse nome
+produz <code>unable to find container named</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>edit</code> e <code>patch</code> mudam um objeto que já existe, e os dois terminam no mesmo lugar: um
+<code>PATCH</code> na API. O <code>edit</code> abre o YAML no seu editor e manda a diferença quando você
+salva; sair sem salvar responde <code>Edit cancelled, no changes made.</code>. O <code>patch</code> recebe só
+o pedaço que muda, em strategic merge, merge ou JSON Patch, e roda sem ninguém olhando.</p>
+
+<p>Os riscos são de natureza diferente. O <code>edit</code> pode conflitar com uma mudança concorrente
+(<code>the object has been modified</code>), depende do seu editor e não deixa rastro. O
+<code>patch</code> é ótimo em automação e péssimo para quem tenta ler depois o que aconteceu. E os dois são
+desfeitos pelo próximo <code>apply</code> do arquivo — porque o arquivo é a fonte da verdade.</p>
+
+<p>Para o dia a dia, prefira as ferramentas que já sabem o formato: <code>set image</code>,
+<code>scale</code>, <code>label</code>, <code>annotate</code>. Para o que precisa durar, o manifesto. E
+guarde o <code>edit</code> para olhar e para a emergência em que não há arquivo à mão — sabendo que, na
+manhã seguinte, a mudança precisa virar commit. Na próxima aula a Ana dá um passo acima do arquivo único e
+conhece o <a href="kustomize-intro.html">Kustomize</a>, que monta o manifesto de cada ambiente a partir de uma
+base comum.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+<li><code>kubectl edit tipo/nome</code>: abre no <code>$EDITOR</code>, salva como patch,
+<code>Edit cancelled, no changes made.</code> se você sair sem mudar.</li>
+<li><code>kubectl patch tipo/nome --type=strategic|merge|json -p '…'</code>: só o campo, sem editor.</li>
+<li>Conflito de edição: <code>the object has been modified; please apply your changes to the latest
+version</code>.</li>
+<li><code>set image deployment/x container=imagem</code>: o nome é o do container, não o do Deployment.</li>
+<li>O <code>apply</code> seguinte desfaz o que não estiver no arquivo. Mudança boa vira commit.</li>
+<li>No painel, <code>patch</code> responde com uma explicação; use <code>set image</code>, <code>scale</code>
+ou <code>apply</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

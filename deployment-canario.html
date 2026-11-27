@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canário | Guia Kubernetes</title>
+<meta name="description" content="Deploy canário no Kubernetes: dois Deployments atrás de um Service, proporção por réplicas, o que o Service não garante e como promover ou reverter sem drama.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Canário</span></h1>
+<p class="intro">A Ana criou um pão de mel novo e quer saber se ele vende antes de trocar a vitrine inteira. No
+site, a mesma dúvida: a versão 2.0 do cardápio mudou o layout da página de preços, e ela não quer que todos os
+clientes vejam uma tela quebrada. O <strong>deploy canário</strong> resolve isso do jeito mais simples
+possível: duas versões rodando ao mesmo tempo, uma delas atendendo pouca gente, e um Service que não sabe que
+elas são diferentes. Nesta aula a Ana monta esse arranjo, entende por que a proporção é feita de réplicas e
+aprende a promover — ou a recuar — sem drama.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>De onde vem o nome “canário” e o que ele resolve que o rolling update não resolve.</li>
+  <li>Como manter duas versões no ar com dois Deployments e um rótulo comum.</li>
+  <li>Por que a proporção do canário é contada em réplicas, e não em porcentagem de usuários.</li>
+  <li>O que o Service faz com quatro endpoints e o que ele não garante.</li>
+  <li>Como observar o canário antes de promover.</li>
+  <li>Como promover e como reverter escalando os dois lados.</li>
+  <li>Os tropeços que fazem o canário receber 100% do tráfego sem ninguém notar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a receita nova e a vitrine inteira</h2>
+
+<p>O pão de mel ficou bom, mas a Ana já queimou uma fornada inteira por confiar no cheiro. No site é a mesma
+coisa: a versão 2.0 mudou a página de preços, e ela quer que <em>alguns</em> clientes vejam antes de todo mundo.
+Se o layout quebrar no celular, o prejuízo é de poucos pedidos, e ela descobre o problema em minutos — não
+depois de uma semana com a vitrine torta.</p>
+
+<p>O jeito antigo de fazer isso era trocar o site inteiro e torcer. O rolling update, que você já viu, troca as
+réplicas uma a uma: em poucos segundos a versão nova está em todo lugar, e não existe a opção “deixe só uma
+réplica na versão nova por uma hora”. O canário existe para esse intervalo de observação.</p>
+
+<p>A ideia é a mesma do passarinho na mina de carvão: ele sente o gás antes dos mineiros, e se ele passar mal,
+todo mundo sai. No Kubernetes, o “passarinho” é uma réplica com a versão nova, recebendo uma fatia do tráfego,
+enquanto o resto continua na versão que funciona. Se a fatia reclamar, você recua; se ela passar bem, você
+aumenta.</p>
+
+<p>Repare no que o canário <em>não</em> é: não é uma estratégia do Deployment. O campo
+<code>spec.strategy.type</code> aceita <code>RollingUpdate</code> e <code>Recreate</code>, e nada mais — você
+viu essa lista na aula de <a href="deployment-estrategias.html">Estratégias de rollout</a>, e o mecanismo
+básico está em <a href="rolling-update.html">Rolling update</a>. Canário é um
+arranjo com <strong>dois</strong> Deployments, um Service e uma decisão humana no meio.</p>
+
+<h2>2. Por que o canário precisa de dois Deployments</h2>
+
+<p>Um Deployment cuida de um conjunto de pods com o mesmo molde. Se você mudar a imagem do molde, o
+controlador cria um ReplicaSet novo e substitui os pods antigos — não existe “metade na 1.0, metade na 2.0”
+dentro do mesmo Deployment. Para ter as duas versões convivendo por tempo indeterminado, são dois objetos
+separados, cada um com seu nome, sua imagem e suas réplicas.</p>
+
+<p>O que liga os dois é a etiqueta. O Service não escolhe Deployment, não escolhe ReplicaSet e não sabe qual
+imagem está rodando: ele escolhe <strong>pods por etiqueta</strong>. Se os dois conjuntos têm
+<code>app: cardapio</code>, os dois entram na lista de endpoints do Service — e o tráfego se divide entre
+eles.</p>
+
+<p>É por isso que o canário é barato: nenhum componente novo, nenhum controlador especial, nenhuma configuração
+de proxy. Só etiquetas iguais e contagens diferentes. O preço dessa simplicidade aparece na seção 5: a divisão
+é por número de pods, não por usuário.</p>
+
+<dl class="anatomy">
+<dt>canário</dt>
+<dd>O Deployment com a versão nova, rodando com poucas réplicas e recebendo uma fatia do tráfego.</dd>
+<dt>estável</dt>
+<dd>O Deployment com a versão que já funciona. É a maioria das réplicas durante o teste.</dd>
+<dt>track</dt>
+<dd>A etiqueta que separa os dois conjuntos (<code>estavel</code> e <code>canario</code>). Não é usada pelo
+Service; serve para você consultar, comparar e escalar cada lado.</dd>
+<dt>endpoints</dt>
+<dd>A lista de IPs e portas que o Service considera prontos para receber tráfego. É o retrato do rateio.</dd>
+<dt>promover</dt>
+<dd>Transformar o canário na versão principal: aumentar as réplicas dele e zerar as do estável.</dd>
+<dt>reverter</dt>
+<dd>Voltar atrás antes de promover: zerar o canário. Não é <code>rollout undo</code>, é escala.</dd>
+</dl>
+
+<p>Guarde a diferença entre <code>track</code> e <code>app</code>. O <code>app</code> é o rótulo público, o que
+o Service usa. O <code>track</code> é interno, para você não se perder ao contar pods, ver logs e escalar. Um
+canário sem essa separação vira uma sopa de pods em que ninguém sabe qual é qual.</p>
+
+<h2>3. A conta é feita de réplicas</h2>
+
+<p>“Dez por cento do tráfego” é fácil de falar e impossível de garantir com este arranjo. O Service manda cada
+conexão para um endpoint da lista, sem olhar de qual Deployment ele veio. Com quatro pods, um canário e três
+estáveis, a chance de um pedido cair no canário é de uma em quatro — 25%. Não existe 10% com quatro pods; o
+menor pedaço é um pod.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Total de pods</th><th>Pods no canário</th><th>Fatia aproximada</th><th>Quando faz sentido</th></tr>
+</thead>
+<tbody>
+<tr><td>4</td><td>1</td><td>25%</td><td>teste rápido, com pouco tráfego</td></tr>
+<tr><td>10</td><td>1</td><td>10%</td><td>o clássico “canário de 10%”</td></tr>
+<tr><td>20</td><td>1</td><td>5%</td><td>serviço grande, mudança arriscada</td></tr>
+<tr><td>4</td><td>2</td><td>50%</td><td>promoção em duas etapas</td></tr>
+<tr><td>2</td><td>1</td><td>50%</td><td>serviço pequeno: canário e estável empatados</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Isso explica por que serviços pequenos sofrem para fazer canário. Com duas réplicas, a menor fatia possível já
+é metade; com uma réplica só, não há canário — ou você troca a imagem e o único pod vira a versão nova, ou não
+testa. Nesse caso, a saída costuma ser aumentar as réplicas durante o teste e diminuir depois.</p>
+
+<p>Há também um custo escondido: um pod a mais é memória e CPU a mais. Num cluster apertado, o canário pode
+deixar o estável sem espaço e virar um <code>Pending</code> — o pod novo não sobe, o Service não ganha endpoint
+novo e você acha que o canário está recebendo tráfego quando ele nem existe. Conferir <code>get pods</code> é
+parte do ritual.</p>
+
+<h2>4. Montando o canário</h2>
+
+<p>A caixa começa com o Deployment estável, com três réplicas. A missão é acrescentar o canário: um segundo
+Deployment, com o mesmo <code>app: cardapio</code>, a etiqueta <code>track: canario</code>, a imagem
+<code>cardapio:2.0</code> e uma réplica. Como são dois objetos, o manifesto usa <code>---</code> entre eles.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:pods[track=canario]=1;;conta:pods[app=cardapio]=4;;texto:Running">
+  <p class="try-task">Acrescente, depois do <code>---</code>, o Deployment <code>cardapio-canario</code>: uma
+  réplica, imagem <code>cardapio:2.0</code> e as etiquetas <code>app: cardapio</code> e
+  <code>track: canario</code> no seletor e no template. O painel tem de mostrar quatro pods, um deles com
+  <code>track=canario</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-estavel
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+      track: estavel
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: estavel
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio-estavel created
+
+NAME                                READY   STATUS    RESTARTS   AGE
+cardapio-estavel-lk7nq8zmgt-22982   1/1     Running   0          8m
+cardapio-estavel-lk7nq8zmgt-l9rvn   1/1     Running   0          10m
+cardapio-estavel-lk7nq8zmgt-xfv78   1/1     Running   0          1m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-estavel
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+      track: estavel
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: estavel
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-canario
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+      track: canario
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: canario
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Quando os dois Deployments sobem, o painel mostra quatro pods: três com <code>track=estavel</code> e um com
+<code>track=canario</code>. Eles não se conhecem, não sabem que fazem parte do mesmo serviço e não têm nenhuma
+ligação entre si — a única coisa que os une é a etiqueta <code>app: cardapio</code>, que o Service vai usar
+depois.</p>
+
+<p>Atenção a um detalhe de seletor: o <code>selector.matchLabels</code> de cada Deployment precisa casar com o
+<code>template</code> daquele Deployment, e os dois seletores não podem se sobrepor. Se o estável usar só
+<code>app: cardapio</code> e o canário também, os dois controladores vão brigar pelos mesmos pods — um deles
+reclama que o pod já tem dono. Por isso cada um leva o seu <code>track</code> no seletor, mesmo que o
+<code>app</code> seja comum aos dois.</p>
+
+<h2>5. O Service escolhe etiqueta, não versão</h2>
+
+<p>Agora o pedaço que faz o rateio acontecer. O Service da padaria precisa selecionar <strong>os dois</strong>
+conjuntos. Se o seletor dele for <code>app: cardapio</code>, os quatro pods entram. Se for
+<code>track: estavel</code>, só os três antigos entram — e o canário fica rodando, saudável e invisível.</p>
+
+<p>A caixa abaixo tem o Service apontando só para o estável. A missão é trocar o seletor para o rótulo comum,
+sem <code>track</code>. Depois disso, o Service passa a mandar tráfego para os dois conjuntos.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="campo:Service/cardapio|spec.selector.app=cardapio;;conta:pods[app=cardapio]=4;;texto:cardapio">
+  <p class="try-task">O Service está selecionando <code>track: estavel</code>, então o canário não recebe
+  ninguém. Troque o seletor por <code>app: cardapio</code> e rode: os quatro pods passam a ser endpoints do
+  mesmo Service.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    track: estavel
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-estavel
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+      track: estavel
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: estavel
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-canario
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+      track: canario
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: canario
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0</pre>
+<pre class="out">
+service/cardapio created
+deployment.apps/cardapio-estavel created
+deployment.apps/cardapio-canario created
+
+NAME       ENDPOINTS                                                   AGE
+cardapio   10.244.66.210:8080,10.244.98.225:8080,10.244.227.191:8080   2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-estavel
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+      track: estavel
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: estavel
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-canario
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+      track: canario
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: canario
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0</pre>
+</div>
+
+<p>O painel mostra os endpoints do Service. Antes da correção, só os pods do estável apareciam; depois, os
+quatro. Essa lista é o retrato fiel do rateio: cada endereço é um pod que pode receber conexão. Se o canário
+não aparece ali, ele não está recebendo tráfego, por mais que esteja <code>Running</code>.</p>
+
+<pre class="term">$ kubectl get pods -l app=cardapio --show-labels
+NAME                                READY   STATUS    RESTARTS   AGE   LABELS
+cardapio-estavel-6b7c9f4d5c-2xj8p   1/1     Running   0          18m   app=cardapio,track=estavel
+cardapio-estavel-6b7c9f4d5c-9qk4m   1/1     Running   0          18m   app=cardapio,track=estavel
+cardapio-estavel-6b7c9f4d5c-tz6vn   1/1     Running   0          18m   app=cardapio,track=estavel
+cardapio-canario-7f8d6b9c4d-hw2pl   1/1     Running   0          2m    app=cardapio,track=canario</pre>
+
+<p>Essa saída é de um cluster local de três nós, na hora em que o canário entrou. Repare que o nome do pod
+começa pelo nome do Deployment: <code>cardapio-estavel-…</code> e <code>cardapio-canario-…</code>. É a única
+pista visual de qual versão está rodando — o Service não tem essa informação em lugar nenhum.</p>
+
+<p>Para conferir o que o Service enxerga, o comando é <code>kubectl get endpoints cardapio</code>. Quatro
+linhas de IP e porta significam quatro pods no rateio. Três, e o canário ficou de fora. Zero, e o seletor não
+casa com nada — o caso mais comum de “o site não abre” depois de renomear uma etiqueta.</p>
+
+<h2>6. O que o Service realmente faz com quatro endpoints</h2>
+
+<p>O Service não tem balança, não tem porcentagem e não tem memória de usuário. Ele entrega a lista de
+endpoints ao mecanismo de rede do nó, que escolhe um destino por conexão. Na prática, com quatro endpoints,
+cada nova conexão tem uma chance em quatro de cair no canário — mas isso é probabilidade, não cota.</p>
+
+<p>Consequências que ninguém conta: se o seu site usa conexões longas (WebSocket, banco de dados, streaming),
+um cliente pode ficar preso no canário por horas. Se usa cache na frente, o cache pode servir a versão antiga
+mesmo depois de você promover. E se o canário tem uma réplica e ela reinicia, por alguns segundos a fatia dele
+é zero.</p>
+
+<p>Também não existe “canário por usuário”. O Service não vê cookie, não vê login, não vê header. Quem quer
+isso precisa de uma camada acima — um Ingress com regra por header, um service mesh com divisão por peso, ou
+uma feature flag dentro da aplicação. O canário por réplicas é o mais simples e o mais grosseiro; é ótimo para
+testar erro 500 e latência, ruim para “só a Maria vê a versão nova”.</p>
+
+<pre class="term">$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                                               AGE
+cardapio   10.244.1.7:8080,10.244.2.9:8080,10.244.2.14:8080,10.244.3.5:8080   21m</pre>
+
+<p>Quatro endereços, um deles o canário. Note que a ordem não diz nada: o primeiro IP não é “a versão nova”.
+Para saber qual pod está por trás de cada IP, o caminho é <code>kubectl get pods -o wide</code> e comparar a
+coluna IP. Vale fazer isso uma vez, só para perder a ilusão de que o Service sabe o que está distribuindo.</p>
+
+<h2>7. Observar antes de promover</h2>
+
+<p>Canário sem observação é só um pod a mais. O teste só vale se você conseguir responder “a versão nova está
+se comportando como a velha?”. As perguntas são sempre as mesmas: a taxa de erro subiu? a latência mudou? o
+log tem algo novo? o pedido que entra no canário chega ao fim?</p>
+
+<p>Como os dois conjuntos têm etiquetas diferentes, dá para filtrar tudo por <code>track</code>. Logs:
+<code>kubectl logs -l track=canario --tail=50</code>. Eventos: <code>kubectl get events</code>. Pods com
+problema: <code>kubectl get pods -l track=canario</code>. A etiqueta que não serve para o Service serve para
+você separar o que é novo do que é velho em qualquer consulta.</p>
+
+<p>O erro clássico é comparar número absoluto. O canário recebe um quarto do tráfego, então é normal ter um
+quarto dos erros. O que importa é a <em>taxa</em>: erros divididos por requisições, dos dois lados. Se o
+canário tem 1% de erro e o estável 0,1%, a diferença é dez vezes — e é isso que decide a promoção.</p>
+
+<p>Também vale combinar um critério de parada antes de começar. “Se a taxa de erro do canário passar de 2% por
+dez minutos, eu zero as réplicas.” Sem esse número escrito, a decisão vira discussão no meio do incidente, e
+todo mundo defende a versão que escreveu.</p>
+
+<h2>8. Promover ou reverter: as duas são escala</h2>
+
+<p>Promover não é aplicar um manifesto novo no estável. É virar o canário em maioria e depois em totalidade:
+escalar o canário para quatro, conferir, escalar o estável para zero. Reverter é o contrário: zerar o canário
+e deixar o estável onde está. Nenhum dos dois caminhos precisa de <code>rollout undo</code> — o histórico de
+revisões do Deployment nem é consultado.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:pods[track=estavel]=0;;conta:pods[track=canario]=4;;pronto:Deployment/cardapio-canario=4">
+  <p class="try-task">O canário passou no teste. Promova: deixe <code>cardapio-canario</code> com quatro
+  réplicas e <code>cardapio-estavel</code> com zero. O Service continua com o mesmo seletor.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-estavel
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+      track: estavel
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: estavel
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-canario
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+      track: canario
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: canario
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0</pre>
+<pre class="out">
+deployment.apps/cardapio-estavel created
+deployment.apps/cardapio-canario created
+
+NAME                                READY   STATUS    RESTARTS   AGE
+cardapio-canario-zwk4wszr9w-lrz8w   1/1     Running   0          24s
+cardapio-estavel-wbz8ngzlqf-69q4p   1/1     Running   0          51s
+cardapio-estavel-wbz8ngzlqf-p7c9p   1/1     Running   0          8m
+cardapio-estavel-wbz8ngzlqf-xmcd2   1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-estavel
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: cardapio
+      track: estavel
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: estavel
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-canario
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+      track: canario
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        track: canario
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0</pre>
+</div>
+
+<p>Depois da promoção, o painel mostra quatro pods com <code>track=canario</code> e nenhum com
+<code>track=estavel</code>. O Service não foi tocado: continua selecionando <code>app: cardapio</code>, e
+agora todos os endpoints são da versão nova. Essa é a elegância do arranjo — a troca de versão é uma mudança
+de quantidade, não de configuração de rede.</p>
+
+<p>Dois cuidados na promoção. Primeiro, o Deployment estável com zero réplicas continua existindo e gastando
+pouco; se você reaplicar o manifesto antigo por engano, ele volta a subir pods com a versão velha e o Service
+mistura tudo de novo. Segundo, promover não “limpa” o canário: no dia seguinte, o Deployment chamado
+<code>canario</code> é a versão principal, e o nome passa a mentir. Renomeie os dois quando o teste virar
+rotina — <code>cardapio-v1</code> e <code>cardapio-v2</code> envelhecem melhor do que <code>estavel</code> e
+<code>canario</code>.</p>
+
+<p>Reverter é mais fácil e é o que você deve treinar primeiro: <code>kubectl scale deployment/cardapio-canario
+--replicas=0</code>. Em segundos, o Service perde os endpoints novos e todo o tráfego volta para a versão que
+funciona. Sem manifesto novo, sem rollout, sem espera. É o botão de pânico que o canário oferece e o rolling
+update não.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Arranjo</th><th>Quantas versões no ar</th><th>Como divide o tráfego</th><th>Voltar atrás</th></tr>
+</thead>
+<tbody>
+<tr><td>RollingUpdate</td><td>duas, por segundos</td><td>o controlador troca pod por pod</td><td><code>rollout undo</code></td></tr>
+<tr><td>Recreate</td><td>uma</td><td>não divide: para tudo e sobe</td><td><code>rollout undo</code></td></tr>
+<tr><td>Canário</td><td>duas, por tempo indeterminado</td><td>por número de réplicas atrás do Service</td><td>escalar o canário para zero</td></tr>
+<tr><td>Blue-green</td><td>duas, inteiras</td><td>o Service aponta para uma cor por vez</td><td>trocar o seletor de volta</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A última linha aparece de propósito: blue-green e canário usam as mesmas peças e resolvem problemas
+diferentes. O canário quer <em>pouca gente</em> na versão nova; o blue-green quer <em>trocar tudo de uma
+vez</em>, com volta instantânea. Na próxima aula a Ana monta o blue-green com dois conjuntos completos.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o canário “não recebia tráfego” e recebia</h3>
+<p>A Ana jurou que o canário estava isolado porque o painel de métricas mostrava poucas requisições. O Service
+selecionava <code>app: cardapio</code>, e o canário tinha essa etiqueta. Com quatro pods, 25% do tráfego ia
+para a versão nova — o suficiente para estragar a página de preços de um em cada quatro clientes. Antes de
+confiar no instinto, confira <code>get endpoints</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o canário ficou Pending e o rateio virou 0%</h3>
+<p>O pod novo não coube em nó nenhum, ficou <code>Pending</code> e nunca entrou nos endpoints. A Ana passou a
+tarde olhando métricas de uma versão que não estava no ar, concluiu que “estava tudo bem” e promoveu. A
+promoção subiu quatro pods que também não couberam, e o site ficou sem réplica. Canário só conta quando o pod
+está <code>Running</code> e <code>Ready</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o cache serviu a versão antiga depois da promoção</h3>
+<p>O Service já mandava tudo para a 2.0, mas o CDN em frente continuava entregando o HTML da 1.0 por meia hora.
+A promoção parecia não ter efeito. Em arranjos com cache, promover exige limpar ou versionar a camada de
+cache; o Kubernetes não sabe que existe um CDN na frente.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que faz o Service dividir tráfego entre estável e canário?</p>
+<label><input type="radio" name="q1"> o campo <code>strategy.type: Canary</code> no Deployment</label>
+<label><input type="radio" name="q1"> uma anotação de porcentagem no Service</label>
+<label><input type="radio" name="q1"> os dois conjuntos terem a mesma etiqueta que o seletor do Service
+usa</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Com três pods estáveis e um canário, qual é a fatia
+aproximada do canário?</p>
+<label><input type="radio" name="q2"> 25%</label>
+<label><input type="radio" name="q2"> 10%</label>
+<label><input type="radio" name="q2"> 50%</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Como reverter um canário que deu errado?</p>
+<label><input type="radio" name="q3"> <code>kubectl rollout undo deployment/cardapio-canario</code></label>
+<label><input type="radio" name="q3"> escalar o canário para zero réplicas</label>
+<label><input type="radio" name="q3"> apagar o Service</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a fatia do canário</h2>
+<p>Complete o campo do segundo Deployment que faz o canário rodar com uma réplica, enquanto o estável fica com
+três.</p>
+<div class="ex-code">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-canario
+spec:
+  <input aria-label="resposta 1" data-answer="replicas" placeholder="...">: 1
+  selector:
+    matchLabels:
+      app: cardapio
+      track: canario</div>
+<p class="ex-dica">Dica: é o mesmo campo que você muda para escalar qualquer Deployment; a fatia do canário é
+consequência dele.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Canário é duas versões no ar ao mesmo tempo, uma delas com poucas réplicas. São dois Deployments, cada um com
+sua imagem e seu <code>track</code>, e um Service que seleciona o rótulo comum aos dois. Não existe estratégia
+“canário” no Deployment: o arranjo é feito de objetos comuns e de uma decisão humana no meio.</p>
+
+<p>A proporção é contada em pods. Quatro pods com um canário dão 25%; dez dão 10%. O Service distribui por
+conexão, não por usuário, e não garante cota: ele só entrega a lista de endpoints. Por isso o canário serve
+para medir erro e latência, não para escolher quem vê o quê.</p>
+
+<p>Promover é escalar o canário para cima e o estável para baixo; reverter é zerar o canário. Nos dois casos, o
+Service fica intacto. Antes de decidir, observe taxa de erro e latência comparando os dois lados, e escreva o
+critério de parada antes de começar.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Canário = dois Deployments + um Service com seletor comum.</li>
+  <li><code>track</code> separa os conjuntos; <code>app</code> é o que o Service usa.</li>
+  <li>A fatia é por número de pods: 1 de 4 = 25%, 1 de 10 = 10%.</li>
+  <li>O Service não garante porcentagem nem lembra de usuário; é por conexão.</li>
+  <li>Pod <code>Pending</code> não entra em endpoints: confira <code>Ready</code> antes de medir.</li>
+  <li>Promover e reverter são <code>kubectl scale</code>, não <code>rollout undo</code>.</li>
+  <li>Compare taxas, não números absolutos: o canário recebe menos tráfego.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

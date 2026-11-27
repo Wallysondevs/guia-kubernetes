@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recarregar configuração | Guia Kubernetes</title>
+<meta name="description" content="Recarregar configuração no Kubernetes: por que a variável não muda sozinha, quando o arquivo montado atualiza, o rollout restart, o subPath que atrapalha e o checklist da troca.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Recarregar <span class="hl">configuração</span></h1>
+<p class="intro">A Ana aplicou o preço novo no ConfigMap, conferiu com <code>get configmaps</code> e o valor
+estava lá. O cliente continuou vendo o preço antigo por três dias. O problema não era o ConfigMap: era o pod,
+que lê a configuração uma vez, no start, e não sabe que o mundo mudou. Nesta aula a Ana aprende as duas rotas
+da mudança — o arquivo que se atualiza sozinho e o pod que precisa nascer de novo —, o comando que faz isso
+sem drama e o que nunca fazer.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que variável de ambiente não se atualiza sozinha, e o que fazer no lugar.</li>
+  <li>Quando o arquivo montado muda e quando o programa continua lendo o antigo.</li>
+  <li><code>kubectl rollout restart</code>: o que ele faz, o que ele não faz e como confirmar.</li>
+  <li>O <code>subPath</code> que congela o arquivo — e a montagem de pasta que resolve.</li>
+  <li>Como tirar o valor do manifesto para a próxima troca ser só apply e restart.</li>
+  <li>O checklist da recarga e os três hábitos que evitam o incidente.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o preço novo que ninguém viu</h2>
+
+<p>Na quinta-feira a farinha subiu e a Ana decidiu cobrar cinco e vinte pelo pão de queijo. Ela editou o
+ConfigMap <code>cardapio</code>, aplicou e conferiu com <code>get configmaps</code>: o <code>data.preco</code>
+estava em <code>"5.20"</code>. O site, porém, continuou respondendo
+<code>4.50</code>. Ela reiniciou o notebook, o navegador, o roteador — e nada. No sábado, um cliente comentou
+que o preço da vitrine estava diferente do preço do site. Três dias com dois preços convivendo.</p>
+
+<p>A explicação é a mesma que apareceu na aula de
+<a href="montando-config.html">montagem da configuração</a>, e agora cobra o preço: quando a configuração
+chega ao container como variável de ambiente, ela é lida <strong>uma vez</strong>, no momento em que o
+processo começa. O processo guarda aquele valor na memória e não tem por que olhar de novo. Mudar o
+ConfigMap muda o objeto no cluster — não o processo que já está rodando. Configuração no cluster e
+configuração em uso são duas coisas diferentes, e é preciso um passo para ligar uma à outra.</p>
+
+<p>Este é o assunto da aula: o passo que liga. Ele tem duas rotas — fazer o processo nascer de novo, ou fazer
+o programa reler o arquivo — e a escolha entre elas depende de como a configuração foi entregue. Quem entende
+as duas rotas para de reiniciar coisas no escuro.</p>
+
+<h2>2. As duas rotas da mudança</h2>
+
+<p>Antes dos comandos, o mapa. Todo valor de configuração chega ao container por um de dois caminhos: o
+ambiente (variável) ou o disco (arquivo montado). Cada caminho tem um comportamento diferente diante de uma
+mudança, e essa diferença é a raiz de quase todo mal-entendido sobre recarregar configuração.</p>
+
+<dl class="anatomy">
+<dt>variável de ambiente</dt>
+<dd>Entregue ao processo no start. Não muda depois. Para ver o valor novo, o processo precisa começar de
+novo.</dd>
+<dt>arquivo montado</dt>
+<dd>Mantido pelo kubelet no nó e sincronizado de tempos em tempos (cerca de um minuto). O arquivo muda
+sozinho; quem lê, não.</dd>
+<dt>releitura</dt>
+<dd>O programa abrir o arquivo outra vez. Depende do programa: alguns têm sinal para isso, outros só leem no
+boot.</dd>
+<dt><code>rollout restart</code></dt>
+<dd>O comando que marca o molde do Deployment como novo, para os pods nascerem de novo — sem mudar a
+imagem.</dd>
+<dt><code>subPath</code></dt>
+<dd>Montagem de um arquivo só. Prático, e com um preço: esse arquivo <em>não</em> acompanha as mudanças do
+ConfigMap.</dd>
+</dl>
+
+<p>Junte as duas colunas e você tem a tabela que resolve o problema da Ana: variável só muda com pod novo;
+arquivo muda sozinho, mas só ajuda se o programa reler (e se a montagem foi feita na pasta, não com
+<code>subPath</code>). Não existe mágica além disso — existe escolha consciente entre reiniciar e reler.</p>
+
+<h2>3. O restart que resolve</h2>
+
+<p>Para a configuração que chega por variável, o caminho é fazer os pods nascerem de novo. No Deployment, o
+comando é <code>kubectl rollout restart</code>. Ele não reinicia o processo dentro do pod (isso seria um
+<code>restart</code> de container, decisão do kubelet): ele marca o molde como alterado, e o controlador
+cria pods novos, um a um, até substituir os antigos.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:deployment.apps/cardapio restarted;;texto:successfully rolled out;;texto:REVISION">
+  <p class="try-task">Reinicie o Deployment do site, confira o histórico de revisões e o estado do rollout.
+  São três comandos, nesta ordem: <code>rollout restart</code>, <code>rollout history</code> e
+  <code>rollout status</code>.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+  <pre class="solucao">kubectl rollout restart deployment/cardapio
+kubectl rollout history deployment/cardapio
+kubectl rollout status deployment/cardapio</pre>
+</div>
+
+<p>O painel do código inicial mostra só os pods que já existiam — e é aí que está a pegadinha: nada muda,
+porque ninguém pediu mudança. Depois da missão, aparecem as três respostas. A primeira,
+<code>deployment.apps/cardapio restarted</code>, é o aceite do comando. A segunda é o histórico, com
+<code>REVISION</code> 1 e 2: o restart criou uma revisão nova, porque mudou o molde. A terceira,
+<code>deployment "cardapio" successfully rolled out</code>, é a confirmação de que os pods novos estão
+prontos.</p>
+
+<p>Na vida real, o restart não é instantâneo. O controlador sobe os pods novos, espera ficarem prontos e só
+então derruba os antigos — o mesmo mecanismo do rolling update, que é o assunto de outra aula. Por isso o
+<code>rollout status</code> é importante: ele acompanha até o fim, e responde
+<code>successfully rolled out</code> quando acabou. Sem ele, você fica olhando o <code>get pods</code> e
+achando que travou.</p>
+
+<p>Duas coisas que o <code>rollout restart</code> não faz, e que valem para não criar expectativa errada. Ele
+não muda a imagem — é o mesmo código, com configuração nova. E ele não conserta configuração ausente: se o
+ConfigMap não existe, os pods novos nascem com o mesmo problema dos antigos, um por um, e você trocou um
+incidente por dois.</p>
+
+<h2>4. O arquivo que se atualiza sozinho</h2>
+
+<p>Para a configuração que chega por arquivo, o restart é opcional — e muitas vezes indesejado. O kubelet
+sincroniza o conteúdo do ConfigMap no nó e reescreve o arquivo dentro do container. A troca é atômica: ele
+monta uma pasta nova e muda um link, para o programa nunca ler um arquivo pela metade. Em cerca de um minuto,
+o arquivo está atualizado, sem nenhum pod reiniciado.</p>
+
+<p>Mas há uma condição que quase todo mundo descobre tarde: isso só vale para montagem de
+<strong>pasta</strong>. Se você montou um arquivo só com <code>subPath</code>, aquele arquivo fica congelado
+no conteúdo do start. A caixa abaixo é exatamente esse caso — a montagem prática, de um arquivo, que impede a
+atualização.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.containers.0.volumeMounts.0.mountPath=/config;;texto:Running">
+  <p class="try-task">O pod monta <code>/config/menu.json</code> com <code>subPath</code>, e o arquivo nunca
+  atualiza. Monte a pasta <code>/config</code> e deixe o <code>menu.json</code> aparecer dentro dela.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  menu.json: |
+    {
+      "preco": 4.5
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      volumeMounts:
+        - name: config
+          mountPath: /config/menu.json
+          subPath: menu.json
+  volumes:
+    - name: config
+      configMap:
+        name: cardapio</pre>
+<pre class="out">
+configmap/cardapio created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  menu.json: |
+    {
+      "preco": 4.5
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      volumeMounts:
+        - name: config
+          mountPath: /config
+  volumes:
+    - name: config
+      configMap:
+        name: cardapio</pre>
+</div>
+
+<p>O painel mostra o pod em <code>Running</code> nas duas versões — de novo, o que muda está dentro do
+container. O que a meta confere é o <code>mountPath</code>: <code>/config</code> em vez de
+<code>/config/menu.json</code>. Com a pasta montada, o arquivo <code>menu.json</code> aparece dentro dela
+(uma chave, um arquivo) e passa a acompanhar as mudanças do ConfigMap.</p>
+
+<p>O <code>subPath</code> existe por um motivo legítimo — o mesmo que apareceu em
+<a href="configmap-como-volume.html">ConfigMap como volume</a> —: montar um arquivo sem esconder o resto da
+pasta —
+caso clássico de configuração que precisa conviver com arquivos da imagem. Se você o usa, saiba que escolheu
+“não atualiza”: a saída é reiniciar o pod quando o valor mudar, ou trocar a montagem por pasta + releitura.
+Não existe almoço grátis nesse canto do Kubernetes.</p>
+
+<h2>5. Tirar o valor do manifesto</h2>
+
+<p>Há um terceiro problema, mais sutil, que faz a recarga falhar mesmo com tudo certo: o valor que está
+<em>duplicado</em>. O ConfigMap tem <code>preco: "5.20"</code>, e o manifesto do Deployment tem
+<code>value: "4.50"</code> escrito à mão. Enquanto o manifesto mandar, o ConfigMap é decoração. A caixa
+abaixo é esse caso, com a missão de deixar uma fonte só.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:ConfigMap/cardapio|data.preco=5.20;;campo:Deployment/cardapio|spec.template.spec.containers.0.env.0.valueFrom.configMapKeyRef.key=preco;;conta:pods[app=cardapio]=2">
+  <p class="try-task">Atualize o preço no ConfigMap para <code>"5.20"</code> e faça a variável <code>PRECO</code>
+  do Deployment ler essa chave, em vez do valor fixo.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          env:
+            - name: PRECO
+              value: "4.50"</pre>
+<pre class="out">
+configmap/cardapio created
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-bm84hk5x5c-7wzsm   1/1     Running   0          9m
+cardapio-bm84hk5x5c-mnfnt   1/1     Running   0          9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "5.20"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          env:
+            - name: PRECO
+              valueFrom:
+                configMapKeyRef:
+                  name: cardapio
+                  key: preco</pre>
+</div>
+
+<p>O painel mostra o ConfigMap, o Deployment e os dois pods. A meta confere duas coisas: o valor novo no
+ConfigMap e a referência no lugar do valor fixo. A partir daqui, mudar o preço é editar <em>um</em> arquivo
+(o do ConfigMap), aplicar e reiniciar os pods — o manifesto do Deployment não muda mais por causa de
+preço.</p>
+
+<p>Tem um efeito colateral interessante nesse desenho: como o pod lê a chave no start, o valor fica
+“fotografado” nos pods que estão rodando. Dois pods criados em momentos diferentes podem ter valores
+diferentes se você aplicar o ConfigMap no meio de um rollout. É por isso que a ordem importa: primeiro o
+ConfigMap, depois o restart. Aplicar na ordem contrária cria uma janela em que os pods novos nascem com o
+valor velho — e aí o restart não resolveu nada.</p>
+
+<h2>6. Avisar o programa em vez de matá-lo</h2>
+
+<p>Reiniciar resolve, mas tem custo: conexões caem, cache esfria, o primeiro cliente depois do restart espera
+mais. Quando o programa sabe reler a configuração, é melhor avisar do que matar. O mecanismo clássico é o
+sinal <code>SIGHUP</code>: o kubelet deixa você enviar um sinal a um processo, e muitos servidores tratam
+esse sinal como “releia a configuração”. O nginx, por exemplo, tem um comando próprio para isso; outros
+programas leem o arquivo a cada requisição e não precisam de sinal nenhum.</p>
+
+<p>Sinal é uma faca de dois gumes. Se o programa não trata <code>SIGHUP</code>, o comportamento padrão é
+encerrar o processo — e você trocou uma recarga por um restart acidental, agora com o pod reiniciando em
+loop se algo reenviar o sinal. Antes de adotar, teste no ambiente de teste e confira no log que a
+configuração foi relida, com uma linha do tipo “recarreguei a configuração”.</p>
+
+<p>O meio-termo mais comum em sistema de verdade é o programa reler o arquivo de tempos em tempos, ou a cada
+requisição, e o Kubernetes só manter o arquivo atualizado. Nesse desenho, a “recarga” não é um comando: é o
+efeito de o arquivo ter mudado. O programador não precisa saber de Kubernetes, e o operador não precisa
+reiniciar nada. É o desenho que a Ana adotou para o cardápio — e é por isso que o JSON é montado como
+pasta.</p>
+
+<h2>7. O que não fazer</h2>
+
+<p>Três hábitos causam a maior parte dos incidentes de configuração, e todos os três parecem razoáveis no
+momento em que são adotados. O primeiro é <strong>editar o objeto direto no cluster</strong>, com
+<code>kubectl edit</code>, e não atualizar o manifesto do repositório. Funciona hoje, e amanhã o cluster tem
+um valor que não está em lugar nenhum — até alguém aplicar o manifesto antigo e “desfazer” a mudança sem
+saber.</p>
+
+<p>O segundo é <strong>apagar pods na mão</strong> para forçar recarga. Apagar um pod de um Deployment faz o
+controlador criar outro, então funciona; mas você perde o controle de quantos por vez, e num Deployment com
+dez réplicas acaba com um restart em massa sem espera, derrubando o serviço. O <code>rollout restart</code>
+faz a mesma coisa com rolling update e com confirmação.</p>
+
+<p>O terceiro é <strong>confiar no arquivo e esquecer do programa</strong>. Montar a configuração como pasta e
+achar que está tudo resolvido é metade do caminho: se o programa leu o arquivo no boot e guardou em memória,
+o arquivo novo não muda nada. A pergunta “quem relê esse arquivo?” tem de ter resposta antes de o desenho ser
+considerado pronto.</p>
+
+<h2>8. O checklist da recarga</h2>
+
+<p>A recarga é sempre a mesma sequência, e vale escrevê-la no runbook. Serve para ConfigMap e para Secret, e
+muda em um único ponto: o Secret tem a etapa extra de gerar o valor novo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Passo</th><th>Comando</th><th>Conferir</th></tr>
+</thead>
+<tbody>
+<tr><td>1. mudar a fonte</td><td>editar o manifesto e <code>kubectl apply -f</code></td><td><code>get
+configmaps</code> mostra o valor novo</td></tr>
+<tr><td>2. decidir a rota</td><td>variável → restart; arquivo → esperar a sincronização</td><td>o programa
+relê o arquivo?</td></tr>
+<tr><td>3. recarregar</td><td><code>kubectl rollout restart deployment/nome</code></td><td><code>rollout
+status</code> diz <code>successfully rolled out</code></td></tr>
+<tr><td>4. confirmar no uso</td><td>uma requisição de teste ou o log do boot</td><td>o valor novo aparece na
+resposta</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="term">ana@notebook:~$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio 
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+2          &lt;none&gt;</pre>
+
+<p>O histórico é a memória das recargas. Cada mudança no molde — imagem, variável, volume, anotação — cria uma
+revisão, e o <code>rollout history</code> lista todas. A coluna <code>CHANGE-CAUSE</code> vem da anotação
+<code>kubernetes.io/change-cause</code> no Deployment; sem ela, aparece <code>&lt;none&gt;</code>, como na
+transcrição acima. Anotar o motivo (“preço de novembro”, “token novo do gateway”) transforma o histórico num
+diário de bordo — e é o que permite, meses depois, saber por que aquela revisão existe.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td>o site continua com o valor antigo</td><td>variável de ambiente, sem restart</td><td><code>rollout
+restart</code> e <code>rollout status</code></td></tr>
+<tr><td>o arquivo não muda nunca</td><td>montagem com <code>subPath</code></td><td>montar a pasta e ler o
+arquivo de dentro dela</td></tr>
+<tr><td>o arquivo mudou e o programa não</td><td>o programa lê no boot e não relê</td><td>releitura periódica,
+sinal ou restart</td></tr>
+<tr><td>dois pods com valores diferentes</td><td>apply do ConfigMap no meio do rollout</td><td>aplicar a
+configuração antes de reiniciar</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>E quando o comando é digitado com o nome errado — o que acontece mais do que se admite —, a resposta é
+curta e útil:</p>
+
+<pre class="term">ana@notebook:~$ kubectl rollout restart deployment/cardapioo
+Error from server (NotFound): deployments.apps "cardapioo" not found</pre>
+
+<p>Traduzindo: o objeto não existe com esse nome. Antes de repetir o comando, vale um
+<code>kubectl get deployments</code> para ver o nome real e um <code>-n</code> para garantir o namespace —
+nove entre dez “not found” são nome torto ou namespace errado.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o restart às onze da noite</h3>
+<p>O token do gateway venceu às 23h, e o plantonista reiniciou o Deployment com dez réplicas de uma vez, sem
+espera, num horário de pico de pedidos agendados. O serviço ficou fora por quarenta segundos e três pedidos
+falharam. O <code>rollout restart</code> faz o mesmo com rolling update e com <code>rollout status</code> —
+mas só se quem opera souber que ele existe. Runbook existe para isso.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o arquivo que atualizava e o cache que não</h3>
+<p>O programa relia o arquivo a cada requisição, mas guardava o cardápio num cache de dez minutos. A Ana
+mudou o preço, o arquivo atualizou em um minuto, e o site só respondeu o valor novo doze minutos depois. Não
+era Kubernetes: era cache. A correção foi reduzir o tempo do cache e escrever no runbook que “arquivo
+atualizado” e “valor em uso” são coisas diferentes.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a configuração que voltou sozinha</h3>
+<p>Alguém ajustou um valor com <code>kubectl edit</code> no cluster de produção e esqueceu de mexer no
+repositório. Duas semanas depois, um <code>apply</code> do manifesto antigo desfez o ajuste, e o site passou a
+cobrar o preço errado. A regra que ficou: o cluster não é o lugar de decidir; o repositório é. Se o valor é
+importante, ele mora num arquivo versionado — e o cluster só recebe cópia.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O ConfigMap mudou e a variável de ambiente do pod continua
+com o valor antigo. Por quê?</p>
+<label><input type="radio" name="q1"> porque o ConfigMap não foi aplicado de verdade</label>
+<label><input type="radio" name="q1"> porque a variável é lida no start do container e não se atualiza
+sozinha</label>
+<label><input type="radio" name="q1"> porque o pod está em outro namespace</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o <code>kubectl rollout restart</code> faz?</p>
+<label><input type="radio" name="q2"> reinicia o processo dentro do container existente</label>
+<label><input type="radio" name="q2"> apaga e recria o ConfigMap</label>
+<label><input type="radio" name="q2"> marca o molde como novo, para os pods nascerem de novo com rolling
+update</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual montagem deixa o arquivo acompanhar as mudanças do
+ConfigMap?</p>
+<label><input type="radio" name="q3"> a pasta, com <code>mountPath: /config</code></label>
+<label><input type="radio" name="q3"> o arquivo, com <code>subPath: menu.json</code></label>
+<label><input type="radio" name="q3"> tanto faz: as duas atualizam</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o comando da recarga</h2>
+<p>Complete o comando que faz os pods do Deployment <code>cardapio</code> nascerem de novo, sem mudar a
+imagem:</p>
+<div class="ex-code">kubectl <input aria-label="resposta 1" data-answer="rollout restart" placeholder="..."> deployment/cardapio</div>
+<p class="ex-dica">Dica: são duas palavras, e a segunda é a mesma que se usa quando algo precisa “começar de
+novo”.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Configuração no cluster não é configuração em uso. Variável de ambiente é lida uma vez, no start: para o
+processo ver o valor novo, ele precisa nascer de novo — e no Deployment isso se chama
+<code>kubectl rollout restart</code>, seguido de <code>rollout status</code> para confirmar. Arquivo montado é
+diferente: o kubelet sincroniza em cerca de um minuto e o arquivo muda sozinho, desde que a montagem seja de
+pasta e não de arquivo com <code>subPath</code>.</p>
+
+<p>Dos dois lados, a mesma pergunta: quem relê? O arquivo novo só ajuda se o programa abrir o arquivo outra
+vez — por conta própria, por sinal ou porque o pod reiniciou. E o valor duplicado no manifesto é a armadilha
+silenciosa: enquanto o <code>value</code> estiver escrito à mão, o ConfigMap não manda em nada.</p>
+
+<p>O resto é disciplina: a mudança começa no manifesto (nunca no <code>kubectl edit</code>), a ordem é
+configuração primeiro e restart depois, e o histórico com <code>change-cause</code> conta a história para quem
+chegar depois. Com isso, o preço novo chega ao cliente no mesmo dia — e a Ana não precisa mais descobrir no
+sábado que o site está cobrando o preço da semana passada.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Variável de ambiente: lida no start. Mudou? <code>rollout restart</code>.</li>
+  <li>Arquivo montado: atualiza em cerca de um minuto — se for pasta, não <code>subPath</code>.</li>
+  <li><code>rollout status</code> confirma; <code>rollout history</code> conta a história.</li>
+  <li>Aplicar o ConfigMap antes de reiniciar; senão os pods novos nascem com o valor velho.</li>
+  <li>Valor escrito no manifesto do pod ganha do ConfigMap — e engana.</li>
+  <li>Nada de <code>kubectl edit</code> em produção: a fonte da verdade é o repositório.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A anatomia do YAML | Guia Kubernetes</title>
+<meta name="description" content="YAML sem mistério: chave e valor, listas com hífen, dois espaços de indentação, comentários, vários documentos e a tradução dos erros que o kubectl devolve ao ler o arquivo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>A anatomia do <span class="hl">YAML</span></h1>
+<p class="intro">A Ana já criou pod, já leu a tabela do <code>kubectl get</code> e já sabe que o manifesto é
+o jeito de guardar a receita. Aí ela copia um manifesto de um blog, roda o <code>kubectl apply</code> e
+recebe um erro que não fala de pod, de imagem nem de cluster: fala de <em>indentação</em>. Nesta aula ela
+aprende a linguagem do arquivo — chave e valor, listas com hífen, dois espaços de recuo, comentários e
+separadores — e a ler os cinco erros de YAML que aparecem antes de qualquer erro de Kubernetes. É a aula
+que economiza mais tempo de todas: quase todo manifesto que “não funciona” está apenas mal escrito.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que o Kubernetes escolheu YAML e o que o arquivo representa.</li>
+  <li>Chave e valor: os dois-pontos, o espaço depois deles e o que é um mapa.</li>
+  <li>Os tipos que você escreve sem perceber: texto, número, booleano, nulo e lista.</li>
+  <li>O hífen das listas e por que ele muda tudo no <code>spec.containers</code>.</li>
+  <li>Indentação com dois espaços, o tab proibido e a mensagem de erro de cada tropeço.</li>
+  <li>Comentários, <code>---</code> e arquivos com vários objetos.</li>
+  <li>Distinguir erro de YAML de erro do Kubernetes pelo texto da mensagem.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o manifesto que não abre</h2>
+
+<p>O site da padaria já roda em um pod com o manifesto escrito à mão pela Ana, e funciona. Animada, ela
+resolve copiar de um blog um manifesto mais completo, com etiquetas, portas e limites de memória, para
+“deixar profissional”. Salva como <code>cardapio.yaml</code>, roda <code>kubectl apply -f cardapio.yaml</code>
+e recebe:</p>
+
+<p><code>error: error parsing cardapio.yaml: error converting YAML to JSON: yaml: line 1: bad indentation of
+a sequence entry</code></p>
+
+<p>A primeira reação é achar que o cluster quebrou. Não quebrou: o arquivo nem chegou ao cluster. O kubectl
+lê o YAML no seu computador, transforma em JSON e só então envia. Se o YAML não fecha, o envio nem começa —
+e o erro é do tradutor, não do Kubernetes. É por isso que ele fala de “sequência” e “indentação”, palavras
+que não existem no vocabulário de pods.</p>
+
+<p>O manifesto copiado tinha uma linha com um espaço a menos. Um espaço. A Ana levou quarenta minutos para
+achar, porque o erro não aponta a linha (no cluster de verdade aponta; no painel deste guia a mensagem vem
+com um número fixo) e porque ela estava procurando problema no lugar errado — na imagem, no nome, na
+memória. O problema estava na forma do arquivo.</p>
+
+<p>Esta aula é sobre essa forma. YAML é pequeno: cinco ou seis regras resolvem 95% dos casos. O resto é
+reconhecer a mensagem e saber onde olhar. No fim, você vai ler um manifesto de dez linhas e enxergar a
+estrutura — o que é mapa, o que é lista, o que é texto e o que é número — sem pensar.</p>
+
+<h2>2. YAML é só um formato de dados</h2>
+
+<p>YAML é uma maneira de escrever dados em texto, como o JSON, só que feita para olho humano. O JSON usa
+chaves, colchetes e vírgulas; o YAML usa recuo e hífen. O conteúdo é o mesmo: um objeto com campos dentro de
+campos. O nome é brincadeira — “YAML Ain't Markup Language”, “YAML não é linguagem de marcação”. Não é
+linguagem de programação também: não tem <code>if</code>, não tem laço, não executa nada. É uma lista de
+dados com aparência de texto.</p>
+
+<p>O Kubernetes adotou YAML porque manifesto é coisa que gente lê, revisa e guarda em repositório. Um
+arquivo com <code>replicas: 3</code> é compreensível por qualquer pessoa da equipe; o mesmo dado em JSON é
+uma linha comprida com três níveis de chaves. E o cluster guarda tudo em JSON no fim das contas — o YAML é
+só a roupa com que você entrega e recebe.</p>
+
+<p>Três ideias resolvem o começo. Primeira: <strong>tudo é chave e valor</strong>. Segunda:
+<strong>o recuo diz a quem a chave pertence</strong>. Terceira: <strong>o hífen diz que aquilo é um item de
+lista</strong>. Se você entender essas três, entende qualquer manifesto deste guia.</p>
+
+<p>Uma coisa que confunde quem vem de HTML: no YAML, espaço não é estilo, é estrutura. Em HTML, você pode
+indentar como quiser e a página não muda. Em YAML, mover uma linha dois espaços para a direita muda o
+significado do arquivo: a chave passa a pertencer a outro pai. É a diferença entre “a imagem do container
+web” e “uma chave solta que ninguém reconhece”.</p>
+
+<h2>3. Chave e valor: o mapa</h2>
+
+<p>A peça básica é o par. À esquerda, o nome do campo; à direita, o valor. Entre os dois, dois-pontos e um
+espaço. Sem o espaço, o YAML não reconhece o par — <code>name:web</code> é lido como um texto solto, e o
+erro que aparece depois não tem nada a ver com o que você escreveu.</p>
+
+<p>Quando o valor é simples, ele fica na mesma linha. Quando o valor é um conjunto de outros campos, ele fica
+nas linhas de baixo, com dois espaços a mais, e os dois-pontos ficam sozinhos no fim:</p>
+
+<pre class="file" data-file="cardapio.yaml">metadata:
+  name: cardapio
+  labels:
+    app: cardapio</pre>
+
+<p>Leia em voz alta: “metadata tem name igual a cardapio, e tem labels, e labels tem app igual a cardapio”.
+O recuo de <code>name</code> e <code>labels</code> é o mesmo (dois espaços), então os dois são filhos de
+<code>metadata</code>. O recuo de <code>app</code> é maior (quatro espaços), então <code>app</code> é filho
+de <code>labels</code>. Essa é a hierarquia inteira. Não há chave de fechamento, não há ponto final: quem
+fecha o bloco é a próxima linha com recuo menor, ou o fim do arquivo.</p>
+
+<p>Dá para escrever mapa na forma curta, entre chaves, como JSON: <code>labels: {app: cardapio}</code>. O
+YAML aceita, e o Kubernetes entende. Só que ninguém escreve manifesto assim, e ler fica pior. Use a forma
+de linhas.</p>
+
+<p>E o mais importante: <strong>dois espaços por nível, sempre</strong>. O YAML aceita qualquer número de
+espaços, desde que o mesmo nível use o mesmo número — um espaço também funciona. A comunidade escolheu dois
+porque cabe muito nível na tela e porque é o que o <code>kubectl</code> usa quando devolve um arquivo. Escolha
+dois e não invente: quando você cola um trecho de outro arquivo com quatro, o desalinhamento é questão de
+tempo.</p>
+
+<h2>4. Os tipos que você digita sem perceber</h2>
+
+<p>YAML não pergunta o tipo: ele adivinha pelo formato. <code>8080</code> vira número; <code>"8080"</code>
+vira texto; <code>true</code> vira booleano; <code>cardapio</code> vira texto. Adivinhar é prático para
+escrever e perigoso para errar, porque o Kubernetes valida tipos com rigor: um campo que espera inteiro
+recusa texto, e um campo que espera texto recusa número. É o assunto do primeiro erro da sua vida com
+manifesto.</p>
+
+<dl class="anatomy">
+<dt>chave</dt>
+<dd>O nome do campo, antes dos dois-pontos: <code>name</code>, <code>image</code>, <code>containerPort</code>.
+Tem de ser exatamente o nome que o Kubernetes conhece — <code>containerPorts</code> no plural não existe.</dd>
+<dt>valor</dt>
+<dd>O que vem depois dos dois-pontos e do espaço. Pode ser um dado simples na mesma linha ou um bloco nas
+linhas seguintes, mais indentado.</dd>
+<dt>hífen</dt>
+<dd>Marca um item de lista. Aparece no começo do item e conta como recuo: tudo o que pertence àquele item
+fica alinhado depois dele.</dd>
+<dt>comentário</dt>
+<dd>Começa com <code>#</code> e vai até o fim da linha. O kubectl ignora. Serve para explicar por que
+aquele valor está ali — e é a única parte do arquivo que não vira dado.</dd>
+<dt>documento</dt>
+<dd>Um arquivo YAML pode ter vários objetos, separados por uma linha com <code>---</code>. Cada pedaço
+desses é um documento.</dd>
+</dl>
+
+<p>As regras de aspas são poucas e valem a pena. Texto comum não precisa de aspas: <code>name: cardapio</code>.
+Use aspas quando o valor tiver dois-pontos seguido de espaço, começar com caractere especial, tiver
+<code>#</code> ou puder ser confundido com número. E, quando usar, saiba a diferença: aspas duplas
+interpretam escapes (<code>\n</code> vira quebra de linha de verdade); aspas simples não, são literais.</p>
+
+<p>O caso clássico é a porta. <code>containerPort: 8080</code> é inteiro, e é o que o campo quer.
+<code>containerPort: "8080"</code> é texto — parece a mesma coisa na tela, e o cluster recusa. A caixa
+abaixo tem esse erro de propósito. Rode, leia a mensagem e conserte.</p>
+
+<div class="tryk8s" data-goal="texto:pod/cardapio created;;campo:Pod/cardapio|spec.containers.0.ports.0.containerPort=8080">
+  <p class="try-task">O campo <code>containerPort</code> está entre aspas, e por isso chega como texto. Tire
+  as aspas, rode de novo e veja o pod nascer.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: "8080"</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.containers[0].ports[0].containerPort: Invalid value: must be an integer
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+</div>
+
+<p>A mensagem é <code>The Pod "cardapio" is invalid: spec.containers[0].ports[0].containerPort: Invalid
+value: must be an integer</code>. Traduzindo: “o pod cardapio é inválido: o campo da porta do primeiro
+container, na primeira porta, tem valor inválido: precisa ser um inteiro”. Repare que ela dá o caminho
+completo, com índices — <code>[0]</code> é o primeiro item da lista. Aprender a ler esse caminho é metade do
+trabalho: ele diz exatamente onde olhar.</p>
+
+<p>Booleanos seguem a mesma lógica: <code>true</code> e <code>false</code>, em minúsculas, sem aspas.
+Escreva assim e não invente. As formas <code>yes</code>, <code>no</code>, <code>on</code> e <code>off</code>
+existem em versões antigas do padrão e são interpretadas de formas diferentes por ferramentas diferentes —
+uma delas vira <code>true</code>, outra deixa como texto. Nenhum manifesto do Kubernetes precisa disso.
+Quando o valor é vazio, use <code>null</code> ou deixe a chave sem nada depois dos dois-pontos.</p>
+
+<h2>5. A lista e o hífen</h2>
+
+<p>Lista é a segunda estrutura do YAML, e é onde o recuo engana. Um item de lista começa com hífen e espaço.
+Uma lista de textos é a forma mais simples:</p>
+
+<pre class="file" data-file="lista.yaml">args:
+  - --porta
+  - "8080"</pre>
+
+<p>Aqui <code>args</code> vale dois textos: <code>--porta</code> e <code>8080</code>. Cada hífen é um item.
+Note que <code>8080</code> está entre aspas porque, como argumento de programa, é texto — sem aspas, viraria
+número e a validação reclamaria.</p>
+
+<p>Agora a lista que importa: lista de mapas. Um container é um mapa com nome, imagem, portas. Vários
+containers são uma lista desses mapas. O hífen marca onde cada mapa começa, e todas as chaves daquele mapa
+ficam alinhadas com a primeira:</p>
+
+<pre class="file" data-file="cardapio.yaml">spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+
+<p>Conte os espaços: <code>containers</code> está em dois; o hífen, em quatro; <code>name</code> vem depois
+do hífen mais um espaço; <code>image</code> e <code>ports</code> estão na mesma coluna de <code>name</code>
+— ou seja, pertencem ao mesmo mapa. E <code>ports</code> é outra lista, com um item só, que começa com
+hífen em oito e tem <code>containerPort</code> em dez.</p>
+
+<p>Existe uma variação que confunde: o hífen pode ficar na mesma coluna da chave pai, e o conteúdo deslocado
+dois espaços. As duas formas abaixo são o mesmo dado, e o YAML aceita as duas:</p>
+
+<pre class="file" data-file="duas-formas.yaml">containers:
+  - name: web
+
+containers:
+- name: web</pre>
+
+<p>Escolha a primeira e não misture. O <code>kubectl</code> devolve a primeira forma quando você pede
+<code>-o yaml</code>, e é a que a maioria dos exemplos usa. Misturar as duas no mesmo arquivo é fonte de
+erro de recuo que ninguém enxerga.</p>
+
+<p>Um erro comum é esquecer o hífen — ou trocar o nome do campo por engano. Escrever <code>container:</code>
+no singular, com as chaves do container embaixo, faz o cluster procurar <code>containers</code> e não achar
+nada. O terminal responde assim (transcrição do painel, que reproduz a resposta do cluster):</p>
+
+<pre class="term">$ kubectl apply -f cardapio.yaml
+The Pod "cardapio" is invalid: spec.containers: Required value</pre>
+
+<p>“Required value” num campo que você jurou que escreveu é sempre sinal de que o campo com aquele nome não
+existe ali — pode ser o hífen que faltou, pode ser a letra trocada. E se a mensagem diz “must be a list”, o
+problema é parecido: o campo existe, mas não é uma lista. Nos dois casos, o erro está na forma, e a linha que
+o cluster cita é a chave pai, não a linha errada.</p>
+
+<h2>6. Indentação é estrutura</h2>
+
+<p>Chegamos ao erro número um. O recuo é o que define hierarquia, então cada nível precisa estar alinhado
+com precisão de coluna. Um espaço a mais e a chave muda de pai; um espaço a menos e a linha briga com a de
+cima. O YAML não conserta, não avisa com jeitinho: ele para de ler e devolve <code>bad indentation of a
+sequence entry</code> (“indentação ruim de um item de lista”) ou <code>bad indentation of a mapping
+entry</code> (“indentação ruim de um campo”).</p>
+
+<p>Pior: a mensagem aponta um lugar que nem sempre é o lugar do erro. O YAML só percebe que algo está
+errado quando encontra uma linha que não encaixa no nível anterior. Na prática, olhe a linha citada e a de
+cima, e conte os espaços das duas.</p>
+
+<p>A caixa abaixo tem o recuo torto de propósito: <code>image</code> está um espaço à esquerda de
+<code>name</code>. Rode, leia, e alinhe as duas chaves.</p>
+
+<div class="tryk8s" data-goal="texto:pod/cardapio created;;texto:Running">
+  <p class="try-task">A chave <code>image</code> está desalinhada em relação a <code>name</code>. Corrija o
+  recuo, rode de novo e veja o pod em <code>Running</code> no painel.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+     image: cardapio:1.0</pre>
+<pre class="out">
+error: error parsing cardapio.yaml: error converting YAML to JSON: yaml: line 1: bad indentation of a sequence entry
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>A mensagem que aparece é <code>error: error parsing cardapio.yaml: error converting YAML to JSON: yaml:
+line 1: bad indentation of a sequence entry</code>. Três pedaços: <code>error parsing</code> diz que o
+problema é o arquivo; <code>error converting YAML to JSON</code> diz a etapa; e a parte depois de
+<code>yaml:</code> é a mensagem do tradutor. No cluster de verdade, esse número é a linha real; no painel
+deste guia ele vem fixo em <code>line 1</code> — o que importa é o texto, e o texto diz “indentação de item
+de lista”, porque a linha anterior era um hífen.</p>
+
+<p>Sobre o tab: <strong>nunca use a tecla Tab para indentar YAML</strong>. O padrão proíbe, e o terminal
+responde com uma frase que não deixa dúvida:</p>
+
+<pre class="term">$ kubectl apply -f cardapio.yaml
+error: error parsing cardapio.yaml: error converting YAML to JSON: yaml: line 1: tab characters must not be used in indentation</pre>
+
+<p>O motivo é histórico — tab não tem largura fixa, então dois editores mostrariam arquivos diferentes —,
+mas a regra é dura. Configure o editor para inserir dois espaços quando você aperta Tab, e o problema
+desaparece para sempre. Se você colar um trecho de um site e o erro falar de tab, é isso: selecione o bloco e
+converta.</p>
+
+<h2>7. Comentários, <code>---</code> e vários objetos</h2>
+
+<p>Comentário começa com <code>#</code> e vale até o fim da linha. O <code>kubectl</code> descarta. Use para
+explicar decisões que o arquivo não conta sozinho: por que a memória é 256Mi, por que a imagem está presa
+naquele número, quem pediu aquele limite. Evite comentar o óbvio (<code># nome do pod</code> em cima de
+<code>name</code>) — comentário que repete o código envelhece mal.</p>
+
+<p>Um arquivo pode ter mais de um objeto, e o separador é uma linha com três hífens: <code>---</code>. Cada
+documento é lido sozinho e aplicado na ordem. É assim que se guarda o site inteiro num arquivo só: o pod, o
+serviço, a configuração. O <code>kubectl apply -f</code> percorre os documentos e aplica um por um,
+mostrando uma linha de resposta para cada.</p>
+
+<p>O erro clássico é esquecer o separador. Sem <code>---</code>, o YAML vê o segundo <code>apiVersion</code>
+como se fosse uma segunda chave do primeiro documento, e responde <code>duplicated mapping key</code>
+(“chave repetida”). A caixa abaixo reproduz exatamente isso: dois objetos colados, sem separador.</p>
+
+<div class="tryk8s" data-goal="texto:configmap/cardapio-config created;;conta:pods=1" data-get="pods">
+  <p class="try-task">O arquivo tem um pod e um ConfigMap, mas falta o separador de documentos. Acrescente a
+  linha <code>---</code> entre os dois e rode: o painel tem de criar os dois objetos.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+data:
+  preco: "3,50"</pre>
+<pre class="out">
+error: error parsing cardapio.yaml: error converting YAML to JSON: yaml: line 1: duplicated mapping key
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+data:
+  preco: "3,50"</pre>
+</div>
+
+<p>Depois do conserto, o painel mostra <code>pod/cardapio created</code> e
+<code>configmap/cardapio-config created</code>, um para cada documento, na ordem do arquivo. Repare no
+<code>"3,50"</code> entre aspas: sem elas, o valor continuaria texto por causa da vírgula, mas com elas não
+há dúvida — e preço é texto, não número, porque tem vírgula e porque ninguém vai somar preço no cluster.</p>
+
+<p>Existe ainda o bloco de texto, útil em ConfigMap que guarda arquivo de configuração. <code>|</code>
+preserva as quebras de linha; <code>&gt;</code> junta tudo num parágrafo. Você vai ver os dois na aula de
+ConfigMap; por ora, saiba que existem e que a barra vertical é a que mantém o texto como você digitou.</p>
+
+<p>E tem o fim de documento, <code>...</code>, que quase ninguém usa. Se você encontrar num arquivo antigo,
+não é erro: é o marcador de que ali termina um documento. Ignore.</p>
+
+<h2>8. Erro de YAML ou erro do Kubernetes?</h2>
+
+<p>Vale treinar o reflexo mais útil desta aula: antes de investigar o cluster, descubra de quem é o erro. A
+mensagem conta. Se ela começa com <code>error: error parsing</code>, o arquivo nem foi lido — é YAML. Se vem
+<code>The Pod "x" is invalid:</code>, o arquivo foi lido e o conteúdo recusado — é validação do Kubernetes.
+Se é <code>resource mapping not found</code>, o YAML está bom e o <code>apiVersion</code> é que não combina
+com o <code>kind</code>. E se aparece <code>Error from server (NotFound)</code>, o arquivo estava perfeito e
+o problema é o que existe (ou não) no cluster.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>O que aconteceu</th><th>Onde olhar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bad indentation of a sequence entry</code></td><td>uma linha de lista não bate com o recuo do
+item</td><td>conte os espaços da linha e da anterior</td></tr>
+<tr><td><code>can not read an implicit mapping pair; a colon is missed</code></td><td>falta o
+<code>:</code> ou o espaço depois dele</td><td><code>chave: valor</code>, sempre com espaço</td></tr>
+<tr><td><code>tab characters must not be used in indentation</code></td><td>o recuo tem tab</td><td>converta
+o bloco para espaços, dois por nível</td></tr>
+<tr><td><code>duplicated mapping key</code></td><td>a mesma chave duas vezes, ou dois documentos sem
+<code>---</code></td><td>procure o segundo <code>apiVersion</code></td></tr>
+<tr><td><code>Invalid value: must be an integer</code></td><td>o YAML leu texto onde o campo quer
+número</td><td>tire as aspas do número</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Há um detalhe que vale para todos: o YAML não tem como saber o que você quis dizer. Ele só sabe o que
+está escrito. Por isso <code>containerPorts</code> (plural) não gera erro de YAML — gera um campo
+desconhecido, que versões antigas ignoravam em silêncio e as novas, com validação estrita, acusam. Se um
+campo parece não ter efeito, confira a grafia antes de tudo: maiúscula no meio, plural a mais, hífen no
+lugar de nada.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>No manifesto</th><th>O YAML lê como</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>8080</code></td><td>número inteiro</td><td>é o que <code>containerPort</code> quer</td></tr>
+<tr><td><code>"8080"</code></td><td>texto</td><td>vira argumento de programa, não porta</td></tr>
+<tr><td><code>1.0</code></td><td>número decimal</td><td>vira <code>1</code> na saída: para versão, use
+texto</td></tr>
+<tr><td><code>true</code></td><td>booleano</td><td>não escreva <code>yes</code> nem <code>True</code></td></tr>
+<tr><td><code>sim</code></td><td>texto</td><td>em YAML antigo podia virar booleano; não conte com
+isso</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Note a linha do <code>1.0</code>: sem aspas, o YAML lê como número e o valor vira <code>1</code> quando
+alguém imprime. Por isso tag de imagem e versão de aplicação se escrevem como texto quando aparecem em
+campo de texto — e por isso <code>image: cardapio:1.0</code> funciona: ali o valor inteiro é lido como
+texto, porque <code>cardapio:1.0</code> não é um número.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o manifesto que só funciona na máquina dela</h3>
+<p>A Ana editou o <code>cardapio.yaml</code> no editor com tab configurado. Na máquina dela, o editor
+mostrava tudo alinhado e o arquivo aplicava. Ao mandar para o colega, o erro de tab apareceu. O conserto não
+foi no arquivo, foi no editor: ligar “insert spaces” e definir dois espaços por nível. Regra prática: se o
+arquivo passa na sua máquina e falha na do outro, o primeiro suspeito é espaço invisível.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod que perdeu a etiqueta</h3>
+<p>Ela colou um bloco de <code>labels</code> de um exemplo e o recuo ficou um nível acima, então as
+etiquetas passaram a ser filhas de <code>metadata.name</code> em vez de <code>metadata.labels</code>. O YAML
+aceitou (é válido!), o pod subiu, e o Service não achava o pod. O erro não era de YAML: era de estrutura.
+O <code>kubectl get pod -o yaml</code> mostrou a bagunça na hora — e é por isso que vale sempre conferir o
+objeto que o cluster guardou, não só o arquivo que você enviou.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: um arquivo, o site inteiro</h3>
+<p>O time dela juntou pod, ConfigMap e Service num único <code>site.yaml</code>, separados por
+<code>---</code>. O ganho é aplicar tudo com um comando e versionar junto. O custo é que um erro de
+indentação em qualquer documento derruba o arquivo inteiro: o kubectl lê todos antes de aplicar qualquer um.
+Quando um <code>apply</code> desse arquivo falha, divida em arquivos menores para achar o culpado — ou
+comente os documentos com <code>#</code> até o erro mudar de lugar.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que define a hierarquia de um manifesto YAML?</p>
+<label><input type="radio" name="q1"> a ordem das linhas, de cima para baixo</label>
+<label><input type="radio" name="q1"> o recuo de cada linha, sempre com o mesmo número de espaços por
+nível</label>
+<label><input type="radio" name="q1"> as chaves de abertura e fechamento, como no JSON</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que muda entre <code>containerPort: 8080</code> e
+<code>containerPort: "8080"</code>?</p>
+<label><input type="radio" name="q2"> nada: o kubectl converte sozinho</label>
+<label><input type="radio" name="q2"> o segundo é o jeito antigo, ainda aceito</label>
+<label><input type="radio" name="q2"> o primeiro é número; o segundo é texto, e o campo recusa texto</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Para que serve a linha com <code>---</code>?</p>
+<label><input type="radio" name="q3"> separar dois objetos dentro do mesmo arquivo</label>
+<label><input type="radio" name="q3"> comentar o resto do arquivo</label>
+<label><input type="radio" name="q3"> indicar que o documento terminou e nada mais será lido</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o separador que faltou</h2>
+<p>Você tem dois objetos no mesmo arquivo e esqueceu a linha que separa um do outro. Complete o código e
+responda: qual é o texto dessa linha?</p>
+<div class="ex-code">metadata:
+  name: cardapio
+<input aria-label="resposta 1" data-answer="---" placeholder="...">
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config</div>
+<p class="ex-dica">Dica: são três caracteres, os mesmos que abrem uma lista, repetidos. Fica sozinha na
+linha, sem recuo e sem dois-pontos.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>YAML é um formato de dados com três estruturas: o par <code>chave: valor</code>, o mapa (vários pares
+aninhados por recuo) e a lista (itens com hífen). O recuo é a estrutura: dois espaços por nível, nunca tab,
+e cada nível alinhado na coluna. O tipo do valor é adivinhado pelo formato — <code>8080</code> é número,
+<code>"8080"</code> é texto — e o Kubernetes valida isso com rigor.</p>
+
+<p>Comentário começa com <code>#</code>; vários objetos no mesmo arquivo são separados por
+<code>---</code>; o hífen marca item de lista, e esquecer o hífen transforma a lista em mapa. Erro de YAML
+vem com <code>error parsing</code> na frente e aparece antes de qualquer contato com o cluster; erro de
+validação vem com <code>is invalid</code> e traz o caminho do campo, com índices, para você achar a linha.
+Erro de versão vem com <code>resource mapping not found</code>.</p>
+
+<p>Com isso, a Ana consegue ler o próprio arquivo. O passo seguinte é a pergunta que fica: o que exatamente
+o <code>kubectl apply</code> faz com esse arquivo — como ele decide criar, atualizar ou não mexer em nada, e
+como testar tudo isso sem tocar no cluster de verdade. É o assunto da <a href="apply-e-dry-run.html">próxima aula</a>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>chave: valor</code>, com dois-pontos e um espaço. Sem o espaço, não é par.</li>
+  <li>Dois espaços por nível, sempre iguais. Tab é proibido.</li>
+  <li>Hífen marca item de lista; as chaves do item se alinham depois dele.</li>
+  <li>Sem aspas é número, booleano ou texto adivinhado; com aspas é texto.</li>
+  <li><code>#</code> comenta a linha; <code>---</code> separa documentos do mesmo arquivo.</li>
+  <li><code>error parsing</code> é YAML; <code>is invalid</code> é validação; <code>resource mapping not
+  found</code> é apiVersion.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

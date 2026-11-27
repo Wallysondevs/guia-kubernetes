@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Startup probe | Guia Kubernetes</title>
+<meta name="description" content="Startup probe na prática: dar tempo ao aplicativo que demora para subir, escolher failureThreshold e periodSeconds, e não deixar a liveness matar o pod antes da hora.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Startup <span class="hl">probe</span></h1>
+<p class="intro">A importação do catálogo da Ana leva quatro minutos: são vinte mil produtos, fotos e
+preços. Só que o pod novo morria em trinta segundos, reiniciava, morria de novo — e o painel não mostrava
+erro nenhum, só um <code>RESTARTS</code> subindo. O culpado era a <em>liveness probe</em>, que fazia a
+pergunta certa na hora errada. Nesta aula a Ana conhece o <strong>startup probe</strong>: a sonda que
+existe para dizer “espera, ainda estou acordando” — e que devolve ao aplicativo lento o direito de
+demorar.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que uma liveness probe sozinha mata aplicativo que demora para subir.</li>
+  <li>Onde o <code>startupProbe</code> fica no manifesto e o que ele muda.</li>
+  <li>Calcular a janela de inicialização com <code>failureThreshold</code> × <code>periodSeconds</code>.</li>
+  <li>Escolher entre <code>httpGet</code>, <code>exec</code> e <code>tcpSocket</code>.</li>
+  <li>Ler a linha <code>Startup:</code> no <code>describe</code> e os eventos de falha.</li>
+  <li>Saber o que o painel faz e o que ele não faz com sondas.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o pod que morria antes de acordar</h2>
+
+<p>O site da padaria tem duas partes com humores diferentes. O cardápio responde em milissegundos — é uma
+lista em memória. A importação do catálogo, não: ela abre um arquivo grande, conversa com o banco, monta
+índices e só depois de quatro minutos começa a aceitar requisição. Durante esse tempo, a porta 8080 está
+aberta mas responde erro: o programa ainda não terminou de se preparar.</p>
+
+<p>Quando a Ana publicou esse serviço com uma liveness probe de dez em dez segundos, o kubelet fez o que
+manda o manual: perguntou <code>/saude</code>, recebeu erro, contou três falhas e reiniciou o container.
+O pod nunca chegava aos quatro minutos, porque era morto aos trinta segundos. O sintoma no
+<code>get pods</code> era um <code>RESTARTS</code> que subia de três em três minutos, sem nenhum erro de
+aplicação — o programa não estava quebrado, estava sendo interrompido.</p>
+
+<p>O conserto óbvio seria aumentar o <code>initialDelaySeconds</code> da liveness. Funciona, mas tem um
+custo escondido: o atraso vale para <em>sempre</em>, inclusive depois que o pod já está rodando há horas.
+Se o aplicativo travar às três da manhã, o kubelet vai esperar o mesmo atraso antes de perceber. Pior: o
+atraso é somado a cada reinício, e um aplicativo que reinicia rápido passa a demorar uma eternidade para
+ser considerado vivo. O startup probe resolve isso sem esse preço.</p>
+
+<h2>2. O que um startup probe faz</h2>
+
+<p>O startup probe é uma sonda com um único trabalho: decidir quando o aplicativo terminou de subir. Enquanto
+ela não passa, o kubelet <em>não</em> executa a liveness nem a readiness. Quando ela passa, as outras duas
+assumem, e a startup nunca mais é consultada — até o próximo reinício do container. É um sinal de largada,
+não um monitor contínuo.</p>
+
+<dl class="anatomy">
+<dt>startupProbe</dt>
+<dd>A sonda de inicialização. Fica dentro do container, ao lado de <code>livenessProbe</code> e
+<code>readinessProbe</code>. Enquanto ela não passa, as outras duas ficam desligadas.</dd>
+<dt>failureThreshold</dt>
+<dd>Quantas falhas seguidas a sonda tolera antes de desistir. No startup probe, esse número é o que define
+a janela de inicialização.</dd>
+<dt>periodSeconds</dt>
+<dd>De quanto em quanto tempo a sonda é executada. A janela total é
+<code>failureThreshold × periodSeconds</code>, mais os tempos de resposta.</dd>
+<dt>httpGet</dt>
+<dd>O tipo mais comum: uma requisição HTTP para um caminho e uma porta. Passa se a resposta for 2xx ou 3xx.</dd>
+<dt>exec</dt>
+<dd>Roda um comando dentro do container e considera sucesso quando o comando sai com código 0. Útil para
+testar um arquivo ou uma conexão que não é HTTP.</dd>
+</dl>
+
+<p>Existe ainda o <code>tcpSocket</code>, que só abre uma conexão TCP na porta e considera sucesso se
+conseguir. É o mais fraco dos três — “a porta aceita conexão” não quer dizer “o programa está pronto” —,
+mas é melhor do que nada em serviços que não falam HTTP. Nesta aula o foco é o <code>httpGet</code>, que é
+o que o site da Ana usa.</p>
+
+<h2>3. O manifesto: onde a sonda fica</h2>
+
+<p>O <code>startupProbe</code> é irmão das outras sondas, dentro do container, no mesmo nível de
+<code>image</code> e <code>ports</code>. A caixa abaixo tem um pod com liveness probe e sem startup. Rode
+do jeito que está: o pod sobe (o painel não executa a sonda), mas o manifesto está incompleto para o
+problema da Ana. A tarefa é acrescentar o startup probe que dá os quatro minutos de que a importação
+precisa.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/importador|spec.containers.0.startupProbe.httpGet.path=/saude;;campo:Pod/importador|spec.containers.0.startupProbe.failureThreshold=30;;texto:Running">
+  <p class="try-task">Acrescente um <code>startupProbe</code> com <code>httpGet</code> em
+  <code>/saude</code>, porta <code>8080</code>, <code>periodSeconds: 10</code> e
+  <code>failureThreshold: 30</code>. Rode e confira o pod em <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: importador
+spec:
+  containers:
+    - name: importador
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        periodSeconds: 10
+        failureThreshold: 3</pre>
+<pre class="out">
+pod/importador created
+
+NAME         READY   STATUS    RESTARTS   AGE
+importador   1/1     Running   0          3m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: importador
+spec:
+  containers:
+    - name: importador
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      startupProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        periodSeconds: 10
+        failureThreshold: 30
+      livenessProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        periodSeconds: 10
+        failureThreshold: 3</pre>
+</div>
+
+<p>O painel aceita o manifesto e mostra o pod em <code>Running</code> — mas ele não executa sonda nenhuma,
+então esse <code>Running</code> não prova que a configuração está boa. O que prova é o campo ter sido
+aceito e guardado. Num cluster de verdade, o efeito é outro: o kubelet começa a bater em
+<code>/saude</code> a cada dez segundos e, enquanto a resposta não vier, nem a liveness nem a readiness
+são avaliadas. A importação ganha os quatro minutos de silêncio de que precisava.</p>
+
+<p>Repare na ordem das sondas no arquivo: startup primeiro, liveness depois. A ordem no YAML não importa
+para o Kubernetes — o que importa é o nome do campo —, mas ajuda quem lê a entender a intenção: primeiro
+“terminou de subir?”, depois “continua vivo?”. Um manifesto em que a liveness aparece antes do startup e
+tem <code>failureThreshold: 3</code> costuma ser exatamente o caso que motivou esta aula.</p>
+
+<h2>4. A janela: failureThreshold × periodSeconds</h2>
+
+<p>Quem define quanto tempo o aplicativo tem para subir é a multiplicação de dois campos. Com
+<code>periodSeconds: 10</code> e <code>failureThreshold: 30</code>, a janela é de 300 segundos — cinco
+minutos, com folga para os quatro da importação. Com <code>3</code> e <code>10</code>, são 30 segundos,
+que é o que a liveness já fazia por conta própria. A caixa abaixo tem a janela curta; a tarefa é esticá-la
+para cinco minutos.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/forno|spec.containers.0.startupProbe.failureThreshold=30;;texto:Running">
+  <p class="try-task">O forno precisa de cinco minutos para aquecer. Com <code>periodSeconds: 10</code>,
+  quantas falhas cabem em cinco minutos? Ponha esse número em <code>failureThreshold</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+      ports:
+        - containerPort: 8080
+      startupProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        periodSeconds: 10
+        failureThreshold: 3</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   1/1     Running   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+      ports:
+        - containerPort: 8080
+      startupProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        periodSeconds: 10
+        failureThreshold: 30</pre>
+</div>
+
+<p>A conta parece boba e é a que mais erra na prática. Cinco minutos são 300 segundos; divididos por dez
+segundos de período, dão trinta tentativas. Se você puser 29, a janela fica em 290 segundos e o pod morre
+dez segundos antes de terminar — o tipo de detalhe que só aparece no ambiente lento, porque na máquina do
+desenvolvedor a importação leva quarenta segundos.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th><code>periodSeconds</code></th><th><code>failureThreshold</code></th><th>Janela</th><th>Serve para</th></tr>
+</thead>
+<tbody>
+<tr><td>10</td><td>3</td><td>30 s</td><td>aplicativo instantâneo; é o valor que mata importações</td></tr>
+<tr><td>10</td><td>30</td><td>5 min</td><td>importação de catálogo, migração média</td></tr>
+<tr><td>15</td><td>32</td><td>8 min</td><td>o pior caso medido, com pouca folga</td></tr>
+<tr><td>30</td><td>60</td><td>30 min</td><td>rotina pesada — e um bom lugar para procurar problema
+escondido</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Vale pensar na folga, não no número exato. Se o pior caso medido é de quatro minutos, uma janela de
+cinco é razoável; uma de trinta é desperdício, porque um aplicativo quebrado vai ficar meia hora sendo
+reiniciado antes de o cluster desistir. E vale lembrar que o relógio da sonda não é o relógio do
+aplicativo: cada tentativa tem o seu próprio <code>timeoutSeconds</code> (padrão 1 segundo), então a
+janela real é um pouco maior que a multiplicação.</p>
+
+<h2>5. O que o kubelet faz enquanto a sonda não passa</h2>
+
+<p>Enquanto o startup não passa, o pod existe, o container roda e — importante — o pod <strong>não fica
+pronto</strong>. Um pod não pronto não entra nos endpoints do Service: o tráfego não chega nele. Isso é
+bom e é o comportamento desejado: ninguém quer um pedido de cliente caindo num servidor que ainda está
+montando o índice. O Service simplesmente não manda nada para lá até a sonda passar.</p>
+
+<p>Se a sonda falhar <code>failureThreshold</code> vezes seguidas, o kubelet considera que o aplicativo não
+conseguiu subir e reinicia o container. Não é o Deployment que age, é o kubelet, aplicando o
+<code>restartPolicy</code> do pod. O ciclo recomeça: nova janela, novas tentativas. Se o problema for
+configuração — caminho errado, porta errada, aplicativo que nunca responde —, o pod entra no ciclo de
+reinícios e o <code>RESTARTS</code> sobe, sem que o status saia de <code>Running</code>.</p>
+
+<pre class="term">    Liveness:       http-get http://:8080/saude delay=0s timeout=1s period=10s #success=1 #failure=3
+    Readiness:      http-get http://:8080/saude delay=0s timeout=1s period=5s #success=1 #failure=3
+    Startup:        http-get http://:8080/saude delay=0s timeout=1s period=10s #success=1 #failure=30
+    Environment:    &lt;none&gt;</pre>
+
+<p>Esse bloco é a transcrição de um <code>kubectl describe pod</code> real, com as três sondas no mesmo
+container. Cada linha resume os campos: o tipo e o caminho, o atraso, o tempo limite, o período e os
+limites de sucesso e falha. O <code>#failure=30</code> no fim da linha <code>Startup</code> é a janela de
+cinco minutos; o <code>#failure=3</code> da liveness é o que reinicia o container depois que o startup já
+passou. É essa separação que faz o aplicativo lento sobreviver ao boot e continuar sendo vigiado depois.</p>
+
+<h2>6. Os eventos: onde a falha aparece</h2>
+
+<p>Quando a sonda falha, o kubelet registra um evento. É ali que você descobre se o problema é a sonda (o
+caminho não existe, a porta está errada) ou o aplicativo (ele responde 500 porque ainda está subindo). O
+evento também aparece no <code>kubectl get events</code>, misturado com os eventos do agendador — e é por
+isso que tanta gente não o encontra: ele fica embaixo de uma pilha de <code>Scheduled</code> e
+<code>Pulled</code>.</p>
+
+<pre class="term">Events:
+  Type     Reason     Age   From     Message
+  ----     ------     ----  ----     -------
+  Warning  Unhealthy  2m    kubelet  Startup probe failed: Get "http://10.244.1.7:8080/saude": dial tcp 10.244.1.7:8080: connect: connection refused</pre>
+
+<p>Essa é a transcrição de um cluster real, com o IP do pod no lugar do nome. A mensagem diz três coisas:
+que foi a sonda de <em>startup</em> (e não a liveness), qual URL foi tentada e por que falhou —
+<code>connection refused</code> quer dizer que ninguém estava escutando naquela porta ainda. Se a mensagem
+falasse de <code>404</code>, o caminho estaria errado; se falasse de <code>500</code>, o aplicativo
+respondeu mas não estava pronto.</p>
+
+<p>A leitura muda o conserto. <code>connection refused</code> com startup curto é sinal de que falta
+janela. <code>404</code> é sinal de que o <code>path</code> está errado em todas as sondas, e aumentar a
+janela só vai adiar o reinício. E um evento de <code>Liveness probe failed</code> logo depois de
+<code>Killing</code> costuma indicar que o startup já passou e o aplicativo travou de verdade — outro
+problema, com outra investigação.</p>
+
+<h2>7. Os tropeços: três jeitos de errar a sonda</h2>
+
+<p>O primeiro tropeço é <strong>medir a coisa errada</strong>. A sonda precisa responder a pergunta “este
+processo terminou de subir?”, e não “o banco está no ar?”. Se o endpoint depender de um serviço externo
+que cai de vez em quando, a sonda vai reiniciar o pod por causa de um problema que não é dele. O caminho
+saudável é um endpoint local, barato, que só verifica o que o próprio processo controla.</p>
+
+<p>O segundo é <strong>esquecer a porta</strong>. O <code>httpGet.port</code> aceita número ou nome de
+porta, e é comum copiar um manifesto com <code>port: http</code> sem que o container tenha uma porta
+chamada <code>http</code>. O resultado é uma sonda que nunca passa e um pod que reinicia para sempre, com
+um evento que fala de porta inválida. O nome só funciona se estiver declarado em
+<code>ports[].name</code>.</p>
+
+<p>O terceiro é <strong>usar o startup para tudo</strong>. O startup probe não substitui a readiness: ele
+só existe durante a inicialização. Depois que ele passa, um pod que fica lento continua recebendo tráfego
+se não houver readiness. As três sondas têm papéis diferentes, e a ordem de leitura é sempre a mesma:
+startup diz “pode começar a avaliar”, readiness diz “pode mandar tráfego”, liveness diz “ainda está vivo”.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sonda</th><th>Pergunta</th><th>Quando age</th></tr>
+</thead>
+<tbody>
+<tr><td><code>startupProbe</code></td><td>terminou de subir?</td><td>só na inicialização; desliga as outras
+duas até passar</td></tr>
+<tr><td><code>readinessProbe</code></td><td>pode receber tráfego agora?</td><td>o tempo todo; falhou, sai dos
+endpoints do Service</td></tr>
+<tr><td><code>livenessProbe</code></td><td>continua vivo?</td><td>o tempo todo; falhou, o container é
+reiniciado</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.startupProbe.exec.command.0=sh;;campo:Deployment/cardapio|spec.template.spec.containers.0.startupProbe.exec.command.1=-c;;pronto:Deployment/cardapio=2;;texto:Running">
+  <p class="try-task">Agora um caso sem HTTP: o serviço de relatórios só fica pronto quando o arquivo
+  <code>/dados/pronto</code> existe. No container <code>web</code> do Deployment, troque a sonda por
+  <code>exec</code> rodando <code>sh -c "test -f /dados/pronto"</code> — no YAML, três itens:
+  <code>sh</code>, <code>-c</code> e o comando entre aspas.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /saude
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 60</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-5hz7m9sg5h-6mln4   1/1     Running   0          1m
+cardapio-5hz7m9sg5h-g267h   1/1     Running   0          4m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -f /dados/pronto"
+            periodSeconds: 5
+            failureThreshold: 60</pre>
+</div>
+
+<p>O painel mostra os dois pods em <code>Running</code> e a meta confere os itens do
+<code>exec.command</code>. Repare que o primeiro item é o executável e os outros são argumentos; é a mesma
+lógica de <code>command</code> e <code>args</code> da aula de containers. O <code>sh</code> no começo não
+é enfeite: <code>test</code> é um comando interno do shell, e sem um shell ele não existe — um erro comum
+é escrever <code>command: ["test", "-f", "/dados/pronto"]</code> e ver a sonda falhar sempre com “executable
+file not found”.</p>
+
+<h2>8. O que o painel faz (e o que ele não faz)</h2>
+
+<p>Vale ser explícito sobre sondas, porque este é o assunto em que a distância entre o painel e um cluster
+real é maior. O painel valida o manifesto, guarda os campos e mostra os pods como <code>Running</code>
+quando o agendador encontra lugar. Ele não roda kubelet, então não existe execução de sonda, não existe
+“container pronto mas não saudável” e não existe reinício por falha de sonda.</p>
+
+<p>Num cluster real, o ciclo é este: o container sobe, a sonda de startup começa a rodar, o pod fica
+<code>Ready: False</code> até ela passar, e só então as outras duas entram em cena. Durante esse tempo o
+<code>get pods</code> mostra <code>0/1</code> com <code>Running</code> — a combinação que mais confunde
+quem está começando, e que significa “o processo está de pé, mas ainda não está pronto”. É por isso que as
+transcrições desta aula existem: elas mostram o que o painel não calcula, e estão identificadas como
+transcrição.</p>
+
+<p>O que você pode praticar aqui é o que decide o sucesso no cluster real: escrever as três sondas com
+papéis distintos, calcular a janela, escolher o tipo certo e ler o evento quando algo falha. O resto é
+observação — e a observação começa no <code>describe</code>, na linha <code>Startup:</code>.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a importação que passou a demorar seis minutos</h3>
+<p>O catálogo cresceu e a importação passou de quatro para seis minutos. A janela de cinco minutos virou
+uma armadilha: o pod era reiniciado no quinto minuto, recomeçava a importação e nunca terminava. O
+<code>RESTARTS</code> subia e o banco ficava com importações pela metade. A Ana subiu a janela para dez
+minutos e passou a medir o tempo de boot no log — a sonda deve seguir a realidade, não a expectativa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o startup que escondia um aplicativo quebrado</h3>
+<p>Um serviço tinha startup de trinta minutos “por segurança”. O aplicativo estava morto desde o deploy e
+ninguém percebeu: o pod ficava meia hora em <code>0/1</code>, reiniciava e recomeçava, e o painel de
+monitoramento só olhava <code>RESTARTS</code>. Quando o time baixou a janela para cinco minutos, a falha
+apareceu na primeira madrugada. Janela grande demais não protege: esconde.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a sonda que derrubava o banco</h3>
+<p>A sonda de startup fazia uma consulta <code>SELECT count(*)</code> numa tabela de milhões de linhas. A
+cada dez segundos, durante o boot, o banco levava uma consulta pesada — e o próprio banco atrasava o boot.
+A correção foi trocar por um <code>SELECT 1</code>: a sonda precisa ser barata e local, não um teste de
+carga disfarçado.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o startup probe faz enquanto não passa?</p>
+<label><input type="radio" name="q1"> reinicia o container a cada falha, sempre</label>
+<label><input type="radio" name="q1"> impede que a liveness e a readiness sejam avaliadas</label>
+<label><input type="radio" name="q1"> apaga o pod e cria outro em outro nó</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Com <code>periodSeconds: 10</code> e
+<code>failureThreshold: 30</code>, qual é a janela de inicialização?</p>
+<label><input type="radio" name="q2"> 300 segundos</label>
+<label><input type="radio" name="q2"> 30 segundos</label>
+<label><input type="radio" name="q2"> 10 segundos</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">3. O aplicativo nunca respondeu e o describe mostra
+<code>Startup probe failed … connection refused</code>. Qual é a leitura?</p>
+<label><input type="radio" name="q3"> a liveness está com o caminho errado</label>
+<label><input type="radio" name="q3"> o cluster está sem memória</label>
+<label><input type="radio" name="q3"> ninguém está escutando na porta indicada — pode ser janela curta
+demais ou porta errada</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a janela do importador</h2>
+<p>A importação da Ana leva, no pior caso, oito minutos. A sonda roda a cada 15 segundos. Complete o campo
+que define a janela e responda: qual é o valor?</p>
+<div class="ex-code">failureThreshold: <input aria-label="resposta 1" data-answer="32"
+placeholder="..."></div>
+<p class="ex-dica">Dica: oito minutos são 480 segundos; divida pelo período de 15 e arredonde para cima —
+32 tentativas dão 480 segundos exatos.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O startup probe existe para o aplicativo que demora a subir. Enquanto ele não passa, liveness e
+readiness ficam desligadas e o pod não entra nos endpoints do Service; quando passa, as outras duas
+assumem e o startup só volta a importar no próximo reinício do container.</p>
+
+<p>A janela é <code>failureThreshold × periodSeconds</code>, com uma folga para o tempo de resposta de cada
+tentativa. O tipo mais comum é <code>httpGet</code> com um caminho barato e local; <code>exec</code> serve
+para verificar arquivos e comandos; <code>tcpSocket</code> é o mais fraco dos três. O
+<code>describe</code> mostra a linha <code>Startup:</code>, e o evento <code>Unhealthy</code> diz qual
+sonda falhou e por quê.</p>
+
+<p>O painel guarda e valida o manifesto, mas não executa sondas — as cenas de sonda falhando vêm de
+transcrição. Na próxima aula o assunto muda de saúde para tamanho: <code>requests</code> e
+<code>limits</code>, os dois números que decidem onde o pod cabe e até onde ele pode crescer.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>startupProbe</code> desliga liveness e readiness até o aplicativo terminar de subir.</li>
+  <li>Janela = <code>failureThreshold × periodSeconds</code>.</li>
+  <li>Sonda boa é barata e local: não dependa de serviço externo para dizer “estou pronto”.</li>
+  <li><code>Startup probe failed</code> com <code>connection refused</code>: porta ou janela.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

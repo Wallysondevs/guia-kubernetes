@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checklist de depuração | Guia Kubernetes</title>
+<meta name="description" content="Checklist de depuração no Kubernetes: a ordem certa de olhar status, pods, endpoints, logs e eventos, e como corrigir uma coisa por vez sem quebrar o resto.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Checklist de <span class="hl">depuração</span></h1>
+<p class="intro">Sexta-feira, seis da tarde, o site da padaria fora do ar. A Ana abriu o terminal e começou a
+digitar tudo o que sabia: <code>get pods</code>, <code>get deployments</code>, <code>describe</code>,
+<code>logs</code>, reiniciou o pod, mudou a imagem, apagou o Service. Duas horas depois o site voltou — e ela
+nunca soube qual das seis coisas resolveu. Esta aula é o oposto disso: um roteiro curto, na ordem certa, que
+leva do sintoma à causa sem chute e sem apagar nada por desespero.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que ter uma ordem fixa vale mais que conhecer muitos comandos.</li>
+  <li>Os seis passos do roteiro, do primeiro olhar até a verificação final.</li>
+  <li>Como cada status aponta para um culpado diferente — e para o comando certo.</li>
+  <li>Como separar “o pod está bem” de “o serviço está entregando”.</li>
+  <li>Por que mudar uma coisa por vez é regra, não mania.</li>
+  <li>Como registrar o que aconteceu para não repetir a investigação no mês seguinte.</li>
+</ul>
+</div>
+
+<h2>1. A cena: seis coisas de uma vez</h2>
+
+<p>Quando o site cai, o impulso é agir. Cada comando parece uma tentativa de conserto, e cada tentativa dá a
+sensação de progresso. O problema é que, ao mexer em seis coisas ao mesmo tempo, você perde a única coisa que
+importa num diagnóstico: saber qual mudança produziu qual efeito. Se o site voltar, você não aprendeu nada;
+se não voltar, você agora tem sete problemas.</p>
+
+<p>O roteiro existe para trocar impulso por ordem. Ele não é burocracia: é a forma mais rápida de chegar à
+causa, porque cada passo elimina uma família inteira de hipóteses. E ele é curto — seis passos, quatro
+comandos, uma correção. Quem segue chega em minutos; quem improvisa chega em horas, quando chega.</p>
+
+<p>A ordem não é arbitrária. Ela vai do mais barato para o mais caro, do mais geral para o mais específico, e
+do que não muda nada para o que muda tudo. Ler status é grátis. Ler log é barato. Apagar um pod pode custar
+caro. Mudar o manifesto pode custar muito caro. O roteiro coloca as leituras antes das escritas — e essa
+única decisão já evita a maior parte dos estragos.</p>
+
+<h2>2. O roteiro em seis passos</h2>
+
+<p>Os seis passos abaixo são os mesmos para qualquer problema: pod que não sobe, site que não responde,
+deploy que não termina. O que muda é o que você encontra em cada um.</p>
+
+<dl class="anatomy">
+<dt>1. sintoma</dt>
+<dd>Descreva o que está errado em uma frase: “o site não abre”, “o relatório não roda”, “a página demora 30
+segundos”. Sem isso, você não sabe quando terminou.</dd>
+<dt>2. status</dt>
+<dd><code>kubectl get pods</code> e olhe a coluna <code>STATUS</code>. Ela divide o problema em famílias:
+agendamento, imagem, container, prontidão.</dd>
+<dt>3. objeto</dt>
+<dd><code>kubectl describe</code> do objeto suspeito: nó, condições, eventos. É onde o cluster explica o
+status.</dd>
+<dt>4. log</dt>
+<dd><code>kubectl logs</code> (com <code>-c</code> e <code>--previous</code> quando preciso): o que o programa
+disse antes de falhar.</dd>
+<dt>5. caminho</dt>
+<dd>Se o pod está bem, o problema está no caminho: Service, endpoints, porta, seletor. <code>get
+endpoints</code> responde.</dd>
+<dt>6. correção</dt>
+<dd>Uma mudança por vez, aplicada com <code>apply</code>, seguida de verificação. Se não resolveu, volte um
+passo.</dd>
+</dl>
+
+<p>Repare que só o último passo escreve. Os cinco primeiros são leitura — e é por isso que o roteiro é seguro.
+Há uma exceção prática: se o problema é óbvio e a correção é reversível, tudo bem pular direto. Mas “óbvio”,
+em Kubernetes, costuma ser a hipótese que você criou antes de olhar os dados. Olhe primeiro.</p>
+
+<h2>3. Passo 2: o status é a bússola</h2>
+
+<p>De todos os campos, o <code>STATUS</code> é o que mais rápido reduz o espaço de busca. Ele não diz a causa,
+mas diz onde procurar — e onde <em>não</em> procurar. A tabela abaixo é a que a Ana colou no monitor.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Status</th><th>Primeira suspeita</th><th>Comando seguinte</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Pending</code></td><td>não achou nó: recurso, seletor ou restrição</td><td><code>describe
+pod</code>, seção Events</td></tr>
+<tr><td><code>ImagePullBackOff</code></td><td>imagem: nome, tag ou credencial</td><td><code>describe
+pod</code>, linha <code>Failed to pull</code></td></tr>
+<tr><td><code>CrashLoopBackOff</code></td><td>o programa morre ao iniciar</td><td><code>logs</code> e
+<code>logs --previous</code></td></tr>
+<tr><td><code>Running</code> com <code>0/1</code></td><td>não passa na verificação de prontidão</td>
+<td><code>describe pod</code>, bloco <code>Conditions</code></td></tr>
+<tr><td><code>Succeeded</code></td><td>terminou: normal em Job, suspeito em servidor</td><td>conferir o
+<code>restartPolicy</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa tabela não substitui as aulas anteriores; ela as organiza. Cada linha é um caminho que você já
+percorreu: <code>Pending</code> leva aos eventos de agendamento, <code>ImagePullBackOff</code> ao evento de
+pull, <code>CrashLoopBackOff</code> ao código de saída, <code>0/1</code> às conditions. Com a tabela na
+cabeça, o primeiro comando deixa de ser um chute.</p>
+
+<p>Um cuidado: o status é do <em>pod</em>. Se o problema é “o site não responde”, o pod pode estar
+<code>Running 1/1</code> e o culpado estar no Service. Nesse caso o passo 2 inclui olhar também
+<code>kubectl get deployments</code> e <code>kubectl get services</code> — três tabelas, dez segundos, e você
+já sabe em qual camada está o problema.</p>
+
+<h2>4. A caixa: o erro que o apply mostra na hora</h2>
+
+<p>Alguns problemas não chegam a virar pod: o <code>apply</code> recusa o objeto. É o caso mais fácil de
+todos, porque a mensagem aparece imediatamente e diz exatamente qual campo está errado. A caixa tem um
+Deployment cujo seletor não casa com as etiquetas do template — o erro clássico de quem copia manifesto.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:pods=2;;texto:Running">
+  <p class="try-task">O <code>selector</code> procura <code>app: cardapio</code> e o template cria pods com
+  <code>app: padaria</code>. Rode e leia o erro; depois acerte a etiqueta do template e veja os dois pods
+  subirem.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: padaria
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value: {"app":"padaria"}: `selector` does not match template `labels`
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>O painel responde <code>The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value:
+{"app":"padaria"}: `selector` does not match template `labels`</code>. Traduzindo: “o seletor não casa com as
+etiquetas do modelo”. Nada foi criado, nada precisa ser apagado — o cluster recusou o objeto inteiro, e o
+conserto é no arquivo.</p>
+
+<p>Esse é o passo 1 do roteiro invertido, e vale entender por quê. Quando o <code>apply</code> falha, não há
+status para olhar: o problema é de manifesto, e a mensagem já é o diagnóstico. Quando o <code>apply</code>
+passa e o pod fica estranho, o problema é de cluster ou de imagem, e aí o roteiro segue do passo 2 em
+diante.</p>
+
+<h2>5. Passo 5: o caminho entre o pod e o cliente</h2>
+
+<p>Com o pod <code>Running 1/1</code> e o site mudo, o problema está no caminho. Ele tem quatro estações:
+Service (seletor e portas), Endpoints (a lista de pods que casaram), kube-proxy (as regras de rede) e o
+cliente. As duas primeiras você vê com dois comandos; as duas últimas raramente são a causa em cluster de
+teste.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Comando</th><th>O que olhar</th></tr>
+</thead>
+<tbody>
+<tr><td>o pod está pronto?</td><td><code>kubectl get pods</code></td><td><code>READY 1/1</code> e
+<code>Running</code></td></tr>
+<tr><td>o Service existe?</td><td><code>kubectl get services</code></td><td><code>PORTA(S)</code> e
+<code>CLUSTER-IP</code></td></tr>
+<tr><td>alguém casou com o seletor?</td><td><code>kubectl get endpoints</code></td><td>IPs na coluna
+<code>ENDPOINTS</code></td></tr>
+<tr><td>a porta confere?</td><td><code>kubectl describe service</code></td><td><code>Port</code> e
+<code>TargetPort</code></td></tr>
+<tr><td>as etiquetas batem?</td><td><code>describe</code> do pod e do service</td><td><code>Labels</code> ×
+<code>Selector</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>get endpoints</code> é o comando que mais gente esquece e o que responde mais rápido. Ele mostra,
+para cada Service, os IPs dos pods que casaram com o seletor e estão prontos. Se a coluna está vazia, o
+Service não tem para onde mandar tráfego — e o problema é de seletor, de etiqueta ou de prontidão, nunca de
+firewall.</p>
+
+<h2>6. A caixa: quem o Service está enxergando</h2>
+
+<p>A caixa tem o cluster da padaria montado: dois pods do cardápio rodando e um Service na frente deles. O
+passo 2 já foi dado (os pods estão bem). Falta o passo 5: o caminho.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:ENDPOINTS;;texto:10.244">
+  <p class="try-task">A caixa só lista os pods. Acrescente <code>kubectl get endpoints</code> e rode: a
+  coluna <code>ENDPOINTS</code> tem de mostrar os IPs dos dois pods.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl get pods
+kubectl get endpoints</pre>
+</div>
+
+<p>O painel mostra <code>cardapio</code> com dois IPs na coluna <code>ENDPOINTS</code>. Isso é a prova de que
+o Service achou os pods: o seletor casou, os pods estão prontos e o tráfego tem para onde ir. Se a coluna
+mostrasse vazio, o próximo passo seria comparar <code>Selector</code> do Service com <code>Labels</code> dos
+pods.</p>
+
+<p>Endpoints com IPs e site ainda mudo apontam para outro lugar: porta errada no <code>TargetPort</code>,
+aplicação escutando em outra interface, ou o problema fora do cluster. O roteiro não promete que todo
+problema está no Kubernetes — promete que você descarta o Kubernetes antes de culpar o resto.</p>
+
+<h2>7. Passo 6: uma mudança por vez</h2>
+
+<p>Chegou a hora de escrever. A regra é simples e quase sempre ignorada: mude uma coisa, aplique, verifique. Se
+resolveu, você sabe o que era. Se não resolveu, você sabe que aquela hipótese está descartada e pode voltar
+um passo sem ter perdido o fio.</p>
+
+<p>“Verifique” significa olhar o mesmo indicador do começo. Se o sintoma era “o site não abre”, abra o site.
+Se era “o pod não sobe”, rode o <code>get pods</code> até ver <code>Running 1/1</code>. Verificação não é
+“achei que funcionou”: é o mesmo teste que falhou antes, agora passando. E, se o problema for intermitente,
+verifique mais de uma vez, em momentos diferentes.</p>
+
+<p>Duas armadilhas comuns nesse passo. A primeira é apagar o pod antes de ler o log — você destrói a prova.
+A segunda é mudar o manifesto e concluir que “não era isso” sem conferir se o <code>apply</code> foi aceito;
+metade das correções que “não funcionaram” na verdade nunca foram aplicadas, por um erro de validação que
+passou batido no meio da pressa.</p>
+
+<p>Por último, registre. Uma linha por incidente — o sintoma, o comando que revelou a causa, a mudança feita e
+o resultado — vira um histórico que economiza horas no mês seguinte, quando o mesmo problema voltar com outro
+nome de pod. Não precisa de ferramenta: um arquivo de texto no repositório serve, e o hábito de escrever
+obriga você a formular a causa em uma frase, o que por si só revela quando ela ainda não está clara.</p>
+
+<p>Vale ver o roteiro inteiro numa sessão de verdade. Esta é uma transcrição de cluster real, do caso do
+forno que não subia — status, objeto e a conclusão, em três comandos:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods
+NAME                     READY   STATUS    RESTARTS   AGE
+forno-7d9f8c6b5-2xk4p    0/1     Pending   0          6m
+
+ana@notebook:~$ kubectl describe pod forno-7d9f8c6b5-2xk4p
+Name:            forno-7d9f8c6b5-2xk4p
+Namespace:       default
+Node:            none
+Status:          Pending
+...
+Events:
+  Type     Reason            Age   From               Message
+  Warning  FailedScheduling  6m    default-scheduler  0/3 nodes are available: 3 Insufficient memory.</pre>
+
+<p>Em vinte segundos: o status disse “agendamento”, o <code>describe</code> mostrou <code>Node</code> vazio e
+o evento entregou o motivo. Nenhum log foi necessário — não havia container para logar. A correção é no
+<code>requests.memory</code> do manifesto, e a verificação é o mesmo comando do começo, agora com resultado
+diferente:</p>
+
+<pre class="term">ana@notebook:~$ kubectl apply -f forno.yaml
+deployment.apps/forno configured
+
+ana@notebook:~$ kubectl get pods
+NAME                     READY   STATUS    RESTARTS   AGE
+forno-6b7d9c4f8-qw2mn    1/1     Running   0          22s</pre>
+
+<p>Dois detalhes importantes nessa segunda sessão. O <code>apply</code> respondeu <code>configured</code>, e
+não <code>created</code>: o objeto já existia e foi atualizado. E o pod tem nome novo, porque o Deployment
+criou um ReplicaSet novo em vez de alterar o pod antigo — pods são imutáveis, então mudança de template vira
+pod novo. Quem procura o nome antigo e não acha conclui, errado, que o deploy não aconteceu.</p>
+
+<h2>8. A caixa: o seletor errado no Service</h2>
+
+<p>O último caso junta os dois seletores do Kubernetes num manifesto só. O Deployment está certo; o Service
+procura <code>app: vitrine</code>, e os pods têm <code>app: cardapio</code>. O <code>apply</code> aceita
+tudo — porque, para a API, não há nada inválido em um seletor que não casa com ninguém. O erro só aparece no
+comportamento.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Service/cardapio|spec.selector.app=cardapio;;conta:pods=2;;texto:Running">
+  <p class="try-task">Acerte o <code>selector</code> do Service para <code>app: cardapio</code> e rode. Os
+  dois pods continuam subindo; a meta confere também que o Service passou a apontar para eles.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: vitrine
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>O painel mostra o Deployment criado, o Service criado e os dois pods em <code>Running</code>. O que ele
+não mostra é o tráfego — e é justamente aí que o seletor errado faria estrago. No roteiro, esse é o caso do
+passo 5: pods bem, endpoints vazios, seletor trocado. A correção é uma linha, e a verificação é o
+<code>get endpoints</code> voltando a mostrar IPs.</p>
+
+<p>Repare que os dois manifestos são enviados juntos, separados por <code>---</code>. É comum na vida real:
+um arquivo com Deployment e Service da mesma aplicação. Quando um deles está errado, o <code>apply</code>
+mostra a linha do objeto com problema, e você corrige só ele.</p>
+
+<p>Aqui está o valor de tudo o que veio antes: você reconheceu o problema no <code>describe</code>, soube
+que não era o pod, foi para o caminho, achou o seletor. Sem o roteiro, esse caso costuma virar “o Kubernetes
+está com bug” — e o site fica fora do ar enquanto alguém reinicia o cluster.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o deploy que “não subiu”</h3>
+<p>A Ana aplicou uma versão nova e o site ficou na antiga. O roteiro: <code>get pods</code> mostrou pods
+<code>Running</code> com idade de dois dias; <code>get deployments</code> mostrou 2/2 disponíveis;
+<code>describe deployment</code> mostrou <code>NewReplicaSet</code> apontando para o ReplicaSet antigo. O
+<code>apply</code> tinha falhado na validação e ela não leu a saída. A correção não foi no cluster: foi no
+YAML e no hábito de ler a resposta do comando.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod saudável e o site mudo</h3>
+<p>Pods <code>1/1 Running</code>, logs limpos, nenhum evento. O roteiro mandou para o passo 5:
+<code>get endpoints</code> mostrou a coluna vazia. O Service procurava <code>app=cardapio</code> e os pods
+tinham <code>tier=web</code> — a troca de manifesto do dia anterior perdeu a etiqueta. Uma linha no template
+resolveu, e o <code>rollout status</code> confirmou.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a correção que não foi aplicada</h3>
+<p>Depois de uma hora, a Ana descobriu que o problema era um <code>requests.memory</code> alto demais. Corrigiu
+o arquivo, rodou <code>kubectl apply -f</code>, e o pod continuou pendente. O <code>apply</code> tinha
+respondido <code>unchanged</code>: ela salvou o arquivo errado, em outra pasta. Desde então, o último passo do
+roteiro dela é sempre conferir a saída do comando e o campo no objeto, com <code>get -o yaml</code>.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. Qual é o primeiro passo do roteiro?</p>
+<label><input type="radio" name="q1"> apagar o pod para ele subir limpo</label>
+<label><input type="radio" name="q1"> reiniciar o cluster</label>
+<label><input type="radio" name="q1"> olhar o <code>STATUS</code> dos pods</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">2. Pods <code>Running 1/1</code> e site sem resposta. Por onde
+continuar?</p>
+<label><input type="radio" name="q2"> pelo <code>logs</code> do container, que com certeza tem erro</label>
+<label><input type="radio" name="q2"> pelo caminho: <code>get endpoints</code> e o seletor do
+Service</label>
+<label><input type="radio" name="q2"> aumentando as réplicas do Deployment</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que mudar uma coisa por vez?</p>
+<label><input type="radio" name="q3"> para saber qual mudança produziu qual efeito</label>
+<label><input type="radio" name="q3"> porque o kubectl só aceita uma mudança por arquivo</label>
+<label><input type="radio" name="q3"> porque o cluster demora a atualizar</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: veja quem o Service enxerga</h2>
+<p>Os pods estão prontos e o site não responde. Complete o comando que mostra os IPs dos pods que casaram com
+o seletor do Service.</p>
+<div class="ex-code">kubectl get <input aria-label="resposta 1" data-answer="endpoints|ep" placeholder="..."></div>
+<p class="ex-dica">Dica: é o objeto que o Service cria automaticamente; a forma curta tem duas letras.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Depurar em Kubernetes é seguir uma ordem, não acumular comandos. Sintoma em uma frase, status para separar
+as famílias, <code>describe</code> para ler o que o cluster tentou, <code>logs</code> para ouvir o programa,
+endpoints para conferir o caminho, e só então uma correção — uma por vez, verificada com o mesmo teste que
+falhou.</p>
+
+<p>O status é a bússola: <code>Pending</code> é lugar, <code>ImagePullBackOff</code> é imagem,
+<code>CrashLoopBackOff</code> é programa, <code>0/1</code> é prontidão, <code>Succeeded</code> é término. O
+<code>apply</code> recusado é o caso mais fácil: nada foi criado e a mensagem diz o campo. E o caso mais
+traiçoeiro é o pod saudável com o site mudo — quase sempre um seletor.</p>
+
+<p>Com isso você fechou o bloco de primeiros problemas e o Nível 1. Você viu o pod nascer, não nascer, baixar
+imagem, falhar ao baixar, morrer em loop, falar por log e por evento, e ser lido por inteiro no
+<code>describe</code>. Daqui para a frente o assunto cresce: Deployments, Services e o resto dos objetos que
+fazem o site da padaria ficar de pé sozinho.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Seis passos: sintoma, status, objeto, log, caminho, correção.</li>
+  <li>Só o último passo escreve; os outros cinco são leitura.</li>
+  <li><code>STATUS</code> separa as famílias: agendamento, imagem, container, prontidão.</li>
+  <li><code>get endpoints</code> prova se o Service achou os pods.</li>
+  <li>Uma mudança por vez, com verificação do mesmo sintoma.</li>
+  <li>Leia a saída do <code>apply</code>: metade das correções “que não funcionaram” não foi aplicada.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hostPath | Guia Kubernetes</title>
+<meta name="description" content="hostPath na prática: montar um diretório do nó dentro do pod, os valores de type, o caso legítimo do DaemonSet e os riscos de portabilidade e segurança.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">hostPath</span></h1>
+<p class="intro">O agente de logs da padaria precisa ler os arquivos que o kubelet e os containers escrevem
+no <em>nó</em> — não no pod. Um <code>emptyDir</code> não serve: ele nasce vazio e não vê nada fora do pod.
+Um PVC também não: ele é um disco novo, não o disco da máquina. O que a Ana precisa é de um volume que
+aponte para um caminho do próprio nó, e o nome disso é <strong>hostPath</strong>. É o volume mais direto e o
+mais perigoso do Kubernetes.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o <code>hostPath</code> monta e de onde ele vem.</li>
+  <li>Os valores de <code>type</code> e o que cada um faz quando o caminho não existe.</li>
+  <li>O caso legítimo: um agente por nó, com <code>DaemonSet</code>.</li>
+  <li>Por que o mesmo manifesto funciona num cluster e falha em outro.</li>
+  <li>Os riscos de segurança de dar ao pod acesso ao sistema de arquivos do nó.</li>
+  <li>Como decidir entre <code>hostPath</code>, <code>emptyDir</code> e
+  <code>PersistentVolumeClaim</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o arquivo que está no nó, não no pod</h2>
+
+<p>O time da Ana instalou um agente de coleta de logs. Ele precisa ler <code>/var/log/containers</code> — o
+diretório onde o runtime do nó escreve um arquivo por container — e mandar o conteúdo para o servidor
+central. O agente roda <em>dentro</em> de um pod, mas os arquivos estão <em>fora</em> dele, no sistema de
+arquivos da máquina. Sem um volume que atravesse essa fronteira, o agente não vê nada.</p>
+
+<p>O <code>hostPath</code> faz exatamente isso: monta um caminho do nó dentro do container. Não há cópia, não
+há sincronização, não há abstração — é o mesmo <em>inode</em>, com os mesmos donos e as mesmas permissões.
+Se o agente apagar um arquivo, ele apaga no nó. Se o nó tiver o arquivo, o pod vê. Se o pod for para outro
+nó, vê outro arquivo.</p>
+
+<p>É por isso que o <code>hostPath</code> é ao mesmo tempo a ferramenta certa para agentes de infraestrutura
+e a errada para quase todo o resto. Ele quebra a ideia central do Kubernetes — “o pod é descartável e pode
+rodar em qualquer lugar” —, porque amarra o pod a uma máquina específica e ao que existe nela. Usar
+<code>hostPath</code> para guardar dados de aplicação é trocar um problema de persistência por dois: o dado
+fica preso ao nó e o backup passa a ser manual.</p>
+
+<h2>2. O que é o hostPath</h2>
+
+<p>Na prática, o <code>hostPath</code> é um volume como outro qualquer: tem nome, é declarado em
+<code>spec.volumes</code> e montado em <code>volumeMounts</code>. A diferença está no tipo: em vez de o
+Kubernetes criar um diretório novo, ele usa um caminho que já existe no nó.</p>
+
+<dl class="anatomy">
+<dt>hostPath</dt>
+<dd>Volume que monta um arquivo ou diretório do sistema de arquivos do nó dentro do container.</dd>
+<dt>path</dt>
+<dd>O caminho no nó. É absoluto e vale para todos os nós onde o pod for agendado — mesmo que o caminho não
+exista em algum deles.</dd>
+<dt>type</dt>
+<dd>O que o kubelet deve exigir antes de montar: que o caminho exista, que seja diretório, que seja arquivo,
+ou que ele crie se não existir.</dd>
+<dt>readOnly</dt>
+<dd>Propriedade do <code>volumeMount</code>: monta o caminho sem permissão de escrita. É a proteção mais
+simples contra um agente que só precisa ler.</dd>
+<dt>DaemonSet</dt>
+<dd>O controlador que garante uma cópia do pod em cada nó. É o par natural do <code>hostPath</code>, porque
+cada pod vê o nó onde está.</dd>
+</dl>
+
+<p>Repare que o caminho é o mesmo em todos os nós. Se o seu cluster tem três máquinas e o agente espera
+<code>/var/log/containers</code>, os três precisam ter esse diretório — e o conteúdo é diferente em cada um.
+Um pod só vê o nó onde foi agendado; para ver todos, é preciso um pod por nó.</p>
+
+<h2>3. A montagem no pod do agente</h2>
+
+<p>A caixa abaixo monta <code>/var/log</code> do nó em <code>/var/log/host</code> dentro do pod, só para
+leitura. O <code>type: Directory</code> diz ao kubelet que ele deve exigir que o caminho exista e seja um
+diretório; se não for, o pod não sobe. Rode e confira os três campos na meta.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/agente|spec.volumes.0.hostPath.path=/var/log;;campo:Pod/agente|spec.volumes.0.hostPath.type=Directory;;texto:Running">
+  <p class="try-task">Declare o volume <code>logs</code> com <code>hostPath</code> em <code>/var/log</code>
+  e <code>type: Directory</code>, e monte-o em <code>/var/log/host</code> no container.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: agente
+spec:
+  containers:
+    - name: agente
+      image: agente:1.0
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log/host</pre>
+<pre class="out">
+pod/agente created
+
+NAME     READY   STATUS    RESTARTS   AGE
+agente   1/1     Running   0          6m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: agente
+spec:
+  containers:
+    - name: agente
+      image: agente:1.0
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log/host
+          readOnly: true
+  volumes:
+    - name: logs
+      hostPath:
+        path: /var/log
+        type: Directory</pre>
+</div>
+
+<p>O painel aceita o manifesto e mostra o pod em <code>Running</code>, mas não monta nada de verdade: sem
+kubelet, não existe sistema de arquivos do nó para atravessar. O que ele prova é o que importa para o
+manifesto — que o volume aponta para <code>/var/log</code>, que o tipo é <code>Directory</code> e que o ponto
+de montagem está no container certo.</p>
+
+<p>O <code>readOnly: true</code> é opcional e quase sempre uma boa ideia. Ele fica no
+<code>volumeMount</code>, não no volume, e vale por container: o mesmo volume pode ser somente leitura para
+um e leitura-escrita para outro. Num agente de logs, a escrita não faz sentido — e negá-la reduz o estrago
+de um <code>rm -rf</code> acidental.</p>
+
+<h2>4. Os tipos de hostPath</h2>
+
+<p>O campo <code>type</code> é a única forma de o kubelet reclamar antes de o container subir. Sem ele, o
+volume aceita qualquer coisa que esteja no caminho — inclusive um arquivo onde você esperava um diretório —
+e o erro só aparece quando o programa tenta ler. Com ele, o pod falha na montagem, com mensagem clara.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th><code>type</code></th><th>Exige</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td>omitido</td><td>nada; não valida</td><td>quase nunca: é o padrão que esconde erro</td></tr>
+<tr><td><code>Directory</code></td><td>que o caminho exista e seja diretório</td><td>ler logs, configurações do
+nó</td></tr>
+<tr><td><code>DirectoryOrCreate</code></td><td>que exista ou seja criado, com permissão 0755</td><td>diretório
+de trabalho do agente</td></tr>
+<tr><td><code>File</code></td><td>que exista e seja arquivo</td><td>montar um arquivo único do nó</td></tr>
+<tr><td><code>FileOrCreate</code></td><td>que exista ou seja criado</td><td>arquivo de estado simples</td></tr>
+<tr><td><code>Socket</code></td><td>que seja um socket Unix</td><td>falar com o runtime do nó</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A escolha do tipo é uma decisão sobre o que fazer quando o caminho não existe: falhar ou criar. Num agente
+que só lê, <code>Directory</code> é a resposta — se o diretório não existe, o pod não tem o que fazer ali e
+é melhor falhar na hora. Num diretório de trabalho que o agente preenche, <code>DirectoryOrCreate</code>
+evita que todo nó novo precise ser preparado à mão.</p>
+
+<p>Existe uma armadilha específica do <code>DirectoryOrCreate</code>: ele cria o diretório como
+<code>root</code>, com permissão 0755. Se o container roda com um usuário sem privilégio, ele vê a pasta e
+não consegue escrever nela — o erro clássico de “permission denied” que aparece só em nó novo. Nesses
+casos, o caminho precisa ser preparado pelo time de infraestrutura, ou o pod precisa de um
+<code>securityContext</code> com o <code>fsGroup</code> certo.</p>
+
+<h2>5. O caso legítimo: um agente por nó</h2>
+
+<p>Se o agente precisa ler os logs de todos os nós, um Deployment não resolve: ele distribui réplicas por
+onde couber, e não garante uma por nó. O controlador certo é o <code>DaemonSet</code>, que garante
+exatamente uma cópia em cada nó — e é por isso que ele e o <code>hostPath</code> andam juntos. A caixa
+abaixo tem o agente como Deployment; a tarefa é trocar para <code>DaemonSet</code>, sem
+<code>replicas</code>.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="objeto:DaemonSet/coletor;;conta:pods=2;;texto:Running">
+  <p class="try-task">Troque o <code>kind</code> para <code>DaemonSet</code> e remova o
+  <code>replicas</code>. O painel deve mostrar um pod por nó de trabalho.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coletor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      containers:
+        - name: coletor
+          image: coletor:1.0
+          volumeMounts:
+            - name: logs
+              mountPath: /var/log/host
+              readOnly: true
+      volumes:
+        - name: logs
+          hostPath:
+            path: /var/log
+            type: Directory</pre>
+<pre class="out">
+deployment.apps/coletor created
+
+NAME                       READY   STATUS    RESTARTS   AGE
+coletor-x9h2wzvz8r-64548   1/1     Running   0          4m
+coletor-x9h2wzvz8r-8krzb   1/1     Running   0          3m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coletor
+spec:
+  selector:
+    matchLabels:
+      app: coletor
+  template:
+    metadata:
+      labels:
+        app: coletor
+    spec:
+      containers:
+        - name: coletor
+          image: coletor:1.0
+          volumeMounts:
+            - name: logs
+              mountPath: /var/log/host
+              readOnly: true
+      volumes:
+        - name: logs
+          hostPath:
+            path: /var/log
+            type: Directory</pre>
+</div>
+
+<p>Com oito réplicas num Deployment, você teria oito pods espalhados por três nós — alguns nós com três
+agentes lendo o mesmo arquivo e outros com nenhum. Com <code>DaemonSet</code>, cada nó de trabalho tem
+exatamente um. Repare que o painel mostra dois pods, e não três: o nó de controle tem uma restrição
+(<em>taint</em>) que o agente não tolera, e o <code>DaemonSet</code> respeita isso — num cluster de verdade,
+é o comportamento normal.</p>
+
+<pre class="term">daemonset.apps/coletor created
+
+NAME            READY   STATUS    RESTARTS   AGE
+coletor-l965k   1/1     Running   0          3m
+coletor-vnk2n   1/1     Running   0          7m</pre>
+
+<p>Essa é a saída que a caixa devolve, copiada do painel: dois pods, um por nó de trabalho. Num cluster com
+dez nós, seriam dez. O <code>DaemonSet</code> não tem <code>replicas</code>: o número é consequência do
+número de nós, e é por isso que ele é o único controlador que faz sentido para um agente de infraestrutura.</p>
+
+<h2>6. O preço: portabilidade, segurança e dados presos</h2>
+
+<p>O primeiro custo é a portabilidade. Um manifesto com <code>hostPath</code> só funciona onde o caminho
+existe. No cluster de teste da Ana, <code>/var/log</code> existe em todos os nós; na máquina de um colega
+que usa outro sistema, o mesmo manifesto falha na montagem. Pior: pode existir e ter outro conteúdo, e aí o
+agente lê lixo sem erro nenhum. O manifesto deixou de ser uma descrição do que você quer e passou a ser uma
+aposta sobre o ambiente.</p>
+
+<p>O segundo custo é a segurança. Montar um diretório do nó é dar ao container acesso ao sistema de
+arquivos da máquina — e, dependendo do caminho, à chave do cluster, ao socket do runtime ou ao
+<code>/etc</code> inteiro. Um pod comprometido com <code>hostPath</code> em <code>/</code> é um pod com o
+nó nas mãos. É por isso que as políticas de segurança mais rígidas do Kubernetes proíbem
+<code>hostPath</code> por padrão; se o seu agente precisa dele, o caminho deve ser o mais estreito
+possível e o pod deve rodar sem privilégio.</p>
+
+<p>O terceiro custo é o dado preso ao nó. Um pod que grava em <code>hostPath</code> grava na máquina, e o
+arquivo fica lá depois que o pod morre. Se o pod for reagendado para outro nó, ele passa a ver outro
+disco — e o anterior fica esquecido, ocupando espaço, sem backup e sem ninguém sabendo. Para dado de
+aplicação, o caminho é PVC; para dado de infraestrutura, <code>hostPath</code> com data de validade
+curta.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/dados|spec.nodeName=guia-worker;;campo:Pod/dados|spec.volumes.0.hostPath.type=DirectoryOrCreate;;texto:Running">
+  <p class="try-task">Prenda o pod ao nó <code>guia-worker</code> com <code>nodeName</code> e monte o
+  caminho <code>/dados-padaria</code> com <code>type: DirectoryOrCreate</code>. Sem o nó certo, o volume é
+  outro.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: dados
+spec:
+  containers:
+    - name: dados
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      hostPath:
+        path: /dados-padaria</pre>
+<pre class="out">
+pod/dados created
+
+NAME    READY   STATUS    RESTARTS   AGE
+dados   1/1     Running   0          4m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: dados
+spec:
+  nodeName: guia-worker
+  containers:
+    - name: dados
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      hostPath:
+        path: /dados-padaria
+        type: DirectoryOrCreate</pre>
+</div>
+
+<p>O <code>nodeName</code> é a forma mais direta de prender um pod a um nó: o agendador nem escolhe, ele
+obedece. Em produção, o mais comum é usar <code>nodeSelector</code> ou <code>affinity</code>, que deixam o
+agendador decidir dentro de um conjunto de nós com a etiqueta certa. As duas abordagens resolvem o mesmo
+problema do <code>hostPath</code>: garantir que o pod está no nó onde o dado existe.</p>
+
+<p>O painel confere o <code>nodeName</code> e o tipo do volume, e mostra o pod em <code>Running</code>. Num
+cluster real, o pod apareceria com <code>NODE: guia-worker</code> no <code>get pods -o wide</code> — e o
+diretório <code>/dados-padaria</code> seria criado no nó se ainda não existisse.</p>
+
+<h2>7. hostPath, emptyDir ou PVC?</h2>
+
+<p>As três opções respondem a perguntas diferentes, e a escolha errada custa caro de um jeito específico. A
+tabela abaixo é o resumo que vale consultar antes de escrever o bloco <code>volumes</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Volume</th><th>Onde o dado vive</th><th>Sobrevive a quê</th><th>Serve para</th></tr>
+</thead>
+<tbody>
+<tr><td><code>emptyDir</code></td><td>diretório novo no nó, preso ao pod</td><td>reinício do container, só</td>
+<td>troca de arquivos entre containers, cache descartável</td></tr>
+<tr><td><code>hostPath</code></td><td>caminho que já existe no nó</td><td>fim do pod e mudança de
+imagem</td><td>agentes que leem o nó, arquivos de infraestrutura</td></tr>
+<tr><td><code>PersistentVolumeClaim</code></td><td>disco gerenciado pelo cluster</td><td>pods, nós e
+deploys</td><td>dados de aplicação que não podem sumir</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A pergunta que decide é “quem é o dono deste dado?”. Se o dado pertence ao pod e pode sumir, é
+<code>emptyDir</code>. Se pertence à máquina e o pod só precisa espiar, é <code>hostPath</code>. Se
+pertence à aplicação e precisa sobreviver a tudo, é PVC. Qualquer outra resposta é uma dessas três
+disfarçada — e o disfarce costuma aparecer no primeiro incidente.</p>
+
+<p>Vale notar que <code>hostPath</code> e PVC não são concorrentes diretos: o PVC é abstração, o
+<code>hostPath</code> é vazamento de infraestrutura para dentro do manifesto. Um cluster gerenciado
+raramente permite <code>hostPath</code>; um cluster local, montado com kind, permite — e é onde ele é mais
+útil para aprender, porque o “nó” é um container na sua máquina.</p>
+
+<h2>8. O que o painel mostra (e o que ele não mostra)</h2>
+
+<p>O painel valida o manifesto, guarda os campos do <code>hostPath</code> e agenda o pod. O que ele não faz
+é montar o caminho: não há kubelet nem sistema de arquivos de nó para atravessar, e por isso não existe
+“arquivo não encontrado” nem falha de montagem aqui. As metas desta aula olham os campos porque são eles
+que o kubelet leria no cluster real.</p>
+
+<p>Uma limitação específica desta versão do painel: o <code>describe pod</code> dele não renderiza o tipo
+<code>hostPath</code> na seção <code>Volumes</code> — mostra o bloco genérico. Num cluster de verdade, a
+seção fica assim (transcrição de um <code>kubectl describe pod</code> real, com o ponto de montagem e o
+tipo):</p>
+
+<pre class="term">    Mounts:
+      /var/log/host from logs (ro)
+Volumes:
+  logs:
+    Type:          HostPath (bare host directory volume)
+    Path:          /var/log
+    HostPathType:  Directory</pre>
+
+<p>Três linhas que respondem a três perguntas: onde está montado, de que tipo é o volume e qual caminho do
+nó ele usa. Quando o pod não sobe e a mensagem fala de montagem, é essa seção que você confere — com
+atenção ao <code>HostPathType</code>, que costuma ser a diferença entre funcionar e falhar em um nó
+preparado de outro jeito.</p>
+
+<h2>9. Cenários do dia a dia da padaria</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o agente que só funcionava em um nó</h3>
+<p>O coletor foi criado como Deployment com uma réplica e <code>hostPath</code>. Ele caiu no nó 2 e passou a
+enviar só os logs do nó 2, sem que ninguém percebesse — os gráficos mostravam “coleta funcionando”. A
+correção foi trocar para <code>DaemonSet</code>: um pod por nó, três fontes de log. O sintoma era sutil
+porque o agente não estava quebrado, só incompleto.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o upload que sumia ao trocar de nó</h3>
+<p>Um serviço gravava as fotos dos bolos em <code>hostPath: /dados/uploads</code>. Funcionou por meses, até
+o nó reiniciar e o pod ser reagendado para outra máquina. As fotos continuavam no nó antigo e o site passou
+a devolver 404. Não havia backup, porque “estava tudo no disco”. A migração para PVC levou uma semana e
+custou as fotos que ninguém tinha.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o manifesto que funcionava na máquina do colega</h3>
+<p>Um manifesto com <code>hostPath: /home/ana/dados</code> funcionava no cluster local da Ana e falhava no
+cluster de teste, porque o caminho não existia lá. O time trocou por <code>DirectoryOrCreate</code> e o
+pod passou a subir — mas gravando num diretório novo, vazio, que ninguém sabia que existia. Portabilidade
+não é só “subir”: é subir no lugar certo.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o <code>hostPath</code> monta?</p>
+<label><input type="radio" name="q1"> um diretório novo, criado com o pod</label>
+<label><input type="radio" name="q1"> um caminho do sistema de arquivos do nó</label>
+<label><input type="radio" name="q1"> um disco gerenciado pelo cluster</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual <code>type</code> faz o pod falhar se o caminho não
+existir?</p>
+<label><input type="radio" name="q2"> <code>DirectoryOrCreate</code></label>
+<label><input type="radio" name="q2"> omitido</label>
+<label><input type="radio" name="q2"> <code>Directory</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual controlador garante um pod por nó, combinando com
+<code>hostPath</code>?</p>
+<label><input type="radio" name="q3"> <code>DaemonSet</code></label>
+<label><input type="radio" name="q3"> <code>Deployment</code> com réplicas iguais ao número de nós</label>
+<label><input type="radio" name="q3"> <code>Job</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o diretório do agente</h2>
+<p>O agente novo precisa de um diretório de trabalho em <code>/var/lib/agente</code> que pode não existir no
+nó. Complete o valor de <code>type</code> que cria o diretório quando ele falta.</p>
+<div class="ex-code">hostPath:
+  path: /var/lib/agente
+  type: <input aria-label="resposta 1" data-answer="DirectoryOrCreate" placeholder="..."></div>
+<p class="ex-dica">Dica: é o tipo que combina “Directory” com a ideia de criar. Se o caminho tiver de
+existir, o tipo seria só <code>Directory</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>hostPath</code> monta um caminho do nó dentro do container: mesmo arquivo, mesmas permissões, sem
+cópia. Declara-se em <code>spec.volumes</code>, com <code>path</code> e <code>type</code>, e monta-se em
+<code>volumeMounts</code>, de preferência com <code>readOnly: true</code>. O tipo decide se o kubelet exige
+que o caminho exista (<code>Directory</code>, <code>File</code>) ou crie (<code>DirectoryOrCreate</code>,
+<code>FileOrCreate</code>).</p>
+
+<p>O caso legítimo é o agente de infraestrutura, um por nó, com <code>DaemonSet</code>. O preço é
+portabilidade (o manifesto depende do ambiente), segurança (acesso ao sistema de arquivos da máquina) e
+dado preso ao nó. Para dado de aplicação, o caminho é <code>PersistentVolumeClaim</code>; para arquivo
+temporário entre containers, <code>emptyDir</code>.</p>
+
+<p>O painel guarda e valida o volume, mas não monta nada; a leitura do <code>describe</code> aparece como
+transcrição. Com isso a Ana fecha o bloco de armazenamento local e pode seguir para o disco que sobrevive a
+tudo: PV e PVC.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>hostPath</code> = caminho do nó montado no pod; nada é copiado.</li>
+  <li><code>type</code> decide entre falhar e criar quando o caminho não existe.</li>
+  <li><code>DaemonSet</code> + <code>hostPath</code> = um agente por nó, vendo o nó onde está.</li>
+  <li>Dado de aplicação em <code>hostPath</code> fica preso à máquina: use PVC.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>restartPolicy | Guia Kubernetes</title>
+<meta name="description" content="restartPolicy no Kubernetes: Always, OnFailure e Never, o backoff do CrashLoopBackOff, quem reinicia container e quem recria pod, e a regra que cada objeto exige.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">restartPolicy</span></h1>
+<p class="intro">A migração do banco da Ana rodou de madrugada, terminou com sucesso e... rodou de novo. E de
+novo. Quando ela abriu o painel de manhã, o pod estava com <code>RESTARTS</code> em 47. Nada estava quebrado
+no script: o Kubernetes só estava fazendo o que mandaram — reiniciar o container sempre que ele termina.
+Quem manda nisso é uma linha do manifesto chamada <code>restartPolicy</code>, e ela é a diferença entre um
+site que nunca cai e uma migração que roda sem parar.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Onde vive o <code>restartPolicy</code> e por que ele é do pod, não do container.</li>
+  <li>Os três valores: <code>Always</code> (o padrão), <code>OnFailure</code> e <code>Never</code>.</li>
+  <li>O que é <code>CrashLoopBackOff</code> e de onde vêm os segundos de espera.</li>
+  <li>A diferença entre reiniciar <em>container</em> e recriar <em>pod</em>.</li>
+  <li>As regras de cada objeto: Deployment só aceita <code>Always</code>, Job só aceita
+  <code>OnFailure</code> ou <code>Never</code>.</li>
+  <li>Como escolher a política certa para cada tarefa da padaria.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a migração que rodava em loop</h2>
+
+<p>O script <code>migrar.js</code> da Ana arruma as tabelas do banco: cria as colunas que faltam, copia os
+dados antigos e termina. É uma tarefa com começo, meio e fim — exatamente o oposto de um servidor que fica
+esperando conexões.</p>
+
+<p>Ela criou um pod com <code>command: ["node", "migrar.js"]</code> e foi dormir. O script rodou em dois
+segundos e saiu com código <code>0</code>, o que quer dizer "terminei bem". O kubelet viu o container
+terminado e, como não havia nenhuma instrução dizendo o contrário, reiniciou. O script rodou de novo, com os
+dados já migrados, e terminou de novo. A cada reinício, o contador subia.</p>
+
+<p>Nenhum erro, nenhum alerta: o pod estava <code>Running</code> praticamente o tempo todo, porque o
+container era reiniciado assim que saía. O sintoma só apareceu quando o banco começou a ficar estranho, com
+a migração aplicada quarenta e sete vezes.</p>
+
+<p>O problema não estava no script nem na imagem. Estava na política de reinício padrão, que existe para
+serviços e atrapalha tarefas. Entender essa política é o que separa "o Kubernetes está maluco" de "eu pedi
+isso sem saber".</p>
+
+<h2>2. A política do pod: uma linha, três valores</h2>
+
+<p>O <code>restartPolicy</code> é um campo do <code>spec</code> do pod — irmão de <code>containers</code> e
+<code>volumes</code>, não filho deles. Isso significa que a decisão vale para o pod inteiro: se ele tem dois
+containers, a política é uma só para os dois. O container declara imagem, comando e recursos; o pod declara
+o que fazer quando o container termina.</p>
+
+<p>Quem executa a política é o <strong>kubelet</strong>, o agente que roda em cada nó. Ele observa o estado
+do container, e quando o processo termina ele decide: reinicia, ou deixa como está? Essa decisão acontece
+sem passar pelo API server, no próprio nó — o que explica por que o reinício é quase instantâneo.</p>
+
+<dl class="anatomy">
+<dt>restartPolicy</dt>
+<dd>Campo de <code>spec</code> no pod: o que fazer quando um container termina. Vale para todos os
+containers do pod.</dd>
+<dt>Always</dt>
+<dd>O padrão. Reinicia o container sempre que ele termina, com código zero ou não.</dd>
+<dt>OnFailure</dt>
+<dd>Reinicia só quando o container termina com código diferente de zero.</dd>
+<dt>Never</dt>
+<dd>Não reinicia nunca. O container termina e fica registrado com o código de saída.</dd>
+<dt>CrashLoopBackOff</dt>
+<dd>O estado em que o container falha, é reiniciado, falha de novo — e o kubelet passa a esperar cada vez
+mais entre tentativas.</dd>
+<dt>backoffLimit</dt>
+<dd>No Job: quantas tentativas antes de desistir de vez. O padrão é 6.</dd>
+</dl>
+
+<p>O valor padrão, quando você não escreve nada, é <code>Always</code>. É uma escolha razoável para o caso
+mais comum — um servidor que deve estar sempre no ar —, e é a origem de 90% das surpresas com tarefas
+curtas. Quando o seu programa tem fim, escreva a política de propósito.</p>
+
+<h2>3. Always: o reinício sem fim</h2>
+
+<p>Com <code>Always</code>, todo término é um recomeço. O site da Ana cai e volta; o processo que estoura
+memória volta; o script que termina bem volta também. Não há distinção entre sucesso e falha, e é por isso
+que esse valor é o certo para serviços e o errado para tarefas.</p>
+
+<p>Quando o container falha repetidamente, o kubelet não reinicia em loop apertado — ele espera. Os atrasos
+dobram: dez segundos, vinte, quarenta, oitenta, cento e sessenta, e o teto de cinco minutos. Se o container
+conseguir rodar dez minutos seguidos, o contador zera. Durante a espera, o pod aparece como
+<code>CrashLoopBackOff</code> no <code>get pods</code>.</p>
+
+<pre class="term">$ kubectl get pods
+NAME       READY   STATUS             RESTARTS      AGE
+cardapio   0/1     CrashLoopBackOff   6 (44s ago)   8m12s
+
+$ kubectl describe pod cardapio | tail -n 6
+Events:
+  Type     Reason     Age                 From      Message
+  ----     ------     ----                ----      -------
+  Warning  BackOff     44s (x14 over 8m)   kubelet   Back-off restarting failed container web in pod cardapio_default
+  Normal   Pulled      30s (x15 over 8m)   kubelet   Container image "cardapio:1.0" already present on machine
+  Normal   Created     30s (x15 over 8m)   kubelet   Created container: web
+  Normal   Started     29s (x15 over 8m)   kubelet   Started container web</pre>
+
+<p>Essa é a transcrição de um cluster local com um pod em laço de falha. A leitura certa: o
+<code>RESTARTS</code> alto mostra que o cluster já desistiu de tentar rápido e agora espera; o
+<code>x15 over 8m</code> mostra quantas vezes tentou em oito minutos; e o <code>BackOff</code> é o motivo do
+estado atual. O problema nunca é o backoff — ele é o cluster protegendo você de um loop que consumiria o nó.
+O problema é o exit code que está causando a falha, e esse está no <code>describe</code>, em
+<code>Last State</code>.</p>
+
+<h2>4. OnFailure: só quando dá errado</h2>
+
+<p>O valor <code>OnFailure</code> é o meio do caminho e resolve a migração da Ana com elegância: se o script
+sai com <code>0</code>, o container fica <code>Completed</code> e ninguém mexe nele; se sai com erro, o
+kubelet tenta de novo, com o mesmo backoff do <code>Always</code>. É a política de quem aceita uma segunda
+chance, mas não uma repetição infinita de sucesso.</p>
+
+<p>A caixa abaixo tem o pod da migração com um erro de digitação no valor — <code>Alwayss</code>, com dois
+"e-sse" — e o cluster recusa o objeto inteiro. Conserte para <code>OnFailure</code> e rode.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/forno|spec.restartPolicy=OnFailure">
+  <p class="try-task">Troque <code>Alwayss</code> por <code>OnFailure</code>: a migração deve ser tentada de
+  novo apenas quando falhar.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  restartPolicy: Alwayss
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      command: ["node", "migrar.js"]</pre>
+<pre class="out">
+The Pod "forno" is invalid: spec.restartPolicy: Unsupported value: "Alwayss": supported values: "Always", "Never", "OnFailure"
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      command: ["node", "migrar.js"]</pre>
+</div>
+
+<p>A resposta do cluster é específica e didática:
+<code>Unsupported value: "Alwayss": supported values: "Always", "Never", "OnFailure"</code>. Repare que ela
+lista os três valores aceitos — quase todo erro de enum no Kubernetes faz isso, e é uma das razões de valer
+a pena ler a mensagem até o fim em vez de olhar só a primeira linha.</p>
+
+<h2>5. Never: uma vez, e o resultado fica</h2>
+
+<p><code>Never</code> é a política de quem não quer repetição nenhuma: o container roda uma vez e, termine
+bem ou mal, o kubelet não toca mais nele. O pod fica com fase <code>Succeeded</code> (se o código foi
+<code>0</code>) ou <code>Failed</code>, e você decide o que fazer com o resultado. É o que se usa em script
+de auditoria, em exportação de dados e em qualquer tarefa em que rodar duas vezes seria pior do que não
+rodar.</p>
+
+<p>Na prática, você quase nunca cria um Pod solto com <code>Never</code>. Cria um <strong>Job</strong>, que é
+o objeto feito para tarefas: ele cria o pod, aplica a política, conta as tentativas
+(<code>backoffLimit</code>) e registra a conclusão. O Job <em>exige</em> que a política seja
+<code>OnFailure</code> ou <code>Never</code> — e recusa <code>Always</code>, porque um Job que reinicia
+eternamente nunca terminaria.</p>
+
+<pre class="term">$ kubectl get jobs
+NAME      COMPLETIONS   DURATION   AGE
+limpeza   1/1           12s        46s
+
+$ kubectl get pods
+NAME            READY   STATUS      RESTARTS   AGE
+limpeza-7k2pd   0/1     Completed   0          46s</pre>
+
+<p>Transcrição de um Job que terminou: <code>1/1</code> conclusões, e o pod com <code>Completed</code> e
+<code>READY 0/1</code>. O <code>0/1</code> aqui não é problema — container terminado não está pronto para
+receber tráfego, e não precisa. O nome do pod ganhou um sufixo (<code>7k2pd</code>) porque foi o Job que o
+criou; pod de Job nunca tem nome fixo.</p>
+
+<h2>6. Os três valores lado a lado</h2>
+
+<p>A tabela que vale colar no monitor: ela responde "e se o meu programa terminar com zero?" e "e se
+terminar com erro?" para cada política.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Política</th><th>Saiu com <code>0</code></th><th>Saiu com erro</th><th>Serve para</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Always</code></td><td>reinicia</td><td>reinicia, com backoff</td><td>serviços que devem estar sempre no ar</td></tr>
+<tr><td><code>OnFailure</code></td><td>fica <code>Completed</code></td><td>reinicia, com backoff</td><td>tarefas que podem ser tentadas de novo</td></tr>
+<tr><td><code>Never</code></td><td>fica <code>Completed</code></td><td>fica <code>Failed</code></td><td>tarefas em que repetir é perigoso</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas leituras úteis. A primeira: <code>Always</code> é o único valor que ignora o código de saída — para
+ele, todo fim é fim. A segunda: a diferença entre <code>OnFailure</code> e <code>Never</code> não está no
+sucesso, está na falha; é ali que você escolhe entre "tenta de novo" e "me mostra o erro e para".</p>
+
+<p>Um aviso sobre a política <code>Always</code> num pod que termina bem: o container reinicia e o pod nunca
+chega a <code>Succeeded</code>. Se você estiver esperando um pod de migração "concluir", isso não vai
+acontecer — ele vai ficar reiniciando para sempre, como o da Ana. Quem precisa de conclusão registrada é o
+Job.</p>
+
+<h2>7. Quem reinicia o quê: kubelet e controlador</h2>
+
+<p>Aqui está a confusão que a palavra "reinício" esconde. Existem dois níveis, com donos diferentes, e eles
+não se substituem.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Nível</th><th>Quem age</th><th>O que acontece</th><th>Nome muda?</th></tr>
+</thead>
+<tbody>
+<tr><td>container</td><td>kubelet, no nó</td><td>reinicia o processo dentro do mesmo pod, conforme a política</td><td>não</td></tr>
+<tr><td>pod</td><td>ReplicaSet do Deployment</td><td>cria um pod novo quando o pod some</td><td>sim, sempre</td></tr>
+<tr><td>pod</td><td>Job</td><td>cria um pod novo a cada tentativa, até o <code>backoffLimit</code></td><td>sim</td></tr>
+<tr><td>pod solto</td><td>ninguém</td><td>apagou, acabou: nenhum controlador olha por ele</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>É por isso que a caixa da seção 4 funciona como exemplo e não como solução: um Pod solto com
+<code>OnFailure</code> reinicia o container, mas se o pod inteiro for apagado (ou o nó morrer), ninguém o
+recria. Quem cuida disso é o Deployment, no caso de serviço, e o Job, no caso de tarefa.</p>
+
+<p>Cada objeto tem a sua regra de política, e o cluster valida na hora de aplicar. Deployment, ReplicaSet,
+StatefulSet e DaemonSet trabalham com <code>Always</code> — eles existem para manter processos vivos, e um
+container que termina seria recriado de qualquer forma. Job e CronJob trabalham com
+<code>OnFailure</code> ou <code>Never</code>. A caixa abaixo tem o Job com a política errada: conserte e
+veja o objeto nascer.</p>
+
+<div class="tryk8s" data-goal="objeto:Job/limpeza;;campo:Job/limpeza|spec.template.spec.restartPolicy=Never;;texto:job.batch/limpeza created">
+  <p class="try-task">O Job está com <code>Always</code> no template, e o cluster recusa. Troque por
+  <code>Never</code>: a limpeza roda uma vez e o resultado fica registrado.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: limpeza
+spec:
+  template:
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: limpeza
+          image: busybox
+          command: ["sh", "-c", "echo limpando"]</pre>
+<pre class="out">
+The Job "limpeza" is invalid: spec.template.spec.restartPolicy: Unsupported value: "Always": supported values: "OnFailure", "Never"
+</pre>
+<pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: limpeza
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: limpeza
+          image: busybox
+          command: ["sh", "-c", "echo limpando"]</pre>
+</div>
+
+<p>A mensagem aponta para <code>spec.template.spec.restartPolicy</code> e lista os dois valores válidos. Note
+o caminho: a política de um Job não fica no <code>spec</code> dele, fica no <code>spec.template.spec</code>
+— dentro do molde do pod que ele vai criar. Essa é a mesma estrutura de Deployment, e é a razão de tanta
+gente errar a indentação na primeira vez.</p>
+
+<h2>8. backoffLimit: até quando o Job insiste</h2>
+
+<p>Se a política do Job é <code>OnFailure</code> ou <code>Never</code>, alguém precisa decidir quando parar
+de tentar — senão o Job vira o mesmo loop do pod solto da Ana, só que com nome de tarefa. Esse alguém é o
+campo <code>backoffLimit</code>, cujo padrão é <code>6</code>: depois da sexta falha, o Job marca o pod como
+<code>Failed</code> e para. A partir daí, o estado é definitivo até alguém apagar e recriar.</p>
+
+<p>As duas políticas contam diferente, e a diferença aparece no que você olha no cluster. Com
+<code>OnFailure</code>, o kubelet reinicia o <em>container dentro do mesmo pod</em>: o nome do pod não muda,
+o <code>RESTARTS</code> sobe, e é o mesmo pod por todas as tentativas. Com <code>Never</code>, cada tentativa
+é um <em>pod novo</em>: você vê vários pods com o sufixo diferente, cada um com <code>RESTARTS</code> zero e
+um exit code registrado.</p>
+
+<pre class="file" data-file="limpeza.yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: limpeza
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: limpeza
+          image: busybox
+          command: ["sh", "-c", "echo limpando"]</pre>
+
+<p>Com <code>Never</code> e <code>backoffLimit: 3</code>, o Job cria até quatro pods (a tentativa inicial
+mais três repetições). Cada falha deixa um pod em <code>Failed</code> no histórico, e esse histórico é o que
+torna o diagnóstico simples: você vê as mensagens de cada tentativa em
+<code>kubectl logs</code> do pod correspondente, sem que uma tentativa apague a anterior.</p>
+
+<p>Para tarefas de dados, a recomendação da Ana é <code>Never</code> — um script de migração que roda duas
+vezes no mesmo container pode deixar o banco em estado meio migrado, e o pod novo a cada tentativa dá
+rastro. Para tarefas de rede, que falham por instabilidade e funcionam na segunda, <code>OnFailure</code> é
+mais econômico.</p>
+
+<h2>9. Escolhendo com o kubectl run</h2>
+
+<p>Quando você cria um pod rápido com <code>kubectl run</code>, a flag <code>--restart</code> decide o
+objeto. E a decisão é maior do que parece: com <code>Always</code> (o padrão), o comando não cria um pod —
+cria um <strong>Deployment</strong>. Com <code>Never</code>, cria um pod solto. Com
+<code>OnFailure</code>, cria um Job.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:pod/forno created;;objeto:Pod/forno">
+  <p class="try-task">O comando está criando um Deployment sem querer. Use a flag que cria um pod solto, que
+  não reinicia nunca.</p>
+<pre class="yaml">kubectl run forno --image=cardapio:1.0 --restart=Always
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run forno --image=cardapio:1.0 --restart=Always
+deployment.apps/forno created
+
+ana@notebook:~$ kubectl get pods
+NAME                     READY   STATUS    RESTARTS   AGE
+forno-8swgvz7wkh-kpgh5   1/1     Running   0          5m
+</pre>
+<pre class="solucao">kubectl run forno --image=cardapio:1.0 --restart=Never
+kubectl get pods</pre>
+</div>
+
+<p>As respostas são diferentes já na primeira linha: <code>deployment.apps/forno created</code> contra
+<code>pod/forno created</code>. No primeiro caso o pod existe, mas com nome comprido, dono e a promessa de
+voltar sempre; no segundo é um pod só, com nome fixo e sem ninguém olhando por ele.</p>
+
+<p>O painel do guia simplifica um dos casos: <code>--restart=OnFailure</code> cria um Job no cluster de
+verdade, e aqui aparece como pod. Use a caixa para fixar a diferença entre <code>Always</code> e
+<code>Never</code>, que é o que ela simula fielmente.</p>
+
+<h2>10. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o relatório que repetia a cada dez minutos</h3>
+<p>O relatório diário foi criado como pod solto com a política padrão. Ele gerava o arquivo, saía com zero e
+reiniciava, gerando de novo — e mandando o e-mail de novo. A Ana trocou por um CronJob, que cria um Job por
+dia, com <code>restartPolicy: OnFailure</code>: uma execução por dia, e nova tentativa só se falhar.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod que ficou "pronto" sem estar</h3>
+<p>Um pod com <code>Never</code> e um servidor dentro: o programa terminou por causa de um arquivo de
+configuração ausente, e o pod ficou <code>Failed</code>, parado, sem ninguém reiniciar. O time estranhou a
+"falta de resiliência". Não era falta de resiliência: era política errada para um serviço. Servidor pede
+<code>Always</code>; tarefa pede Job.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o CrashLoopBackOff que não era do cluster</h3>
+<p>O pod do site entrava em <code>CrashLoopBackOff</code> de hora em hora. O cluster estava tentando, com
+espera crescente, e o exit code <code>1</code> no <code>Last State</code> apontava para uma variável de
+ambiente faltando. A política estava certíssima; o programa é que não tinha o que precisava. Sem o
+<code>describe</code>, a tentação é culpar o Kubernetes — e ele só estava reiniciando.</p>
+</div>
+
+<h2>11. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual é o valor padrão do <code>restartPolicy</code>?</p>
+<label><input type="radio" name="q1"> <code>Never</code>, para não gastar recurso à toa</label>
+<label><input type="radio" name="q1"> <code>Always</code>, reiniciando o container sempre que ele
+termina</label>
+<label><input type="radio" name="q1"> <code>OnFailure</code>, reiniciando somente em caso de erro</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Um container com <code>OnFailure</code> terminou com
+código <code>0</code>. O que acontece?</p>
+<label><input type="radio" name="q2"> reinicia imediatamente, como em <code>Always</code></label>
+<label><input type="radio" name="q2"> o pod é apagado pelo cluster</label>
+<label><input type="radio" name="q2"> fica <code>Completed</code> e não reinicia</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que o <code>CrashLoopBackOff</code> indica?</p>
+<label><input type="radio" name="q3"> o container falha e o kubelet está esperando cada vez mais para
+tentar de novo</label>
+<label><input type="radio" name="q3"> a imagem não foi encontrada no registro</label>
+<label><input type="radio" name="q3"> o pod não coube em nenhum nó</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a política da migração</h2>
+<p>O pod <code>migracao</code> roda <code>node migrar.js</code>, pode ser tentado de novo se falhar e nunca
+deve terminar como <code>Failed</code> sem uma segunda chance. Complete o manifesto.</p>
+<div class="ex-code">spec:
+  restartPolicy: <input aria-label="resposta 1" data-answer="OnFailure" placeholder="...">
+  containers:
+    - name: migracao
+      image: cardapio:1.0
+      command: ["node", "migrar.js"]</div>
+<p class="ex-dica">Dica: o valor que reinicia só quando o código de saída não é zero. Se a tarefa pudesse
+rodar duas vezes sem problema nenhum, <code>Never</code> também serviria — a escolha é sua.</p>
+</div>
+
+<h2>12. Resumo</h2>
+
+<p>O <code>restartPolicy</code> é um campo do <code>spec</code> do pod e vale para todos os containers dele.
+São três valores: <code>Always</code> (o padrão) reinicia sempre, ignorando o código de saída;
+<code>OnFailure</code> reinicia só quando o programa falha; <code>Never</code> deixa o container terminar e
+não mexe mais. Quem executa é o kubelet, no nó, e é por isso que o reinício é rápido.</p>
+
+<p>Falhas repetidas entram em backoff: dez, vinte, quarenta segundos, dobrando até o teto de cinco minutos.
+Durante essa espera o pod aparece como <code>CrashLoopBackOff</code>, e o <code>RESTARTS</code> alto indica
+que o cluster já está esperando. O backoff é proteção, não a causa — a causa está no exit code do
+<code>describe</code>.</p>
+
+<p>Reiniciar container (kubelet) e recriar pod (ReplicaSet, Job) são coisas diferentes, e pod solto não tem
+quem o recrie. Cada objeto tem sua regra: Deployment só aceita <code>Always</code>; Job e CronJob só aceitam
+<code>OnFailure</code> ou <code>Never</code>, no <code>spec.template.spec</code>. Para a padaria, a regra
+prática é: site e API sempre <code>Always</code>; migração e relatório em Job. Na próxima aula a Ana coloca
+um passo <em>antes</em> do container principal — os init containers.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>restartPolicy</code> fica em <code>spec</code> e vale para o pod inteiro; o padrão é
+  <code>Always</code>.</li>
+  <li><code>OnFailure</code> só reinicia quando o código de saída é diferente de zero.</li>
+  <li><code>CrashLoopBackOff</code> é espera crescente: 10s, 20s, 40s… até 5 minutos.</li>
+  <li>Deployment exige <code>Always</code>; Job exige <code>OnFailure</code> ou <code>Never</code>.</li>
+  <li>No Job, a política fica em <code>spec.template.spec.restartPolicy</code>.</li>
+  <li><code>kubectl run --restart=Always</code> cria Deployment; <code>--restart=Never</code> cria Pod.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
