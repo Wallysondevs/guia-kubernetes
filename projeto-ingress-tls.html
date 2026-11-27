@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ingress com TLS | Guia Kubernetes</title>
+<meta name="description" content="Projeto guiado: o cadeado na loja da Ana com um Secret kubernetes.io/tls feito à mão, o Ingress apontando para o Service e o que o painel mostra do roteamento.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Ingress com <span class="hl">TLS</span></h1>
+<p class="intro">A loja da Ana já tem Service e responde dentro do cluster, mas o cliente digita
+<code>https://loja.test</code> — e é aí que entram duas peças que ainda faltam: um <strong>Secret</strong> com
+o certificado e a chave, e um <strong>Ingress</strong> que diz “este nome, este caminho, este Service, com
+este certificado”. Nesta página a Ana monta os dois à mão, na ordem, e aprende a ler no painel o que é
+roteamento de verdade e o que é só modelo — porque o painel não tem rede.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Criar à mão um Secret do tipo <code>kubernetes.io/tls</code>, com as duas chaves obrigatórias.</li>
+  <li>Escrever a regra do Ingress que aponta para o Service da loja.</li>
+  <li>Declarar o bloco <code>tls</code>, ligar o Secret ao host e conferir com o <code>describe</code>.</li>
+  <li>Por que <code>pathType</code> é obrigatório e o que muda entre <code>Prefix</code> e
+  <code>Exact</code>.</li>
+  <li>O que o painel prova sobre roteamento e o que só um cluster com controller e DNS mostra.</li>
+  <li>Os cinco erros que deixam o cadeado quebrado ou o site em 503.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>A imagem mental é a porta da loja. Hoje a loja tem um balcão (o Service <code>cardapio</code>) e um
+endereço interno que ninguém de fora alcança. O que falta é a porta com tabuleta: um nome
+(<code>loja.test</code>), um cadeado (TLS) e uma regra que diga “quem chegar neste nome, neste caminho, vai
+para aquele balcão”.</p>
+
+<p>No Kubernetes, a tabuleta é o Ingress e o cadeado é um Secret. O Ingress não atende ninguém sozinho: ele é
+uma <em>declaração de intenção</em> que um controller (nginx, Traefik, o que estiver instalado) lê e
+transforma em configuração de proxy. O Secret também não atende: ele guarda dois arquivos — o certificado
+público e a chave privada — para o controller usar no handshake TLS.</p>
+
+<p>O projeto tem três passos e cada um resolve um pedaço: o Secret (o par certificado/chave), o Ingress (a
+regra e o backend) e o bloco <code>tls</code> (quem usa o certificado em qual nome). A ordem importa pouco no
+<code>apply</code> — o Kubernetes aceita os três em qualquer sequência — e importa muito na hora de
+depurar: sem Secret, o controller não tem o que apresentar; sem regra que case com o host, ele devolve 404;
+com regra apontando para um Service que não existe, devolve 503.</p>
+
+<h2>2. O cenário da padaria</h2>
+
+<p>A loja vende bolo de encomenda, e o formulário pede endereço e telefone. Quando o site rodava em HTTP, o
+navegador mostrava “Não seguro” ao lado do endereço — e a Ana perdia pedidos no momento do pagamento, porque
+cliente desconfia de aviso. Ela contratou um certificado para <code>loja.test</code> e recebeu dois arquivos
+por e-mail: <code>loja.crt</code> e <code>loja.key</code>.</p>
+
+<p>O primeiro instinto foi colocar os arquivos na imagem e configurar o servidor Node para falar HTTPS direto.
+Funcionou até a renovação: a imagem precisou ser refeita, o deploy derrubou o site, e a chave privada passou a
+morar em três lugares (a imagem, o repositório e o notebook da Ana). Trocar isso por Ingress + Secret resolve
+as duas pontas: o certificado sai da aplicação e a aplicação para de se preocupar com TLS.</p>
+
+<p>O segundo detalhe é o nome. O certificado vale para <code>loja.test</code>; se alguém digitar
+<code>www.loja.test</code> e o Ingress só tiver a regra do nome sem <code>www</code>, o navegador avisa que o
+certificado não cobre aquele nome. Um projeto de TLS é metade configuração e metade disciplina de nomes.</p>
+
+<h2>3. Antes de começar</h2>
+
+<p>Você precisa de três coisas prontas. A primeira é o Service da loja funcionando — o Ingress aponta para um
+Service, não para um pod, e um Service sem endpoints dá 503 mesmo com o Ingress perfeito. A segunda é um
+controller de Ingress instalado: sem ele, o objeto Ingress é aceito e não faz nada. A terceira é o par
+certificado/chave; para estudo, um certificado autoassinado serve e o navegador vai reclamar da autoridade, não
+do nome.</p>
+
+<p>Para gerar um par autoassinado no terminal, o comando é <code>openssl req -x509 -newkey rsa:2048 -nodes
+-keyout loja.key -out loja.crt -days 365 -subj "/CN=loja.test"</code>. O resultado são dois arquivos de texto,
+cada um começando e terminando com uma linha de cinco hífens. É esse conteúdo que vai para o Secret — em
+base64, dentro de <code>data</code>.</p>
+
+<p>Nesta página usamos valores curtos de exemplo em vez de um certificado real: um certificado de verdade
+ocupa a tela inteira e não acrescenta nada ao aprendizado. O formato é o mesmo; o que muda é o tamanho. No seu
+cluster, prefira o comando <code>kubectl create secret tls loja-tls --cert=loja.crt --key=loja.key</code>, que
+faz o base64 por você e valida o par antes de gravar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>peça</th><th>papel</th><th>o que quebra sem ela</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Service</code></td><td>o balcão: encontra os pods por etiqueta</td><td>o Ingress tem para onde
+apontar e nada do outro lado: 503</td></tr>
+<tr><td><code>Secret</code> <code>kubernetes.io/tls</code></td><td>o cadeado: certificado e chave</td><td>o
+controller não tem o que apresentar; o handshake falha</td></tr>
+<tr><td><code>Ingress</code></td><td>a tabuleta: host, caminho e backend</td><td>ninguém de fora chega ao
+Service</td></tr>
+<tr><td>controller</td><td>quem lê o Ingress e configura o proxy</td><td>o objeto existe e não faz nada; o
+<code>ADDRESS</code> fica vazio</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>4. Passo 1 — o Secret TLS feito à mão</h2>
+
+<p>O Secret de TLS tem duas particularidades: o <code>type</code> precisa ser exatamente
+<code>kubernetes.io/tls</code> e as chaves internas precisam se chamar <code>tls.crt</code> e
+<code>tls.key</code>. O controller procura por esses dois nomes; qualquer outro é ignorado, mesmo que o
+conteúdo esteja certo. A caixa começa com um Secret vazio, do tipo comum.</p>
+
+<div class="tryk8s" data-get="secrets" data-goal="campo:Secret/loja-tls|type=kubernetes.io/tls;;conta:secrets=1">
+  <p class="try-task">Transforme o Secret no tipo que o controller espera e ponha as duas chaves:
+  <code>tls.crt</code> com o base64 do certificado e <code>tls.key</code> com o da chave (os valores estão
+  no enunciado da solução). Rode e veja a coluna <code>DATA</code> sair de 0 para 2.</p>
+<pre class="yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: loja-tls
+type: Opaque
+data: {}</pre>
+<pre class="out">
+secret/loja-tls created
+
+NAME       DATA   AGE
+loja-tls   0      9m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Secret
+metadata:
+  name: loja-tls
+type: kubernetes.io/tls
+data:
+  tls.crt: Y2VydGlmaWNhZG8tZGEtbG9qYQ==
+  tls.key: Y2hhdmUtcHJpdmFkYS1kYS1sb2ph</pre>
+</div>
+
+<p>Com o Secret vazio, a tabela mostra <code>DATA 0</code>: o objeto existe, tem nome, e não serve para nada.
+Na solução, <code>DATA 2</code> — duas chaves, <code>tls.crt</code> e <code>tls.key</code>. O tipo não aparece
+nessa tabela; quem confirma é o <code>describe secret</code> no seu cluster, que imprime
+<code>Type: kubernetes.io/tls</code> seguido do tamanho de cada chave.</p>
+
+<dl class="anatomy">
+<dt><code>type: kubernetes.io/tls</code></dt>
+<dd>O tipo que diz “aqui dentro há um certificado e a chave dele”. É o que o controller procura antes de
+montar o handshake. Com <code>Opaque</code>, o Secret é aceito e ignorado para TLS.</dd>
+<dt><code>tls.crt</code></dt>
+<dd>A chave interna com o certificado público (a parte que o navegador recebe). O nome é fixo: não é
+<code>cert</code>, não é <code>certificado.pem</code>.</dd>
+<dt><code>tls.key</code></dt>
+<dd>A chave interna com a chave privada. É o arquivo que nunca sai do cluster — e o motivo de o Secret
+precisar de RBAC restrito.</dd>
+<dt><code>data</code></dt>
+<dd>Onde os dois vão, em base64. No cluster, <code>kubectl create secret tls</code> lê os arquivos, valida o
+par e grava; no manifesto, você cola o resultado de <code>base64 -w0 loja.crt</code>.</dd>
+</dl>
+
+<p>Um cuidado que economiza horas: se o certificado e a chave não forem um par, o <code>apply</code> aceita
+o Secret e o erro só aparece no controller, no handshake. O <code>kubectl create secret tls</code> valida
+antes de gravar; o manifesto, não. Por isso o caminho de produção costuma ser <code>create secret tls</code>
+ou um controlador que gera o Secret sozinho.</p>
+
+<h2>5. Passo 2 — o Ingress apontando para o Service</h2>
+
+<p>Com o cadeado guardado, entra a tabuleta. O Ingress tem três níveis: <code>rules</code> (por host), dentro
+dele <code>http.paths</code> (por caminho) e, em cada caminho, o <code>backend</code> — o Service e a porta
+que recebem a requisição. A caixa começa sem <code>pathType</code>, que é obrigatório e é o erro que mais
+aparece em manifesto copiado.</p>
+
+<div class="tryk8s" data-get="ingress" data-goal="campo:Ingress/loja|spec.rules.0.http.paths.0.backend.service.name=cardapio;;campo:Ingress/loja|spec.ingressClassName=nginx;;texto:loja.test">
+  <p class="try-task">Complete a regra com <code>pathType: Prefix</code> e confirme que o backend é o Service
+  <code>cardapio</code> na porta 80, atendido pelo controller <code>nginx</code>. Rode e veja a tabela do
+  Ingress.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: loja
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+<pre class="out">
+The Ingress "loja" is invalid: spec.rules[0].http.paths[0].pathType: Required value
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: loja
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>Sem <code>pathType</code>, o painel não mostra tabela nenhuma: mostra a recusa
+<code>The Ingress "loja" is invalid: spec.rules[0].http.paths[0].pathType: Required value</code>. Repare que o
+número entre colchetes é o índice da regra e do caminho — <code>rules[0]</code> é a primeira regra,
+<code>paths[0]</code> o primeiro caminho — e é assim que você acha a linha errada num arquivo com dez hosts.
+Com o campo no lugar, a tabela aparece: <code>loja</code>, classe <code>nginx</code>, host
+<code>loja.test</code>.</p>
+
+<p><code>Prefix</code> e <code>Exact</code> não são sinônimos. <code>Prefix</code> casa <code>/</code> e
+tudo abaixo (<code>/cardapio</code>, <code>/pedidos/7</code>); <code>Exact</code> casa só aquele caminho,
+letra por letra. Para uma loja com um só caminho, <code>Prefix: /</code> é o que você quer; para uma API com
+rotas separadas, cada rota ganha seu <code>Exact</code>.</p>
+
+<dl class="anatomy">
+<dt><code>ingressClassName</code></dt>
+<dd>Qual controller deve atender esta regra. Com mais de um instalado (nginx e outro, por exemplo), é o que
+evita os dois brigarem pela mesma regra. Sem ele, vale a classe padrão do cluster — ou nenhuma.</dd>
+<dt><code>rules[].host</code></dt>
+<dd>O nome que a regra atende. Precisa ser o mesmo que o cliente digita e o mesmo que o certificado cobre;
+um <code>www</code> a mais é o bastante para o cadeado quebrar.</dd>
+<dt><code>paths[].path</code> e <code>pathType</code></dt>
+<dd>O caminho e a forma de casar: <code>Prefix</code> (começa com) ou <code>Exact</code> (é igual).
+<code>pathType</code> é obrigatório desde a <code>networking.k8s.io/v1</code>.</dd>
+<dt><code>backend.service</code></dt>
+<dd>O nome e a porta do Service que recebe o tráfego. Nome errado aqui é 503; porta errada é 503 também, com
+a diferença de que o Service existe e o log do controller reclama do endpoint.</dd>
+</dl>
+
+<h2>6. Passo 3 — o bloco <code>tls</code> e o cadeado</h2>
+
+<p>Falta ligar o cadeado à tabuleta. Isso é feito com o bloco <code>spec.tls</code>: uma lista com
+<code>hosts</code> e <code>secretName</code>. Enquanto ele não existe, o Ingress atende só HTTP; com ele, o
+controller passa a terminar TLS naquele host e a responder HTTPS na 443. É o único passo do projeto em que o
+painel não muda de aparência: ele imprime <code>PORTS</code> como <code>80, 443</code> em qualquer Ingress, com
+ou sem TLS, e quem prova o bloco aqui é o Verificar.</p>
+
+<div class="tryk8s" data-get="ingress" data-goal="campo:Ingress/loja|spec.tls.0.secretName=loja-tls;;campo:Ingress/loja|spec.tls.0.hosts.0=loja.test">
+  <p class="try-task">Acrescente ao <code>spec</code> o bloco <code>tls</code> com o host <code>loja.test</code>
+  e o segredo <code>loja-tls</code>. Rode e clique em Verificar: a tabela fica igual, e a conferência prova
+  <code>spec.tls.0.secretName</code> e <code>spec.tls.0.hosts.0</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: loja-tls
+type: kubernetes.io/tls
+data:
+  tls.crt: Y2VydGlmaWNhZG8tZGEtbG9qYQ==
+  tls.key: Y2hhdmUtcHJpdmFkYS1kYS1sb2ph
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: loja
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+<pre class="out">
+secret/loja-tls created
+ingress.networking.k8s.io/loja created
+
+NAME   CLASS   HOSTS       ADDRESS      PORTS     AGE
+loja   nginx   loja.test   192.0.2.10   80, 443   8m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Secret
+metadata:
+  name: loja-tls
+type: kubernetes.io/tls
+data:
+  tls.crt: Y2VydGlmaWNhZG8tZGEtbG9qYQ==
+  tls.key: Y2hhdmUtcHJpdmFkYS1kYS1sb2ph
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: loja
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - loja.test
+      secretName: loja-tls
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>Vale a honestidade sobre o painel: a tabela é idêntica antes e depois — <code>loja</code>, classe
+<code>nginx</code>, host <code>loja.test</code>, endereço <code>192.0.2.10</code> e <code>PORTS</code>
+<code>80, 443</code> nas duas versões. Num cluster de verdade a coluna acompanha as regras (um Ingress só com
+HTTP mostra <code>80</code>) e o <code>describe</code> ganha a linha <code>TLS</code>. Repare que o host do
+<code>tls</code> repete o host da regra: é essa repetição que diz ao controller “para <code>loja.test</code>,
+apresente o certificado deste Secret”. Se os dois não casarem, o controller pode servir o certificado padrão —
+e o navegador mostra aviso de nome errado mesmo com tudo <code>Running</code>.</p>
+
+<p>Um Ingress pode ter mais de um item em <code>tls</code>, um por conjunto de hosts. Uma loja com
+<code>loja.test</code> e <code>www.loja.test</code> pode usar o mesmo Secret para os dois (se o certificado
+cobrir os dois nomes) ou dois Secrets diferentes. A regra é simples: cada <code>secretName</code> vale para os
+hosts listados no seu item.</p>
+
+<h2>7. O que o painel mostra do roteamento</h2>
+
+<p>Aqui é preciso ser honesto: o painel não tem rede. Ele aceita o Ingress, calcula a tabela do
+<code>kubectl get ingress</code> a partir do manifesto e mostra um endereço de exemplo
+(<code>192.0.2.10</code>, da faixa reservada para documentação), mas não existe tráfego, não existe DNS e não
+existe handshake TLS. O que você prova
+com ele é que a regra está escrita e aceita — que é onde a maioria dos erros mora.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get ingress
+NAME   CLASS   HOSTS      ADDRESS      PORTS     AGE
+loja   nginx   loja.test  192.0.2.10   80, 443   8m
+
+ana@notebook:~$ kubectl describe ingress loja
+Name:             loja
+Namespace:        default
+Address:          192.0.2.10
+Ingress Class:    nginx
+TLS:
+  loja-tls terminates loja.test
+Rules:
+  Host          Path  Backends
+  ----          ----  --------
+  loja.test
+                /     cardapio:80 (10.244.111.241:8080)
+Events:
+  Type    Reason  Age   From                      Message
+  ----    ------  ----  ----                      -------
+  Normal  Sync    21s   nginx-ingress-controller  Scheduled for sync</pre>
+
+<p>A linha <code>loja-tls terminates loja.test</code> é a frase que você quer ler: “este Secret encerra o TLS
+para este host”. As três colunas de <code>Rules</code> são a tabuleta inteira — host, caminho e o backend com o
+IP real do pod entre parênteses. Se o backend aparecer vazio ou o IP não estiver lá, o problema é do Service,
+não do Ingress. A transcrição acima é de um cluster local com o controller nginx instalado.</p>
+
+<p>O que só o cluster mostra, depois do <code>describe</code>, é o pedido de verdade. A transcrição abaixo é do
+mesmo cluster, com o certificado autoassinado do exemplo — o navegador reclamaria da autoridade, o
+<code>curl</code> com <code>-k</code> não:</p>
+
+<pre class="term">ana@notebook:~$ curl -i -k https://loja.test/cardapio
+HTTP/2 200
+content-type: text/html; charset=utf-8
+strict-transport-security: max-age=31536000; includeSubDomains
+content-length: 615
+
+ana@notebook:~$ kubectl describe secret loja-tls
+Name:         loja-tls
+Namespace:    default
+Labels:       &lt;none&gt;
+Annotations:  &lt;none&gt;
+
+Type:  kubernetes.io/tls
+
+Data
+====
+tls.crt:  19 bytes
+tls.key:  21 bytes</pre>
+
+<p>Repare nos tamanhos: 19 e 21 bytes são os valores curtos de exemplo desta página. Um certificado real tem
+entre um e dois mil bytes, e a chave, mais. O que importa é o formato: <code>Type:
+kubernetes.io/tls</code> e as duas chaves com os nomes exatos. É essa combinação que o controller procura antes
+de montar o handshake.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>o que você quer saber</th><th>onde olhar no painel</th><th>onde olhar no cluster</th></tr>
+</thead>
+<tbody>
+<tr><td>a regra foi aceita?</td><td>a tabela do <code>get ingress</code> aparece</td><td><code>kubectl describe
+ingress</code> e os eventos</td></tr>
+<tr><td>o TLS está registrado?</td><td>não mostra: <code>PORTS</code> sai sempre
+<code>80, 443</code></td><td>a linha <code>TLS: … terminates …</code></td></tr>
+<tr><td>o backend tem pods?</td><td>não mostra</td><td>o IP entre parênteses em <code>Backends</code></td></tr>
+<tr><td>o certificado é válido?</td><td>não mostra</td><td><code>openssl s_client</code> ou o
+navegador</td></tr>
+<tr><td>o site responde?</td><td>não mostra: sem rede</td><td><code>curl</code> e os logs do
+controller</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Os cinco erros abaixo se parecem no sintoma e são bem diferentes na causa. A ordem da tabela é a ordem em
+que vale investigar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>sintoma</th><th>causa</th><th>conserto</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pathType: Required value</code></td><td>o campo obrigatório não está no caminho</td><td>
+acrescentar <code>pathType: Prefix</code> (ou <code>Exact</code>)</td></tr>
+<tr><td>404 do controller</td><td>nenhuma regra casa com o host ou o caminho digitado</td><td>conferir
+<code>host</code> e <code>path</code>; <code>www</code> é outro host</td></tr>
+<tr><td>503 Service Temporarily Unavailable</td><td>o <code>backend.service.name</code> não existe ou não tem
+endpoints</td><td><code>kubectl get endpoints</code> e o nome do Service</td></tr>
+<tr><td>aviso de certificado no navegador</td><td>o host do <code>tls</code> não casa com o host da regra, ou
+o certificado não cobre o nome</td><td>alinhar os dois e conferir o <code>CN</code>/SAN do
+certificado</td></tr>
+<tr><td><code>ADDRESS</code> vazio</td><td>não há controller atendendo aquela classe</td><td>instalar o
+controller ou corrigir o <code>ingressClassName</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="cenario">
+<h3>Cenário 1: o cadeado que sumiu na renovação</h3>
+<p>O certificado venceu num domingo. A renovação criou um Secret novo chamado <code>loja-tls-2027</code>, mas o
+Ingress continuava apontando para <code>loja-tls</code>, com o certificado velho. O site seguiu no ar e o
+navegador passou a avisar. O conserto foi atualizar o <code>secretName</code> — e o hábito novo é manter o
+nome do Secret estável e trocar só o conteúdo, para o Ingress não precisar mudar.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o <code>www</code> que ninguém testou</h3>
+<p>A regra atendia <code>loja.test</code>; o <code>tls</code> também. Cliente que digitava
+<code>www.loja.test</code> caía no certificado padrão do controller e via aviso de nome errado. Ninguém
+percebeu porque todo mundo do time testava o endereço sem <code>www</code>. O conserto foi declarar os dois
+hosts na regra e no <code>tls</code>, com um certificado que cobrisse os dois nomes.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o 503 que parecia problema de TLS</h3>
+<p>Depois de instalar o cadeado, o site passou a devolver 503. O time passou a tarde mexendo em certificado —
+e o problema era o <code>backend.service.name</code>, que apontava para <code>cardapio-svc</code>, um Service
+que nunca existiu. O <code>describe ingress</code> mostrava o backend sem IP entre parênteses; ninguém olhou
+essa coluna porque todos olhavam o bloco <code>TLS</code>.</p>
+</div>
+
+<p>O 503 tem uma assinatura própria, e ela aparece em dois comandos. A transcrição abaixo é do cluster da
+Ana no dia do susto:</p>
+
+<pre class="term">ana@notebook:~$ curl -i https://loja.test/cardapio
+HTTP/2 503
+server: nginx
+content-type: text/html
+
+ana@notebook:~$ kubectl get endpoints cardapio
+NAME       ENDPOINTS   AGE
+cardapio   &lt;none&gt;      6m</pre>
+
+<p>O <code>503</code> vem do controller, não da aplicação: ele aceitou a conexão, terminou o TLS e não achou
+para onde mandar o pedido. O <code>ENDPOINTS</code> vazio confirma que o problema está no Service — e, se o
+backend do Ingress apontasse para <code>cardapio-svc</code>, o Service nem seria encontrado com esse nome.</p>
+
+<p>Dos três, o mais instrutivo é o 503: <strong>TLS quebrado dá aviso no navegador; backend quebrado dá 503</strong>.
+São sintomas diferentes e lugares diferentes. Quando o erro é de certificado, a página carrega com aviso; quando
+é de backend, não carrega nada.</p>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>O cadeado na loja da Ana é a soma de três objetos e uma disciplina de nomes. O Secret guarda o par, com
+<code>type: kubernetes.io/tls</code> e as chaves <code>tls.crt</code> e <code>tls.key</code>. O Ingress declara
+host, caminho, <code>pathType</code> e backend. O bloco <code>tls</code> liga um Secret a um host, e é ele que
+faz o controller apresentar o certificado naquele nome.</p>
+
+<p>Para praticar sozinho: (1) acrescente <code>www.loja.test</code> como segunda regra e no
+<code>tls</code>, e veja a coluna <code>HOSTS</code> ganhar os dois nomes; (2) troque o
+<code>backend.service.name</code> por um nome que não existe e observe que o painel aceita — é o 503 que só o
+cluster mostra; (3) mude <code>pathType</code> para <code>Exact</code> em <code>/</code> e pense no que acontece
+com <code>/cardapio</code>.</p>
+
+<p>O que o painel prova e o que ele não prova, para fechar: ele prova o manifesto aceito, o tipo do Secret, o
+<code>pathType</code> obrigatório e o backend apontado. Ele não muda a tabela quando o <code>tls</code> entra, não
+tem rede, não resolve DNS e não faz handshake — então “o site abre com cadeado” é conclusão do seu cluster, com
+controller instalado e DNS apontando para ele. A parte que o painel cobre é justamente a que você escreve; a
+outra é infraestrutura.</p>
+
+<p>Com a loja aberta e o cadeado no lugar, o próximo projeto sai do caminho feliz e entra no dia a dia de quem
+opera: medir, enxergar e reagir. Observabilidade é o assunto seguinte.</p>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual tipo de Secret o controller espera para terminar
+TLS?</p>
+<label><input type="radio" name="q1"> <code>Opaque</code>, com qualquer nome de chave</label>
+<label><input type="radio" name="q1"> <code>kubernetes.io/tls</code>, com <code>tls.crt</code> e
+<code>tls.key</code></label>
+<label><input type="radio" name="q1"> <code>kubernetes.io/dockerconfigjson</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Qual linha do <code>kubectl describe ingress</code> prova
+que o certificado está ligado ao host?</p>
+<label><input type="radio" name="q2"> <code>TLS: loja-tls terminates loja.test</code></label>
+<label><input type="radio" name="q2"> <code>Address: 192.0.2.10</code></label>
+<label><input type="radio" name="q2"> <code>Ingress Class: nginx</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O site devolve 503 depois do Ingress. Onde olhar
+primeiro?</p>
+<label><input type="radio" name="q3"> no <code>backend.service.name</code> e nos endpoints do Service</label>
+<label><input type="radio" name="q3"> no conteúdo do <code>tls.crt</code></label>
+<label><input type="radio" name="q3"> no <code>pathType</code>, que sempre causa 503</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o nome que a regra atende</h2>
+<p>A loja tem duas regras, uma para <code>loja.test</code> e outra para <code>www.loja.test</code>. Complete o
+campo de cada regra que diz qual nome ela atende.</p>
+<div class="ex-code">rules:
+  - <input aria-label="resposta 1" data-answer="host" placeholder="...">: loja.test
+    http:
+      paths:
+        - path: /
+          pathType: Prefix</div>
+<p class="ex-dica">Dica: é o campo que precisa casar com o <code>hosts</code> do bloco <code>tls</code>; sem
+ele, a regra vale para qualquer nome que chegue ao controller.</p>
+</div>
+
+<h2>Resumo</h2>
+
+<p>TLS no Ingress são três objetos e uma coincidência de nomes. O Secret do tipo
+<code>kubernetes.io/tls</code> guarda <code>tls.crt</code> e <code>tls.key</code>, em base64 dentro de
+<code>data</code>. O Ingress declara <code>rules</code> com <code>host</code>, <code>paths</code> com
+<code>path</code> e <code>pathType</code> obrigatório, e <code>backend.service</code> apontando para o Service.
+O bloco <code>tls</code> liga o Secret ao host — e é o host do <code>tls</code> que precisa ser igual ao host da
+regra.</p>
+
+<p>No painel não há mudança visual quando o <code>tls</code> entra: a tabela do <code>get ingress</code> sai
+igual nas duas versões, com <code>PORTS 80, 443</code>. Num cluster, a coluna acompanha as regras e o
+<code>describe</code> (transcrição) mostra a linha <code>TLS: loja-tls terminates loja.test</code> e o IP do pod
+no backend. Quem prova o bloco no painel é o Verificar, não a tabela.</p>
+
+<p>O painel não tem rede: ele não resolve DNS, não faz handshake e não roteia. O que ele prova é a regra
+aceita — o que costuma ser a maior parte dos problemas. 404 é regra que não casa; 503 é backend errado ou sem
+endpoints; aviso de certificado é host fora do <code>tls</code> ou certificado que não cobre o nome;
+<code>ADDRESS</code> vazio é controller ausente.</p>
+
+<p>Para produção, o caminho é não criar o Secret à mão: um controlador como o cert-manager emite e renova, e o
+Ingress só aponta para o nome do Secret. Feito à mão, o hábito que salva é manter o nome do Secret estável e
+acompanhar a data de validade.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>type: kubernetes.io/tls</code> + <code>tls.crt</code> + <code>tls.key</code>: o trio que o
+  controller procura.</li>
+  <li><code>pathType</code> é obrigatório: <code>Prefix</code> para a loja, <code>Exact</code> para rota
+  fechada.</li>
+  <li><code>spec.tls</code> com host igual ao da regra: no cluster, <code>PORTS</code> mostra
+  <code>80, 443</code> e o <code>describe</code> mostra a linha <code>TLS</code>.</li>
+  <li>Painel = regra aceita. Cluster + controller + DNS = site com cadeado.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

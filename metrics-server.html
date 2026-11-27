@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metrics Server | Guia Kubernetes</title>
+<meta name="description" content="De onde vêm os números do kubectl top: o metrics-server como add-on, o scrape do kubelet, o APIService, o que ele não mede e por que o HPA fica cego sem ele.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Metrics <span class="hl">Server</span></h1>
+<p class="intro">A Ana criou um cluster novo, rodou <code>kubectl top pods</code> e recebeu um erro. O comando
+existe, o cluster está de pé, os pods estão rodando — falta uma peça que ninguém instala por padrão: o
+metrics-server. Nesta aula ela entende o que é esse componente, de onde ele tira os números de CPU e memória,
+por que ele se registra como uma API à parte, o que ele não mede e por que o HPA fica cego quando ele falta.
+É a aula que separa “o cluster não tem métricas” de “o cluster tem métricas e eu não sei ler”.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é o metrics-server e por que ele não vem no cluster.</li>
+  <li>De onde vêm os números: kubelet, cgroups e o endpoint de resumo de cada nó.</li>
+  <li>As quatro peças da instalação: Deployment, Service, APIService e RBAC.</li>
+  <li>O que ele guarda — e por que não serve para histórico.</li>
+  <li>O que ele mede e o que não mede, comparado com o Prometheus.</li>
+  <li>Os erros clássicos: <code>Metrics API not available</code>, certificado do kubelet e
+  <code>&lt;unknown&gt;</code>.</li>
+  <li>Quem consome esses números: <code>kubectl top</code>, o HPA e o agendador.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o comando que não existe</h2>
+
+<p>O cluster de teste da Ana foi criado com <code>kind create cluster</code>, e o site subiu. Curiosa, ela
+digitou <code>kubectl top pods</code> para ver quanto de CPU o pod estava usando e recebeu:</p>
+
+<pre class="term">$ kubectl top pods
+error: Metrics API not available</pre>
+
+<p>A primeira interpretação foi “o Kubernetes não tem métricas”. Não é isso. O <code>kubectl top</code> é só
+um cliente: ele pergunta a uma API chamada <code>metrics.k8s.io</code>, e essa API não faz parte do núcleo do
+Kubernetes. Ela é servida por um componente instalado à parte, o <strong>metrics-server</strong>. Sem ele, a
+API não existe, e o kubectl responde exatamente isso — de forma honesta e pouco amigável.</p>
+
+<p>No cluster gerenciado de nuvem, o metrics-server normalmente já vem instalado. No cluster que você cria
+para estudar, não. É por isso que a mesma pessoa tem experiências opostas em dois clusters: o comando é o
+mesmo, o que muda é a peça que responde.</p>
+
+<p>E não é só o <code>top</code> que sofre. O HPA, aquele objeto que aumenta e diminui réplicas conforme a
+carga, lê a mesma API. Num cluster sem metrics-server, o HPA não tem número, não decide nada e mostra
+<code>&lt;unknown&gt;</code> na coluna de alvo. Duas funcionalidades importantes do dia a dia dependem de um
+componente que quase ninguém lembra de instalar.</p>
+
+<h2>2. O que é o metrics-server</h2>
+
+<p>É um programa pequeno, escrito em Go, que roda como um pod do próprio cluster — um Deployment no namespace
+<code>kube-system</code>, com um Service na frente. A cada ciclo ele visita o kubelet de cada nó, pega os
+números de CPU e memória de todos os containers e guarda o resultado em memória. Quando alguém pergunta, ele
+responde no formato de uma API do Kubernetes.</p>
+
+<p>A parte esperta é como ele se encaixa. O Kubernetes tem um mecanismo chamado <strong>agregação de
+API</strong>: o servidor principal pode delegar um caminho de URL para outro serviço. O metrics-server se
+registra como um objeto <code>APIService</code> chamado <code>v1beta1.metrics.k8s.io</code>, e a partir daí
+todo pedido a <code>/apis/metrics.k8s.io/v1beta1</code> é encaminhado para ele. Para o kubectl, é como se as
+métricas fossem parte do cluster.</p>
+
+<dl class="anatomy">
+<dt>metrics-server</dt>
+<dd>O componente que coleta e serve CPU e memória. Roda como Deployment, quase sempre em
+<code>kube-system</code>, com uma réplica (duas para alta disponibilidade).</dd>
+<dt>APIService</dt>
+<dd>O objeto que diz ao servidor principal “esse caminho de API é servido por aquele Service”. É o que faz o
+<code>kubectl top</code> encontrar a resposta.</dd>
+<dt>resumo do kubelet</dt>
+<dd>O endpoint de cada nó que devolve o uso de CPU e memória de todos os containers daquele nó. É a fonte
+primária do metrics-server.</dd>
+<dt>metric-resolution</dt>
+<dd>De quanto em quanto tempo o metrics-server visita os kubelets. Padrão de 60 segundos; baixar aumenta a
+precisão e o custo.</dd>
+<dt>utilization</dt>
+<dd>Uso dividido pelo <code>request</code> do container, em porcentagem. É a unidade que o HPA usa para decidir
+escalar.</dd>
+</dl>
+
+<p>Vale conhecer o manifesto do componente, porque ele é um Deployment comum com argumentos próprios. O
+primeiro deles é a resolução da coleta: com 60 segundos, o número que você vê pode ter até um minuto; com 15,
+acompanha melhor um pico curto.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/metrics-server|spec.template.spec.containers.0.args.0=--metric-resolution=15s;;texto:deployment.apps/metrics-server created" data-get="deployments">
+  <p class="try-task">O Deployment do metrics-server coleta a cada 60 segundos. Troque a resolução para
+  <code>15s</code> e rode. (No painel ele fica no namespace <code>default</code>; num cluster real mora em
+  <code>kube-system</code>.)</p>
+<pre class="yaml" data-file="metrics-server.yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metrics-server
+  template:
+    metadata:
+      labels:
+        app: metrics-server
+    spec:
+      containers:
+        - name: metrics-server
+          image: registry.k8s.io/metrics-server/metrics-server:v0.7.2
+          args:
+            - --metric-resolution=60s
+            - --kubelet-insecure-tls
+          ports:
+            - containerPort: 10250</pre>
+<pre class="out">
+deployment.apps/metrics-server created
+
+NAME             READY   UP-TO-DATE   AVAILABLE   AGE
+metrics-server   1/1     1            1           8m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metrics-server
+  template:
+    metadata:
+      labels:
+        app: metrics-server
+    spec:
+      containers:
+        - name: metrics-server
+          image: registry.k8s.io/metrics-server/metrics-server:v0.7.2
+          args:
+            - --metric-resolution=15s
+            - --kubelet-insecure-tls
+          ports:
+            - containerPort: 10250</pre>
+</div>
+
+<p>O argumento <code>--kubelet-insecure-tls</code> aparece em quase todo tutorial de cluster local, e por um
+motivo específico: o kubelet se apresenta com um certificado autoassinado, e o metrics-server, sendo rigoroso,
+recusa. Em produção, a resposta certa é configurar o certificado do kubelet, não desligar a verificação. Em
+cluster de estudo, o argumento economiza uma tarde.</p>
+
+<h2>3. De onde vêm os números</h2>
+
+<p>O metrics-server não inventa nada e não tem agente próprio. Ele pergunta ao kubelet, que já sabe. Cada nó
+roda um kubelet, e cada kubelet tem acesso ao <em>cgroup</em> de cada container — o mecanismo do Linux que
+contabiliza CPU e memória por grupo de processos. O kubelet expõe isso num endpoint de resumo, e o
+metrics-server só organiza.</p>
+
+<p>O caminho completo é: o container queima CPU, o cgroup conta, o kubelet resume, o metrics-server visita
+cada nó e soma, a API responde, o <code>kubectl top</code> desenha a tabela. Quando alguém pergunta “de onde
+vem esse número?”, a resposta é <code>cgroup</code> — e é por isso que ele é confiável para consumo e não para
+faturamento: é uma leitura instantânea, não uma média acumulada.</p>
+
+<p>Duas consequências práticas. A primeira: o número é do último ciclo. Se o pico aconteceu entre duas visitas,
+ele pode não aparecer. A segunda: a memória reportada é a memória de trabalho do processo naquele instante —
+não inclui cache de disco do nó e não é “quanto o pod já consumiu no total”.</p>
+
+<p>O metrics-server também não guarda série histórica: ele mantém os últimos valores em memória para
+responder, e pronto. Reiniciou o componente, começa do zero. Quem precisa de gráfico, de média de uma hora ou
+de comparação entre semanas não usa ele — usa Prometheus, que é o assunto de uma aula adiante.</p>
+
+<h2>4. As peças da instalação</h2>
+
+<p>Instalar o metrics-server não é aplicar um Deployment e pronto. São quatro peças, e cada uma resolve um
+problema diferente. O Deployment roda o programa. O Service dá a ele um endereço estável dentro do cluster. O
+APIService diz ao servidor principal para encaminhar as requisições para esse Service. E o RBAC dá ao
+componente permissão para ler os nós e os pods.</p>
+
+<p>A peça que mais quebra silenciosamente é o Service. O metrics-server usa um Service seletor para achar o
+pod, exatamente como qualquer aplicação. Se o seletor não casa com as etiquetas do Deployment, o Service existe
+e não tem endpoint — e o APIService, que aponta para ele, responde 503. O sintoma para você é
+<code>error: Metrics API not available</code>, mesmo com o pod do metrics-server rodando e saudável.</p>
+
+<div class="tryk8s" data-goal="campo:Service/metrics-server|spec.selector.app=metrics-server;;texto:service/metrics-server created" data-get="services">
+  <p class="try-task">O Service procura <code>app: metrics</code> e o Deployment do metrics-server tem a
+  etiqueta <code>app: metrics-server</code>. Faça o seletor casar e rode.</p>
+<pre class="yaml" data-file="metrics-service.yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-server
+spec:
+  selector:
+    app: metrics
+  ports:
+    - port: 443
+      targetPort: 10250</pre>
+<pre class="out">
+service/metrics-server created
+
+NAME             TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+metrics-server   ClusterIP   10.96.185.194   &lt;none&gt;        443/TCP   8m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-server
+spec:
+  selector:
+    app: metrics-server
+  ports:
+    - port: 443
+      targetPort: 10250</pre>
+</div>
+
+<p>Repare nas portas: o Service escuta em 443 e manda para 10250, que é a porta segura em que o metrics-server
+responde. Trocar uma das duas produz o mesmo 503 e a mesma mensagem no kubectl — por isso, quando o
+<code>top</code> falha, a ordem de conferência é Service, endpoints, pod, APIService.</p>
+
+<p>A quarta peça é o RBAC. O componente precisa listar nós e pods e ler as estatísticas de cada um; sem
+permissão, ele autentica, recebe <code>Forbidden</code> e não monta nada. O manifesto de referência do projeto
+traz uma ClusterRole <code>system:metrics-server</code> e um ClusterRoleBinding ligando essa role ao
+ServiceAccount do componente. Se o binding falta, o pod fica em <code>Running</code> e a API não responde.</p>
+
+<div class="tryk8s" data-goal="campo:ClusterRoleBinding/metrics-server|roleRef.name=system:metrics-server;;texto:clusterrolebinding.rbac.authorization.k8s.io/metrics-server created" data-get="clusterrolebindings">
+  <p class="try-task">O ClusterRoleBinding aponta para a role <code>system:metrics</code>, que não é a certa.
+  Corrija para <code>system:metrics-server</code> e rode.</p>
+<pre class="yaml" data-file="metrics-rbac.yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metrics-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:metrics
+subjects:
+  - kind: ServiceAccount
+    name: metrics-server
+    namespace: kube-system</pre>
+<pre class="out">
+clusterrolebinding.rbac.authorization.k8s.io/metrics-server created
+
+NAME             AGE
+metrics-server   7m
+</pre>
+<pre class="solucao">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metrics-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:metrics-server
+subjects:
+  - kind: ServiceAccount
+    name: metrics-server
+    namespace: kube-system</pre>
+</div>
+
+<p>Com as quatro peças no lugar, o teste é sempre o mesmo: <code>kubectl top nodes</code>. Se os nós aparecem,
+a coleta funciona; se o comando responde erro de API, o problema está na instalação, não nos pods. E vale
+lembrar que o painel deste guia não roda container nem tem a camada de agregação: ele guarda os objetos e
+mostra a resposta do kubectl para eles, mas o <code>top</code> continua indisponível aqui — como num cluster
+sem o componente.</p>
+
+<h2>5. O que ele guarda (e por quanto tempo)</h2>
+
+<p>Quase nada. O metrics-server mantém em memória o último valor de cada pod e de cada nó, e responde a partir
+disso. Não há banco, não há arquivo, não há série temporal. Se você perguntar “quanto este pod usou ontem às
+três da tarde?”, a resposta honesta é que ninguém sabe — aquele número existiu por um instante e foi
+substituído.</p>
+
+<p>É por isso que ele é barato e é por isso que ele é limitado. Um componente que guarda tudo precisaria de
+disco, de compactação e de política de retenção; o metrics-server escolheu não ter nada disso e servir uma
+necessidade específica: decisão rápida com o número de agora. O HPA precisa exatamente disso, a cada quinze
+segundos.</p>
+
+<p>A resolução é o único ajuste de retenção que existe. Com 60 segundos, você tem 60 números por hora, mas só
+o último disponível. Com 15, o número é mais fresco e a coleta custa quatro vezes mais chamadas aos kubelets.
+Em cluster grande, baixar a resolução demais vira carga nos kubelets e no próprio componente.</p>
+
+<p>Existe ainda um detalhe de agregação: o metrics-server soma os containers do pod para dar o total do pod, e
+mantém o detalhe por container. É por isso que <code>kubectl top pod cardapio</code> mostra o total e
+<code>kubectl top pod cardapio --containers</code> mostra linha por container. Em pod com sidecar, a diferença
+importa: o total inclui o proxies e os agentes ao lado.</p>
+
+<h2>6. O que ele mede e o que não mede</h2>
+
+<p>CPU e memória. Só. Ele não sabe quantas requisições o site recebeu, quanto tempo cada uma levou, quantas
+falharam, quantas conexões estão abertas, quanto de disco foi lido. Essas perguntas são de outra família de
+ferramenta, e é aí que entra o Prometheus.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>metrics-server</th><th>Prometheus</th></tr>
+</thead>
+<tbody>
+<tr><td>quanta CPU e memória agora?</td><td>sim</td><td>sim</td></tr>
+<tr><td>quantas requisições por segundo?</td><td>não</td><td>sim, se a aplicação expõe</td></tr>
+<tr><td>qual a latência do 95%?</td><td>não</td><td>sim, com histograma</td></tr>
+<tr><td>como estava há três dias?</td><td>não guarda</td><td>sim, até a retenção configurada</td></tr>
+<tr><td>alimenta o HPA?</td><td>sim, métricas de recurso</td><td>sim, via adaptador</td></tr>
+<tr><td>custo de operação</td><td>um pod</td><td>servidor, banco, coleta e regras</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Há uma confusão comum que vale desfazer: <code>kubectl describe node</code> mostra uma seção de recursos
+alocados, com porcentagens. Aquele número não vem do metrics-server: vem dos <code>requests</code> declarados
+nos pods, somados pelo próprio agendador. É a reserva, não o consumo. Um nó pode estar com 90% de CPU alocada e
+10% de uso real — ou o contrário.</p>
+
+<p>O <code>top</code> mostra consumo; o <code>describe node</code> mostra reserva; o HPA compara um com o outro.
+Entender os três evita a conclusão errada de que “o cluster está cheio” quando só está reservado.</p>
+
+<h2>7. Quando não funciona</h2>
+
+<p>Os erros do metrics-server são poucos e cada um aponta para uma peça diferente. O mais comum é o do começo
+desta aula: <code>error: Metrics API not available</code>, que significa APIService ausente ou sem resposta.
+Logo depois vem <code>error: metrics not available yet</code>, que aparece nos primeiros minutos após instalar —
+o componente ainda não completou o primeiro ciclo de coleta.</p>
+
+<p>Num cluster local, o campeão é o certificado do kubelet. A mensagem aparece nos logs do pod do
+metrics-server, não no kubectl: <code>x509: cannot validate certificate for 192.0.2.10 because it doesn't
+contain any IP SANs</code>. É o kubelet se apresentando com um certificado que não cobre o endereço, e a
+solução de estudo é o <code>--kubelet-insecure-tls</code>.</p>
+
+<p>O terceiro grupo é o HPA reclamando. Com métricas de recurso, o HPA precisa do <code>request</code> de CPU
+do container para transformar consumo em porcentagem. Sem request, não há divisão, e o alvo fica
+<code>&lt;unknown&gt;</code>. A transcrição abaixo é de um cluster real com esse problema:</p>
+
+<pre class="term">$ kubectl get hpa cardapio
+NAME       REFERENCE             TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+cardapio   Deployment/cardapio   &lt;unknown&gt;/60%   1         4         1          5m
+
+$ kubectl describe hpa cardapio
+Events:
+  Type     Reason                        Age   Message
+  Warning  FailedGetResourceMetric       30s   failed to get cpu utilization: missing request for cpu</pre>
+
+<p>“missing request for cpu” é literal: falta o pedido de CPU. Não adianta reinstalar o metrics-server nem
+aumentar a resolução; o problema está no manifesto da aplicação. A outra metade dos casos de
+<code>&lt;unknown&gt;</code> é a aplicação sem metrics-server — mesma tela, causa oposta, e o caminho de
+diagnóstico é sempre começar pelo <code>kubectl top</code>: se ele funciona, o componente está bem e o problema
+é o request.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>Onde aparece</th><th>Causa provável</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Metrics API not available</code></td><td>kubectl top e HPA</td><td>APIService ausente, Service sem
+endpoint ou componente fora do ar</td></tr>
+<tr><td><code>metrics not available yet</code></td><td>kubectl top</td><td>primeiros minutos após
+instalar</td></tr>
+<tr><td><code>x509: cannot validate certificate</code></td><td>logs do metrics-server</td><td>certificado do
+kubelet não cobre o endereço</td></tr>
+<tr><td><code>the server is currently unable to handle the request</code></td><td>kubectl top</td><td>Service
+sem endpoints ou pod não pronto</td></tr>
+<tr><td><code>missing request for cpu</code></td><td>eventos do HPA</td><td>container sem
+<code>resources.requests.cpu</code></td></tr>
+<tr><td><code>&lt;unknown&gt;</code> em um pod só</td><td>kubectl top</td><td>pod recém-criado: ainda não
+entrou no ciclo</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um detalhe de leitura: <code>kubectl top pod</code> mostra <code>&lt;unknown&gt;</code> quando o pod é novo
+demais para ter sido coletado. Não é erro de instalação; é o ciclo ainda não ter passado por ele. Esperar um
+minuto resolve — e é mais um lembrete de que os números são amostras, não fluxo contínuo.</p>
+
+<h2>8. Quem consome esses números</h2>
+
+<p>Três consumidores importam. O primeiro é você, no terminal, com <code>kubectl top</code>: a tabela mostra
+CPU em milicores e memória em mebibytes, e aceita <code>--sort-by=cpu</code>,
+<code>--sort-by=memory</code>, <code>-l</code> para filtrar por etiqueta e <code>--containers</code> para
+abrir por container.</p>
+
+<pre class="term">$ kubectl top pods
+NAME                        CPU(cores)   MEMORY(bytes)
+cardapio-6d8f89b786-88dn9   12m          48Mi
+cardapio-6d8f89b786-4jjxx   9m           51Mi
+forno-7b9c4f5d8-2xkqp       3m           22Mi</pre>
+
+<p>O segundo é o HPA, que fala com a mesma API a cada quinze segundos e transforma consumo em porcentagem do
+request. O terceiro é o agendador, mas de forma indireta: ele não usa o metrics-server, e sim os requests, para
+decidir onde cabe cada pod. Os três olham para números diferentes do mesmo container — consumo, consumo sobre
+reserva e reserva.</p>
+
+<p>Por isso a frase “o nó está com 95%” precisa de contexto. Se for <code>top nodes</code>, é consumo real
+agora; se for <code>describe node</code>, é reserva comprometida. Um cluster com reserva alta e consumo baixo
+está superdimensionado; um com consumo alto e reserva baixa está a um pico de distância do
+<code>OOMKilled</code>.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o cluster novo sem top</h3>
+<p>A Ana recriou o cluster de estudo e perdeu o <code>top</code>. O metrics-server era um add-on instalado à
+mão na primeira vez e ninguém versionou o manifesto. O conserto foi guardar os quatro objetos num arquivo no
+repositório e aplicá-los junto com o resto do ambiente. Add-on sem manifesto versionado é add-on que some no
+próximo cluster.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o HPA que nunca escalou</h3>
+<p>O HPA existia, o metrics-server também, e mesmo assim a coluna de alvo ficava em <code>&lt;unknown&gt;</code>.
+O evento dizia <code>missing request for cpu</code>: o Deployment não declarava requests. O time passou a
+tratar <code>requests</code> como parte do contrato de deploy, e o HPA passou a funcionar. Sem request não há
+porcentagem, por mais precisa que seja a medição.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o número que sumia</h3>
+<p>O time queria provar que o pod usava pouca CPU ao longo do dia, e o <code>top</code> só mostrava o
+instantâneo. Tentaram baixar a resolução para 5 segundos, o que só deixou a amostra mais fresca — não criou
+histórico. A conclusão foi instalar Prometheus para as séries e manter o metrics-server só para o HPA e para a
+olhada rápida. Cada ferramenta no seu papel.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. De onde o metrics-server tira os números de CPU e
+memória?</p>
+<label><input type="radio" name="q1"> do etcd, que guarda o consumo de cada pod</label>
+<label><input type="radio" name="q1"> do servidor de logs do cluster</label>
+<label><input type="radio" name="q1"> do resumo que cada kubelet expõe, alimentado pelos cgroups</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">2. O que o APIService faz?</p>
+<label><input type="radio" name="q2"> cria o Service do metrics-server automaticamente</label>
+<label><input type="radio" name="q2"> diz ao servidor principal para encaminhar um caminho de API para o
+Service do componente</label>
+<label><input type="radio" name="q2"> guarda o histórico das métricas no etcd</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que o HPA mostra <code>&lt;unknown&gt;/60%</code> com
+o metrics-server funcionando?</p>
+<label><input type="radio" name="q3"> porque o container não declara <code>requests.cpu</code>, e sem
+denominador não há porcentagem</label>
+<label><input type="radio" name="q3"> porque o HPA só aceita métricas de memória</label>
+<label><input type="radio" name="q3"> porque o metrics-server guarda apenas um dia de dados</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a resolução da coleta</h2>
+<p>Você quer que o metrics-server colete a cada 15 segundos. Complete o argumento do container:</p>
+<div class="ex-code">args:
+  - --metric-resolution=<input aria-label="resposta 1" data-answer="15s" placeholder="..."></div>
+<p class="ex-dica">Dica: duração em segundos com sufixo <code>s</code>. O padrão é <code>60s</code>; baixar
+deixa o número mais fresco e aumenta a carga nos kubelets.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O metrics-server é um add-on, não parte do núcleo: sem ele, <code>kubectl top</code> responde
+<code>Metrics API not available</code> e o HPA fica sem número. Ele roda como Deployment em
+<code>kube-system</code>, com Service, APIService e RBAC, e se registra na API agregada como
+<code>v1beta1.metrics.k8s.io</code>.</p>
+
+<p>Os números vêm do resumo que cada kubelet expõe, alimentado pelos cgroups: CPU e memória, por container e
+por nó, amostrados a cada <code>metric-resolution</code> (60 segundos por padrão). Ele guarda só o último
+valor — para histórico, Prometheus. O HPA transforma consumo em porcentagem dividindo pelo
+<code>request</code>, e sem request a conta não existe.</p>
+
+<p>Quando o <code>top</code> falha, a ordem de conferência é Service, endpoints, pod, APIService, RBAC. Quando
+o <code>&lt;unknown&gt;</code> aparece só no HPA, o problema é o manifesto da aplicação. A próxima aula sai do
+número e vai para o texto: os logs, que começam por pod e terminam num sistema de agregação.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Sem metrics-server não há <code>kubectl top</code> nem métrica de recurso para o HPA.</li>
+  <li>Quatro peças: Deployment, Service, APIService e RBAC.</li>
+  <li>Fonte dos números: resumo do kubelet, alimentado pelos cgroups de cada container.</li>
+  <li><code>--metric-resolution</code> padrão de 60s; baixar custa mais coleta.</li>
+  <li>Ele guarda só o último valor: não é ferramenta de histórico.</li>
+  <li>Mede CPU e memória; não mede latência, erros nem requisições.</li>
+  <li><code>&lt;unknown&gt;</code> no HPA costuma ser falta de <code>requests.cpu</code>.</li>
+  <li><code>describe node</code> mostra reserva (requests), não consumo.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

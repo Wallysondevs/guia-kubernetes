@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Services e Ingress | Guia Kubernetes</title>
+<meta name="description" content="Consulta de Services e Ingress: ClusterIP, NodePort, LoadBalancer e ExternalName, a diferença entre port e targetPort, e os campos de regra do Ingress.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Services e <span class="hl">Ingress</span></h1>
+<p class="intro">O site da padaria da Ana tem dois endereços: um de dentro do cluster, para o cardápio
+conversar com o banco, e um de fora, para o cliente abrir <code>loja.test</code> no celular. O primeiro é um
+<strong>Service</strong>; o segundo é um <strong>Ingress</strong> em cima de um Service. Esta página é a
+consulta dos dois: os quatro tipos de Service, a diferença entre <code>port</code> e
+<code>targetPort</code> que derruba qualquer iniciante, e os campos de uma regra de Ingress.</p>
+
+<div class="note">
+<strong>Como usar esta página</strong>
+<ul>
+  <li>A tabela 1 é por tipo de Service; a tabela 2, pelos campos do Ingress.</li>
+  <li>A seção 5 é a das quatro portas: leia antes de culpar o Service.</li>
+  <li>Rede no painel é modelo: o manifesto é validado, mas não há tráfego de verdade — a seção 7 diz o
+  que isso muda.</li>
+</ul>
+</div>
+
+<h2>1. Para que serve esta página (e o que ela não cobre)</h2>
+
+<p>Esta é a folha de consulta de quem expõe. Ela responde “qual é o tipo certo para o meu caso?”, “por que
+o Service não acha os pods?” e “o que é <code>pathType</code>?”. Também traduz as mensagens de validação dos
+dois objetos, que falam de <code>selector</code>, <code>ports</code>, <code>targetPort</code> e
+<code>pathType</code>.</p>
+
+<p>Ela não substitui as aulas: <a href="service-clusterip.html">Service ClusterIP</a> conta a história do
+endereço estável; <a href="service-nodeport.html">Service NodePort</a> e
+<a href="service-loadbalancer.html">Service LoadBalancer</a> mostram os outros dois tipos;
+<a href="endpoints.html">Endpoints</a> explica o que fica atrás do Service; e
+<a href="ingress.html">Ingress</a> é a aula completa do roteamento. Para a anatomia das portas, a referência
+é <a href="portas-e-protocolos.html">Portas e protocolos</a>.</p>
+
+<p>Há uma imagem que organiza tudo nesta página: uma corrente de três elos. O primeiro é o
+<strong>Service</strong>, que transforma um conjunto instável de pods num endereço estável. O segundo são os
+<strong>Endpoints</strong>, a lista de IPs e portas que o Service mantém atualizada. O terceiro é o
+<strong>Ingress</strong>, que dá nome e caminho ao Service. Quando algo não responde, o elo quebrado está
+em um desses três — e cada um tem um comando de leitura.</p>
+
+<p>Uma coisa que vale dizer de saída: Service e Ingress resolvem problemas diferentes. O Service dá
+<em>um endereço estável</em> para um conjunto de pods que nascem e morrem. O Ingress dá <em>um nome e um
+caminho</em> para um Service. Sem Service, o Ingress não tem para onde apontar; sem Ingress, o Service só é
+alcançável de dentro do cluster (ou por uma porta alta do nó).</p>
+
+<h2>2. O essencial em 10 linhas</h2>
+
+<ul>
+  <li>Service escolhe pods por <code>selector</code> e dá a eles um IP fixo e um nome DNS.</li>
+  <li><code>port</code> é a porta do Service; <code>targetPort</code> é a porta do container.</li>
+  <li>Sem <code>targetPort</code>, o valor de <code>port</code> é usado — e é aí que nasce a maioria dos
+  erros.</li>
+  <li><code>ClusterIP</code> é o padrão: só de dentro do cluster.</li>
+  <li><code>NodePort</code> abre uma porta entre 30000 e 32767 em todos os nós.</li>
+  <li><code>LoadBalancer</code> pede um IP ao provedor e inclui um NodePort por baixo.</li>
+  <li><code>ExternalName</code> é só um apelido DNS; não tem seletor nem porta.</li>
+  <li>Ingress roteia HTTP por host e caminho, e o destino é sempre um Service.</li>
+  <li><code>pathType</code> é obrigatório: <code>Prefix</code>, <code>Exact</code> ou
+  <code>ImplementationSpecific</code>.</li>
+  <li>Sem controller de Ingress instalado, o objeto existe e não roteia nada.</li>
+</ul>
+
+<p>A terceira linha é a que mais custa tempo. O Service tem duas portas e elas não precisam ser iguais: o
+cliente bate na <code>port</code> (digamos, 80) e o Service entrega na <code>targetPort</code> do container
+(digamos, 8080). Se você omitir <code>targetPort</code>, o Kubernetes assume que é a mesma da
+<code>port</code> — e um container que escuta em 8080 nunca recebe o tráfego. O sintoma é traiçoeiro: o
+Service existe, os endpoints existem, e a conexão dá <em>timeout</em>.</p>
+
+<p>Sobre o nome: todo Service ganha um DNS interno no formato
+<code>nome.namespace.svc.cluster.local</code>, e dentro do mesmo namespace basta o <code>nome</code>. É
+esse nome que o site da Ana usa para falar com o banco: <code>postgres:5432</code>, em vez de um IP que
+muda. O IP do Service é estável enquanto o objeto existir; os IPs dos pods atrás dele mudam o tempo todo,
+e é justamente por isso que ninguém deveria falar com eles diretamente.</p>
+
+<p>A última linha também merece atenção. O Ingress é só a <em>regra</em>: quem escuta na porta 80 do mundo
+é um programa chamado controller (nginx, Traefik, o do provedor). Sem ele, o objeto fica na API como
+documentação — e num cluster local, sem rede de verdade, é exatamente isso que você vê.</p>
+
+<h2>3. Anatomia de um Service</h2>
+
+<dl class="anatomy">
+<dt>selector</dt>
+<dd>As etiquetas que escolhem os pods. Vazio, o Service não escolhe ninguém — e você precisa criar os
+Endpoints na mão.</dd>
+<dt>ports.port</dt>
+<dd>A porta que o Service escuta, de dentro do cluster. É o número que aparece no DNS:
+<code>cardapio:80</code>.</dd>
+<dt>ports.targetPort</dt>
+<dd>A porta do container que recebe o tráfego. Pode ser número ou o nome de uma porta declarada no
+pod.</dd>
+<dt>type</dt>
+<dd><code>ClusterIP</code> (padrão), <code>NodePort</code>, <code>LoadBalancer</code> ou
+<code>ExternalName</code>. Muda quem consegue alcançar o Service.</dd>
+<dt>ports.nodePort</dt>
+<dd>Só em <code>NodePort</code> e <code>LoadBalancer</code>: a porta entre 30000 e 32767 aberta em cada nó.
+Omitida, o controlador escolhe uma.</dd>
+<dt>sessionAffinity</dt>
+<dd><code>None</code> (padrão) distribui por conexão; <code>ClientIP</code> mantém o mesmo cliente no mesmo
+pod por um tempo.</dd>
+</dl>
+
+<p>Uma coisa que o nome do campo esconde: <code>targetPort</code> aceita texto. Se você declarar no
+container uma porta com <code>name: http</code>, pode escrever <code>targetPort: http</code> no Service — e
+o encaminhamento continua certo mesmo que o número mude. É o tipo de detalhe que parece cosmeticamente
+melhor e que, num cluster com dezenas de Services, evita uma classe inteira de erro de digitação.</p>
+
+<p>Fora do <code>spec</code>, mas dentro do objeto, há duas coisas que você vai ver no <code>describe</code>:
+o <code>clusterIP</code> (o IP virtual, escolhido pelo controlador) e o objeto <strong>Endpoints</strong> de
+mesmo nome, que lista os IPs dos pods prontos. O Service não fala com pods diretamente: quem faz isso é o
+<code>kube-proxy</code>, que programa as regras de rede em cada nó a partir dessa lista.</p>
+
+<h2>4. Os quatro tipos e os campos do Ingress</h2>
+
+<p>Primeiro o Service. A pergunta que decide o tipo é “quem precisa alcançar isto?”. A resposta muda o
+custo: cada degrau acima do ClusterIP envolve mais infraestrutura.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tipo</th><th>Quem alcança</th><th>Como se expõe</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ClusterIP</code></td><td>só de dentro do cluster</td><td>IP virtual e DNS
+interno</td><td>comunicação entre serviços</td></tr>
+<tr><td><code>NodePort</code></td><td>quem alcança qualquer nó pela porta alta</td><td><code>nodePort</code>
+entre 30000 e 32767</td><td>teste local e acesso sem balanceador</td></tr>
+<tr><td><code>LoadBalancer</code></td><td>a internet, pelo IP do provedor</td><td>pede um IP ao provedor e
+inclui NodePort</td><td>serviço público em nuvem</td></tr>
+<tr><td><code>ExternalName</code></td><td>quem está dentro do cluster, via CNAME</td><td>apelido para um
+nome externo</td><td>apontar para um banco fora do cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Agora o Ingress. Ele não substitui o Service: ele decide <em>qual</em> Service recebe cada combinação de
+host e caminho. A tabela lista os campos de uma regra, na ordem em que aparecem no manifesto.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo do Ingress</th><th>O que faz</th><th>Exemplo</th><th>Obrigatório?</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ingressClassName</code></td><td>qual controller atende esta regra</td><td><code>nginx</code></td><td>depende
+do cluster</td></tr>
+<tr><td><code>rules[].host</code></td><td>o nome que o cliente digita</td><td><code>loja.test</code></td><td>não;
+vazio pega qualquer host</td></tr>
+<tr><td><code>rules[].http.paths[].path</code></td><td>o caminho dentro do host</td><td><code>/cardapio</code></td><td>sim</td></tr>
+<tr><td><code>rules[].http.paths[].pathType</code></td><td>como comparar o caminho</td><td><code>Prefix</code></td><td>sim</td></tr>
+<tr><td><code>backend.service.name</code></td><td>o Service de destino</td><td><code>cardapio</code></td><td>sim</td></tr>
+<tr><td><code>backend.service.port.number</code></td><td>a porta do Service</td><td><code>80</code></td><td>sim, ou
+<code>port.name</code></td></tr>
+<tr><td><code>tls[]</code></td><td>o certificado e o host HTTPS</td><td><code>secretName:
+loja-tls</code></td><td>não</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Quando o assunto é expor para fora, a escolha entre <code>NodePort</code> e
+<code>LoadBalancer</code> costuma ser uma decisão de ambiente, não de gosto. Num cluster local
+(<code>kind</code>, <code>minikube</code>), não existe provedor para dar IP público: o
+<code>LoadBalancer</code> fica com <code>EXTERNAL-IP &lt;pending&gt;</code> para sempre, e o caminho prático
+é <code>NodePort</code> com <code>kubectl port-forward</code> para testar do notebook. Em nuvem, o
+<code>LoadBalancer</code> é o caminho normal, e cada Service desse tipo costuma custar um balanceador na
+fatura.</p>
+
+<p>Repare que a porta do backend é a porta do <em>Service</em>, não a do container. É o erro de leitura mais
+comum: quem escreve <code>8080</code> no Ingress está apontando para uma porta que o Service talvez não
+escute — e o 404 aparece no cliente sem nenhum erro no cluster. A regra é: Ingress → <code>port</code> do
+Service → <code>targetPort</code> do container. Três números, três donos.</p>
+
+<h2>5. Os campos que mais confundem</h2>
+
+<p>Existem quatro portas no caminho entre o cliente e o container, e cada uma tem um dono. Confundir duas
+delas é a causa número um de “o Service não funciona”.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Porta</th><th>Onde vive</th><th>Quem usa</th><th>Exemplo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nodePort</code></td><td>no Service (tipo NodePort/LoadBalancer)</td><td>quem está fora, batendo no
+IP do nó</td><td><code>30080</code></td></tr>
+<tr><td><code>port</code></td><td>no Service</td><td>quem está dentro do cluster, pelo DNS</td><td><code>80</code></td></tr>
+<tr><td><code>targetPort</code></td><td>no Service, apontando para o pod</td><td>o <code>kube-proxy</code>, ao
+encaminhar</td><td><code>8080</code></td></tr>
+<tr><td><code>containerPort</code></td><td>no pod (informativa)</td><td>ninguém em termos de
+roteamento</td><td><code>8080</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Outras quatro confusões que aparecem no mesmo dia:</p>
+
+<p><strong>Porta com nome.</strong> Em vez de <code>targetPort: 8080</code>, você pode escrever
+<code>targetPort: http</code> e declarar <code>name: http</code> na porta do container. Parece detalhe e é
+resiliência: se o programa mudar de 8080 para 9090, basta mudar o número no pod, e o Service continua
+certo. O mesmo nome serve para o Ingress escolher a porta do Service com
+<code>backend.service.port.name</code>.</p>
+
+<p><strong>Service sem <code>selector</code>.</strong> É permitido e significa “eu não escolho pods; alguém
+vai criar os Endpoints para mim”. Serve para apontar para um serviço fora do cluster ou para um banco
+gerenciado. Sem seletor e sem Endpoints, o Service existe e não entrega nada.</p>
+
+<p><strong><code>ExternalName</code> com <code>selector</code>.</strong> Não existe: esse tipo é um CNAME,
+não um balanceador. Ele também não aceita <code>ports</code> — quem resolve a porta é o destino.</p>
+
+<p><strong>Endpoints vazio.</strong> Não é um erro do Service: é o retrato de um seletor que não casa com
+pods prontos. As causas vão de etiqueta digitada errada a pods que existem mas não passam na verificação de
+prontidão — e o <code>describe</code> do Service não distingue as duas. Quem distingue é o
+<code>get pods</code> com <code>-l</code>, na mesma etiqueta do seletor.</p>
+
+<p><strong>Headless (<code>clusterIP: None</code>).</strong> O Service deixa de ter IP virtual e o DNS passa
+a devolver os IPs dos pods. É o que StatefulSet usa para dar nome estável a cada réplica. Não é um
+<code>type</code>: é um valor no <code>clusterIP</code>.</p>
+
+<p><strong><code>pathType</code> ausente.</strong> A API recusa o Ingress inteiro. E o valor importa:
+<code>Prefix</code> casa <code>/cardapio</code> e <code>/cardapio/precos</code>; <code>Exact</code> só o
+primeiro; <code>ImplementationSpecific</code> deixa a decisão para o controller, o que costuma ser a fonte
+de comportamento diferente entre ambientes.</p>
+
+<h2>6. Erros e mensagens</h2>
+
+<p>As mensagens dos dois objetos são curtas e apontam o campo. A tabela reúne as que você vai encontrar
+montando o caminho do cliente até o container.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>O que significa</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>spec.ports: Required value</code></td><td>o Service não declara
+porta</td><td>acrescente <code>ports</code> com <code>port</code></td></tr>
+<tr><td><code>spec.ports[0].port: Required value</code></td><td>a porta veio sem
+número</td><td>escreva <code>port: 80</code></td></tr>
+<tr><td><code>spec.ports[0].nodePort: Invalid value: 8080</code></td><td>fora da faixa
+permitida</td><td>use de 30000 a 32767</td></tr>
+<tr><td><code>spec.ports[0].name: Required value</code></td><td>há mais de uma porta e nenhuma tem
+nome</td><td>dê um <code>name</code> a cada porta</td></tr>
+<tr><td><code>spec.type: Unsupported value: "ClusterIp"</code></td><td>maiúscula no meio</td><td>use
+<code>ClusterIP</code></td></tr>
+<tr><td><code>spec.clusterIP: Invalid value: ""</code></td><td>sem seletor e sem clusterIP</td><td>acrescente
+o <code>selector</code> ou um <code>clusterIP</code> explícito</td></tr>
+<tr><td><code>spec.rules[0].http.paths[0].pathType: Required value</code></td><td>falta o
+<code>pathType</code></td><td>use <code>Prefix</code>, <code>Exact</code> ou
+<code>ImplementationSpecific</code></td></tr>
+<tr><td><code>spec.rules[0].http.paths[0].backend.service: Required value</code></td><td>a regra não diz para onde
+ir</td><td>acrescente <code>backend.service.name</code> e a porta</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Num cluster de verdade, a leitura do caminho começa pelo Service e pelos Endpoints. A transcrição abaixo
+mostra os três comandos na ordem em que se investiga:</p>
+
+<pre class="term">$ kubectl get services
+NAME       TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   10.96.147.79    &lt;none&gt;        80/TCP    3d
+
+$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                         AGE
+cardapio   10.244.1.9:8080,10.244.2.7:8080   3d
+
+$ kubectl describe service cardapio
+Name:              cardapio
+Namespace:         default
+Selector:          app=cardapio
+Type:              ClusterIP
+IP:                10.96.147.79
+Port:              http  80/TCP
+TargetPort:        8080/TCP
+Endpoints:         10.244.1.9:8080,10.244.2.7:8080
+Session Affinity:  None
+Events:            &lt;none&gt;</pre>
+
+<p>Três leituras. Se <code>Endpoints</code> mostra <code>&lt;none&gt;</code>, o seletor não está casando
+com nenhum pod pronto — o problema é antes do Service. Se mostra IPs com a porta <em>errada</em> (por
+exemplo <code>:80</code> quando o programa escuta em 8080), o problema é o <code>targetPort</code>. E se
+tudo está certo e mesmo assim não responde, o programa pode não estar escutando em
+<code>0.0.0.0</code> — um detalhe de aplicação que o Kubernetes não conserta.</p>
+
+<p>Uma diferença de diagnóstico que vale guardar: <em>timeout</em> e <em>connection refused</em> apontam
+para portas e rede (o tráfego chegou e ninguém atendeu, ou não chegou); <em>404</em> e <em>502</em> no
+Ingress apontam para regra e backend (o tráfego chegou ao controller e ele não soube para onde mandar). São
+duas famílias de erro, com dois lugares de investigação diferentes: a primeira no Service e nos Endpoints;
+a segunda no Ingress e no <code>pathType</code>.</p>
+
+<p>Do lado do Ingress, a leitura é pelo <code>describe</code>, que mostra a tabela de regras com host,
+caminho e backend:</p>
+
+<pre class="term">$ kubectl get ingress
+NAME       CLASS   HOSTS       ADDRESS       PORTS   AGE
+cardapio   nginx   loja.test   192.0.2.10    80      2d
+
+$ kubectl describe ingress cardapio
+Name:             cardapio
+Namespace:        default
+Ingress Class:    nginx
+Rules:
+  Host        Path  Backends
+  ----        ----  --------
+  loja.test
+              /     cardapio:80 (10.244.1.9:8080,10.244.2.7:8080)
+Annotations:  &lt;none&gt;
+Events:       &lt;none&gt;</pre>
+
+<p>Repare na linha do <code>Backends</code>: ela mostra o Service <em>e</em> os pods por trás dele. É a
+prova de que a corrente está fechada — Ingress → Service → Endpoints. Quando algum elo falta, essa linha
+mostra só o nome do Service, ou nada.</p>
+
+<h2>7. Duas coisas para praticar agora</h2>
+
+<p>A primeira caixa monta o mínimo que funciona: um Deployment e o Service que aponta para a porta certa do
+container. A segunda conserta um Ingress sem <code>pathType</code>, que é o erro que a API recusa de
+imediato.</p>
+
+<div class="tryk8s" data-goal="campo:Service/cardapio|spec.ports.0.port=80;;campo:Service/cardapio|spec.ports.0.targetPort=8080;;conta:endpoints=1" data-get="services">
+  <p class="try-task">O Service do cardápio escuta na 80, mas o container do Deployment escuta na 8080 — e o
+  <code>targetPort</code> ficou igual à <code>port</code>. Corrija o <code>targetPort</code> e rode.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        80/TCP    2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<div class="tryk8s" data-goal="objeto:Ingress/cardapio;;campo:Ingress/cardapio|spec.rules.0.http.paths.0.pathType=Prefix;;texto:ingress.networking.k8s.io/cardapio created" data-get="ingress">
+  <p class="try-task">O Ingress da loja está sem <code>pathType</code> e o servidor recusa. Acrescente
+  <code>Prefix</code> e rode: o objeto tem de ser criado com a regra intacta.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+<pre class="out">
+The Ingress "cardapio" is invalid: spec.rules[0].http.paths[0].pathType: Required value
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>No painel, o Service que casa com pods ganha <code>CLUSTER-IP</code> na faixa
+<code>10.96.x.y</code> e um objeto <code>Endpoints</code> com os IPs dos pods prontos. É o suficiente para
+conferir seletor, <code>port</code> e <code>targetPort</code>; o que não existe é o tráfego. O Ingress
+aparece na tabela com <code>HOSTS</code> do manifesto e <code>CLASS</code> em <code>&lt;none&gt;</code>
+quando você não declara <code>ingressClassName</code>.</p>
+
+<p>As duas caixas provam coisas diferentes. A primeira prova o par de portas: a meta exige
+<code>port: 80</code>, <code>targetPort: 8080</code> e a existência do objeto <code>Endpoints</code> — que
+só nasce quando o seletor casa com pelo menos um pod pronto. A segunda prova a regra: o Ingress só existe
+se o <code>pathType</code> estiver lá, e a meta confere o valor gravado no campo.</p>
+
+<p>Sobre o painel, três avisos honestos. Não há rede: o Service ganha IP e Endpoints, mas nenhum tráfego
+atravessa; o Ingress é validado e guardado, e o <code>ADDRESS</code> que aparece é o de documentação
+(<code>192.0.2.10</code>). O <code>targetPort</code> é conferido no objeto, não por conexão. E a coluna
+<code>TARGETS</code> que você vê em outros objetos não existe aqui: o que prova o Service é o par
+<code>port</code>/<code>targetPort</code> e a lista de Endpoints.</p>
+
+<h2>8. Para ir além</h2>
+
+<ul>
+  <li><a href="service-clusterip.html">Service ClusterIP</a> — o endereço estável, do zero.</li>
+  <li><a href="service-nodeport.html">Service NodePort</a> — a porta alta em cada nó.</li>
+  <li><a href="service-loadbalancer.html">Service LoadBalancer</a> — o IP do provedor.</li>
+  <li><a href="endpoints.html">Endpoints</a> — a lista que fica atrás do Service.</li>
+  <li><a href="headless-service.html">Headless Service</a> — <code>clusterIP: None</code> e o DNS por
+  pod.</li>
+  <li><a href="ingress.html">Ingress</a> — host, caminho, controller e os três elos.</li>
+  <li><a href="ingress-tls.html">Ingress com TLS</a> — o bloco <code>tls</code> e o Secret do
+  certificado.</li>
+  <li><a href="portas-e-protocolos.html">Portas e protocolos</a> — as quatro portas com
+  profundidade.</li>
+</ul>
+
+<h2>Resumo</h2>
+
+<p>Service dá endereço estável a um conjunto de pods escolhidos por <code>selector</code>. Os quatro tipos
+mudam quem alcança: <code>ClusterIP</code> (só dentro), <code>NodePort</code> (porta 30000–32767 em cada
+nó), <code>LoadBalancer</code> (IP do provedor, com NodePort por baixo) e <code>ExternalName</code> (CNAME,
+sem seletor nem porta). O par que mais confunde é <code>port</code> × <code>targetPort</code>: o cliente
+bate na primeira, o container escuta na segunda, e omitir a segunda faz o Service entregar na porta
+errada.</p>
+
+<p>Ingress roteia HTTP por <code>host</code> e <code>path</code> para um Service, e exige
+<code>pathType</code> (<code>Prefix</code>, <code>Exact</code> ou <code>ImplementationSpecific</code>). Sem
+um controller instalado, ele é só a regra — não há tráfego. A ordem de investigação é sempre a mesma:
+<code>get svc</code>, <code>get endpoints</code>, <code>describe svc</code>; e, do lado do Ingress,
+<code>describe ingress</code> para ver a linha de <code>Backends</code>. Se os Endpoints estão vazios, o
+problema é o seletor; se estão certos e a porta não, é o <code>targetPort</code>; se está tudo certo, é a
+aplicação.</p>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

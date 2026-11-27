@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quota e LimitRange | Guia Kubernetes</title>
+<meta name="description" content="O namespace com teto: ResourceQuota recusando pod, LimitRange preenchendo defaults e o erro real de quota estourada, explicado linha por linha — com as caixas do painel.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Quota e <span class="hl">LimitRange</span></h1>
+<p class="intro">A padaria da Ana divide o cluster com mais três times. Numa terça, o serviço de relatórios
+subiu quarenta réplicas para testar uma consulta e comeu a CPU que o site precisava — o cardápio ficou lento
+para todo mundo. Não houve ataque nem bug: houve falta de teto. Nesta aula a Ana aprende a colocar um limite
+por namespace com <strong>ResourceQuota</strong>, a preencher o que o time esquece com
+<strong>LimitRange</strong> e a ler o erro de quota estourada sem entrar em pânico.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é uma cota de namespace e o que ela conta (CPU, memória, objetos).</li>
+  <li>Como escrever uma <code>ResourceQuota</code> que o time consegue cumprir.</li>
+  <li>O que significa cada pedaço do erro <em>exceeded quota</em>.</li>
+  <li>Como o <code>LimitRange</code> preenche requests e limits que ninguém escreveu.</li>
+  <li>O que acontece quando um pod passa do máximo permitido.</li>
+  <li>Por que quota sem LimitRange costuma virar uma enxurrada de pods recusados.</li>
+</ul>
+</div>
+
+<h2>1. A cena: quarenta réplicas numa terça</h2>
+
+<p>O cluster da padaria tem três nós e capacidade para uns cem pods pequenos. O time de relatórios precisava
+rodar uma consulta pesada e fez o que parecia natural: <code>kubectl scale deployment relatorios
+--replicas=40</code>. Quarenta pods, cada um pedindo meio núcleo, ocuparam tudo. O agendador passou a
+distribuir os pods do cardápio onde ainda havia migalha, e o site ficou lento das dez ao meio-dia.</p>
+
+<p>Nada disso foi maldade. Foi a ausência de uma regra que dissesse “este namespace pode pedir até X de CPU,
+e não mais”. O Kubernetes não adivinha esse número: se você não declarar, o namespace do time tem o mesmo
+direito ao cluster inteiro que os outros. Quem chega primeiro leva.</p>
+
+<p>A regra tem nome: <strong>ResourceQuota</strong>. Ela é um objeto de namespace, e o verbo é “limitar o
+total que aquele namespace pode pedir e usar”. Combinada com outra peça — o <strong>LimitRange</strong>, que
+preenche o que cada pod pede — ela transforma “primeiro que chega” em “cada um no seu quadrado”.</p>
+
+<h2>2. O teto do namespace: o ResourceQuota</h2>
+
+<p>Volte à imagem do prédio com vários apartamentos. O namespace é o apartamento; a quota é o disjuntor com
+limite de amperagem. Não importa quantos aparelhos o morador ligue: quando a soma passa do limite, o
+disjuntor desarma — e desarma na hora de ligar o aparelho, não depois que a fiação esquenta. No Kubernetes é
+igual: o pod que estouraria a cota é recusado na criação, antes de existir.</p>
+
+<p>Uma quota é declarada com um mapa de valores máximos. O nome das chaves é o que ela conta:</p>
+
+<pre class="file" data-file="quota-padaria.yaml">apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: padaria-quota
+  namespace: padaria
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+    count/deployments.apps: "10"
+    count/services: "5"
+    requests.storage: 50Gi</pre>
+
+<p>Leia como um orçamento. O namespace <code>padaria</code> pode pedir, somando todos os pods, até 4 núcleos
+de CPU e 8 GiB de memória; pode declarar até 8 núcleos e 16 GiB de limite; pode ter no máximo 20 pods, 10
+Deployments, 5 Services e 50 GiB de volume pedido. Cada objeto criado consome uma linha desse orçamento, e
+cada objeto apagado devolve.</p>
+
+<dl class="anatomy">
+<dt>ResourceQuota</dt>
+<dd>Objeto de namespace que define o total máximo de recursos e de objetos que aquele namespace pode
+consumir.</dd>
+<dt>hard</dt>
+<dd>O mapa de limites da quota: cada chave é o que se conta e cada valor é o teto.</dd>
+<dt>used</dt>
+<dd>O total consumido naquele momento. O cluster calcula e atualiza sozinho.</dd>
+<dt>LimitRange</dt>
+<dd>Objeto de namespace que define valores padrão e faixas aceitáveis por container (ou por pod, ou por
+PVC).</dd>
+<dt>defaultRequest</dt>
+<dd>O valor de <code>requests</code> que o LimitRange coloca em quem não declarou nada.</dd>
+<dt>admissão</dt>
+<dd>O momento em que o API server valida o objeto antes de gravá-lo. É ali que quota e LimitRange
+atuam.</dd>
+</dl>
+
+<p>Duas notas importantes. A primeira: quota é por namespace; não existe quota global no Kubernetes nativo
+(para isso há ferramentas de custo e capacity planning, assunto de outra aula). A segunda: a soma é feita
+com o que os objetos <em>declaram</em>, não com o que eles usam de verdade. Um pod ocioso que pediu 2 núcleos
+ocupa 2 núcleos do orçamento até ser apagado — pedir é reservar.</p>
+
+<h2>3. As duas listas de uma quota</h2>
+
+<p>Quem começa acha que quota é só CPU e memória, e leva susto quando o time não consegue criar um Service
+porque o número de Services estourou. Uma quota tem duas famílias de contagem: recursos de computação
+(somados a partir dos pods) e contagem de objetos (um por objeto criado).</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Chave em <code>hard</code></th><th>O que conta</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>requests.cpu</code> / <code>requests.memory</code></td><td>soma dos <code>requests</code> de
+todos os containers</td><td>pod sem request declarado é recusado quando a quota pede esse campo</td></tr>
+<tr><td><code>limits.cpu</code> / <code>limits.memory</code></td><td>soma dos <code>limits</code></td><td>quem
+declara limite alto consome orçamento mesmo sem usar</td></tr>
+<tr><td><code>pods</code></td><td>quantidade de pods no namespace</td><td>conta pods de Job e de
+CronJob também</td></tr>
+<tr><td><code>count/deployments.apps</code></td><td>quantidade de Deployments</td><td>vale para qualquer tipo:
+<code>count/services</code>, <code>count/configmaps</code>...</td></tr>
+<tr><td><code>requests.storage</code></td><td>soma dos PVCs pedidos</td><td>volume <code>emptyDir</code> não
+entra na conta</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Há uma consequência que pega todo mundo na primeira semana: quando a quota inclui
+<code>requests.cpu</code> ou <code>limits.memory</code>, todo pod criado naquele namespace
+<strong>precisa</strong> declarar o campo correspondente. Não é “se declarar, conta”; é “se não declarar, é
+recusado”. O API server não tem como adivinhar quanto reservar, então ele nega — com uma mensagem que fala de
+quota, mesmo que o problema real seja o manifesto sem <code>resources</code>.</p>
+
+<p>É exatamente aqui que o <code>LimitRange</code> entra. Ele preenche o que falta antes da checagem de
+quota, e o pod deixa de ser recusado. Quota e LimitRange não são alternativas: um é o teto do time, o outro é
+o preenchimento automático do que cada pod pede.</p>
+
+<h2>4. O erro de quota estourada, linha por linha</h2>
+
+<p>Quando a soma passa do teto, o API server recusa a criação com <code>Forbidden</code>. A frase é longa
+porque ela presta contas abertamente — e vale aprender a lê-la, porque é a mesma estrutura em qualquer
+versão. Esta é a mensagem (formato do API server; o painel deste guia não implementa ResourceQuota, então
+você não a verá numa caixa):</p>
+
+<pre class="cmd">Error from server (Forbidden): error when creating "STDIN": pods "cardapio" is forbidden: exceeded quota: padaria-quota, requested: requests.cpu=500m, used: requests.cpu=2, limited: requests.cpu=2</pre>
+
+<p>Traduzindo pedaço por pedaço. <code>Forbidden</code> é “você não pode”, diferente de “objeto inválido”:
+nada no seu manifesto está errado, o pedido é que não cabe no orçamento. <code>pods "cardapio" is
+forbidden</code> diz qual objeto foi recusado. <code>exceeded quota: padaria-quota</code> nomeia a quota que
+barrou. <code>requested: requests.cpu=500m</code> é o que este pod pediria. <code>used: requests.cpu=2</code>
+é o que já está em uso. E <code>limited: requests.cpu=2</code> é o teto.</p>
+
+<p>Com esses quatro números, a conta aparece: 2 + 0,5 = 2,5, e o teto é 2. Não é um bug, não é cache, não é
+“o cluster que não aceita pod”: é aritmética. As saídas são reduzir o pedido, apagar algo que já está lá ou
+conversar com quem definiu o teto — nunca “aplicar de novo e ver se passa”.</p>
+
+<p>Para ver o retrato do namespace, o comando é <code>kubectl get resourcequota</code> ou
+<code>kubectl describe resourcequota padaria-quota</code>, que mostram, por chave, o <code>hard</code> e o
+<code>used</code>. No painel do guia, o comando responde que o tipo não existe — é uma limitação do
+simulador, e você vai ver isso na seção 7. Num cluster de verdade, essa saída é a primeira coisa a olhar
+quando um pod é recusado.</p>
+
+<h2>5. LimitRange: o default que preenche o esquecido</h2>
+
+<p>Se você só puser quota, o time vai passar o dia consertando manifesto: todo Deployment que esquece
+<code>resources</code> é recusado, e a mensagem fala de quota, o que confunde. O <code>LimitRange</code>
+resolve isso declarando valores padrão para o namespace. Ele é aplicado na admissão: se o container não traz
+<code>requests</code>, o LimitRange põe o <code>defaultRequest</code>; se não traz <code>limits</code>, põe o
+<code>default</code>.</p>
+
+<pre class="file" data-file="limitrange-padaria.yaml">apiVersion: v1
+kind: LimitRange
+metadata:
+  name: padaria-limites
+  namespace: padaria
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        cpu: 500m
+        memory: 256Mi
+      max:
+        cpu: "2"
+        memory: 2Gi
+      min:
+        cpu: 50m
+        memory: 64Mi
+      maxLimitRequestRatio:
+        cpu: "4"</pre>
+
+<p>Cada campo tem um papel. <code>defaultRequest</code> é o que o pod reserva quando não pede nada;
+<code>default</code> é o limite máximo que ele pode usar; <code>max</code> e <code>min</code> são a faixa
+aceita para quem <em>declara</em> algo — um pedido fora da faixa é recusado; e
+<code>maxLimitRequestRatio</code> impede a prática de pedir 10m de CPU e limite de 4 núcleos, que distorce
+toda a conta do agendador.</p>
+
+<p>O <code>type: Container</code> é o mais usado, mas existem outros dois: <code>type: Pod</code> (soma dos
+containers do pod) e <code>type: PersistentVolumeClaim</code> (mínimo e máximo de volume por pedido). É
+comum um namespace de banco de dados ter LimitRange de PVC para impedir pedidos de 1 TiB.</p>
+
+<p>Uma sutileza de tempo: o LimitRange vale para objetos criados <em>depois</em> dele. Um pod que já existe
+não é reescrito — ele mantém o que declarou. Se você mudar o <code>default</code>, os pods antigos
+continuam com o valor antigo até serem recriados. Isso explica por que “o default está lá e o pod está
+sem”: ele nasceu antes.</p>
+
+<h2>6. A caixa: os <em>resources</em> que o LimitRange preencheria</h2>
+
+<p>No painel deste guia não existe ResourceQuota nem LimitRange — o motor modela pods, Deployments,
+Services, volumes, RBAC e rede, mas não a admissão de quota. Isso significa que aqui você faz à mão o
+trabalho que o LimitRange faria: declarar <code>requests</code> e <code>limits</code> em cada container.
+Comece pelo Deployment do cardápio, que está sem nenhum dos dois.</p>
+
+<div class="tryk8s" data-get="deployments" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.resources.requests.cpu=100m;;campo:Deployment/cardapio|spec.template.spec.containers.0.resources.limits.memory=256Mi;;pronto:Deployment/cardapio=2">
+  <p class="try-task">Acrescente <code>requests.cpu: 100m</code> e <code>limits.memory: 256Mi</code> ao
+  container <code>web</code> — são os valores que o LimitRange do time aplicaria. O painel tem de mostrar o
+  Deployment com <code>2/2</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi</pre>
+</div>
+
+<p>O painel responde <code>deployment.apps/cardapio created</code> e a tabela mostra <code>2/2</code>. Cada
+pod criado por esse Deployment carrega os <em>requests</em> e <em>limits</em> do template — e é essa soma que
+a quota contaria: dois pods de 100m dão 200m de <code>requests.cpu</code> consumidos dos 4 núcleos do
+orçamento.</p>
+
+<p>O mesmo vale para os objetos que nascem fora de um Deployment. A caixa abaixo tem dois pods: um sem nada
+declarado e outro com pedido e limite. Complete o primeiro, como o LimitRange faria, e confira que os dois
+existem.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/padeiro|spec.containers.0.resources.requests.cpu=50m;;campo:Pod/forno-novo|spec.containers.0.resources.limits.memory=128Mi;;conta:pods=2">
+  <p class="try-task">No pod <code>padeiro</code>, acrescente <code>requests.cpu: 50m</code>. No pod
+  <code>forno-novo</code>, acrescente <code>limits.memory: 128Mi</code>. Rode e veja os dois pods.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: padeiro
+  labels:
+    app: padeiro
+spec:
+  containers:
+    - name: padeiro
+      image: cardapio:1.0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: forno-novo
+  labels:
+    app: forno-novo
+spec:
+  containers:
+    - name: forno-novo
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi</pre>
+<pre class="out">
+pod/padeiro created
+pod/forno-novo created
+
+NAME         READY   STATUS    RESTARTS   AGE
+forno-novo   1/1     Running   0          5m
+padeiro      1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: padeiro
+  labels:
+    app: padeiro
+spec:
+  containers:
+    - name: padeiro
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: 50m
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: forno-novo
+  labels:
+    app: forno-novo
+spec:
+  containers:
+    - name: forno-novo
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          memory: 128Mi</pre>
+</div>
+
+<p>Os dois pods sobem. Note a diferença: <code>padeiro</code> tem só o pedido e nenhum limite — ele pode
+usar o nó inteiro se precisar, e por isso é o primeiro candidato a ser despejado quando o nó aperta.
+<code>forno-novo</code> tem pedido e limite, o que o torna mais previsível. Essa diferença é o que o
+Kubernetes chama de classe de QoS, e o próximo passo mostra como ler isso no <code>describe</code>.</p>
+
+<h2>7. A caixa: o pod que não cabe</h2>
+
+<p>Quota é uma forma de teto; a capacidade do nó é outra. Antes de Culpar a quota, vale saber distinguir as
+duas mensagens, porque elas aparecem em lugares diferentes. A caixa abaixo pede CPU absurda para um pod
+único: nada de quota, só falta de lugar. Reduza o pedido até o pod caber.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="texto:Running;;campo:Pod/forno|spec.containers.0.resources.requests.cpu=500m">
+  <p class="try-task">Troque o pedido de CPU para <code>500m</code> e rode: o painel tem de mostrar o pod em
+  <code>Running</code> e o evento de agendamento.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+      resources:
+        requests:
+          cpu: "64"</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: forno:1.0
+      resources:
+        requests:
+          cpu: 500m</pre>
+</div>
+
+<p>A primeira tentativa deixa o pod em <code>Pending</code>: o agendador percorre os três nós, nenhum tem 64
+núcleos livres, e ele escreve o motivo num evento. Quando você reduz para <code>500m</code> (meio núcleo), o
+pod entra e a tabela mostra <code>Running</code>. A diferença entre os dois fracassos é fundamental: quota
+recusa na <em>criação</em> (o objeto nem existe); capacidade insuficiente deixa o objeto existir e
+<code>Pending</code> (o objeto existe, mas não roda).</p>
+
+<p>Este é o evento do pod que não cabe. Capturei a saída rodando o mesmo manifesto com
+<code>kubectl get events</code>:</p>
+
+<pre class="term">LAST SEEN   TYPE      REASON             OBJECT      MESSAGE
+20s         Normal    Created            Pod/forno   created by ana
+23s         Warning   FailedScheduling   Pod/forno   0/3 nodes are available: 3 Insufficient cpu. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.</pre>
+
+<p><code>0/3 nodes are available</code> é o resumo: três nós avaliados, nenhum serve.
+<code>3 Insufficient cpu</code> é o motivo, repetido três vezes, um por nó. A segunda frase conta que o
+cluster tentou despejar pods de menor prioridade para abrir espaço e não achou nenhum — preempção é assunto
+de prioridade, não de quota. Guarde a diferença: aqui o pod <em>existe</em> e espera; na quota, o pod nem
+nasce.</p>
+
+<h2>8. O efeito colateral: a classe de QoS</h2>
+
+<p>Declarar <em>requests</em> e <em>limits</em> não muda só a conta da quota: muda o comportamento do pod sob
+pressão. O Kubernetes classifica cada pod em três grupos, e a regra é simples. Sem nenhum pedido nem limite,
+o pod é <code>BestEffort</code> — o primeiro a ser despejado quando o nó fica sem memória. Com pedido e sem
+limite, ou com limite maior que o pedido, é <code>Burstable</code>. Com pedido igual ao limite em todos os
+containers, é <code>Guaranteed</code> — o último a sofrer.</p>
+
+<p>Você lê essa classificação no <code>describe</code>. Este é o <code>forno</code> do cenário de pod
+pendente, que pediu 8 núcleos e 16 GiB sem declarar limite:</p>
+
+<pre class="term">Containers:
+  forno:
+    Image:          forno:1.0
+    Port:           &lt;none&gt;
+    State:          Waiting
+      Reason:       FailedScheduling
+    Ready:          False
+    Restart Count:  0
+QoS Class:                   Burstable
+Node-Selectors:              &lt;none&gt;</pre>
+
+<p><code>Burstable</code> porque há pedido sem limite: ele tem uma reserva, mas pode crescer até o teto do
+nó. Se você usar o LimitRange com <code>defaultRequest</code> igual ao <code>default</code>, todo pod do
+namespace nasce <code>Guaranteed</code> — mais estável e mais caro, porque a reserva fica presa. Cada
+escolha tem preço, e a aula de classes de QoS entra nesse detalhe.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que você vê</th><th>Quem causou</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td>pod recusado com <code>Forbidden</code> e “exceeded quota”</td><td>soma do namespace passou do
+teto</td><td>reduzir pedido, apagar objeto ou revisar a quota</td></tr>
+<tr><td>pod recusado citando <code>must specify limits.cpu</code></td><td>quota de compute sem
+<code>resources</code> no manifesto</td><td>declarar; ou criar LimitRange com
+<code>default</code></td></tr>
+<tr><td>pod <code>Pending</code> com <code>Insufficient cpu</code></td><td>capacidade dos nós, não
+quota</td><td>reduzir pedido ou adicionar nó</td></tr>
+<tr><td>container morto por memória (<code>OOMKilled</code>)</td><td><code>limit</code> menor que o consumo
+real</td><td>ajustar limite; ver consumo antes</td></tr>
+<tr><td>namespace parado em 20 pods e ninguém sabe por quê</td><td>chave <code>pods</code> da
+quota</td><td><code>describe resourcequota</code> para ver o usado</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a quota que ninguém conseguia cumprir</h3>
+<p>A Ana criou a quota com <code>requests.cpu: "4"</code> e não criou LimitRange. No dia seguinte, todo
+Deployment novo era recusado, porque nenhum manifesto do time declarava <code>resources</code>. A mensagem
+falava de quota, e o time passou a manhã procurando o problema no lugar errado. A correção foi criar o
+LimitRange antes de ligar a quota — nessa ordem, ninguém é recusado por esquecimento.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Job que estourou o teto de pods</h3>
+<p>Um CronJob de relatórios disparava de hora em hora e, num dia de reprocessamento, deixou dezenas de pods
+pendurados. O namespace bateu no teto de <code>pods: "20"</code> e o site parou de escalar: o Deployment não
+conseguia criar réplicas novas. Quota conta pods de Job também — e Job com <code>backoffLimit</code> alto
+pode multiplicar pods rapidamente se o programa falhar em série.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o default que ninguém viu mudar</h3>
+<p>O time ajustou o <code>default</code> do LimitRange de 256Mi para 1Gi e esperou ver os pods maiores. Nada
+mudou nos pods que já existiam: LimitRange vale na criação. Só um <code>rollout restart</code> (ou um deploy
+novo) recria os pods com o valor novo. E aí aparece o outro lado: com <code>default</code> maior, a soma dos
+<em>limits</em> pode estourar a quota e os pods novos são recusados.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que a ResourceQuota limita?</p>
+<label><input type="radio" name="q1"> o consumo de cada container individualmente</label>
+<label><input type="radio" name="q1"> o total de recursos e de objetos de um namespace</label>
+<label><input type="radio" name="q1"> o número de nós do cluster</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Para que serve o <code>defaultRequest</code> do
+LimitRange?</p>
+<label><input type="radio" name="q2"> para apagar pods que pedem muita CPU</label>
+<label><input type="radio" name="q2"> para definir o teto do namespace</label>
+<label><input type="radio" name="q2"> para preencher o <code>requests</code> de quem não declarou
+nada</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual é a diferença entre quota estourada e pod
+<code>Pending</code> por CPU?</p>
+<label><input type="radio" name="q3"> na quota o pod é recusado na criação; na falta de capacidade ele
+existe e espera</label>
+<label><input type="radio" name="q3"> as duas coisas são o mesmo erro com nomes diferentes</label>
+<label><input type="radio" name="q3"> a quota só vale para pods de Deployment</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a quota da confeitaria</h2>
+<p>O namespace <code>confeitaria</code> precisa de uma quota que permita no máximo 3 núcleos de
+<code>requests.cpu</code>, 6 GiB de <code>requests.memory</code> e 15 pods. Escreva o manifesto. Depois
+responda: qual campo do <code>spec</code> guarda os limites da quota?</p>
+<div class="ex-code">spec:<input aria-label="resposta 1" data-answer="hard" placeholder="...">:<br>&nbsp;&nbsp;requests.cpu: "3"</div>
+<p class="ex-dica">Dica: <code>hard</code> é o teto; o consumo atual aparece como <code>used</code> no
+<code>kubectl describe resourcequota</code>, não no manifesto.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>ResourceQuota é o teto do namespace: um mapa em <code>spec.hard</code> com o que se conta (CPU, memória,
+pods, objetos, armazenamento) e quanto é permitido. O pod que estouraria a cota é recusado na criação, com
+<code>Forbidden</code> e a frase <em>exceeded quota</em>, que mostra pedido, usado e limite — aritmética, não
+bug.</p>
+
+<p>Quota sozinha é dura com quem esquece: se a quota inclui <code>requests.cpu</code>, todo pod precisa
+declarar o campo. O LimitRange resolve isso preenchendo <code>defaultRequest</code> e
+<code>default</code>, e ainda impõe faixas com <code>min</code>, <code>max</code> e
+<code>maxLimitRequestRatio</code>. Os dois juntos são o par que dá ao time um orçamento previsível.</p>
+
+<p>Vale distinguir os fracassos: quota recusa antes de o objeto existir; falta de capacidade deixa o pod em
+<code>Pending</code> com <code>Insufficient cpu</code> nos eventos. E lembrar do efeito colateral —
+<em>requests</em> e <em>limits</em> definem a classe de QoS, que decide quem é despejado primeiro quando o
+nó aperta.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>ResourceQuota</code> = teto do namespace; <code>LimitRange</code> = padrão por container.</li>
+  <li>Quota com <code>requests.cpu</code> exige <code>resources</code> em todo pod.</li>
+  <li><em>exceeded quota</em> mostra pedido, usado e limite: some e compare.</li>
+  <li>Quota recusa na criação; capacidade insuficiente deixa o pod <code>Pending</code>.</li>
+  <li>LimitRange só vale para objetos criados depois dele.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Boas práticas de config | Guia Kubernetes</title>
+<meta name="description" content="A checklist da configuração no Kubernetes: segredo fora do ConfigMap, um objeto por assunto, nomes com dono, versão e imutabilidade onde a config não muda.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Boas práticas de <span class="hl">config</span></h1>
+<p class="intro">Depois de três incidentes causados por configuração — uma senha num ConfigMap, um objeto com
+vinte e duas chaves de assuntos diferentes e uma troca de preço que ninguém conseguiu rastrear — a Ana decidiu
+escrever as regras. Nesta aula ela monta a checklist da configuração: o que nunca pode morar num ConfigMap,
+como dividir por assunto, como dar dono e versão aos nomes e por que tornar imutável o que não muda é uma
+decisão de operação, não de estética.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que segredo não entra em ConfigMap — e o que fazer no lugar.</li>
+  <li>O anti-padrão do objeto único com todas as chaves.</li>
+  <li>Uma convenção de nomes que diz dono, assunto e versão.</li>
+  <li>Config versionada no repositório e aplicada por pipeline.</li>
+  <li>Quando marcar <code>immutable: true</code> e o que isso custa.</li>
+  <li>O que nunca deve virar configuração.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a revisão que ninguém faz</h2>
+
+<p>Configuração raramente é revisada. O código passa por revisão de colega, teste automatizado e pipeline;
+o ConfigMap vai direto, colado no terminal, às vezes com <code>kubectl create configmap --from-literal</code>
+digitado de memória. O resultado aparece meses depois, sempre do mesmo jeito: alguém troca um valor achando
+que é outro, ou descobre uma senha em texto claro num objeto que todo mundo podia ler.</p>
+
+<p>As três regras que a Ana escreveu não são invenção dela: são o consenso de quem já operou isso. E todas
+cabem numa frase cada. Segredo não mora em ConfigMap. Um objeto, um assunto. Nome que não diz de quem é não
+é nome, é apelido.</p>
+
+<p>O resto desta aula é a checklist completa, com o manifesto de cada prática e o raciocínio atrás dela. A
+ideia é que ela sirva de revisão: abra o manifesto do seu serviço, leia a lista e veja quantos itens você
+cumpre.</p>
+
+<dl class="anatomy">
+<dt>configuração</dt>
+<dd>O que difere entre ambientes: endereço, preço, horário, tempo de cache. Vive fora da imagem.</dd>
+<dt>segredo</dt>
+<dd>Valor que, revelado, causa dano: senha, token, chave privada. Mora em Secret, nunca em ConfigMap.</dd>
+<dt>assunto</dt>
+<dd>O recorte de um objeto: cardápio, banco, e-mail. Um objeto por assunto evita acoplamento.</dd>
+<dt>dono</dt>
+<dd>Quem responde pelo objeto. Nas etiquetas (<code>app</code>, <code>managed-by</code>) e no nome.</dd>
+<dt>imutável</dt>
+<dd><code>immutable: true</code>: o objeto não aceita edição. Mudar exige objeto novo, com nome novo.</dd>
+<dt>pipeline</dt>
+<dd>Quem aplica o manifesto no cluster, a partir do repositório, com revisão registrada.</dd>
+</dl>
+
+<h2>2. Segredo não mora em ConfigMap</h2>
+
+<p>O ConfigMap não é criptografado, não tem controle de acesso próprio e não é tratado como sensível por
+ferramenta nenhuma. Quem pode ler ConfigMap no namespace lê o valor; quem lista objetos no dashboard vê o
+conteúdo; o valor aparece em <code>kubectl get configmap -o yaml</code> sem cerimônia. Colocar senha ali é
+escrever a senha no quadro de avisos da cozinha.</p>
+
+<p>A prática é mover para o Secret, que ao menos é um tipo separado, com RBAC separado e com a convenção
+social de “não mexa”. E, no consumo, entregar por <code>secretKeyRef</code> ou volume, nunca por
+<code>envFrom</code> do ConfigMap com a chave misturada.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/web|spec.containers.0.envFrom.0.configMapRef.name=cardapio;;campo:Pod/web|spec.containers.0.env.0.valueFrom.secretKeyRef.name=banco;;campo:Pod/web|spec.containers.0.env.0.valueFrom.secretKeyRef.key=senha;;conta:secrets=1">
+  <p class="try-task">O pod importa um ConfigMap que tem preço <em>e</em> senha. Tire a senha do ConfigMap,
+  crie o Secret <code>banco</code> com a chave <code>senha</code> (valor <code>czNuaDQ=</code>) e entregue-a
+  ao container por <code>secretKeyRef</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+  senha: czNuaDQ=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:2.0
+      envFrom:
+        - configMapRef:
+            name: cardapio</pre>
+<pre class="out">
+configmap/cardapio created
+pod/web created
+
+error: the server doesn't have a resource type "configmaps,pods"
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: banco
+data:
+  senha: czNuaDQ=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:2.0
+      envFrom:
+        - configMapRef:
+            name: cardapio
+      env:
+        - name: SENHA
+          valueFrom:
+            secretKeyRef:
+              name: banco
+              key: senha</pre>
+</div>
+
+<p>Duas coisas mudaram no pod: o ConfigMap perdeu a chave <code>senha</code> e o container ganhou um
+<code>env</code> explícito com <code>secretKeyRef</code>. Repare que a variável agora se chama
+<code>SENHA</code>, e não <code>senha</code>: quando você usa <code>envFrom</code>, o nome da chave vira o nome
+da variável; com <code>env</code>, você escolhe. Essa escolha importa quando o código espera maiúsculas.</p>
+
+<p>Uma armadilha de convivência: enquanto as duas fontes existirem com a mesma chave, o
+<code>env</code> explícito vence o <code>envFrom</code>. Isso significa que o pod pode funcionar por semanas e
+só quebrar quando alguém remover o <code>env</code> — porque aí a variável volta a vir do ConfigMap, com o
+valor velho. Duplicidade de fonte é dívida silenciosa.</p>
+
+<h2>3. Um objeto, um assunto</h2>
+
+<p>O segundo anti-padrão é o objeto único com tudo dentro: preço, horário, endereço do banco, chave de API,
+versão da imagem e mais uma dúzia de chaves. Ele nasce por conveniência e morre por acoplamento: mudar o preço
+exige tocar no mesmo objeto que guarda a credencial do banco, e a permissão de quem mexe em preço passa a ser
+a mesma de quem mexe em credencial.</p>
+
+<p>A prática é dividir por assunto: um ConfigMap para o cardápio, outro para a configuração de banco, um
+Secret para as credenciais. Cada um com o seu nome, a sua etiqueta e o seu dono. O Deployment referencia todos,
+com <code>prefix</code> para evitar colisão de nomes de variável.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:ConfigMap/cardapio-config|data.horario=6h as 19h;;campo:ConfigMap/banco-config|data.host=banco.padaria.svc;;campo:Deployment/cardapio|spec.template.spec.containers.0.envFrom.0.prefix=CARDAPIO_;;campo:Deployment/cardapio|spec.template.spec.containers.0.envFrom.1.prefix=BANCO_;;texto:Running">
+  <p class="try-task">O ConfigMap <code>config</code> guarda tudo, inclusive <code>host</code> do banco.
+  Separe em dois assuntos — <code>cardapio-config</code> (preço e horário) e <code>banco-config</code>
+  (<code>host</code> e <code>porta</code>) — e importe os dois no Deployment com os prefixos
+  <code>CARDAPIO_</code> e <code>BANCO_</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+  host: banco.padaria.svc
+  porta: "5432"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          envFrom:
+            - configMapRef:
+                name: config</pre>
+<pre class="out">
+configmap/config created
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-4l5m7pkqz9-48smz   1/1     Running   0          2m
+cardapio-4l5m7pkqz9-7ll45   1/1     Running   0          3m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+  labels:
+    app: cardapio
+    assunto: cardapio
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: banco-config
+  labels:
+    app: cardapio
+    assunto: banco
+data:
+  host: banco.padaria.svc
+  porta: "5432"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          envFrom:
+            - configMapRef:
+                name: cardapio-config
+              prefix: CARDAPIO_
+            - configMapRef:
+                name: banco-config
+              prefix: BANCO_</pre>
+</div>
+
+<p>O prefixo resolve dois problemas de uma vez. O primeiro é colisão: se as duas fontes tivessem uma chave
+<code>host</code>, a segunda sobrescreveria a primeira sem aviso. O segundo é legibilidade: no código, fica
+óbvio de onde vem cada valor — <code>CARDAPIO_PRECO</code> versus <code>BANCO_HOST</code>. Nomes que dizem a
+origem economizam uma consulta ao manifesto.</p>
+
+<p>E as etiquetas fazem a divisão sobreviver ao tempo: com <code>app: cardapio</code> e
+<code>assunto: banco</code> em cada objeto, um <code>kubectl get configmaps -l app=cardapio</code> lista a
+família inteira, e <code>-l assunto=banco</code> isola o assunto. É o mesmo raciocínio de etiqueta que
+apareceu nas aulas de labels, aplicado a configuração.</p>
+
+<h2>4. Nomes com dono e com versão</h2>
+
+<p>Nome genérico é armadilha. <code>config</code>, <code>app-config</code>, <code>settings</code> — nada disso
+diz de quem é o objeto, para que serve ou em que ambiente roda. Em um namespace com cinquenta objetos, o
+plantão precisa adivinhar, e adivinhar às três da manhã é como se perde tempo.</p>
+
+<p>A convenção que funciona tem três pedaços: o assunto, o dono e — quando o valor precisa mudar sem mexer no
+objeto antigo — a versão. <code>cardapio-config</code> diz o assunto. A etiqueta <code>app: cardapio</code> e
+a anotação de dono dizem o time. <code>cardapio-config-v2</code> diz que é a segunda geração daquele valor, e
+que a primeira continua existindo intacta.</p>
+
+<p>Para as etiquetas, o padrão da comunidade é o conjunto <code>app.kubernetes.io/*</code>:
+<code>name</code>, <code>component</code>, <code>part-of</code>, <code>managed-by</code>. Ele é verboso e é o
+que ferramentas de catálogo entendem. A vantagem de usar o padrão aparece quando o time cresce: o objeto é
+encontrado por ferramenta, não por memória.</p>
+
+<p>O efeito no cluster é fácil de conferir: os objetos passam a se apresentar sozinhos na listagem, com o
+assunto no nome e o dono na etiqueta.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get configmaps
+NAME                DATA   AGE
+banco-config        2      3m
+cardapio-config     2      5m
+kube-root-ca.crt    1      9m
+
+ana@notebook:~$ kubectl get configmaps -l assunto=banco
+NAME            DATA   AGE
+banco-config    2      3m
+
+ana@notebook:~$ kubectl get secrets
+NAME                TYPE     DATA   AGE
+banco-credenciais   Opaque   2      3m</pre>
+
+<p>A primeira listagem tem o objeto do próprio cluster (<code>kube-root-ca.crt</code>) no meio — e ele não
+atrapalha, porque os nossos têm nome que diz o assunto. O filtro por etiqueta reduz a lista a um objeto. E o
+Secret de credenciais tem nome próprio, separado do ConfigMap de banco: quem lê um não lê o outro.</p>
+
+<h2>5. Config versionada, config revisada</h2>
+
+<p>A prática mais importante não é técnica: é a configuração morar no mesmo lugar do código, versionada,
+revisada e aplicada por pipeline. ConfigMap criado à mão com <code>--from-literal</code> não tem histórico, não
+tem revisão e não tem como ser reproduzido. Se o cluster se perder, a configuração se perde junto.</p>
+
+<p>O ciclo saudável é curto: editar o arquivo no repositório, abrir revisão, aplicar com
+<code>kubectl apply -f</code> pelo pipeline. O cluster vira consequência do repositório, e não o contrário. E
+quem chega depois encontra o porquê no histórico da revisão, não na memória de alguém.</p>
+
+<p>Antes de aplicar, existe um comando que quase ninguém usa e que deveria ser hábito:
+<code>kubectl diff -f arquivo.yaml</code> mostra exatamente o que mudaria no cluster. É a revisão do que o
+manifesto faz de verdade, comparada com o estado atual — e o único jeito honesto de responder “o que esse
+apply vai alterar?”.</p>
+
+<h2>6. Imutável quando não muda</h2>
+
+<p>Configuração que nunca muda não precisa ser mutável. O campo <code>immutable: true</code> existe para
+dizer isso ao cluster: este objeto está fechado, ninguém edita. Mudar de valor passa a exigir um objeto novo,
+com nome novo — e é aí que a versão entra no nome.</p>
+
+<p>O ganho é dupla proteção. Primeiro, contra acidente: um <code>apply</code> errado, um
+<code>kubectl edit</code> distraído, uma ferramenta antiga reaplicando valor velho — tudo isso falha, em vez de
+alterar silenciosamente o que está rodando. Segundo, contra custo: o cluster para de vigiar mudanças daquele
+objeto, o que faz diferença em clusters grandes com milhares de ConfigMaps.</p>
+
+<p>O preço é a disciplina de trocar a referência: criar <code>cardapio-config-v3</code>, apontar o Deployment
+para ele, esperar o rollout e só então apagar o <code>-v2</code>. Quem esquecer o último passo acumula lixo;
+quem apagar antes de apontar derruba o pod.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get configmap cardapio-config-v2 -o yaml
+apiVersion: v1
+data:
+  horario: 6h as 19h
+  preco: "4.90"
+immutable: true
+kind: ConfigMap
+metadata:
+  labels:
+    app: cardapio
+    assunto: cardapio
+  name: cardapio-config-v2
+  namespace: default</pre>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:ConfigMap/cardapio-config-v2|data.preco=4.90;;campo:ConfigMap/cardapio-config-v2|immutable=true;;campo:Deployment/cardapio|spec.template.spec.containers.0.envFrom.0.configMapRef.name=cardapio-config-v2;;texto:Running">
+  <p class="try-task">O preço subiu para <code>4.90</code> e o objeto atual não pode ser editado. Crie
+  <code>cardapio-config-v2</code> com o preço novo, marque como <code>immutable: true</code> e aponte o
+  Deployment para ele.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+data:
+  preco: "4.50"
+  horario: 6h as 19h
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          envFrom:
+            - configMapRef:
+                name: cardapio-config</pre>
+<pre class="out">
+configmap/cardapio-config created
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-c9dqgrjj55-b9hnq   1/1     Running   0          3m
+cardapio-c9dqgrjj55-xnqrv   1/1     Running   0          1m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config-v2
+  labels:
+    app: cardapio
+    assunto: cardapio
+data:
+  preco: "4.90"
+  horario: 6h as 19h
+immutable: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          envFrom:
+            - configMapRef:
+                name: cardapio-config-v2</pre>
+</div>
+
+<p>Uma honestidade sobre o painel: ele guarda o campo <code>immutable</code> e as metas conferem isso, mas não
+bloqueia uma segunda edição do objeto — a trava de imutabilidade é do servidor de API, e simulação não simula
+essa recusa. Num cluster de verdade, mudar o <code>data</code> de um ConfigMap imutável responde erro de
+validação e o objeto fica como estava.</p>
+
+<h2>7. O que não vira configuração</h2>
+
+<p>Configuração tem limite, e passar dele cria problema novo. Três coisas não deveriam morar em ConfigMap nem
+em Secret. A primeira é <strong>arquivo grande</strong>: o objeto tem limite de tamanho (cerca de um
+megabyte), e transformar binário em base64 para caber num Secret é receita de dor — para isso existe volume
+persistente ou imagem.</p>
+
+<p>A segunda é <strong>o que é comportamento</strong>. Uma regra de negócio que muda a resposta do site é
+código, não configuração: se mora em ConfigMap, passa a poder mudar sem teste e sem revisão, e o próximo
+incidente vai ser “alguém mudou um limiar no cluster”. Configuração deve ser o que difere entre ambientes;
+comportamento é o que o código decide.</p>
+
+<p>A terceira é <strong>o segredo de outra pessoa</strong>. Credencial de banco que o time da padaria não
+administra, token de terceiro com prazo longo, chave de outro sistema: o lugar dessas coisas é o cofre da
+empresa (Vault, Secret Manager), com o cluster apenas sincronizando. Guardar cópia manual no cluster é criar
+uma segunda fonte de verdade que envelhece sozinha.</p>
+
+<p>Vale um critério para separar os dois primeiros casos, porque a fronteira não é óbvia. Pergunte: se este
+valor mudar sozinho às três da manhã, o que acontece? Se a resposta for “nada de mais, é um preço”, é
+configuração. Se for “o site começa a se comportar diferente sem ninguém ter mexido no código”, é
+comportamento disfarçado — e o lugar dele é a revisão de código, com teste, não o cluster.</p>
+
+<h2>8. A checklist</h2>
+
+<p>Reunindo tudo numa página, para usar como revisão de manifesto. A primeira tabela é a checklist; a segunda
+é o catálogo dos anti-padrões, com o sintoma que cada um produz.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Item</th><th>Como fica no manifesto</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>segredo fora do ConfigMap</td><td><code>Secret</code> + <code>secretKeyRef</code></td><td>ConfigMap não é
+sensível</td></tr>
+<tr><td>um objeto por assunto</td><td><code>cardapio-config</code>, <code>banco-config</code></td><td>mudança e
+permissão isoladas</td></tr>
+<tr><td>prefixo por fonte</td><td><code>prefix: BANCO_</code></td><td>evita colisão e diz a origem</td></tr>
+<tr><td>dono e assunto em etiqueta</td><td><code>app</code>, <code>assunto</code>,
+<code>app.kubernetes.io/*</code></td><td>encontrar depois, por ferramenta</td></tr>
+<tr><td>nome com versão quando muda</td><td><code>cardapio-config-v2</code></td><td>troca sem editar o antigo</td></tr>
+<tr><td>imutável quando não muda</td><td><code>immutable: true</code></td><td>proteção contra acidente</td></tr>
+<tr><td>no repositório, com revisão</td><td><code>kubectl apply -f</code> no pipeline</td><td>histórico e
+reprodução</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Anti-padrão</th><th>Sintoma</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td>senha no ConfigMap</td><td>qualquer um lê o valor</td><td>mover para Secret</td></tr>
+<tr><td>objeto com vinte chaves</td><td>mexer no preço exige revisar credencial</td><td>dividir por assunto</td></tr>
+<tr><td>duas fontes com a mesma chave</td><td>valor inesperado, sem erro</td><td>prefixo por fonte</td></tr>
+<tr><td>objeto criado à mão</td><td>config some quando o cluster é recriado</td><td>manifesto no
+repositório</td></tr>
+<tr><td>mesmo objeto editado em produção</td><td>não há histórico de quem mudou</td><td>versão nova + referência
+nova</td></tr>
+<tr><td>ConfigMap gigante</td><td>apply lento, objeto perto do limite</td><td>volume ou imagem</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Se você aplicar só três itens desta lista, escolha estes: segredo no Secret, um objeto por assunto e tudo
+no repositório. São os três que evitam incidente de verdade; os outros evitam retrabalho.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o preço que voltou</h3>
+<p>Alguém aplicou um manifesto antigo do <code>cardapio-config</code> “só para conferir” e o preço voltou
+para o valor do mês passado. Como o objeto era mutável e não havia revisão, a mudança foi silenciosa. Depois
+disso, o time passou a versionar o nome e a marcar como imutável: reaplicar manifesto antigo agora falha, em
+vez de alterar o que está no ar.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a senha no dashboard</h3>
+<p>Durante um plantão, alguém abriu o ConfigMap do site no dashboard para conferir o horário e viu, na mesma
+tela, a senha do banco. Nada foi vazado, mas o susto foi suficiente para o time mover a credencial para um
+Secret, com RBAC restrito ao time de plantão. Levou uma tarde e evitou uma conversa muito pior.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o ConfigMap que ninguém sabia de quem era</h3>
+<p>Havia três objetos chamados <code>config</code> em três namespaces, de três times diferentes, com chaves
+parecidas e valores diferentes. A auditoria levou dias até alguém admitir a propriedade de cada um. A regra
+que saiu daí foi simples: nome com assunto e etiqueta com dono — quem cria, assina.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Onde mora uma senha de banco?</p>
+<label><input type="radio" name="c1"> em ConfigMap, que é mais rápido de editar</label>
+<label><input type="radio" name="c1"> em Secret, entregue por <code>secretKeyRef</code> ou volume</label>
+<label><input type="radio" name="c1"> no manifesto do Deployment, dentro de <code>env</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Para que serve o <code>prefix</code> no <code>envFrom</code>?</p>
+<label><input type="radio" name="c2"> para renomear o ConfigMap</label>
+<label><input type="radio" name="c2"> para criptografar as variáveis</label>
+<label><input type="radio" name="c2"> para evitar colisão de chaves e mostrar de que fonte vem cada
+variável</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que <code>immutable: true</code> provoca?</p>
+<label><input type="radio" name="c3"> o objeto não pode ser editado: mudar exige um objeto novo</label>
+<label><input type="radio" name="c3"> o objeto é apagado quando o pod reinicia</label>
+<label><input type="radio" name="c3"> o valor é criptografado em repouso</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o campo que trava</h2>
+<p>Você decidiu que aquele ConfigMap não muda mais. Complete o campo que diz isso ao cluster:</p>
+<div class="ex-code"><input aria-label="resposta 1" data-answer="immutable" placeholder="...">: true</div>
+<p class="ex-dica">Dica: em inglês, “imutável”. É o mesmo campo que existe no Secret.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>A checklist da configuração tem três regras que resolvem a maior parte: segredo mora em Secret, um objeto
+por assunto e tudo versionado no repositório. Em cima delas vêm os hábitos: prefixo por fonte no
+<code>envFrom</code>, etiquetas com dono e assunto, nome com versão quando o valor precisa mudar, e
+<code>immutable: true</code> para o que não muda.</p>
+
+<p>Configuração é o que difere entre ambientes; comportamento é código. Senha de terceiro mora no cofre de
+quem administra, não numa cópia no cluster. E o comando que fecha o ciclo é <code>kubectl diff</code>: ele
+mostra o efeito real do manifesto antes de o cluster mudar.</p>
+
+<p>Com isso, o bloco de configuração e segredos fecha: você sabe onde guardar cada valor, como entregá-lo ao
+pod, como fazê-lo atualizar e como revisar antes de aplicar. A próxima etapa do guia muda de assunto — e os
+objetos que você já domina continuam sendo a base de tudo.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>ConfigMap não é lugar de segredo: Secret + RBAC.</li>
+  <li>Um objeto por assunto; <code>prefix</code> em cada fonte.</li>
+  <li>Nome com assunto e versão; etiqueta com dono.</li>
+  <li>Config no repositório, revisada, aplicada por pipeline; <code>kubectl diff</code> antes.</li>
+  <li><code>immutable: true</code> protege contra reaplicação de valor velho.</li>
+  <li>Arquivo grande e regra de negócio não são configuração.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

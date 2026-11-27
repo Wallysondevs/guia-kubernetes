@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RBAC multiusuário | Guia Kubernetes</title>
+<meta name="description" content="Projeto de RBAC multiusuário: dois times no mesmo cluster, cada um com namespace, ServiceAccount, Role e RoleBinding — e a prova com kubectl auth can-i.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>RBAC <span class="hl">multiusuário</span></h1>
+<p class="intro">A padaria cresceu e agora divide o cluster com o time da entrega. Os dois precisam trabalhar
+no mesmo lugar, mas ninguém pode apagar o banco do vizinho por engano. Neste projeto a Ana monta a divisão
+inteira em três passos: as pastas (namespaces), as identidades (ServiceAccounts) e as listas de permissão
+(Roles e RoleBindings). No fim, cada time enxerga só a sua parte — e a prova disso é um comando que responde
+<code>yes</code> ou <code>no</code> antes de qualquer coisa quebrar.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>A diferença entre autenticação e autorização, e quem é “usuário” no cluster.</li>
+  <li>Criar namespace e ServiceAccount para cada time.</li>
+  <li>Escrever uma Role com <code>apiGroups</code>, <code>resources</code> e <code>verbs</code>.</li>
+  <li>Ligar a Role à identidade com um RoleBinding.</li>
+  <li>Provar permissão com <code>kubectl auth can-i</code> antes de precisar dela.</li>
+  <li>Os cinco erros clássicos — e por que RBAC não tem regra de “negar”.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>No fim deste projeto existem duas pastas no cluster, <code>padaria</code> e <code>entrega</code>, e dentro
+de cada uma uma identidade de programa com nome próprio. O time da padaria tem a ServiceAccount
+<code>estoque</code>; o time da entrega tem a ServiceAccount <code>app</code>. Cada identidade recebe uma
+Role que lista o que ela pode fazer e um RoleBinding que amarra a Role à identidade.</p>
+
+<p>A analogia é a do prédio com portarias separadas. O namespace é o andar: muda o endereço e evita que dois
+“sala 12” se confundam. A ServiceAccount é o crachá: identifica quem está entrando. A Role é a lista de salas
+que aquele crachá abre. E o RoleBinding é a recepção que entrega o crachá com a lista anexada — sem ele, o
+crachá existe mas não abre nada.</p>
+
+<p>Repare no que o projeto <em>não</em> faz: ele não cria usuário humano, não define senha e não configura
+login. Kubernetes não tem cadastro de pessoas: quem entra já vem autenticado pelo certificado do kubeconfig
+ou por um provedor de identidade. O que o cluster decide é o segundo passo — o que aquela identidade
+<em>pode</em> fazer. É esse segundo passo que se chama RBAC, e é ele que dá para montar aqui dentro.</p>
+
+<h2>2. O cenário da padaria</h2>
+
+<p>O time da entrega construiu um painel que mostra as rotas do dia. Para funcionar, o painel precisa listar
+os pods da padaria e ler os eventos do cluster — nada além disso. O primeiro pedido de acesso veio assim:
+“me dá admin que eu resolvo em cinco minutos”. É a frase mais perigosa do Kubernetes, porque resolve o
+problema de hoje e cria o incidente do mês que vem.</p>
+
+<p>Com admin, o painel da entrega pode apagar o Deployment do cardápio, mudar a imagem de produção e ler os
+Secrets da padaria — e ninguém vai saber quem fez, porque todo mundo vira o mesmo usuário. O acidente não
+precisa ser maldade: um laço de script com o verbo errado faz o estrago igual.</p>
+
+<p>A alternativa é a que este projeto monta: a identidade da entrega pode <em>listar</em> pods e
+<em>ler</em> eventos, e nada mais. Se o painel precisar de outra coisa amanhã, alguém abre um pull request
+mudando a Role — com revisão, com histórico e com uma linha de diferença. Permissão vira código, e código se
+revisa.</p>
+
+<h2>3. Antes de começar</h2>
+
+<p>Três ideias precisam estar claras antes do primeiro manifesto. A primeira é a separação entre
+autenticação (quem é você) e autorização (o que você pode). O cluster recebe a identidade pronta e só decide
+o segundo item. A segunda é que permissão em Kubernetes é <strong>aditiva</strong>: não existe regra de
+“negar”. Se qualquer RoleBinding conceder, está concedido; para tirar, é preciso remover a concessão.</p>
+
+<p>A terceira é a diferença entre as quatro peças. <code>Role</code> e <code>RoleBinding</code> vivem dentro
+de um namespace e valem só ali. <code>ClusterRole</code> e <code>ClusterRoleBinding</code> valem no cluster
+inteiro. Um RoleBinding pode apontar para uma ClusterRole — e aí a permissão da ClusterRole fica restrita
+àquele namespace, o que é o truque mais útil do assunto.</p>
+
+<p>Sobre identidade de programa: todo pod roda com uma ServiceAccount. Se você não escolhe, ele usa a
+<code>default</code> do namespace — que existe em todo namespace e que quase sempre tem permissão demais para
+o gosto de quem audita. Dar nome próprio a cada aplicação é o primeiro passo para conseguir responder “quem
+fez isso?” no futuro.</p>
+
+<h2>4. Passo 1 — as pastas e as identidades</h2>
+
+<p>O primeiro manifesto cria os dois namespaces e as duas ServiceAccounts, cada uma no seu lugar. São quatro
+documentos num arquivo só, separados por <code>---</code>, na ordem em que precisam existir: o namespace
+antes do que mora dentro dele.</p>
+
+<div class="tryk8s" data-get="serviceaccounts -n entrega -o yaml" data-goal="texto:serviceaccount/app created;;texto:serviceaccount/estoque created;;texto:namespace: entrega">
+  <p class="try-task">Cada ServiceAccount precisa nascer no seu namespace: <code>app</code> em
+  <code>entrega</code> e <code>estoque</code> em <code>padaria</code>. Complete o campo
+  <code>namespace</code> das duas e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: entrega
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: estoque</pre>
+<pre class="out">
+namespace/padaria created
+namespace/entrega created
+serviceaccount/app created
+serviceaccount/estoque created
+
+No resources found in entrega namespace.
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: entrega
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app
+  namespace: entrega
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: estoque
+  namespace: padaria</pre>
+</div>
+
+<p>O painel termina mostrando a ServiceAccount <code>app</code> dentro de <code>entrega</code>, e a linha
+<code>namespace: entrega</code> no YAML confirma o que o <code>kubectl get serviceaccounts -n entrega</code>
+já dizia. Se você rodar o manifesto sem os campos, as duas identidades nascem no <code>default</code> — e a
+consulta em <code>entrega</code> responde “não achei”. É o mesmo erro de namespace da aula de namespaces,
+agora com consequência de segurança: a identidade existe, mas ninguém sabe de quem ela é.</p>
+
+<dl class="anatomy">
+<dt>ServiceAccount</dt>
+<dd>A identidade de um programa. O nome dela aparece para o cluster como
+<code>system:serviceaccount:&lt;namespace&gt;:&lt;nome&gt;</code>.</dd>
+<dt>namespace</dt>
+<dd>Onde a identidade nasce. Duas ServiceAccounts com o mesmo nome, em namespaces diferentes, são pessoas
+diferentes para o cluster.</dd>
+<dt>automountServiceAccountToken</dt>
+<dd>Se o token da identidade é montado dentro do pod. Padrão <code>true</code>; desligar é boa prática
+quando a aplicação não fala com a API.</dd>
+<dt>serviceAccountName</dt>
+<dd>O campo do pod que escolhe a identidade. Sem ele, o pod usa a <code>default</code> do namespace.</dd>
+</dl>
+
+<p>Um detalhe que confunde na primeira leitura: o <code>kind</code> é <code>ServiceAccount</code>, sem
+espaço, mas o comando aceita <code>serviceaccounts</code>, <code>serviceaccount</code> e o apelido
+<code>sa</code>. O plural que aparece nas mensagens de erro é sempre o do servidor, nunca o que você
+digitou.</p>
+
+<h2>5. Passo 2 — a Role: a lista do que pode</h2>
+
+<p>A Role é uma lista de regras. Cada regra responde a três perguntas: em que grupo da API
+(<code>apiGroups</code>), em que tipo de objeto (<code>resources</code>) e o que pode ser feito
+(<code>verbs</code>). O grupo da API do pod e do Service é o vazio — escrito como <code>[""]</code> —,
+enquanto Deployment é <code>apps</code> e Job é <code>batch</code>.</p>
+
+<div class="tryk8s" data-get="role leitor -n entrega -o yaml" data-goal="texto:- list;;texto:- get;;texto:role.rbac.authorization.k8s.io/leitor created">
+  <p class="try-task">A Role <code>leitor</code> deve permitir <em>ver</em> pods e <em>listar</em> pods no
+  namespace <code>entrega</code>. Acrescente os verbos <code>get</code> e <code>list</code> à regra e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: entrega
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leitor
+  namespace: entrega
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["watch"]</pre>
+<pre class="out">
+namespace/entrega created
+role.rbac.authorization.k8s.io/leitor created
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leitor
+  namespace: entrega
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - watch
+spec: {}
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: entrega
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leitor
+  namespace: entrega
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]</pre>
+</div>
+
+<p>Repare que a Role não diz <em>quem</em>. Ela é só a lista; quem recebe é o próximo passo. Essa separação
+parece burocracia e é o que torna o RBAC reaproveitável: a mesma Role <code>leitor</code> pode ser dada para
+três identidades diferentes com três bindings, e revisar o que ela permite é ler um arquivo só.</p>
+
+<p>Os verbos mais comuns são <code>get</code> (um objeto pelo nome), <code>list</code> (a lista),
+<code>watch</code> (acompanhar mudanças), <code>create</code>, <code>update</code>, <code>patch</code> e
+<code>delete</code>. Existem também <code>deletecollection</code> e os sub-recursos, como
+<code>pods/log</code>. E há um verbo que quase ninguém lembra: ler log é
+<code>resources: ["pods/log"]</code>, com <code>get</code> — não é o mesmo que ler o pod.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Verbo</th><th>O que libera</th><th>Quando o time pede</th></tr>
+</thead>
+<tbody>
+<tr><td><code>get</code></td><td>buscar um objeto pelo nome</td><td>o painel que abre o detalhe de um pod</td></tr>
+<tr><td><code>list</code></td><td>listar todos os objetos do tipo</td><td>a tabela do painel de rotas</td></tr>
+<tr><td><code>watch</code></td><td>receber mudanças em tempo real</td><td>painel que atualiza sozinho</td></tr>
+<tr><td><code>create</code></td><td>criar objeto novo</td><td>job de importação que abre pods</td></tr>
+<tr><td><code>patch</code></td><td>alterar parte de um objeto</td><td>operador que ajusta réplicas</td></tr>
+<tr><td><code>delete</code></td><td>apagar objeto</td><td>limpeza automática de pods concluídos</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma regra de ouro do começo: conceda o mínimo, e por recurso. “Pods e deployments e services e secrets”
+numa regra só é o caminho mais curto para dar, sem perceber, acesso a segredo. <code>secrets</code> merece
+linha separada e motivo escrito, porque quem lê um Secret lê senha de banco.</p>
+
+<h2>6. Passo 3 — o RoleBinding: quem recebe</h2>
+
+<p>O RoleBinding tem duas partes: <code>subjects</code>, que diz quem recebe, e <code>roleRef</code>, que diz
+qual Role é entregue. No caso de uma ServiceAccount, o subject precisa de três campos:
+<code>kind: ServiceAccount</code>, <code>name</code> e <code>namespace</code>. Esquecer o namespace faz o
+cluster assumir o namespace do próprio binding — e é a causa número um de permissão que “não pega”.</p>
+
+<div class="tryk8s" data-get="rolebinding leitor -n entrega -o yaml" data-goal="texto:rolebinding.rbac.authorization.k8s.io/leitor created;;texto:name: app;;texto:roleRef:">
+  <p class="try-task">O binding aponta para a ServiceAccount errada. Troque o subject para a identidade
+  <code>app</code>, do namespace <code>entrega</code>, e confira o resultado no YAML.</p>
+<pre class="yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: entrega
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app
+  namespace: entrega
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leitor
+  namespace: entrega
+subjects:
+  - kind: ServiceAccount
+    name: estoque
+    namespace: padaria
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor</pre>
+<pre class="out">
+namespace/entrega created
+serviceaccount/app created
+rolebinding.rbac.authorization.k8s.io/leitor created
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leitor
+  namespace: entrega
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor
+spec: {}
+subjects:
+  - kind: ServiceAccount
+    name: estoque
+    namespace: padaria
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: entrega
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app
+  namespace: entrega
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leitor
+  namespace: entrega
+subjects:
+  - kind: ServiceAccount
+    name: app
+    namespace: entrega
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor</pre>
+</div>
+
+<dl class="anatomy">
+<dt>subjects</dt>
+<dd>A lista de quem recebe: um usuário, um grupo ou uma ServiceAccount. Para ServiceAccount, o namespace é
+obrigatório.</dd>
+<dt>roleRef</dt>
+<dd>A Role (ou ClusterRole) entregue. Tem três campos: <code>apiGroup</code>, <code>kind</code> e
+<code>name</code>.</dd>
+<dt>apiGroup</dt>
+<dd>O grupo da API da Role. Em RBAC é sempre <code>rbac.authorization.k8s.io</code>; esquecer esse campo é
+um dos erros de validação mais comuns.</dd>
+<dt>User e Group</dt>
+<dd>Os outros dois tipos de subject. <code>User</code> é uma identidade humana vinda do certificado ou do
+OIDC; <code>Group</code> é um conjunto delas, como <code>system:masters</code>.</dd>
+</dl>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Subject</th><th>Como se identifica</th><th>De onde vem</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ServiceAccount</code></td><td><code>system:serviceaccount:entrega:app</code></td><td>objeto criado por você no namespace</td></tr>
+<tr><td><code>User</code></td><td><code>ana</code> ou um e-mail</td><td>certificado do kubeconfig ou provedor de identidade</td></tr>
+<tr><td><code>Group</code></td><td><code>system:masters</code>, <code>devs</code></td><td>vem junto com o certificado, no campo de organização</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Quem prefere o caminho curto cria o binding por comando, sem escrever YAML — e o comando monta o
+<code>roleRef</code> e o subject para você:</p>
+
+<pre class="term">ana@notebook:~$ kubectl create rolebinding entrega-leitor -n entrega --role=leitor --serviceaccount=entrega:app
+rolebinding.rbac.authorization.k8s.io/entrega-leitor created</pre>
+
+<p>O <code>--serviceaccount=namespace:nome</code> é a parte que mais erra. Sem o namespace, o comando recusa;
+com o namespace errado, cria um binding válido para a pessoa errada — e o erro só aparece no
+<code>can-i</code> do dia seguinte.</p>
+
+<p>O <code>roleRef</code> tem uma regra dura: ele é <strong>imutável</strong>. Depois de criado, não dá para
+trocar a Role de um binding com <code>apply</code>; o cluster recusa com
+<code>cannot change roleRef</code>. O caminho é apagar o binding e criar outro — e vale saber disso antes de
+tentar consertar no desespero, porque a mensagem não sugere a saída.</p>
+
+<p>Com o binding no lugar, o pod da entrega pode listar pods de <code>entrega</code> e nada mais. O pod que
+usa essa identidade declara <code>serviceAccountName: app</code> no <code>spec</code>; sem isso, ele roda com
+a <code>default</code> e a permissão fica sem dono. Nome de ServiceAccount no pod e nome no subject do
+binding são a mesma string — e é por isso que erro de digitação aqui vira “usuário sem permissão”.</p>
+
+<h2>7. Conferindo com o painel</h2>
+
+<p>A conferência começa pelos objetos: <code>kubectl get roles,rolebindings -n entrega</code> mostra as
+peças, e <code>kubectl get role leitor -n entrega -o yaml</code> mostra as regras como o cluster guardou. Mas
+a pergunta de verdade não é “o objeto existe?” e sim “este pedido passa?”. Para isso existe um comando que
+não muda nada e responde direto:</p>
+
+<pre class="term">ana@notebook:~$ kubectl auth can-i list pods -n entrega --as=system:serviceaccount:entrega:app
+yes
+
+ana@notebook:~$ kubectl auth can-i delete pods -n entrega --as=system:serviceaccount:entrega:app
+no
+
+ana@notebook:~$ kubectl auth can-i list pods -n padaria --as=system:serviceaccount:entrega:app
+no</pre>
+
+<p>Três respostas, três certezas. A identidade da entrega lista pods na própria pasta, não apaga nada e não
+enxerga a pasta da padaria. O <code>--as=</code> é o coração do comando: ele finge ser aquela identidade só
+para a checagem, sem precisar de token, sem precisar de pod e sem alterar coisa nenhuma. É a primeira coisa a
+rodar quando alguém diz “não tenho permissão” — e a última antes de fechar um acesso novo.</p>
+
+<p>Quando o pedido realmente falha, a mensagem do cluster é explícita. Esta é de um cluster real, com a
+identidade da entrega tentando listar pods na padaria:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods -n padaria --as=system:serviceaccount:entrega:app
+Error from server (Forbidden): pods is forbidden: User "system:serviceaccount:entrega:app" cannot list
+resource "pods" in API group "" in the namespace "padaria"</pre>
+
+<p>Leia por partes: <code>Forbidden</code> é “autenticado, mas sem permissão” — diferente de
+<code>Unauthorized</code>, que é “não sei quem você é”. O usuário aparece com o nome completo
+<code>system:serviceaccount:entrega:app</code>, e a frase diz o verbo, o recurso, o grupo e o namespace. Com
+essas cinco informações, achar a Role que falta é mecânico.</p>
+
+<p>Agora o limite honesto do painel deste guia: ele não simula a checagem de autorização, então
+<code>kubectl auth can-i</code> responde <code>no</code> para tudo, inclusive para o que você acabou de
+conceder. Não é a sua Role que está errada — é o simulador. Por isso as caixas provam o que ele sabe provar
+(os objetos existem, com as regras e os subjects certos) e a prova de permissão mora nas transcrições acima,
+que são de cluster real. No cluster do trabalho, as duas verificações andam juntas: objeto certo e
+<code>can-i</code> respondendo <code>yes</code>.</p>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Cinco tropeços explicam quase todo chamado de “RBAC não funciona”. O primeiro é o subject com namespace
+errado: o binding está em <code>entrega</code>, o subject aponta para <code>padaria</code>, e a permissão é
+concedida a uma identidade que não existe. O segundo é o verbo faltando: a Role tem <code>get</code> e o
+painel usa <code>list</code>; são verbos diferentes, e o cluster não empresta um do outro.</p>
+
+<p>O terceiro é o <code>roleRef</code> imutável. Alguém edita a Role de <code>leitor</code> para
+<code>editor</code>, aplica, e recebe <code>cannot change roleRef</code>; o objeto continua com a Role antiga
+e o time acha que a mudança “não subiu”. O quarto é esquecer o <code>serviceAccountName</code> no pod: a
+Role está certa, o binding está certo, e o pod roda com a <code>default</code> — que não tem nada.</p>
+
+<p>O quinto é o escopo. Uma Role só vale no namespace dela; se a aplicação precisa listar pods em todos os
+namespaces, o caminho é ClusterRole com ClusterRoleBinding — e isso é uma decisão de segurança, não um
+detalhe. E existe o sexto, invisível: alguém apagou a Role e deixou o binding. O binding continua lá,
+apontando para o vazio, e a permissão some sem nenhum aviso.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Peça</th><th>Pergunta que responde</th><th>Escopo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ServiceAccount</code></td><td>quem é você?</td><td>namespace</td></tr>
+<tr><td><code>Role</code></td><td>o que pode ser feito?</td><td>namespace</td></tr>
+<tr><td><code>RoleBinding</code></td><td>quem recebe essa lista?</td><td>namespace</td></tr>
+<tr><td><code>ClusterRole</code></td><td>o que pode ser feito em qualquer lugar?</td><td>cluster</td></tr>
+<tr><td><code>ClusterRoleBinding</code></td><td>quem recebe a lista de cluster?</td><td>cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>E a prova de que o desenho está certo é sempre a mesma dupla: <code>kubectl auth can-i --list
+--as=system:serviceaccount:entrega:app</code> mostra tudo o que aquela identidade pode, numa tabela; e
+<code>kubectl auth can-i &lt;verbo&gt; &lt;recurso&gt;</code> responde um pedido específico. Rodar os dois no
+fim de qualquer mudança de permissão é o equivalente ao teste automatizado do RBAC.</p>
+
+<div class="cenario">
+<h3>Cenário 1: o painel que ficou sem dados</h3>
+<p>O time da entrega subiu o painel e recebeu <code>Forbidden</code> em toda consulta. A Role estava certa, o
+binding estava certo — e o pod rodava com a ServiceAccount <code>default</code>, porque ninguém tinha posto
+<code>serviceAccountName</code> no manifesto. Uma linha resolveu; o diagnóstico veio de
+<code>kubectl auth can-i list pods --as=system:serviceaccount:entrega:default</code>, que respondeu
+<code>no</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o admin emprestado</h3>
+<p>Para “destravar rápido”, alguém deu ClusterRoleBinding de <code>cluster-admin</code> para a ServiceAccount
+do painel. Ficou seis meses. Num sábado, um laço mal escrito no painel apagou o Deployment do cardápio — com
+permissão de admin, o cluster obedeceu na hora. O conserto foi voltar à Role de dois verbos e criar um alerta
+para bindings de <code>cluster-admin</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a Role apagada no fim de semana</h3>
+<p>Alguém limpou “objetos sem uso” e apagou a Role <code>leitor</code>. O RoleBinding continuou existindo,
+apontando para um nome que não estava mais lá. Nenhum erro no cluster, nenhum alerta — só o painel vazio na
+segunda-feira. A lição: Role e RoleBinding são um par, e a limpeza precisa conferir o que aponta para o quê.</p>
+</div>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>Você montou a divisão completa: duas pastas, duas identidades, uma lista de permissões e um binding. O
+vocabulário que fica é o das quatro perguntas — quem é você (ServiceAccount), o que pode (Role), onde vale
+(namespace ou cluster) e quem recebeu (RoleBinding). Com essas quatro, qualquer pedido de acesso vira uma
+conversa curta e concreta em vez de um “me dá admin”.</p>
+
+<p>Para continuar sozinho, três exercícios bons. O primeiro é dar à padaria uma Role que permita
+<code>get</code> em <code>pods/log</code> e conferir com <code>can-i</code> que ela <em>não</em> permite
+<code>delete</code> em pods. O segundo é criar uma ClusterRole de leitura e amarrá-la a cada time com um
+RoleBinding no namespace dele — o truque que evita duplicar regras. O terceiro é auditar: listar todos os
+bindings que apontam para <code>cluster-admin</code> e escrever, para cada um, a frase que justifica.</p>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que uma Role define?</p>
+<label><input type="radio" name="q1"> quem pode entrar no cluster</label>
+<label><input type="radio" name="q1"> quais verbos são permitidos em quais recursos, dentro de um
+namespace</label>
+<label><input type="radio" name="q1"> o token da ServiceAccount</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual comando prova se a identidade da entrega consegue
+listar pods, sem alterar nada?</p>
+<label><input type="radio" name="q2"> <code>kubectl get pods --as=…</code> e ler a tabela</label>
+<label><input type="radio" name="q2"> <code>kubectl describe role leitor</code></label>
+<label><input type="radio" name="q2"> <code>kubectl auth can-i list pods --as=system:serviceaccount:entrega:app</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que o RBAC é chamado de aditivo?</p>
+<label><input type="radio" name="q3"> porque só existem regras que concedem; para tirar, remove-se a
+concessão</label>
+<label><input type="radio" name="q3"> porque as permissões somam ao longo do tempo</label>
+<label><input type="radio" name="q3"> porque cada Role nova substitui a anterior</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o verbo que falta</h2>
+<p>O painel da entrega lista os pods com <code>kubectl get pods -n entrega</code> e recebe
+<code>Forbidden</code>. A Role tem a regra abaixo. Complete a lista de verbos com o que falta para a
+<em>listagem</em> funcionar:</p>
+<div class="ex-code">rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "<input aria-label="resposta 1" data-answer="list" placeholder="...">"]</div>
+<p class="ex-dica">Dica: <code>get</code> busca um objeto pelo nome; a listagem é outro verbo. Depois de
+mudar, confira com <code>kubectl auth can-i list pods -n entrega --as=system:serviceaccount:entrega:app</code>
+— e lembre que uma Role alterada vale na hora, sem reiniciar pod nenhum.</p>
+</div>
+
+<h2>10. Resumo</h2>
+
+<p>RBAC tem quatro peças e uma regra. As peças: ServiceAccount (identidade de programa), Role (lista de
+verbos por recurso, dentro de um namespace), RoleBinding (quem recebe a lista) e as versões de cluster,
+ClusterRole e ClusterRoleBinding. A regra: permissão é aditiva e vale pelo mais generoso — não existe
+“negar”.</p>
+
+<p>O caminho do projeto foi: namespace antes de tudo, identidade com nome próprio, Role com o mínimo
+(<code>get</code> e <code>list</code> em pods), binding amarrando as duas. A prova é
+<code>kubectl auth can-i</code>, com <code>--as=system:serviceaccount:namespace:nome</code>: ele responde
+<code>yes</code> ou <code>no</code> sem alterar nada e é o primeiro comando de qualquer investigação de
+permissão. Quando o pedido falha de verdade, a resposta é <code>Forbidden</code> com o nome completo da
+identidade.</p>
+
+<p>E o limite do simulador: aqui o <code>can-i</code> responde <code>no</code> sempre, porque a autorização
+não é simulada; as caixas provam os objetos e as transcrições provam a permissão. Guarde também as três
+armadilhas: namespace do subject, verbo faltando e <code>roleRef</code> imutável. Na próxima etapa do guia a
+Ana troca a permissão pelo processo: o repositório passa a ser a fonte da verdade do cluster.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+<li>ServiceAccount é identidade de programa; o nome real é
+<code>system:serviceaccount:&lt;ns&gt;:&lt;nome&gt;</code>.</li>
+<li>Role e RoleBinding valem no namespace; ClusterRole e ClusterRoleBinding, no cluster.</li>
+<li>Regra = <code>apiGroups</code> + <code>resources</code> + <code>verbs</code>; mínimo por recurso.</li>
+<li>Subject de ServiceAccount precisa de <code>name</code> e <code>namespace</code>.</li>
+<li><code>roleRef</code> não muda: apague o binding e crie outro.</li>
+<li>Prove com <code>kubectl auth can-i … --as=…</code>; no painel, sem um <code>RoleBinding</code> no cluster de exemplo, ele responde <code>no</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

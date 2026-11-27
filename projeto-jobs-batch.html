@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jobs em lote | Guia Kubernetes</title>
+<meta name="description" content="Projeto guiado: o fechamento do caixa da padaria como Job em lote — completions, parallelism, backoffLimit, prazo e limpeza, com o painel conferindo cada passo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Jobs em <span class="hl">lote</span></h1>
+<p class="intro">A Ana fecha o caixa toda noite: soma as vendas do dia, gera o arquivo do contador e
+confere se sobrou dinheiro na gaveta. O trabalho é sempre o mesmo, o tamanho é sempre parecido, e nada
+precisa ficar rodando depois. Nos próximos minutos você vai construir isso de verdade — um Job que
+processa o caixa, dividido em três turnos, com prazo e limpeza — e vai ver o painel responder a cada
+passo, inclusive quando o manifesto está errado.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Montar um Job do zero, com o molde de pod dentro dele.</li>
+  <li>Por que o Kubernetes exige <code>restartPolicy</code> num Job e o que acontece sem ela.</li>
+  <li>Fatiar o trabalho com <code>completions</code> e controlar o ritmo com <code>parallelism</code>.</li>
+  <li>Pôr prazo e limpeza: <code>activeDeadlineSeconds</code> e <code>ttlSecondsAfterFinished</code>.</li>
+  <li>Conferir o resultado pelo <code>get jobs</code>, pelo <code>describe</code> e pelo
+  <code>status.succeeded</code>.</li>
+  <li>Reconhecer os cinco erros que aparecem em quase todo primeiro Job.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>No fim desta página a Ana tem três Jobs que funcionam sozinhos: um que fecha o caixa do dia, um que
+processa o mesmo caixa dividido em três partes (um por turno: manhã, tarde e noite) e um que faz o backup
+das vendas com prazo máximo de quinze minutos. Cada um entrega um arquivo, termina e para. Nada deixa
+container pendurado e nada fica tentando para sempre.</p>
+
+<p>A imagem mental é a de uma <em>linha de produção com começo e fim</em>. O Deployment é uma loja
+aberta: sempre tem alguém atrás do balcão. O Job é uma encomenda: alguém recebe a lista, executa, entrega
+e vai embora. O que você vai montar aqui é a encomenda do fechamento — e o painel vai mostrar os pods
+terminando em <code>Succeeded</code>, um a um, na sua frente.</p>
+
+<p>São três passos, e cada um tem uma caixa para você editar e rodar. O primeiro é o Job mínimo: só o
+necessário para o cluster aceitar. O segundo divide o trabalho em partes iguais. O terceiro põe os freios
+que separam um script de teste de um Job que pode rodar sozinho em produção. Entre um passo e outro há
+texto explicando por que cada campo existe — leia antes de rodar, senão a resposta vira mágica.</p>
+
+<h2>2. O cenário da padaria: o fechamento do dia</h2>
+
+<p>Toda noite, quando a última fornada sai, a Ana faz o fechamento. Ela abre o sistema de vendas, exporta
+o movimento do dia, soma por forma de pagamento, confere a gaveta e manda o arquivo para o contador. Leva
+uns quatro minutos, quase sempre dá certo, e é chato do jeito que só tarefa repetida é.</p>
+
+<p>Na época em que ela fazia isso à mão, dois problemas apareciam. O primeiro: quando ela esquecia, o
+arquivo do dia não existia — e no dia seguinte ninguém sabia se o problema era o sistema ou a memória
+dela. O segundo: quando o sistema travava no meio da exportação, ela não percebia e mandava um arquivo
+pela metade para o contador. Um Job resolve os dois, porque ele registra cada tentativa e não considera
+“terminou” um processo que saiu com erro.</p>
+
+<p>E tem o detalhe do volume. No fim do mês, o fechamento cresce: são trinta dias de vendas para
+processar. Rodar isso num único processo leva meia hora e, se falhar no minuto vinte e nove, começa tudo
+de novo. É aí que entra o trabalho em lote: dividir o serviço em três pedaços (um por turno) e deixar o
+cluster cuidar de quantos rodam ao mesmo tempo. O resultado final é o mesmo arquivo; o caminho é que fica
+mais curto e mais seguro.</p>
+
+<h2>3. Antes de começar</h2>
+
+<p>Você precisa saber três coisas que já apareceram nas aulas anteriores — a primeira delas está na aula
+<a href="job.html">Job</a>, se quiser revisar antes de montar o lote. Um Job pertence ao
+grupo <code>batch/v1</code>, não ao <code>v1</code> dos pods nem ao <code>apps/v1</code> dos Deployments.
+Trocar essa linha é o erro de copiar e colar mais comum, e o cluster recusa com uma mensagem que fala de
+“no matches for kind”.</p>
+
+<p>A segunda: o Job não tem <code>replicas</code>. Quem diz quantas vezes a tarefa roda é
+<code>completions</code>, e quem diz quantas rodam juntas é <code>parallelism</code>. Confundir os dois
+é como pedir três bolos e esperar que saiam três ao mesmo tempo: uma coisa é a quantidade, outra é o
+ritmo.</p>
+
+<p>A terceira: dentro do Job existe um molde de pod, em <code>spec.template</code>, exatamente como no
+Deployment. Tudo o que você já sabe sobre container, imagem, <code>command</code> e limites vale ali
+dentro. E uma linha é obrigatória nesse molde: <code>restartPolicy</code>. Um pod comum aceita
+<code>Always</code>, <code>OnFailure</code> e <code>Never</code>; um pod de Job aceita só as duas
+últimas — porque “sempre reiniciar” impediria o Job de chegar a “terminou”.</p>
+
+<dl class="anatomy">
+<dt>apiVersion: batch/v1</dt>
+<dd>O grupo do Job. Nem <code>v1</code> (pods) nem <code>apps/v1</code> (Deployments): é
+<code>batch</code>.</dd>
+<dt>metadata.name</dt>
+<dd>O nome do Job, em minúsculas com hífen. Não pode repetir no mesmo namespace: para rodar de novo, use
+outro nome ou apague o anterior.</dd>
+<dt>spec.template</dt>
+<dd>O molde do pod: imagem, <code>command</code>, limites, volumes e a <code>restartPolicy</code>
+obrigatória.</dd>
+<dt>spec.completions</dt>
+<dd>Quantas fatias precisam terminar. Fica fora do <code>template</code> — indentar errado aqui é o erro
+silencioso mais comum.</dd>
+<dt>spec.parallelism</dt>
+<dd>Quantas fatias rodam juntas. Também fora do <code>template</code>.</dd>
+<dt>spec.backoffLimit</dt>
+<dd>Quantas falhas o Job aceita antes de desistir. Padrão 6.</dd>
+</dl>
+
+<h2>4. Passo 1 — o Job do caixa</h2>
+
+<p>Comece pelo mínimo que o cluster aceita. O manifesto abaixo tem nome, um molde de pod, uma imagem e um
+comando — o script que gera o arquivo do fechamento. Falta uma coisa, e você vai descobrir qual rodando:
+o painel mostra a mensagem do servidor, não uma explicação inventada.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="objeto:Job/caixa-do-dia;;campo:Job/caixa-do-dia|spec.template.spec.restartPolicy=Never;;campo:Job/caixa-do-dia|status.succeeded=1">
+  <p class="try-task">Rode do jeito que está e leia o erro. Depois acrescente
+  <code>restartPolicy: Never</code> dentro de <code>spec.template.spec</code> e rode de novo: o Job tem de
+  existir e o pod terminar em <code>Succeeded</code>.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: caixa-do-dia
+spec:
+  template:
+    metadata:
+      labels:
+        app: caixa
+    spec:
+      containers:
+        - name: caixa
+          image: caixa:1.0
+          command: ["python", "fechar.py"]</pre>
+<pre class="out">
+The Job "caixa-do-dia" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+</pre>
+  <pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: caixa-do-dia
+spec:
+  template:
+    metadata:
+      labels:
+        app: caixa
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: caixa
+          image: caixa:1.0
+          command: ["python", "fechar.py"]</pre>
+</div>
+
+<p>A mensagem que o painel devolve é a do servidor, palavra por palavra — e é a mesma que você veria no
+seu cluster:</p>
+
+<pre class="term">$ kubectl apply -f lote.yaml
+The Job "caixa-do-dia" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"</pre>
+
+<p>Traduzindo: “o campo é obrigatório e só aceita OnFailure ou Never”. Repare que o Kubernetes nem
+sugere <code>Always</code>: a lista já vem filtrada pelo tipo do objeto. Depois de corrigir, o painel
+mostra duas coisas — a linha do <code>apply</code> e a tabela dos pods, com o pod do Job já em
+<code>Succeeded</code>. Esse é o estado de sucesso: o processo rodou, saiu com zero e não vai voltar.</p>
+
+<h2>5. Passo 2 — fatiar em três turnos</h2>
+
+<p>Agora o fechamento do mês: trinta dias de vendas, três turnos por dia. Em vez de um pod fazendo tudo,
+o Job pode pedir <code>completions: 3</code> — três pods, cada um responsável por uma fatia. O Job só é
+considerado completo quando os três terminam bem. Se um falhar, o controlador cria outro até o orçamento
+de falhas acabar.</p>
+
+<p>E <code>parallelism</code> decide quantos rodam ao mesmo tempo. Com <code>parallelism: 2</code>, dois
+começam juntos e o terceiro entra quando um deles sai. Na padaria isso importa: o banco de dados aguenta
+duas conexões pesadas, não três. Limitar o ritmo é proteger o que está do outro lado.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Job/caixa-do-dia|spec.completions=3;;campo:Job/caixa-do-dia|spec.parallelism=2;;campo:Job/caixa-do-dia|status.succeeded=3;;conta:pods=3">
+  <p class="try-task">Acrescente <code>completions: 3</code> e <code>parallelism: 2</code> em
+  <code>spec</code> — fora do <code>template</code>. Rode e confira três pods e
+  <code>status.succeeded: 3</code>.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: caixa-do-dia
+spec:
+  template:
+    metadata:
+      labels:
+        app: caixa
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: caixa
+          image: caixa:1.0
+          command: ["python", "fechar.py"]</pre>
+<pre class="out">
+job.batch/caixa-do-dia created
+
+NAME                 READY   STATUS      RESTARTS   AGE
+caixa-do-dia-5fvxg   0/1     Succeeded   0          6m
+</pre>
+  <pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: caixa-do-dia
+spec:
+  completions: 3
+  parallelism: 2
+  template:
+    metadata:
+      labels:
+        app: caixa
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: caixa
+          image: caixa:1.0
+          command: ["python", "fechar.py"]</pre>
+</div>
+
+<p>O painel mostra três pods com nomes compridos, todos em <code>Succeeded</code>, e o Job com
+<code>status.succeeded: 3</code>. Cada pod é uma tentativa independente: tem nome próprio, log próprio e
+código de saída próprio. Isso é o que torna o lote depurável — quando o turno da noite falha, você lê o
+log <em>daquele</em> pod, não de um arquivo gigante misturado.</p>
+
+<p>Uma honestidade do painel, que vale para o resto do guia: ele cria um pod por
+<code>completion</code>, todos de uma vez, e não simula a fila do <code>parallelism</code>. Num cluster de
+verdade você veria dois pods <code>Running</code> e um <code>Pending</code> — ou nem isso, porque o
+terceiro só nasce quando um dos dois termina. O manifesto e o resultado final são os mesmos; a dança do
+meio é do controlador.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Configuração</th><th>Quantos pods no total</th><th>Uso na padaria</th></tr>
+</thead>
+<tbody>
+<tr><td><code>completions: 1</code>, <code>parallelism: 1</code></td><td>1</td><td>fechamento de um dia
+só</td></tr>
+<tr><td><code>completions: 3</code>, <code>parallelism: 1</code></td><td>3, em fila</td><td>três turnos, um
+de cada vez, sem sobrecarregar o banco</td></tr>
+<tr><td><code>completions: 3</code>, <code>parallelism: 2</code></td><td>3, dois juntos</td><td>o meio
+termo que a Ana usa</td></tr>
+<tr><td><code>completions: 3</code>, <code>parallelism: 3</code></td><td>3, todos juntos</td><td>só quando o
+outro lado aguenta</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>6. Passo 3 — prazo, insistência e limpeza</h2>
+
+<p>Um Job com <code>completions</code> ainda pode dar dois tipos de dor de cabeça. O primeiro é ficar
+preso: o script espera um arquivo que nunca chega, o pod fica <code>Running</code> para sempre e ninguém
+percebe, porque “não falhou”. O segundo é ficar tentando: o banco está fora, o Job tenta seis vezes e
+enche o cluster de pods falhos. Prazo e orçamento resolvem os dois.</p>
+
+<p><code>activeDeadlineSeconds</code> é o prazo total: passados os segundos, o Job é encerrado com motivo
+<code>DeadlineExceeded</code>, mesmo que ainda esteja tentando. <code>backoffLimit</code> é o orçamento de
+falhas: quantas tentativas ruins ele aceita antes de desistir. E <code>ttlSecondsAfterFinished</code> é a
+limpeza: quanto tempo o Job concluído fica no cluster antes de ser apagado com os pods dele.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:jobs=2;;campo:Job/backup-vendas|spec.activeDeadlineSeconds=900;;campo:Job/caixa-do-dia|spec.ttlSecondsAfterFinished=3600;;conta:pods=4">
+  <p class="try-task">Junte as peças no mesmo arquivo. No <code>caixa-do-dia</code>, acrescente
+  <code>ttlSecondsAfterFinished: 3600</code>. Depois de <code>---</code>, crie o Job
+  <code>backup-vendas</code> com <code>activeDeadlineSeconds: 900</code> e <code>restartPolicy:
+  Never</code>. Rode e confira dois Jobs e quatro pods.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: caixa-do-dia
+spec:
+  completions: 3
+  parallelism: 2
+  template:
+    metadata:
+      labels:
+        app: caixa
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: caixa
+          image: caixa:1.0
+          command: ["python", "fechar.py"]</pre>
+<pre class="out">
+job.batch/caixa-do-dia created
+
+NAME                 READY   STATUS      RESTARTS   AGE
+caixa-do-dia-5fvxg   0/1     Succeeded   0          6m
+caixa-do-dia-kvx84   0/1     Succeeded   0          3m
+caixa-do-dia-n5m69   0/1     Succeeded   0          1m
+</pre>
+  <pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: caixa-do-dia
+spec:
+  completions: 3
+  parallelism: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: caixa
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: caixa
+          image: caixa:1.0
+          command: ["python", "fechar.py"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backup-vendas
+spec:
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app: backup
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backup
+          image: backup:2.0
+          command: ["pg_dump", "-f", "/dados/vendas.sql"]</pre>
+</div>
+
+<p>Quatro pods porque três são do caixa e um é do backup. Dois Jobs porque são duas tarefas diferentes
+com donos diferentes: o caixa fecha o dia, o backup guarda o mês. Separar em objetos separados é o que
+permite dar prazo a um e limpeza ao outro sem mexer no que já funciona.</p>
+
+<p>O <code>---</code> entre os dois documentos é a linha que separa objetos num mesmo arquivo. É o que
+permite aplicar tudo com um <code>kubectl apply -f lote.yaml</code> só, e é também o que permite versionar
+o lote inteiro como uma unidade. Se você esquecer o <code>---</code>, o YAML vira um objeto só — e o erro
+que aparece fala de campo desconhecido, não de documento faltando.</p>
+
+<h2>7. Conferindo com o painel</h2>
+
+<p>Três comandos contam a história inteira, e cada um responde uma pergunta diferente.
+<code>kubectl get pods</code> responde “quais tentativas existem e como terminaram”.
+<code>kubectl get jobs</code> responde “quais tarefas existem e quantas completaram”.
+<code>kubectl describe job</code> responde “o que o controlador tentou fazer”.</p>
+
+<p>Esta é a transcrição de um cluster de prova, com o lote já rodado — a coluna
+<code>COMPLETIONS</code> é a que interessa:</p>
+
+<pre class="term">$ kubectl get jobs
+NAME           COMPLETIONS   DURATION   AGE
+backup-vendas  1/1           22s        3m
+caixa-do-dia   3/3           1m34s      3m
+
+$ kubectl get pods
+NAME                 READY   STATUS      RESTARTS   AGE
+backup-vendas-7xk2p  0/1     Completed   0          3m
+caixa-do-dia-2mn4q   0/1     Completed   0          3m
+caixa-do-dia-9pz6v   0/1     Completed   0          3m
+caixa-do-dia-lt8wj   0/1     Completed   0          3m</pre>
+
+<p>Repare em dois detalhes que costumam assustar. O <code>READY</code> está em <code>0/1</code>: um pod
+concluído não está pronto para receber tráfego, e não precisa estar. E o status é
+<code>Completed</code> aqui, enquanto o painel do guia mostra <code>Succeeded</code> — são o mesmo estado,
+com nomes diferentes conforme a versão do kubectl. O que vale é o significado: saiu com zero.</p>
+
+<p>Agora o <code>describe</code>, com os eventos do controlador. Também transcrição, porque o painel
+mostra o <code>describe</code> de forma resumida:</p>
+
+<pre class="term">$ kubectl describe job caixa-do-dia
+Name:           caixa-do-dia
+Namespace:      default
+Selector:       controller-uid=6f1c2a90-3a4e-4d1f-9f4a-1f0d2a7b3c11
+Labels:         app=caixa
+Parallelism:    2
+Completions:    3
+Pods Statuses:  0 Active / 3 Succeeded
+Events:
+  Type    Reason            Age    From            Message
+  ----    ------            ----   ----            -------
+  Normal  SuccessfulCreate  1m40s  job-controller  Created pod: caixa-do-dia-2mn4q
+  Normal  SuccessfulCreate  1m40s  job-controller  Created pod: caixa-do-dia-9pz6v
+  Normal  SuccessfulCreate  1m12s  job-controller  Created pod: caixa-do-dia-lt8wj
+  Normal  Completed         1m     job-controller  Job completed</pre>
+
+<p>Leia a terceira linha de evento com atenção: o terceiro pod foi criado trinta segundos depois dos
+outros dois. É o <code>parallelism: 2</code> fazendo o trabalho dele. Quem olha só o resultado final não
+vê isso; quem olha o evento entende por que o Job demorou o que demorou.</p>
+
+<dl class="anatomy">
+<dt>completions</dt>
+<dd>Quantos pods precisam terminar com sucesso. Padrão 1. Aparece como o primeiro número de
+<code>COMPLETIONS</code>.</dd>
+<dt>parallelism</dt>
+<dd>Quantos podem rodar ao mesmo tempo. Padrão 1. Não aparece no <code>get</code>; aparece no
+<code>describe</code>.</dd>
+<dt>status.succeeded</dt>
+<dd>Quantos pods já terminaram bem. É o número que a meta das caixas confere.</dd>
+<dt>status.conditions</dt>
+<dd><code>Complete</code> quando acabou; <code>Failed</code> quando o orçamento ou o prazo estourou.</dd>
+<dt>ACTIVE</dt>
+<dd>Quantos pods do Job estão rodando agora. Zero com tudo completo é o estado feliz.</dd>
+</dl>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Estes cinco erros cobrem quase todo Job que não sobe. Todos já apareceram nas caixas acima em algum
+momento, e cada um tem uma tradução direta.</p>
+
+<p><strong>1. Falta <code>restartPolicy</code>.</strong> A mensagem é
+<code>spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"</code>. Não é
+aviso, é recusa: o objeto não é criado. Conserto: uma linha no molde do pod.</p>
+
+<p><strong>2. <code>restartPolicy: Always</code>.</strong> A mensagem muda para
+<code>Unsupported value: "Always"</code>. Quase sempre é manifesto copiado de um Deployment, onde
+<code>Always</code> é o padrão. Conserto: trocar por <code>Never</code> ou <code>OnFailure</code>.</p>
+
+<p><strong>3. <code>apiVersion</code> errado.</strong> Job é <code>batch/v1</code>. Com <code>v1</code>, o
+cluster responde <code>no matches for kind "Job" in version "v1"</code>. Conserto: corrigir a primeira
+linha do arquivo.</p>
+
+<p><strong>4. <code>completions</code> no lugar errado.</strong> Se você escrever
+<code>completions</code> dentro de <code>template.spec</code>, ele vira um campo desconhecido do pod — e o
+Job cria um pod só, sem erro nenhum. É o pior tipo de erro: o que passa em silêncio. Conserto: indentar
+para <code>spec.completions</code>, ao lado de <code>template</code>.</p>
+
+<p><strong>5. O Job que nunca termina.</strong> O pod fica <code>Running</code> indefinidamente, sem falha
+e sem sucesso. A causa quase sempre está no programa (esperando um arquivo, um lock, uma conexão), não no
+Kubernetes. Conserto: <code>activeDeadlineSeconds</code> para o cluster desistir por você, e
+<code>kubectl logs</code> no pod para ver onde o script parou.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma no painel</th><th>Causa provável</th><th>Primeiro comando</th></tr>
+</thead>
+<tbody>
+<tr><td>mensagem <code>is invalid</code> e nenhum Job criado</td><td>campo obrigatório faltando ou com valor
+não aceito</td><td>ler a mensagem inteira; ela diz o campo e os valores válidos</td></tr>
+<tr><td>Job criado, um pod só</td><td><code>completions</code> ausente ou indentado errado</td><td><code>kubectl get job nome -o yaml</code></td></tr>
+<tr><td>um pod <code>Failed</code> e o Job parado</td><td><code>backoffLimit: 0</code> ou orçamento
+esgotado</td><td><code>kubectl logs</code> no pod que falhou</td></tr>
+<tr><td>pods <code>Running</code> há muito tempo</td><td>programa travado; falta prazo</td><td><code>kubectl describe job</code> e o log</td></tr>
+<tr><td><code>COMPLETIONS 2/3</code> para sempre</td><td>uma fatia falha e o Job tenta de novo</td><td>procurar o pod <code>Failed</code> mais recente</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>Você construiu três Jobs e viu o ciclo inteiro: o manifesto recusado, o Job aceito, os pods terminando
+e o resultado contado em <code>status.succeeded</code>. O que separa o primeiro do último é só um punhado
+de linhas — <code>completions</code>, <code>parallelism</code>, <code>backoffLimit</code>,
+<code>activeDeadlineSeconds</code>, <code>ttlSecondsAfterFinished</code> — e cada uma responde a uma
+pergunta de operação, não de programação.</p>
+
+<p>Duas coisas valem ser ditas em voz alta. A primeira: o Job não é um Deployment pequeno. Ele promete
+terminar, e essa promessa muda tudo — o status, a política de reinício, o que você faz com o resultado. A
+segunda: o painel é honesto sobre o que consegue provar. Ele cria os pods, marca <code>Succeeded</code> e
+conta; ele não roda o script, não simula a fila do <code>parallelism</code> e não apaga o Job pelo TTL.
+Nesses pontos, o texto mostra a transcrição de um cluster de prova e diz que é transcrição.</p>
+
+<p>O que vale tentar sozinho, antes de fechar a página: mude um campo por vez, rode e olhe o que mudou.
+Cada linha da tabela abaixo é um experimento de dois minutos.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Experimento</th><th>O que mexer</th><th>O que você deve ver</th></tr>
+</thead>
+<tbody>
+<tr><td>dividir mais</td><td><code>completions: 5</code></td><td>cinco pods <code>Succeeded</code> e
+<code>status.succeeded: 5</code></td></tr>
+<tr><td>segurar o ritmo</td><td><code>parallelism: 1</code></td><td>o mesmo total de pods; num cluster real,
+um de cada vez</td></tr>
+<tr><td>desistir rápido</td><td><code>backoffLimit: 0</code></td><td>uma falha encerra o Job com condição
+<code>Failed</code></td></tr>
+<tr><td>não travar</td><td><code>activeDeadlineSeconds: 300</code></td><td>Job encerrado com
+<code>DeadlineExceeded</code> se passar de cinco minutos</td></tr>
+<tr><td>limpar depois</td><td><code>ttlSecondsAfterFinished: 600</code></td><td>num cluster real, o Job some
+do <code>get jobs</code> dez minutos depois</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="cenario">
+<h3>Cenário 1: o lote que rodou duas vezes a mesma fatia</h3>
+<p>Um Job com <code>completions: 3</code> processava pedidos por faixa de horário. Um dos pods falhou
+depois de gravar metade dos pedidos, o controlador criou outro, e a segunda tentativa gravou os mesmos
+pedidos de novo. A conta ficou dobrada. O conserto não foi no Job: foi no script, que passou a marcar no
+banco qual faixa já tinha sido processada. Job garante tentativa; idempotência é responsabilidade do
+programa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o backup que nunca aparecia no histórico</h3>
+<p>O time pôs <code>ttlSecondsAfterFinished: 60</code> em tudo, para “limpar o cluster”. Uma semana depois,
+ninguém conseguia responder se o backup de terça tinha rodado: o Job já tinha sido apagado, com o log
+junto. A correção foi separar por importância — tarefa descartável com TTL curto, tarefa de auditoria com
+TTL longo (sete dias) ou sem TTL.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o prazo que salvou a madrugada</h3>
+<p>O fechamento do mês travou às 2h esperando um arquivo que o sistema de vendas não gerou. Sem prazo, o
+pod ficaria <code>Running</code> até alguém olhar. Com <code>activeDeadlineSeconds: 900</code>, o Job foi
+encerrado quinze minutos depois, o alarme tocou, e a Ana refez o fechamento pela manhã com o arquivo no
+lugar. O Job não consertou o sistema de vendas; ele só não deixou o problema passar em silêncio.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual campo diz quantas vezes a tarefa precisa rodar?</p>
+<label><input type="radio" name="q1"> <code>replicas</code></label>
+<label><input type="radio" name="q1"> <code>completions</code></label>
+<label><input type="radio" name="q1"> <code>parallelism</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O que <code>parallelism: 2</code> com
+<code>completions: 3</code> significa?</p>
+<label><input type="radio" name="q2"> três pods no total, no máximo dois rodando ao mesmo tempo</label>
+<label><input type="radio" name="q2"> dois pods no total, um esperando</label>
+<label><input type="radio" name="q2"> três pods, todos ao mesmo tempo</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">3. O Job está <code>Running</code> há duas horas. Qual campo
+faz o cluster desistir?</p>
+<label><input type="radio" name="q3"> <code>ttlSecondsAfterFinished</code></label>
+<label><input type="radio" name="q3"> <code>backoffLimit</code></label>
+<label><input type="radio" name="q3"> <code>activeDeadlineSeconds</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a terceira fatia</h2>
+<p>O lote da padaria precisa processar quatro turnos, mas o banco só aguenta dois ao mesmo tempo. Complete
+as duas linhas que fazem isso:</p>
+<div class="ex-code">spec:
+  <input aria-label="resposta 1" data-answer="completions" placeholder="...">: 4
+  <input aria-label="resposta 2" data-answer="parallelism" placeholder="...">: 2</div>
+<p class="ex-dica">Dica: o primeiro é o total de pods; o segundo é quantos rodam juntos. Os dois ficam em
+<code>spec</code>, fora do <code>template</code>.</p>
+</div>
+
+<h2>Resumo</h2>
+
+<p>Job em lote é o Job com <code>completions</code> maior que um: a mesma tarefa, repetida em fatias
+independentes. <code>completions</code> diz quantas fatias existem; <code>parallelism</code> diz quantas
+rodam juntas; o Job só fica <code>Complete</code> quando todas terminam bem. Cada fatia é um pod com nome
+e log próprios, e é isso que torna o lote depurável.</p>
+
+<p>Os freios são três: <code>backoffLimit</code> conta falhas, <code>activeDeadlineSeconds</code> conta
+tempo e <code>ttlSecondsAfterFinished</code> conta a memória — quanto tempo o resultado fica guardado
+antes de sumir. Sem eles, um Job pode insistir demais, travar para sempre ou encher o cluster de objetos
+concluídos.</p>
+
+<p>E o painel: ele aplica, valida e conta de verdade — pods, <code>Succeeded</code>,
+<code>status.succeeded</code> — mas não roda o script nem apaga pelo TTL. Quando a prova depende disso, a
+página mostra a transcrição de um cluster de prova e diz que é transcrição. Com isso na mão, você já pode
+montar o lote da sua própria rotina: escolha as fatias, escolha o ritmo, ponha prazo e limpeza, e confie
+no <code>COMPLETIONS</code> em vez da memória.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Job é <code>batch/v1</code> e exige <code>restartPolicy</code> <code>Never</code> ou
+  <code>OnFailure</code>.</li>
+  <li><code>completions</code> é o total; <code>parallelism</code> é o ritmo. Os dois em <code>spec</code>.</li>
+  <li><code>status.succeeded</code> conta as fatias prontas; <code>COMPLETIONS</code> mostra
+  <code>prontas/total</code>.</li>
+  <li><code>activeDeadlineSeconds</code> encerra o Job preso; <code>backoffLimit</code> limita as
+  tentativas.</li>
+  <li><code>ttlSecondsAfterFinished</code> apaga o Job concluído — e o log vai junto.</li>
+  <li>Pod de Job concluído mostra <code>READY 0/1</code>: não é erro.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

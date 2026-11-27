@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deploy canário | Guia Kubernetes</title>
+<meta name="description" content="Projeto guiado: duas versões da loja da padaria convivendo no cluster — um Service para a estável, outro para a nova — e a decisão de promover ou voltar.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Deploy <span class="hl">canário</span></h1>
+<p class="intro">A Ana vai trocar a versão do site da padaria. A versão nova tem o carrinho de encomendas e
+uma página de produto refeita — e a Ana não quer descobrir um bug com a loja inteira no ar às sete da
+manhã. Nos próximos minutos você vai montar um canário de verdade: duas versões convivendo no cluster, um
+Service para a estável, outro só para a nova, e a decisão de promover ou voltar tomada com números na
+mão.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Subir a versão estável com etiqueta e Service que casam de verdade.</li>
+  <li>Colocar a versão nova ao lado, com Deployment e Service próprios.</li>
+  <li>Por que dois Services deixam o canário testável antes de qualquer cliente ver.</li>
+  <li>Ler os <em>endpoints</em> e descobrir em segundos por que um Service está sem tráfego.</li>
+  <li>Promover virando o seletor, e voltar atrás do mesmo jeito.</li>
+  <li>Reconhecer os erros de etiqueta que fazem o canário “não funcionar”.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>No fim desta página existem quatro objetos no cluster: dois Deployments e dois Services. O Deployment
+<code>loja</code> roda a versão 1.0 com três réplicas, e o Service <code>loja</code> entrega o site para os
+clientes de sempre. O Deployment <code>loja-nova</code> roda a versão 1.1 com uma réplica, e o Service
+<code>loja-nova</code> existe só para você testar a novidade antes de qualquer pessoa entrar.</p>
+
+<p>A imagem mental é a de uma <em>padaria com dois balcões</em>. O balcão da frente é o de sempre: fila
+normal, atendentes treinados, cartaz antigo. Nos fundos, um balcão de teste com o produto novo, aberto só
+para quem você chamar pelo nome. Se o pão de queijo novo for aprovado, você troca o cartaz da frente e o
+balcão de teste vira o principal. Se não for, fecha o balcão dos fundos — e ninguém na fila percebeu nada.</p>
+
+<p>O detalhe que faz isso funcionar é chato e decisivo: <strong>etiqueta</strong>. Cada pod carrega
+<code>app: loja</code> e mais uma etiqueta de versão (<code>version: estavel</code> ou
+<code>version: canario</code>). O Service não conhece versão nenhuma; ele conhece etiqueta. Quem aponta
+para quem é uma linha de YAML que você muda quando quiser — e é essa linha que vamos virar no último
+passo.</p>
+
+<h2>2. O cenário da padaria</h2>
+
+<p>O site da Ana tem três anos e uma média de duzentos pedidos por dia. A versão 1.1 mexe em duas coisas
+que ela considera arriscadas: o cálculo do frete e o carrinho, que agora guarda encomendas para retirada.
+Um bug no frete cobra errado; um bug no carrinho perde o pedido. Nenhum dos dois dá erro no console — os
+dois aparecem como reclamação de cliente no dia seguinte.</p>
+
+<p>A alternativa clássica é parar o site, subir a versão nova e rezar. Numa padaria pequena isso talvez
+funcionasse num domingo. Mas o site vende de madrugada também — o pessoal que trabalha à noite pede pão
+para o café da manhã —, e “parar o site” virou palavra proibida. A outra alternativa é subir a versão nova
+só para uma parte das pessoas. Só que aí você precisa de controle sobre quem vê o quê, e isso é mais
+complicado do que parece.</p>
+
+<p>A terceira alternativa — a que a aula <a href="deployment-canario.html">Deploy canário</a>
+explica em teoria e que aqui você monta na prática — é a mais simples de todas: a versão nova sobe
+<em>inteira</em>, em paralelo, com um endereço próprio. Ninguém de fora chega nela. Você testa, mede e
+decide. Se aprovar, troca uma etiqueta e a versão nova passa a receber os clientes. Se reprovar, apaga os
+objetos e a 1.0 continua exatamente onde estava, intocada. O nome disso é canário — o passarinho que
+desce primeiro na mina.</p>
+
+<h2>3. Antes de começar</h2>
+
+<p>Três coisas precisam estar claras antes do primeiro manifesto. A primeira é que <strong>um Service não
+escolhe pod pelo nome</strong>: escolhe por etiqueta. Se o pod tem <code>app: loja</code> e
+<code>version: estavel</code>, e o Service pede as duas, ele entra. Se faltar uma, não entra — e o Service
+fica com <code>&lt;none&gt;</code> na coluna de endpoints, sem erro nenhum.</p>
+
+<p>A segunda é que o Deployment também compara etiquetas: o <code>selector</code> dele tem de casar com as
+etiquetas do <code>template</code> do pod. Isso não é preciosismo, é validação do servidor — e é a
+primeira coisa que vai acontecer no Passo 1, porque o manifesto começa com essa inconsistência de
+propósito.</p>
+
+<p>A terceira é o vocabulário de endereço. Um <em>endpoint</em> é o par IP:porta de um pod que o Service
+considera pronto. A tabela do <code>get endpoints</code> tem uma linha por Service e, na coluna
+<code>ENDPOINTS</code>, a lista de pods que ele encontrou. É o comando mais rápido para responder “por que
+o site não abre?”.</p>
+
+<dl class="anatomy">
+<dt>spec.selector</dt>
+<dd>As etiquetas que o Service procura nos pods. Casamento exato: todas as etiquetas listadas precisam
+existir no pod.</dd>
+<dt>spec.ports[].port</dt>
+<dd>A porta que o Service oferece, o que os outros usam para falar com ele. Na padaria, 80.</dd>
+<dt>spec.ports[].targetPort</dt>
+<dd>A porta que o container escuta de verdade. Na padaria, 8080.</dd>
+<dt>spec.type</dt>
+<dd><code>ClusterIP</code> por padrão: só dentro do cluster. É o que usamos aqui, porque o canário é
+interno.</dd>
+<dt>Endpoints</dt>
+<dd>O objeto que o cluster cria para cada Service, com os IPs dos pods que casaram. É o que
+<code>kubectl get endpoints</code> mostra.</dd>
+</dl>
+
+<h2>4. Passo 1 — a versão estável no ar</h2>
+
+<p>Comece pelo que já deveria existir: a loja 1.0 com três réplicas e o Service que a entrega. O manifesto
+abaixo tem os dois objetos e uma inconsistência: o <code>selector</code> do Deployment pede
+<code>app: loja</code> e <code>version: estavel</code>, mas o <code>template</code> do pod só declara
+<code>app: loja</code>. Rode e leia o que o servidor responde.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="conta:endpoints=1;;texto:10.244.;;campo:Deployment/loja|spec.template.metadata.labels.version=estavel;;pronto:Deployment/loja=3">
+  <p class="try-task">Acrescente <code>version: estavel</code> nas etiquetas do pod, em
+  <code>spec.template.metadata.labels</code>. Rode e confira os três IPs na coluna de endpoints do Service
+  <code>loja</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+      version: estavel
+  template:
+    metadata:
+      labels:
+        app: loja
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loja
+spec:
+  selector:
+    app: loja
+    version: estavel
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+service/loja created
+The Deployment "loja" is invalid: spec.template.metadata.labels: Invalid value: {"app":"loja"}: `selector` does not match template `labels`
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+      version: estavel
+  template:
+    metadata:
+      labels:
+        app: loja
+        version: estavel
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loja
+spec:
+  selector:
+    app: loja
+    version: estavel
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>A mensagem do servidor é específica e vale decorar, porque ela aparece toda vez que alguém esquece uma
+etiqueta:</p>
+
+<pre class="term">$ kubectl apply -f canario.yaml
+The Deployment "loja" is invalid: spec.template.metadata.labels: Invalid value: {"app":"loja"}: `selector` does not match template `labels`</pre>
+
+<p>Traduzindo: “o seletor não casa com as etiquetas do molde”. O Deployment não é criado, então não existe
+pod — e o painel mostra a recusa e para por aí: com erro no apply, ele nem lista endpoints. Num cluster
+de verdade o Service que já estava lá continuaria existindo, com <code>ENDPOINTS</code> em
+<code>&lt;none&gt;</code>. Repare na ordem das consequências: uma etiqueta faltando derruba o Deployment,
+que derruba os pods, que esvazia o Service. Um erro de digitação, três camadas de silêncio.</p>
+
+<h2>5. Passo 2 — a versão nova ao lado</h2>
+
+<p>Agora o balcão dos fundos. Você acrescenta um segundo Deployment, <code>loja-nova</code>, com a imagem
+<code>loja:1.1</code> e <strong>uma</strong> réplica, e um segundo Service, <code>loja-nova</code>, que
+aponta só para ele. As etiquetas são o que separa os dois mundos: a estável continua
+<code>version: estavel</code>, a nova usa <code>version: canario</code>.</p>
+
+<p>Uma réplica é suficiente, e é de propósito. O canário existe para ser testado por você, não para
+aguentar carga. Se ele aguentar os seus testes e os números fecharem, a promoção resolve o resto.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="conta:deployments=2;;conta:pods=4;;conta:endpoints=2;;campo:Deployment/loja-nova|spec.replicas=1">
+  <p class="try-task">Acrescente, depois do Service <code>loja</code>, um Deployment <code>loja-nova</code>
+  (imagem <code>loja:1.1</code>, 1 réplica, etiquetas <code>app: loja</code> e <code>version:
+  canario</code>) e um Service <code>loja-nova</code> com o mesmo seletor. Rode e confira dois Services com
+  endpoints.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+      version: estavel
+  template:
+    metadata:
+      labels:
+        app: loja
+        version: estavel
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loja
+spec:
+  selector:
+    app: loja
+    version: estavel
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+deployment.apps/loja created
+service/loja created
+
+NAME   ENDPOINTS                                                    AGE
+loja   10.244.242.239:8080,10.244.69.235:8080,10.244.195.194:8080   8m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+      version: estavel
+  template:
+    metadata:
+      labels:
+        app: loja
+        version: estavel
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loja
+spec:
+  selector:
+    app: loja
+    version: estavel
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja-nova
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loja
+      version: canario
+  template:
+    metadata:
+      labels:
+        app: loja
+        version: canario
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.1
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loja-nova
+spec:
+  selector:
+    app: loja
+    version: canario
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>O painel mostra duas linhas: <code>loja</code> com três IPs e <code>loja-nova</code> com um. Quatro pods
+no total, três de uma versão, um da outra. É o canário em repouso: ninguém de fora chega no
+<code>loja-nova</code>, porque esse nome só resolve dentro do cluster — e é justamente por isso que ele é
+seguro.</p>
+
+<p>Como você testaria de verdade? De dentro de um pod qualquer:
+<code>curl http://loja-nova</code>. O DNS interno resolve o nome do Service e manda o pedido para o pod da
+1.1. O painel do guia não tem rede, então esse teste aparece aqui como transcrição e como instrução, não
+como resposta do motor — a parte que ele prova é a que importa neste passo: o Service da nova existe e tem
+exatamente um pod atrás dele.</p>
+
+<dl class="anatomy">
+<dt>app: loja</dt>
+<dd>A etiqueta que diz “sou a loja”. Comum às duas versões — é o que faz os dois Deployments serem a mesma
+aplicação vista de dois jeitos.</dd>
+<dt>version: estavel</dt>
+<dd>Marca os pods que atendem os clientes hoje. O Service <code>loja</code> pede esta etiqueta.</dd>
+<dt>version: canario</dt>
+<dd>Marca o pod novo. O Service <code>loja-nova</code> pede esta.</dd>
+<dt>selector do Deployment</dt>
+<dd>Precisa ser subconjunto das etiquetas do template: se pede duas, o template declara as duas.</dd>
+<dt>selector do Service</dt>
+<dd>Precisa casar com as etiquetas dos pods em execução. Se nenhum pod casar, a coluna
+<code>ENDPOINTS</code> mostra <code>&lt;none&gt;</code>.</dd>
+</dl>
+
+<h2>6. Passo 3 — a virada: promover ou voltar</h2>
+
+<p>Chegou a hora da decisão, e ela cabe numa linha. Promover é apontar o Service <code>loja</code> para
+<code>version: canario</code>: os clientes passam a falar com a 1.1, e o pod da 1.0 deixa de receber
+tráfego sem ser apagado. Voltar é a mesma edição ao contrário. Nada é recriado, nada é reiniciado, nada
+cai.</p>
+
+<p>A caixa tem o cluster inteiro montado — dois Deployments, dois Services — com o Service principal ainda
+na versão estável. A missão é só trocar o seletor dele.</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="campo:Service/loja|spec.selector.version=canario;;conta:pods=4;;conta:endpoints=2">
+  <p class="try-task">No Service <code>loja</code>, troque <code>version: estavel</code> por
+  <code>version: canario</code> em <code>spec.selector</code>. Rode e confira que os dois Services agora
+  apontam para o mesmo pod novo — e que nada foi apagado.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+      version: estavel
+  template:
+    metadata:
+      labels:
+        app: loja
+        version: estavel
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loja
+spec:
+  selector:
+    app: loja
+    version: estavel
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja-nova
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loja
+      version: canario
+  template:
+    metadata:
+      labels:
+        app: loja
+        version: canario
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loja-nova
+spec:
+  selector:
+    app: loja
+    version: canario
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+deployment.apps/loja created
+service/loja created
+deployment.apps/loja-nova created
+service/loja-nova created
+
+NAME        ENDPOINTS                                                    AGE
+loja        10.244.185.133:8080,10.244.122.131:8080,10.244.11.201:8080   8m
+loja-nova   10.244.175.172:8080                                          3m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+      version: estavel
+  template:
+    metadata:
+      labels:
+        app: loja
+        version: estavel
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loja
+spec:
+  selector:
+    app: loja
+    version: canario
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja-nova
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loja
+      version: canario
+  template:
+    metadata:
+      labels:
+        app: loja
+        version: canario
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loja-nova
+spec:
+  selector:
+    app: loja
+    version: canario
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>Repare no que <em>não</em> mudou: quatro pods, dois Services, dois Deployments. A virada não mexe em
+capacidade — e é aí que mora o cuidado que quase todo mundo esquece. Se o pod novo é um só e ele recebe
+todo o tráfego, você acabou de trocar três réplicas por uma. A promoção correta tem duas partes: virar o
+seletor <em>e</em> ajustar as réplicas, subindo a nova para três e baixando a antiga para zero.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Peça</th><th>O que ela garante</th><th>O que ela não faz</th></tr>
+</thead>
+<tbody>
+<tr><td>Deployment <code>loja</code></td><td>três pods da 1.0 sempre vivos</td><td>não recebe tráfego sozinho:
+precisa de Service</td></tr>
+<tr><td>Service <code>loja</code></td><td>o endereço que os clientes usam</td><td>não escolhe versão: escolhe
+etiqueta</td></tr>
+<tr><td>Deployment <code>loja-nova</code></td><td>um pod da 1.1 pronto para teste</td><td>não atrai tráfego
+sem Service</td></tr>
+<tr><td>Service <code>loja-nova</code></td><td>o endereço interno de teste da 1.1</td><td>não é alcançável de
+fora do cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>7. Conferindo com o painel</h2>
+
+<p>Dois comandos resolvem o dia a dia do canário. O primeiro é <code>kubectl get endpoints</code>: uma
+linha por Service, com os IPs dos pods que ele encontrou. Se a linha mostra <code>&lt;none&gt;</code>, o
+seletor não casa com pod nenhum — e não adianta olhar o Deployment, porque o Deployment pode estar
+perfeito.</p>
+
+<p>Esta é a saída real do motor com o canário montado:</p>
+
+<pre class="term">$ kubectl get endpoints
+NAME        ENDPOINTS                                                    AGE
+loja        10.244.185.133:8080,10.244.122.131:8080,10.244.11.201:8080   8m
+loja-nova   10.244.175.172:8080                                          3m
+
+$ kubectl get svc
+NAME        TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+loja        ClusterIP   10.96.138.106   &lt;none&gt;        80/TCP    8m
+loja-nova   ClusterIP   10.96.105.192   &lt;none&gt;        80/TCP    3m</pre>
+
+<p>O segundo é <code>kubectl get pods --show-labels</code>, que mostra a etiqueta de cada pod. É a visão
+que explica o <code>get endpoints</code>:</p>
+
+<pre class="term">$ kubectl get pods --show-labels
+NAME                         READY   STATUS    RESTARTS   AGE   LABELS
+loja-42vp89lrk8-85hrt        1/1     Running   0          3m    app=loja,version=estavel
+loja-42vp89lrk8-qvk68        1/1     Running   0          7m    app=loja,version=estavel
+loja-42vp89lrk8-rzq6w        1/1     Running   0          5m    app=loja,version=estavel
+loja-nova-n7mlsggc9n-2qg9h   1/1     Running   0          2m    app=loja,version=canario</pre>
+
+<p>Com essas duas telas abertas, você diagnostica quase tudo. Service sem endpoint? Olhe as etiquetas dos
+pods. Pod com etiqueta errada? Olhe o <code>selector</code> do Deployment, que é quem injeta as etiquetas
+no pod. E se o Deployment nem existe, o problema é anterior: o servidor recusou o manifesto, e a mensagem
+está na saída do <code>apply</code>.</p>
+
+<p>Quando você promove trocando a imagem do Deployment <code>loja</code> (em vez de virar o seletor), entra
+em cena o histórico de revisões. O motor responde assim:</p>
+
+<pre class="term">$ kubectl rollout status deployment/loja-nova
+deployment "loja-nova" successfully rolled out
+
+$ kubectl rollout history deployment/loja-nova
+deployment.apps/loja-nova
+REVISION   CHANGE-CAUSE
+1          &lt;none&gt;</pre>
+
+<p>É o mesmo <code>rollout</code> da aula de atualizações: cada mudança de imagem no template cria uma
+revisão nova, e <code>rollout undo</code> volta para a anterior. A diferença do canário é que você não
+depende dele para voltar: virar o seletor de volta é imediato e não reinicia pod nenhum.</p>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Os cinco problemas abaixo explicam quase todo canário que “não sobe” ou “não recebe tráfego”. Nenhum é
+raro.</p>
+
+<p><strong>1. <code>selector</code> não casa com o template.</strong> O servidor recusa o Deployment com
+<code>selector does not match template labels</code>. Conserto: declarar no template todas as etiquetas que
+o seletor pede.</p>
+
+<p><strong>2. Service sem endpoints.</strong> O Deployment está de pé, os pods rodam, e
+<code>get endpoints</code> mostra <code>&lt;none&gt;</code>. Quase sempre é o Service pedindo
+<code>version: estavel</code> enquanto os pods têm <code>version: v1</code>. Conserto: alinhar a etiqueta,
+não o Service.</p>
+
+<p><strong>3. Os dois Services com o mesmo seletor.</strong> Se <code>loja-nova</code> pedir só
+<code>app: loja</code>, ele vai receber os quatro pods — inclusive os três da versão antiga. O teste do
+canário vira loteria. Conserto: sempre incluir a etiqueta de versão no seletor dos dois Services.</p>
+
+<p><strong>4. A etiqueta no lugar errado.</strong> Etiqueta em <code>metadata.labels</code> do Deployment
+não vale para o pod: o que conta para o Service é <code>spec.template.metadata.labels</code>. É o erro de
+indentação mais caro deste projeto.</p>
+
+<p><strong>5. Promover sem escalar.</strong> Tudo funciona, o seletor vira, e a loja fica com uma réplica
+só. Não dá erro nenhum — só lentidão no primeiro sábado. Conserto: promoção = seletor + réplicas.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Onde olhar primeiro</th></tr>
+</thead>
+<tbody>
+<tr><td>Deployment recusado com <code>is invalid</code></td><td>seletor e etiquetas do template
+divergem</td><td>a mensagem do <code>apply</code></td></tr>
+<tr><td><code>ENDPOINTS &lt;none&gt;</code></td><td>seletor do Service não casa com nenhum pod</td><td><code>get pods --show-labels</code></td></tr>
+<tr><td>os dois Services com os mesmos IPs</td><td>faltou a etiqueta de versão no seletor</td><td>o YAML dos dois Services</td></tr>
+<tr><td>canário recebe tráfego de cliente</td><td>o Service principal foi virado cedo demais</td><td><code>get svc loja -o yaml</code></td></tr>
+<tr><td>lentidão depois da promoção</td><td>réplicas não foram ajustadas</td><td><code>get deploy</code>: <code>READY</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>Você montou duas versões convivendo, cada uma com seu endereço, e viu que a separação não vem de
+Deployment nenhum: vem de etiqueta. O Service é o único lugar onde “quem recebe tráfego” é decidido, e a
+decisão cabe numa linha de YAML. Promover e voltar são a mesma operação, em sentidos opostos.</p>
+
+<p>Também ficou claro o preço. Duas versões no ar custam mais pods e mais atenção: alguém precisa lembrar
+de apagar o canário depois da promoção, e alguém precisa lembrar de escalar a versão nova antes de virar o
+seletor. Canário não é de graça; é barato comparado a descobrir o bug do frete com duzentos pedidos no
+dia.</p>
+
+<p>E o painel: ele prova o que é cálculo — pods criados, etiquetas, endpoints, seletor de Service. Ele não
+tem rede, então “abrir o site do canário” é transcrição e instrução, não resultado. Quando a página mostra
+endpoints com IPs, é o motor falando; quando mostra um <code>curl</code>, é o que você faria num cluster
+de verdade.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sinal observado</th><th>Leitura</th><th>Decisão</th></tr>
+</thead>
+<tbody>
+<tr><td>erros no canário abaixo de 1% em uma hora</td><td>a versão nova se comporta como a antiga</td><td>subir réplicas da nova e virar o seletor</td></tr>
+<tr><td>erro de frete ou carrinho em qualquer pedido</td><td>bug de regra de negócio</td><td>não promover; apagar o canário e investigar o log</td></tr>
+<tr><td>lentidão só no canário</td><td>uma réplica não aguenta a carga de teste</td><td>subir para duas réplicas e medir de novo</td></tr>
+<tr><td>canário sem endpoint</td><td>problema de etiqueta, não de versão</td><td>consertar o seletor antes de qualquer decisão</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="cenario">
+<h3>Cenário 1: o canário que recebeu a loja inteira</h3>
+<p>O time criou o Service <code>loja-nova</code> com o seletor <code>app: loja</code> e esqueceu a versão.
+Resultado: o Service de teste do canário recebeu os quatro pods — e o teste de carga de uma réplica virou
+teste de carga de três. O número medido não queria dizer nada. Depois de corrigir o seletor, o mesmo teste
+mostrou o que o pod novo realmente aguentava.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a promoção que deixou a loja lenta</h3>
+<p>A virada do seletor foi feita numa sexta, com o canário ainda em uma réplica. Funcionou: os clientes
+chegaram na 1.1, e a versão nova estava saudável. No sábado, com o dobro de pedidos, a loja ficou lenta. O
+conserto foi <code>kubectl scale deployment/loja-nova --replicas=3</code>, e a lição entrou no roteiro:
+promover é seletor <strong>e</strong> réplicas, na mesma janela.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o canário esquecido</h3>
+<p>Três meses depois da promoção, alguém descobriu um Deployment <code>loja-nova</code> rodando a 1.1
+antiga, consumindo memória e recebendo patch de segurança nenhum. O canário virou dívida porque ninguém
+apagou. A correção foi de processo: toda promoção termina com <code>kubectl delete deployment loja-nova</code>
+e <code>kubectl delete service loja-nova</code> na mesma tarefa que virou o seletor.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que decide quais pods um Service atende?</p>
+<label><input type="radio" name="q1"> o nome do Deployment</label>
+<label><input type="radio" name="q1"> as etiquetas declaradas em <code>spec.selector</code></label>
+<label><input type="radio" name="q1"> a ordem de criação dos pods</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O canário está no ar e o Service mostra
+<code>ENDPOINTS &lt;none&gt;</code>. Qual é a causa mais provável?</p>
+<label><input type="radio" name="q2"> o seletor do Service não casa com as etiquetas dos pods</label>
+<label><input type="radio" name="q2"> a imagem do canário é grande demais</label>
+<label><input type="radio" name="q2"> o Deployment precisa de um segundo Service</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">3. Promover virando o seletor do Service faz o quê?</p>
+<label><input type="radio" name="q3"> apaga os pods da versão antiga</label>
+<label><input type="radio" name="q3"> reinicia os pods da versão nova</label>
+<label><input type="radio" name="q3"> muda para quem o endereço aponta, sem recriar nada</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a etiqueta que separa</h2>
+<p>O Service <code>loja</code> deve atender só a versão estável. Complete o seletor com as duas
+etiquetas:</p>
+<div class="ex-code">spec:
+  selector:
+    app: loja
+    <input aria-label="resposta 1" data-answer="version" placeholder="...">: estavel</div>
+<p class="ex-dica">Dica: é a chave da etiqueta de versão — a mesma que o Deployment declara em
+<code>spec.template.metadata.labels</code>.</p>
+</div>
+
+<h2>Resumo</h2>
+
+<p>Canário é duas versões no ar ao mesmo tempo, com endereços separados e uma decisão pendente. O
+Deployment estável roda a versão de sempre, o Deployment novo roda a candidata, e cada um tem o seu
+Service. Quem separa os dois não é o nome nem a ordem: é a etiqueta <code>version</code>, declarada no
+template do pod e pedida no seletor do Service.</p>
+
+<p>O roteiro tem três passos: subir a estável com etiqueta e Service coerentes, colocar a nova ao lado com
+uma réplica e um Service só de teste, e então decidir. Promover é apontar o Service principal para a versão
+nova e subir as réplicas dela; voltar é o mesmo movimento ao contrário, sem reiniciar nada. O canário só se
+paga se alguém o apagar depois da decisão.</p>
+
+<p>E o painel: ele prova etiqueta, pod, endpoint e seletor, comandando um cluster simulado que responde com
+as mesmas tabelas e as mesmas mensagens de erro do kubectl. Ele não tem rede — então o <code>curl</code> no
+canário é instrução, não resultado. Com isso, você já consegue trocar a versão da sua aplicação sem parar
+o site, e sem apostar a loja inteira num deploy de sexta.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Service escolhe etiqueta, não Deployment: casamento exato de todas as chaves do seletor.</li>
+  <li>Etiqueta do pod mora em <code>spec.template.metadata.labels</code>, não em
+  <code>metadata.labels</code>.</li>
+  <li><code>ENDPOINTS &lt;none&gt;</code> é diagnóstico de seletor, não de imagem.</li>
+  <li>Promover = virar o seletor <strong>e</strong> subir as réplicas da versão nova.</li>
+  <li>Voltar = virar o seletor de volta; nada é recriado.</li>
+  <li>Canário esquecido é dívida: apague os objetos de teste depois da decisão.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

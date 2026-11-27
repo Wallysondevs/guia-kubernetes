@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deploy sem queda | Guia Kubernetes</title>
+<meta name="description" content="A receita completa do deploy sem queda: maxSurge e maxUnavailable como contrato de capacidade, readinessProbe como porteiro, preStop e grace period para terminar o pedido.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Deploy sem <span class="hl">queda</span></h1>
+<p class="intro">A Ana publicou a versão nova e, por vinte segundos, quem abriu o site viu “serviço
+indisponível”. Vinte segundos — mas ela perdeu três encomendas. O problema não era a versão: era o jeito de
+trocar. Nesta aula ela monta a receita completa do deploy sem queda: um contrato de capacidade escrito em dois
+números, uma readinessProbe que funciona como porteiro na porta, um tempo de despedida para o pedido que está
+sendo atendido e a checagem no fim. Cada peça resolve um instante diferente da troca — e tirar qualquer uma
+delas é o suficiente para o site piscar de novo.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que “rolling update” sozinho não garante zero de queda.</li>
+  <li><code>maxSurge</code> e <code>maxUnavailable</code> como contrato de capacidade.</li>
+  <li>A readinessProbe como condição de entrada no serviço.</li>
+  <li>O que acontece com o pod velho entre o <code>SIGTERM</code> e o <code>SIGKILL</code>.</li>
+  <li><code>preStop</code>, <code>terminationGracePeriodSeconds</code> e <code>minReadySeconds</code>.</li>
+  <li>O que o painel não simula: tráfego real, endpoints e PDB.</li>
+</ul>
+</div>
+
+<h2>1. A cena: os vinte segundos da vitrine</h2>
+
+<p>O site da padaria rodava com uma réplica só. Na hora de publicar a versão nova, a Ana usou a estratégia
+padrão do Deployment, que troca os pods aos poucos. Com uma réplica, “aos poucos” significa: não existe
+nenhum outro pod para atender enquanto o novo nasce. O pod velho morreu, o novo levou vinte segundos para
+subir, e nesses vinte segundos o Service não tinha para onde mandar ninguém.</p>
+
+<p>Vinte segundos é o tempo de baixar a imagem (que já estava no nó, felizmente), criar o container, iniciar o
+programa e carregar o cardápio. É também o tempo de três clientes desistirem. A conta é cruel e simples: com
+uma réplica, qualquer troca é uma queda — a menos que o cluster tenha permissão para ter duas.</p>
+
+<p>A primeira ideia que vem à cabeça é a errada: “então vou configurar para nunca derrubar pod”. Não existe
+essa opção. Trocar uma versão exige matar pods velhos, e todo pod morto é um pod que não atende. A engenharia
+do negócio é outra: garantir que, <em>em cada instante</em> da troca, exista pod pronto suficiente para
+atender. É isso que os dois números da estratégia controlam — e é por isso que eles são um contrato de
+capacidade, não um detalhe de manifesto.</p>
+
+<h2>2. O contrato de capacidade</h2>
+
+<p>A aula de estratégias de rollout apresentou os dois campos e a aritmética de cada um. O que interessa aqui é
+a consequência: eles definem o <em>pior instante</em> da troca. <code>maxUnavailable</code> diz quantos pods
+podem estar fora do ar ao mesmo tempo; <code>maxSurge</code> diz quantos pods a mais podem existir durante a
+troca. Um é o piso, o outro é o teto.</p>
+
+<p>Com <code>maxUnavailable: 0</code> e <code>maxSurge: 1</code>, o Deployment nunca derruba ninguém antes de
+ter substituto pronto: ele cria o pod novo, espera ficar pronto, e só então mata um velho. É o ajuste mais
+conservador que existe sem exagerar no consumo de recursos, e é o que a maioria dos times deveria usar em
+produção.</p>
+
+<dl class="anatomy">
+<dt>maxUnavailable</dt>
+<dd>Quantos pods podem faltar durante a troca. <code>0</code> significa “nunca menos que o desejado”.</dd>
+<dt>maxSurge</dt>
+<dd>Quantos pods a mais podem existir durante a troca. <code>1</code> significa um pod extra por vez.</dd>
+<dt>minReadySeconds</dt>
+<dd>Quanto tempo um pod precisa ficar pronto antes de contar como disponível. Filtra o “pronto e caindo”.</dd>
+<dt>readinessProbe</dt>
+<dd>A pergunta que o kubelet faz ao container para saber se ele pode receber tráfego.</dd>
+<dt>preStop</dt>
+<dd>Um comando executado antes do <code>SIGTERM</code>, quando o pod vai ser encerrado.</dd>
+<dt>terminationGracePeriodSeconds</dt>
+<dd>Quanto tempo o container tem para morrer sozinho antes do <code>SIGKILL</code>. Padrão: 30 segundos.</dd>
+</dl>
+
+<p>Existe uma regra que pega muita gente: <code>maxUnavailable: 0</code> com <code>maxSurge: 0</code> é
+recusado. O cluster responde <code>Invalid value: 0: may not be 0 when maxSurge is 0</code> — em português,
+“os dois zerados não dá”. E não dá por um motivo honesto: se nada pode faltar e nada pode sobrar, não existe
+ordem de operações capaz de trocar a versão. O Kubernetes prefere recusar o manifesto a prometer o impossível
+e quebrar a promessa no pior momento.</p>
+
+<h2>3. O porteiro na porta</h2>
+
+<p>Contrato de capacidade resolve o <em>número</em> de pods. Falta resolver a <em>qualidade</em> deles: um pod
+conta como disponível quando o Kubernetes diz que está pronto, e quem decide isso é a readinessProbe. Sem ela,
+“pronto” significa apenas “container iniciado” — e container iniciado não é o mesmo que programa atendendo.
+Um servidor que leva quinze segundos para carregar o cardápio em memória está iniciado no primeiro segundo e
+atendendo no décimo sexto.</p>
+
+<p>É por isso que a probe é o porteiro: o pod só entra na lista de quem recebe tráfego depois que a probe
+responde “estou pronto”. Com <code>maxUnavailable: 0</code>, o Deployment também só mata o pod velho depois
+disso. Uma peça protege o usuário, a outra protege a troca — e as duas dependem do mesmo sinal.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|spec.strategy.rollingUpdate.maxUnavailable=0;;campo:Deployment/cardapio|spec.template.spec.containers.0.readinessProbe.httpGet.path=/saude;;conta:pods=2">
+  <p class="try-task">O manifesto está com <code>maxUnavailable: 1</code> e sem probe: é a receita da queda. Deixe
+  <code>maxUnavailable: 0</code>, mantenha <code>maxSurge: 1</code> e acrescente uma readinessProbe em
+  <code>/saude</code>, porta <code>8080</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-xtrk59z2qs-g7t5g   1/1     Running   0          31s
+cardapio-xtrk59z2qs-lfq86   1/1     Running   0          4m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /saude
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5</pre>
+</div>
+
+<p>As duas réplicas continuam subindo — o painel mostra <code>2/2</code> porque, no fim, o estado é o mesmo:
+dois pods rodando. O que mudou foi o que acontece <em>no meio do caminho</em>, e isso vive no manifesto: com
+<code>maxUnavailable: 0</code>, o controlador não tem autorização para derrubar um pod antes de outro estar
+pronto; com a probe, “pronto” passa a significar “atende em <code>/saude</code>”.</p>
+
+<p>Vale um aviso sobre a probe escolhida. <code>/saude</code> precisa ser um caminho que responda rápido e que
+só responda bem quando o programa realmente atende — banco conectado, cardápio carregado. Uma probe que
+devolve 200 sempre é pior que não ter probe: ela dá ao cluster a certeza errada, e o tráfego entra num pod que
+ainda está aquecendo. Probe honesta é probe que falha quando o programa está incompleto.</p>
+
+<h2>4. A anatomia da troca de um pod</h2>
+
+<p>Agora o instante que ninguém vê. Quando o Deployment decide tirar um pod do ar, ele não “desliga” o
+container: manda um pedido de encerramento e dá um prazo. O pod entra no estado <code>Terminating</code>, sai da
+lista de endpoints (para de receber pedido novo) e o kubelet executa a sequência de despedida no container.</p>
+
+<p>A sequência real é: primeiro o <code>preStop</code>, se existir; depois o <code>SIGTERM</code> para o
+programa; depois o prazo de <code>terminationGracePeriodSeconds</code>; e só no fim o <code>SIGKILL</code>,
+que mata sem cerimônia. O detalhe que causa queda em produção é que a remoção dos endpoints e o
+<code>SIGTERM</code> acontecem praticamente juntos — e a propagação dessa remoção para os proxies leva alguns
+segundos. Nessa janela, um pedido novo ainda pode chegar num pod que já recebeu ordem de morrer.</p>
+
+<p>Numa troca de duas réplicas, o instante do meio tem três pods: dois novos e um velho de saída. É essa
+superposição que garante o atendimento — e é o que os dois números da estratégia permitem. Transcrição de um
+cluster real no meio de uma publicação:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS        RESTARTS   AGE
+cardapio-74824llwrp-b7p28   1/1     Running       0          40s
+cardapio-74824llwrp-g7lqs   1/1     Running       0          25s
+cardapio-5cbfb4c44d-4jjxx   1/1     Terminating   0          18m
+
+ana@notebook:~$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                           AGE
+cardapio   10.244.1.12:8080,10.244.2.9:8080   18m</pre>
+
+<p>Repare que a lista de endpoints já tem só dois endereços, enquanto a de pods tem três: o pod
+<code>Terminating</code> saiu da rotação antes de morrer. Essa defasagem de segundos entre “saiu da lista” e
+“a rede toda sabe” é exatamente o buraco que o <code>preStop</code> tapa.</p>
+
+<p>Do lado do pod, a despedida aparece no <code>describe</code>. Os eventos de um pod encerrado por rollout
+contam a história em ordem:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe pod cardapio-5cbfb4c44d-4jjxx
+Status:       Terminating
+Containers:
+  web:
+    State:          Terminating
+      Reason:       Completed
+    Ready:          False
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Killing    20s   kubelet            Stopping container web
+  Normal  Scheduled  18m   default-scheduler  Successfully assigned default/cardapio-5cbfb4c44d-4jjxx to guia-worker
+  Normal  Pulled     18m   kubelet            Container image "cardapio:1.0" already present on machine
+  Normal  Started    18m   kubelet            Started container web</pre>
+
+<p><code>Ready: False</code> e <code>Killing</code> são a prova de que o pod já não conta para o serviço. Se
+o programa estava no meio de um pedido, os trinta segundos de prazo são o tempo que ele tem para terminar. É
+por isso que a conta do prazo importa: passou disso, o <code>SIGKILL</code> corta o cliente.</p>
+
+<p>É exatamente essa janela que o <code>preStop</code> cobre. Um <code>preStop</code> que apenas espera cinco
+segundos antes de deixar o programa morrer dá tempo para a rede inteira saber que aquele pod saiu. Parece
+gambiarra; é recomendação oficial e uma das práticas mais eficazes de deploy sem queda.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|spec.template.spec.terminationGracePeriodSeconds=40;;campo:Deployment/cardapio|spec.template.spec.containers.0.lifecycle.preStop.httpGet.path=/sair;;conta:pods=2">
+  <p class="try-task">O site tem pedido que demora até 25 segundos para responder. Dê 40 segundos de prazo ao
+  pod e um <code>preStop</code> que bate em <code>/sair</code> na porta <code>8080</code> antes de encerrar.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-xtrk59z2qs-g7t5g   1/1     Running   0          31s
+cardapio-xtrk59z2qs-lfq86   1/1     Running   0          4m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080
+          lifecycle:
+            preStop:
+              httpGet:
+                path: /sair
+                port: 8080</pre>
+</div>
+
+<p>Repare no lugar dos campos: <code>terminationGracePeriodSeconds</code> é do <strong>pod</strong>, então
+mora em <code>spec.template.spec</code>, ao lado de <code>containers</code>. Já o
+<code>lifecycle.preStop</code> é do <strong>container</strong>, então mora dentro do item da lista. Trocar os
+dois de lugar é erro de validação na hora do apply — e é um dos enganos mais comuns de quem copia manifesto.</p>
+
+<p>Vinte e cinco segundos de pedido com trinta de prazo padrão é uma conta que não fecha: sobra uma margem de
+cinco segundos que qualquer lentidão de banco consome. Quarenta dá folga. A regra é simples e vale escrever no
+manifesto como comentário: <em>o prazo tem de ser maior que o pior pedido que o site atende</em>. Se o prazo
+acaba antes, o <code>SIGKILL</code> corta o cliente no meio da resposta — e o cliente vê erro no checkout, não
+no dashboard.</p>
+
+<h2>5. A receita completa, num manifesto só</h2>
+
+<p>Juntando as peças: réplicas suficientes para a troca, contrato de capacidade que nunca derruba antes de ter
+substituto, probe honesta como porteiro, prazo de despedida maior que o pior pedido, e um filtro para o pod
+“pronto e morrendo” — o <code>minReadySeconds</code>, que obriga o pod a ficar pronto por alguns segundos
+antes de contar como disponível.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|spec.strategy.rollingUpdate.maxUnavailable=0;;campo:Deployment/cardapio|spec.strategy.rollingUpdate.maxSurge=1;;campo:Deployment/cardapio|spec.template.spec.minReadySeconds=10;;campo:Deployment/cardapio|spec.template.spec.containers.0.readinessProbe.httpGet.path=/saude;;conta:pods=2">
+  <p class="try-task">Falta fechar a receita: <code>maxUnavailable: 0</code>, <code>maxSurge: 1</code>,
+  <code>minReadySeconds: 10</code> e a readinessProbe em <code>/saude</code>. As duas réplicas têm de subir.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-xtrk59z2qs-g7t5g   1/1     Running   0          31s
+cardapio-xtrk59z2qs-lfq86   1/1     Running   0          4m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      minReadySeconds: 10
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /saude
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5</pre>
+</div>
+
+<p>Esse é o manifesto que vale copiar para o repositório da padaria. Cada linha existe por um motivo que já
+foi explicado, e nenhuma é enfeite: <code>maxSurge: 1</code> permite o substituto nascer;
+<code>maxUnavailable: 0</code> proíbe a queda antes dele; <code>minReadySeconds: 10</code> evita contar um pod
+que sobe e cai; a probe define o que é “pronto”; e o <code>preStop</code> da caixa anterior cobre a janela de
+rede. Faltando qualquer uma, a promessa fica mais frágil.</p>
+
+<p>Duas réplicas é o mínimo honesto para esse contrato. Com uma réplica e <code>maxUnavailable: 0</code>,
+<code>maxSurge: 1</code>, o Deployment cria a segunda durante a troca — funciona, mas o site fica o tempo todo
+com uma cópia só, e uma falha de nó no meio do caminho deixa o serviço sem ninguém. Três réplicas é o número
+confortável para um site com tráfego de padaria; o custo é o que você decide pagar.</p>
+
+<h2>6. O que quebra a promessa</h2>
+
+<p>Deploy sem queda não é um campo mágico: é um conjunto de condições. Quando uma delas falta, o site pisca —
+e o sintoma aparece sempre do mesmo jeito, como “erro 502 por alguns segundos”. A tabela abaixo é o mapa
+entre sintoma e causa.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que falta</th><th>Sintoma</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td>réplica suficiente para a troca</td><td>502 durante todo o deploy</td><td>subir <code>replicas</code> e usar
+<code>maxUnavailable: 0</code></td></tr>
+<tr><td>readinessProbe</td><td>poucos erros logo no início do pod, “aquecendo”</td><td>probe em caminho que só responde
+quando atende</td></tr>
+<tr><td>prazo maior que o pior pedido</td><td>pedido longo cortado no meio</td><td><code>terminationGracePeriodSeconds</code>
+maior</td></tr>
+<tr><td><code>preStop</code></td><td>alguns 502 na virada, mesmo com tudo certo</td><td><code>preStop</code> com espera
+curta</td></tr>
+<tr><td>estratégia <code>Recreate</code></td><td>queda total e garantida</td><td><code>RollingUpdate</code></td></tr>
+<tr><td>probe apontando para porta errada</td><td>rollout que nunca termina</td><td>conferir porta e caminho na
+probe</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O item que mais engana é o <code>preStop</code>. Sem ele, muita gente conclui que “Kubernetes derruba
+requisição em andamento” — e não é isso: o Kubernetes dá o prazo e o sinal; o que falta é o tempo para a rede
+acompanhar a saída. Cinco segundos de espera resolvem; um <code>preStop</code> que espera trinta segundos só
+atrasa o deploy.</p>
+
+<p>A tabela abaixo resume o papel de cada peça, para consulta rápida quando você for revisar o manifesto de
+outro time. Se alguma linha estiver ausente no manifesto, você já sabe qual é a aposta que aquele time está
+fazendo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Peça</th><th>Onde fica</th><th>Protege contra</th></tr>
+</thead>
+<tbody>
+<tr><td><code>replicas</code></td><td><code>spec.replicas</code></td><td>ficar sem ninguém durante a
+troca</td></tr>
+<tr><td><code>maxUnavailable</code></td><td><code>spec.strategy.rollingUpdate</code></td><td>derrubar antes de ter
+substituto</td></tr>
+<tr><td><code>maxSurge</code></td><td><code>spec.strategy.rollingUpdate</code></td><td>consumo extra descontrolado
+durante a troca</td></tr>
+<tr><td><code>minReadySeconds</code></td><td><code>spec.template.spec</code></td><td>pod que fica pronto e cai em
+seguida</td></tr>
+<tr><td><code>readinessProbe</code></td><td>container</td><td>tráfego entrando em pod que não atende</td></tr>
+<tr><td><code>preStop</code></td><td>container (<code>lifecycle</code>)</td><td>pedido novo chegando em pod que está
+saindo</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>7. Manutenção de nó e o PDB</h2>
+
+<p>Falta um pedaço que não está no manifesto do Deployment: o que acontece quando o pod é derrubado por
+<em>outro</em> motivo, que não uma publicação. Drenar um nó para manutenção, atualizar o cluster, despejar pods
+por falta de memória — tudo isso tira pods do ar sem passar pelo controlador de rollout. Para esse caso existe
+o <strong>PodDisruptionBudget</strong>, um objeto separado que declara quantos pods do seu site podem estar
+fora por vez durante interrupções voluntárias.</p>
+
+<p>Um PDB com <code>minAvailable: 1</code> num site de três réplicas diz: “drenar o nó pode tirar no máximo
+dois de cada vez, sempre deixo um no ar”. É a rede de proteção da manutenção, e é diferente do contrato do
+rollout: o Deployment controla as trocas que <em>ele</em> faz; o PDB controla as que <em>o cluster</em> faz. Os
+dois convivem, e um não substitui o outro.</p>
+
+<p>Aqui a honestidade sobre o painel: ele não conhece PDB. O motor simula pods, Deployments, Services e
+volumes; objetos de política como PDB e PriorityClass ficam de fora, e pedir um deles responde que o servidor
+não tem aquele tipo. O PDB é assunto de nó e de manutenção — vale saber que existe, vale aplicar no cluster de
+verdade e vale conferir com <code>kubectl get pdb</code> antes de drenar. No guia, o manifesto dele aparece
+como leitura, não como caixa.</p>
+
+<h2>8. O que o painel mostra — e o que ele não mostra</h2>
+
+<p>Toda esta aula é sobre tempo: o pod novo nasce, fica pronto, o velho sai. O painel não tem relógio. Ele
+aplica o manifesto, reconcilia o estado final e responde com o retrato de depois — duas réplicas prontas, três
+talvez, dependendo do que você escreveu. As metas das caixas conferem os campos do manifesto e a contagem de
+pods, que é o que o painel sabe provar.</p>
+
+<p>O que ele não faz: gerar tráfego, remover endpoints, executar <code>preStop</code>, cortar pedido por prazo.
+Por isso, nesta aula, o que você aprende a ler é o manifesto — o contrato — e não a dança dos pods. A dança
+aparece em transcrição de cluster real, como a do <code>rollout status</code> da aula anterior, sempre
+identificada.</p>
+
+<p>Isso não é limitação do seu aprendizado: é uma vantagem de estudo. O manifesto é o que você versiona, revisa
+e aplica; se ele estiver certo, a dança acontece como consequência. Quem confia no manifesto errado e fica
+olhando o painel vai descobrir o problema pelo cliente, do mesmo jeito que a Ana descobriu.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o deploy com uma réplica e a promessa impossível</h3>
+<p>O time configurou <code>maxUnavailable: 0</code> com uma réplica e <code>maxSurge: 1</code>, e o deploy
+passou a subir dois pods por alguns segundos. Funcionou — até o dia em que o nó escolhido para o pod novo não
+tinha memória. O Deployment esperou para sempre, sem derrubar o velho: o site continuou no ar com a versão
+antiga. Não foi queda; foi deploy travado. A lição: contrato de capacidade protege o usuário, não garante que
+a publicação termine.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o prazo de trinta segundos e a nota fiscal</h3>
+<p>O endpoint de emitir nota levava quarenta segundos em dia de movimento. Toda publicação cortava alguma
+emissão no meio, e o suporte recebia “erro ao emitir” sem relação aparente com deploy. O conserto foi subir
+<code>terminationGracePeriodSeconds</code> para 60 e implementar o caminho <code>/sair</code>, que termina os
+pedidos em andamento e para de aceitar novos. Duas linhas no manifesto, um problema de meses resolvido.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a manutenção que derrubou o site</h3>
+<p>Na atualização do cluster, o time drenou o nó sem PDB e com duas réplicas no mesmo nó. As duas saíram
+juntas, e o site ficou fora por um minuto. Não foi o deploy: foi a manutenção. Depois disso, o time aprendeu a
+espalhar réplicas entre nós e a declarar um PDB com <code>minAvailable: 1</code> antes de qualquer drenagem.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="1"><p class="mc-q">1. Qual combinação nunca derruba um pod antes de ter substituto
+pronto?</p>
+<label><input type="radio" name="d1"> <code>maxUnavailable: 0</code> e <code>maxSurge: 1</code></label>
+<label><input type="radio" name="d1"> <code>maxUnavailable: 1</code> e <code>maxSurge: 0</code></label>
+<label><input type="radio" name="d1"> <code>maxUnavailable: 0</code> e <code>maxSurge: 0</code></label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Para que serve o <code>preStop</code>?</p>
+<label><input type="radio" name="d2"> para impedir que o pod seja apagado</label>
+<label><input type="radio" name="d2"> para reiniciar o container antes de morrer</label>
+<label><input type="radio" name="d2"> para dar tempo de a rede saber que o pod está saindo antes do
+<code>SIGTERM</code></label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. O que a readinessProbe muda no deploy sem queda?</p>
+<label><input type="radio" name="d3"> ela impede o pod de ser criado sem configuração</label>
+<label><input type="radio" name="d3"> ela define o momento em que o pod conta como pronto para receber
+tráfego</label>
+<label><input type="radio" name="d3"> ela aumenta o número de réplicas durante a troca</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o piso da capacidade</h2>
+<p>Você quer garantir que, durante a troca, nunca exista menos pod que o desejado. Complete o campo com o
+valor que faz isso:</p>
+<div class="ex-code">maxUnavailable: <input aria-label="resposta 1" data-answer="0" placeholder="..."></div>
+<p class="ex-dica">Dica: é o menor valor possível — e ele exige que o <code>maxSurge</code> seja maior que
+zero.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Deploy sem queda não é uma configuração: é um conjunto de quatro garantias trabalhando juntas. Capacidade
+(<code>replicas</code> suficiente), contrato (<code>maxUnavailable: 0</code> com <code>maxSurge</code> maior que
+zero), porteiro (readinessProbe honesta) e despedida (<code>preStop</code> mais
+<code>terminationGracePeriodSeconds</code> maior que o pior pedido). O <code>minReadySeconds</code> fecha o
+cerco contra o pod que fica pronto e cai logo depois.</p>
+
+<p>Cada peça cobre um instante diferente da troca, e é por isso que tirar uma delas quebra a promessa: o
+usuário não vê o manifesto, vê o erro. E o PDB fica de fora do Deployment porque protege outro momento — a
+manutenção do nó, em que quem derruba o pod é o cluster, não o rollout.</p>
+
+<p>Na próxima aula o assunto muda de pasta: em vez de orquestrar a troca, a Ana vai organizar os segredos —
+os tipos de Secret, o que cada um exige e o que o cluster valida antes de aceitar.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>maxUnavailable: 0</code> + <code>maxSurge: 1</code> = nunca derrubar antes do substituto.</li>
+  <li>Os dois zerados são recusados pelo cluster: o impossível é proibido.</li>
+  <li>readinessProbe é o que transforma “iniciado” em “pronto”.</li>
+  <li><code>preStop</code> roda antes do <code>SIGTERM</code>; o <code>SIGKILL</code> vem no fim do prazo.</li>
+  <li>Prazo de despedida maior que o pior pedido do site.</li>
+  <li>PDB protege a manutenção do nó — e o painel não o simula.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

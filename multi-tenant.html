@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-tenant | Guia Kubernetes</title>
+<meta name="description" content="Dividir um cluster entre times: namespace, RBAC, quota e NetworkPolicy na prática, o que cada camada isola de verdade e o preço de isolar com nós dedicados.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Multi-tenant</span></h1>
+<p class="intro">O cluster da Ana hospeda a padaria, a confeitaria e o time de relatórios. Três times, um
+cluster, uma conta de nuvem — e nenhum deles quer que o vizinho veja seus Secrets, apague seus Deployments
+ou coma sua CPU. Isso se chama multi-tenancy, e não se resolve com uma configuração só: é uma pilha de
+camadas, cada uma fechando uma porta diferente. Nesta aula a Ana monta as quatro camadas (namespace, RBAC,
+quota e rede), vê o que cada uma realmente isola e descobre quanto custa isolar de verdade.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é dividir um cluster entre times, e os graus de isolamento que existem.</li>
+  <li>Como o RBAC dá a cada time só o que ele precisa, com Role e RoleBinding.</li>
+  <li>Por que o ServiceAccount do pod não é o seu usuário — e o risco disso.</li>
+  <li>Como quota e LimitRange impedem o vizinho barulhento.</li>
+  <li>Como a NetworkPolicy separa o tráfego entre namespaces.</li>
+  <li>O preço do isolamento forte: nós dedicados, capacidade ociosa e complexidade.</li>
+</ul>
+</div>
+
+<h2>1. A cena: dois times, um cluster, um acidente</h2>
+
+<p>Na quinta, alguém do time de relatórios rodou um <code>kubectl delete deploy -n padaria --all</code>
+achando que estava no próprio namespace. O comando apagou os Deployments da padaria, e o site ficou fora por
+vinte minutos. Ninguém fez por mal: o <em>kubeconfig</em> da pessoa apontava para o cluster e tinha permissão
+de administrador em todos os namespaces.</p>
+
+<p>A causa não foi o comando, foi a permissão. Num cluster onde todo mundo é <code>cluster-admin</code>, o
+namespace é só uma etiqueta bonita: qualquer um faz qualquer coisa em qualquer lugar. Multi-tenancy começa
+quando você para de dar tudo para todos e passa a distribuir permissões por time.</p>
+
+<p>A palavra vem de prédio: <em>tenant</em> é inquilino. Você tem um prédio (o cluster) dividido em
+apartamentos (namespaces). O apartamento separa o endereço e a porta, mas não impede o vizinho de arrombar
+nada se ele tiver a chave-mestra. Isolamento de verdade exige fechadura, hidrômetro e parede de verdade —
+que, no Kubernetes, são RBAC, quota e, quando necessário, nós separados.</p>
+
+<h2>2. Os graus de isolamento</h2>
+
+<p>Existe uma escala, e o erro comum é achar que ela tem um degrau só. No primeiro grau, os times
+compartilham o cluster e se separam por <strong>namespace + RBAC</strong>: cada um vê e mexe só no seu. É
+barato, é o que a maioria precisa e é o que esta aula monta. No segundo grau, entram <strong>quota e
+rede</strong>: o namespace tem teto de recursos e o tráfego entre times é negado por padrão. No terceiro,
+<strong>nós dedicados</strong>: os pods de um time só rodam em máquinas reservadas a ele. E, no extremo,
+<strong>clusters separados</strong> — cada time com o seu.</p>
+
+<p>Cada degrau custa mais e resolve um problema específico. Namespace + RBAC não impede um pod de consumir
+toda a memória do nó; quota impede o pedido, não o uso acima do limite; nó dedicado impede o vizinho de
+derrubar o seu pod por barulho, mas dobra a conta. Escolher o degrau é decisão de negócio, não de
+ferramenta.</p>
+
+<dl class="anatomy">
+<dt>tenant</dt>
+<dd>Cada “inquilino” do cluster: um time, um cliente ou um ambiente, com os seus namespaces e as suas
+permissões.</dd>
+<dt>RBAC</dt>
+<dd>Controle de acesso por papel: define quem pode fazer o quê em qual recurso e namespace.</dd>
+<dt>Role / RoleBinding</dt>
+<dd>A permissão (Role, dentro de um namespace) e a ligação dela a um sujeito (RoleBinding).</dd>
+<dt>ClusterRole</dt>
+<dd>Permissão válida no cluster inteiro ou reaproveitável em vários namespaces.</dd>
+<dt>ServiceAccount</dt>
+<dd>A identidade que o <em>pod</em> usa para falar com o API server — diferente da sua.</dd>
+<dt>isolamento de rede</dt>
+<dd>Impedir que pods de um namespace falem com os de outro, via NetworkPolicy.</dd>
+</dl>
+
+<p>Uma distinção que vale guardar desde já: há dois planos. O <strong>plano de controle</strong> é quem pode
+criar, ver ou apagar objetos (RBAC). O <strong>plano de dados</strong> é o que os pods trocam entre si
+(rede) e o que consomem (CPU, memória, disco). Um time pode ter RBAC perfeito e, ainda assim, derrubar o
+vizinho por consumo — são camadas diferentes, e as duas precisam existir.</p>
+
+<h2>3. Camada 1: namespace e RBAC</h2>
+
+<p>A regra é simples: cada time ganha um ou mais namespaces, e o usuário do time recebe permissão apenas
+neles. Nada de <code>cluster-admin</code> para quem só precisa reiniciar o próprio Deployment. O RBAC tem
+quatro peças, e duas delas são de namespace, duas são de cluster.</p>
+
+<p><strong>Role</strong> é uma lista de permissões dentro de um namespace: “pode <code>get</code>,
+<code>list</code> e <code>watch</code> pods”, “pode <code>update</code> deployments”. <strong>RoleBinding</strong>
+liga essa Role a um sujeito — um usuário, um grupo ou uma ServiceAccount. <strong>ClusterRole</strong> é a
+mesma lista, mas válida no cluster inteiro (ou reaproveitável em vários namespaces, quando ligada por um
+RoleBinding). <strong>ClusterRoleBinding</strong> liga uma ClusterRole a um sujeito no cluster todo.</p>
+
+<pre class="file" data-file="rbac-padaria.yaml">apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cardapio
+  namespace: padaria
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: operador-padaria
+  namespace: padaria
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: equipe-padaria
+  namespace: padaria
+subjects:
+  - kind: Group
+    name: equipe-padaria
+    apiGroup: rbac.authorization.k8s.io
+  - kind: ServiceAccount
+    name: cardapio
+    namespace: padaria
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: operador-padaria</pre>
+
+<p>Leia de baixo para cima: o RoleBinding <code>equipe-padaria</code> pega o grupo de usuários
+<code>equipe-padaria</code> (grupos vêm do provedor de identidade, não do Kubernetes) e a ServiceAccount
+<code>cardapio</code>, e dá a eles o que a Role <code>operador-padaria</code> permite. Note o que
+<em>não</em> está na lista: <code>delete</code>, <code>secrets</code>, <code>namespaces</code>,
+<code>nodes</code>. O time consegue listar e atualizar o que é dele, e não consegue apagar nem espiar
+segredo.</p>
+
+<p>Repare também no <code>apiGroups</code>. RBAC não usa o nome do recurso sozinho: precisa do grupo da API.
+Pods, Services e ConfigMaps estão no grupo vazio (<code>""</code>); Deployments estão em <code>apps</code>.
+Esquecer o grupo é a causa número um de “dei a permissão e não funciona”.</p>
+
+<p>Para conferir antes de confiar, existe um comando que responde sim ou não sem tentar de verdade:
+<code>kubectl auth can-i delete pods --as=system:serviceaccount:padaria:cardapio -n padaria</code>. A
+resposta é <code>yes</code> ou <code>no</code>. É a melhor forma de testar um RBAC recém-criado — e a única
+que não exige criar um pod para descobrir.</p>
+
+<h2>4. A caixa: o RoleBinding que aponta para o Role errado</h2>
+
+<p>O manifesto abaixo é o RBAC do time da padaria, com um erro clássico: o RoleBinding aponta para uma Role
+com outro nome. O resultado é um vínculo que existe e não dá permissão nenhuma — e, como não há erro na
+criação, ninguém descobre até alguém tentar usar. Corrija o <code>roleRef</code> e rode.</p>
+
+<div class="tryk8s" data-get="rolebindings -o yaml" data-goal="campo:RoleBinding/equipe-padaria|roleRef.name=operador-padaria;;campo:RoleBinding/equipe-padaria|subjects.0.kind=Group;;campo:Role/operador-padaria|rules.0.resources.0=pods">
+  <p class="try-task">Faça o <code>roleRef.name</code> apontar para <code>operador-padaria</code>, que é a
+  Role criada aqui. O painel tem de mostrar o RoleBinding com o vínculo certo e a Role com
+  <code>pods</code>.</p>
+<pre class="yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: operador-padaria
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: equipe-padaria
+subjects:
+  - kind: Group
+    name: equipe-padaria
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: operador
+</pre>
+<pre class="out">
+role.rbac.authorization.k8s.io/operador-padaria created
+rolebinding.rbac.authorization.k8s.io/equipe-padaria created
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: equipe-padaria
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: operador
+spec: {}
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: equipe-padaria
+</pre>
+<pre class="solucao">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: operador-padaria
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: equipe-padaria
+subjects:
+  - kind: Group
+    name: equipe-padaria
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: operador-padaria</pre>
+</div>
+
+<p>O painel mostra os dois objetos criados e o RoleBinding em YAML, com <code>roleRef</code> e
+<code>subjects</code>. Com o nome errado, o vínculo existia e não valia nada: o API server não valida se a
+Role referenciada existe no momento da criação, então o erro é silencioso. A permissão simplesmente não
+acontece, e o sintoma é sempre <code>Forbidden</code> em quem deveria poder.</p>
+
+<p>A Role criada aparece assim no painel (saída de <code>kubectl get roles -o yaml</code>):</p>
+
+<pre class="term">rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - services
+    verbs:
+      - get
+      - list
+      - watch</pre>
+
+<p>É literalmente a lista que você escreveu — o RBAC não tem mágica, tem comparação. O API server pega o
+verbo do pedido (<code>get</code>, <code>list</code>, <code>delete</code>...), o recurso e o namespace, e
+procura uma regra que case. Se não achar, responde <code>Forbidden</code> antes de qualquer coisa
+acontecer.</p>
+
+<h2>5. Camada 2: quota e LimitRange por namespace</h2>
+
+<p>RBAC resolve quem mexe no quê; não resolve consumo. Um time com permissão só no seu namespace ainda pode
+subir quarenta réplicas e comer a CPU do cluster inteiro — o limite de recursos não é uma permissão, é um
+orçamento. É aqui que entram a <code>ResourceQuota</code> e o <code>LimitRange</code> da aula anterior,
+uma dupla por namespace.</p>
+
+<p>A receita do inquilino é sempre a mesma: quota com <code>requests.cpu</code>,
+<code>requests.memory</code>, <code>limits.*</code> e contagem de objetos (<code>pods</code>,
+<code>count/deployments.apps</code>, <code>count/services</code>); LimitRange com
+<code>defaultRequest</code> e <code>default</code> para que ninguém seja recusado por esquecer
+<code>resources</code>. Sem o LimitRange, o time passa o dia levando erro de quota em manifesto correto.</p>
+
+<p>Há um detalhe de vizinhança que quota nenhuma resolve: o <strong>uso</strong> acima do pedido. Um pod
+<code>Burstable</code> sem limite pode consumir toda a memória do nó e derrubar pods de outro time que
+estavam ali. Quem protege contra isso é o <code>limit</code> — e, se nem isso bastar, o nó dedicado do
+degrau seguinte. Quota limita o que se <em>pede</em>; limit limita o que se <em>usa</em>.</p>
+
+<h2>6. Camada 3: a rede entre os inquilinos</h2>
+
+<p>Por padrão, todo pod fala com todo pod. Um pod da confeitaria alcança o banco da padaria se souber o nome
+do Service, e nada no cluster impede. Para um cluster multi-inquilino, isso é o mesmo que prédio sem porta:
+o apartamento existe, mas qualquer um entra.</p>
+
+<p>A solução é a <code>NetworkPolicy</code>, e a regra de ouro é começar negando tudo e liberar o que
+precisa. Uma política com <code>podSelector: {}</code> (todos os pods do namespace) e
+<code>policyTypes: [Ingress]</code> nega toda entrada; a partir daí, você cria políticas permitindo o
+tráfego legítimo — inclusive de outro namespace, com <code>namespaceSelector</code>.</p>
+
+<p>Duas coisas costumam pegar. A primeira: NetworkPolicy só funciona se o plugin de rede implementar. Em
+cluster cujo CNI ignora políticas, o manifesto é aceito, aparece no <code>get</code> e não bloqueia nada —
+uma falsa sensação de segurança que só se descobre testando. A segunda: negar tudo também bloqueia o DNS,
+porque a resolução de nomes passa pela rede. Se os pods passam a falhar em tudo com erro de nome, é sinal
+de que falta liberar a saída para o DNS do cluster.</p>
+
+<div class="tryk8s" data-get="networkpolicies -o yaml" data-goal="campo:NetworkPolicy/nega-tudo|spec.policyTypes.0=Ingress;;campo:NetworkPolicy/nega-tudo|spec.podSelector.matchLabels.app=cardapio;;conta:networkpolicies=1">
+  <p class="try-task">Ajuste a política para valer só nos pods com a etiqueta <code>app: cardapio</code> e
+  negar a entrada (<code>Ingress</code>). Rode e veja a política no painel.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nega-tudo
+spec:
+  podSelector:
+    matchLabels: {}
+  policyTypes:
+    - Egress</pre>
+<pre class="out">
+networkpolicy.networking.k8s.io/nega-tudo created
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nega-tudo
+  namespace: default
+spec:
+  podSelector:
+    matchLabels: {}
+  policyTypes:
+    - Egress
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nega-tudo
+spec:
+  podSelector:
+    matchLabels:
+      app: cardapio
+  policyTypes:
+    - Ingress</pre>
+</div>
+
+<p>O painel mostra a política criada, com <code>podSelector</code> e <code>policyTypes</code> — que é o que
+o cluster guarda. O tráfego em si não é simulado: nosso painel não tem rede, então ele descreve a política,
+não os pacotes. Num cluster de verdade, a prova é tentar a conexão e ver o tempo esgotar; a política é a
+intenção, o CNI é quem a cumpre.</p>
+
+<p>O desenho completo de um inquilino, então, tem três políticas: negar tudo na entrada, permitir entrada
+apenas dos pods do próprio namespace (para o Service interno funcionar), e permitir entrada do
+<code>ingress-controller</code> (que roda em outro namespace, e é identificado por
+<code>namespaceSelector</code>). A aula de NetworkPolicy mostra a sintaxe de cada uma.</p>
+
+<h2>7. A caixa: o namespace como fronteira de listagem</h2>
+
+<p>Namespace não é só um agrupador: ele é o escopo de quase tudo. Um <code>get pods</code> sem
+<code>-n</code> mostra só o namespace corrente; para ver o cluster inteiro é preciso pedir
+<code>--all-namespaces</code> — e é essa permissão que você não dá ao inquilino. A caixa abaixo cria os
+namespaces dos dois times e mostra a diferença entre listar com e sem escopo.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:namespace/padaria created;;texto:namespace/confeitaria created;;texto:kube-system;;texto:No resources found in padaria namespace">
+  <p class="try-task">Crie os namespaces <code>padaria</code> e <code>confeitaria</code>, liste os
+  namespaces e depois liste os pods dentro de <code>padaria</code>. O painel tem de mostrar os dois
+  “created”, a tabela do cluster e a resposta vazia do namespace novo.</p>
+<pre class="yaml">kubectl get namespaces
+kubectl get pods -n padaria</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get namespaces
+NAME          AGE
+default       8m
+kube-system   9m
+
+ana@notebook:~$ kubectl get pods -n padaria
+No resources found in padaria namespace.
+</pre>
+<pre class="solucao">kubectl create namespace padaria
+kubectl create namespace confeitaria
+kubectl get namespaces
+kubectl get pods -n padaria</pre>
+</div>
+
+<p>O painel mostra <code>namespace/padaria created</code>, <code>namespace/confeitaria created</code>, a
+tabela de namespaces do cluster e a resposta do <code>get pods -n padaria</code>: “No resources found in
+padaria namespace”. Esse último detalhe é o que interessa: o comando não lista pods do <code>default</code>,
+não lista do cluster inteiro — lista o que está naquele escopo.</p>
+
+<p>Num cluster recém-criado, a lista de namespaces é curta assim (transcrição do painel, antes de criar os
+dois times):</p>
+
+<pre class="term">$ kubectl get namespaces
+NAME          AGE
+default       8m
+kube-system   9m</pre>
+
+<p>O <code>default</code> é onde tudo cai quando você não escolhe; o <code>kube-system</code> guarda os
+componentes do próprio cluster e não é lugar de aplicação. Os namespaces dos times você cria — e é a
+primeira decisão de desenho do multi-tenancy: um por time, um por ambiente, ou um por time por ambiente. O
+nome precisa ser curto, porque ele aparece em todo lugar.</p>
+
+<p>É por isso que o namespace é a base do multi-tenancy: ele é o escopo de permissão (RoleBinding), de
+orçamento (quota), de política de rede (NetworkPolicy) e de nomes (o Service
+<code>cardapio.padaria</code> não colide com <code>cardapio.confeitaria</code>). Sem ele, nada das outras
+camadas tem onde se apoiar.</p>
+
+<h2>8. Isolar de verdade: nós dedicados e o preço</h2>
+
+<p>As três camadas acima convivem no mesmo nó. Isso significa que um pod do time A e um pod do time B
+disputam a mesma CPU, o mesmo disco e o mesmo kernel. Para a maioria dos casos internos, está ótimo. Para
+cliente externo com contrato de isolamento, não basta.</p>
+
+<p>O degrau seguinte é o <strong>nó dedicado</strong>: um conjunto de máquinas marcadas com etiqueta
+(<code>tenant=padaria</code>) e uma <em>taint</em> que expulsa quem não tolera, com os pods daquele time
+usando <code>nodeSelector</code> e toleration. O efeito é separação física: o consumo de um time não afeta o
+outro, e um bug de kernel em um nó não derruba todos. O preço é capacidade ociosa — máquinas reservadas
+para um time ficam paradas quando ele não precisa.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Grau</th><th>Mecanismo</th><th>O que ainda vaza</th></tr>
+</thead>
+<tbody>
+<tr><td>lógico</td><td>namespace + RBAC</td><td>consumo, rede, nós compartilhados</td></tr>
+<tr><td>lógico com teto</td><td>+ ResourceQuota e LimitRange</td><td>picos acima do limite e tráfego entre
+namespaces</td></tr>
+<tr><td>rede isolada</td><td>+ NetworkPolicy default-deny</td><td>disputa de CPU, memória e disco no mesmo
+nó</td></tr>
+<tr><td>nós dedicados</td><td>+ taint, toleration e nodeSelector</td><td>custo de capacidade ociosa;
+complexidade operacional</td></tr>
+<tr><td>clusters separados</td><td>um cluster por inquilino</td><td>custo de operar N clusters; perda de
+economia de escala</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Existe ainda um risco que nenhuma dessas camadas resolve: o <strong>kernel compartilhado</strong>. Dois
+pods no mesmo nó usam o mesmo kernel; um container privilegiado ou uma falha de runtime pode, em tese,
+atingir o vizinho. Quem precisa desse nível de garantia usa nós dedicados, runtime com isolamento mais forte
+ou clusters separados — e é importante saber que essa fronteira existe, mesmo que você nunca precise
+chegar lá.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a ServiceAccount com poder demais</h3>
+<p>O time criou um pod e, para “resolver logo”, amarrou a ele uma ClusterRole de administrador. Semanas
+depois, uma falha na aplicação permitiu que alguém executasse comandos dentro do pod — e, de lá, apagasse
+recursos de outros namespaces. A identidade do pod é uma credencial como qualquer outra: dê a ela só o que
+a aplicação precisa, e nunca <code>cluster-admin</code> “temporariamente”.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o vizinho barulhento</h3>
+<p>A confeitaria subiu um Job de processamento sem limite de memória. Ele cresceu até o teto do nó, o kernel
+começou a matar processos por falta de memória e pods da padaria foram despejados junto. A quota não
+impediu: o manifesto não pedia muito, ele <em>usava</em> muito. A correção foi <code>limit</code> explícito
+mais — no caso mais grave — nó dedicado.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o time que não conseguia ver os próprios pods</h3>
+<p>O RBAC dava <code>get</code> em <code>pods</code>, mas não em <code>pods/log</code> — e o
+<code>kubectl logs</code> falhava com <code>Forbidden</code>. Sub-recurso é outro recurso no RBAC: logs,
+<code>exec</code> e <code>port-forward</code> precisam ser concedidos separadamente, com
+<code>resources: ["pods/log"]</code>. Não é bug; é granularidade.</p>
+</div>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que separar</th><th>Como</th><th>Erro comum</th></tr>
+</thead>
+<tbody>
+<tr><td>quem mexe em quê</td><td>Role + RoleBinding por namespace</td><td>dar <code>cluster-admin</code> e
+chamar de “temporário”</td></tr>
+<tr><td>quanto pode consumir</td><td>ResourceQuota + LimitRange</td><td>quota sem LimitRange: todo manifesto
+sem <code>resources</code> é recusado</td></tr>
+<tr><td>quem fala com quem</td><td>NetworkPolicy default-deny</td><td>esquecer o DNS e culpar o
+Service</td></tr>
+<tr><td>onde roda</td><td>taint + toleration + nodeSelector</td><td>esquecer a toleration e ver os pods
+<code>Pending</code></td></tr>
+<tr><td>identidade do pod</td><td>ServiceAccount com Role mínima</td><td>usar a ServiceAccount
+<code>default</code> com permissão herdada</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual é a base de tudo no multi-tenancy?</p>
+<label><input type="radio" name="q1"> a versão do Kubernetes</label>
+<label><input type="radio" name="q1"> o namespace, porque é o escopo de permissão, quota, rede e
+nomes</label>
+<label><input type="radio" name="q1"> o número de nós do cluster</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que um RoleBinding faz?</p>
+<label><input type="radio" name="q2"> define as permissões de um recurso</label>
+<label><input type="radio" name="q2"> cria a ServiceAccount do pod</label>
+<label><input type="radio" name="q2"> liga as permissões de uma Role a um sujeito (usuário, grupo ou
+ServiceAccount)</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que a NetworkPolicy <em>não</em> garante?</p>
+<label><input type="radio" name="q3"> que o plugin de rede realmente implemente a política</label>
+<label><input type="radio" name="q3"> que o manifesto seja aceito pelo API server</label>
+<label><input type="radio" name="q3"> que a política apareça no <code>kubectl get networkpolicy</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o Role da confeitaria</h2>
+<p>O time da confeitaria precisa <code>get</code>, <code>list</code> e <code>watch</code> em pods,
+<code>get</code> em ConfigMaps e <code>update</code> em Deployments — e nada mais. Escreva a Role no
+namespace <code>confeitaria</code>. Depois responda: qual campo lista os verbos permitidos?</p>
+<div class="ex-code">rules:<br>&nbsp;&nbsp;- apiGroups: [""]<br>&nbsp;&nbsp;&nbsp;&nbsp;resources:
+["pods"]<br>&nbsp;&nbsp;&nbsp;&nbsp;<input aria-label="resposta 1" data-answer="verbs" placeholder="...">:
+["get", "list", "watch"]</div>
+<p class="ex-dica">Dica: <code>verbs</code> são as ações; <code>resources</code> são os objetos;
+<code>apiGroups</code> é o grupo da API (vazio para pods, <code>apps</code> para Deployments).</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Multi-tenant é dividir um cluster entre times com fronteiras claras, e isso se monta em camadas:
+namespace + RBAC diz quem pode o quê, quota e LimitRange dizem quanto cada um pode pedir, NetworkPolicy diz
+quem fala com quem, e nós dedicados separam fisicamente quem precisa de garantia mais forte.</p>
+
+<p>O RBAC tem quatro peças (Role, RoleBinding, ClusterRole, ClusterRoleBinding) e um erro silencioso: um
+RoleBinding apontando para Role inexistente é criado sem erro e não concede nada. O ServiceAccount é a
+identidade do pod — não é a sua — e merece só o mínimo. E sub-recursos como <code>pods/log</code> precisam
+de permissão própria.</p>
+
+<p>A tabela de graus resume o preço: cada degrau fecha uma porta e aumenta a conta. Isolar de verdade custa
+capacidade ociosa e complexidade; isolar de menos custa o incidente de quinta-feira. A decisão é escolher o
+degrau que o seu risco justifica — e saber exatamente o que cada camada ainda deixa passar.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Namespace é o escopo de permissão, quota, rede e nomes.</li>
+  <li>RoleBinding para Role inexistente não dá erro — e não dá permissão.</li>
+  <li>Quota limita o pedido; <code>limit</code> limita o uso.</li>
+  <li>NetworkPolicy sem CNI compatível é decoração; não esqueça o DNS.</li>
+  <li>ServiceAccount do pod não é o seu usuário: dê o mínimo.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

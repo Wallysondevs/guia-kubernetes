@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logs agregados | Guia Kubernetes</title>
+<meta name="description" content="Por que kubectl logs não escala: onde o log do container mora, o agente em DaemonSet, metadados e multiline, Loki e ELK, e o que fazer antes de agregar.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Logs <span class="hl">agregados</span></h1>
+<p class="intro">A Ana sabe ler o log de um pod com <code>kubectl logs</code> — até o dia em que o pod morre, o
+Deployment cria outro e a evidência vai embora com o nome antigo. Com três réplicas, são três comandos e três
+saídas para comparar à mão. Nesta aula ela entende por que o log do container é um arquivo no nó, por que
+<code>kubectl logs</code> não escala e como um agente em DaemonSet leva tudo para um sistema de agregação —
+Loki ou ELK —, com metadados, busca e retenção.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Onde o log do container realmente mora, e por que ele some com o pod.</li>
+  <li>Os cinco motivos para <code>kubectl logs</code> não resolver em produção.</li>
+  <li>O caminho do log até o backend: stdout, runtime, arquivo no nó, agente.</li>
+  <li>Por que o agente é um DaemonSet e o que ele acrescenta a cada linha.</li>
+  <li>O problema do multiline e o que fazer com stack trace.</li>
+  <li>Loki e ELK: as duas famílias de backend e quando cada uma faz sentido.</li>
+  <li>O que ajustar na aplicação antes de agregar — log estruturado, nível e segredo.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o pod levou a evidência embora</h2>
+
+<p>O site da Ana deu erro por dez minutos e voltou sozinho. Quando ela abriu o terminal para investigar, o pod
+que falhou já não existia: o Deployment tinha criado outro, com outro nome, e o <code>kubectl logs</code> do
+pod novo mostrava um log saudável. A mensagem de erro que explicaria tudo tinha ido embora junto com o
+container.</p>
+
+<p>Ela tentou o <code>kubectl logs</code> no pod antigo, de memória, e recebeu <code>Error from server
+(NotFound): pods "cardapio-6d8f89b786-88dn9" not found</code>. Aí percebeu o tamanho do problema: com três
+réplicas, cada uma tem o seu log; o pod que interessa pode ter morrido há dez minutos; e não existe comando
+para “me mostre os erros de todos os pods da última hora”.</p>
+
+<p>Essa última frase é a definição do problema. O <code>kubectl logs</code> é uma ferramenta de inspeção, não
+de investigação. Ele responde “o que este container está escrevendo agora”, e a pergunta de um incidente é “o
+que qualquer container escreveu de errado no intervalo em que o site caiu”. São perguntas diferentes, e a
+segunda exige um sistema que guarde o que já passou.</p>
+
+<p>Esse sistema se chama agregação de logs. Ele não substitui o <code>kubectl logs</code> — que continua sendo
+o primeiro comando do dia a dia —, mas cobre o que ele não cobre: volume, tempo e busca.</p>
+
+<h2>2. Onde o log do container mora</h2>
+
+<p>Quando um processo escreve na saída padrão ou no erro padrão, quem captura é o runtime de containers do nó —
+containerd, na maioria dos clusters. O runtime grava essas linhas num arquivo em disco, dentro de
+<code>/var/log/pods</code>, num diretório por pod e por container. É desse arquivo que o kubelet tira o que o
+<code>kubectl logs</code> mostra.</p>
+
+<p>Duas consequências caem direto daí. A primeira: o log é do <strong>nó</strong>, não do pod. Se o pod é
+recriado em outro nó, o arquivo antigo fica no nó antigo, e o comando novo procura no nó novo. A segunda: o
+arquivo é rotacionado pelo kubelet, por tamanho. Passou do limite, as linhas mais antigas são descartadas. Não
+existe “log de duas semanas atrás” no cluster.</p>
+
+<p>E há a consequência mais importante para quem programa: <strong>o que não vai para a saída padrão não é
+coletado</strong>. Se a aplicação escreve em <code>/var/log/app/erro.log</code> dentro do container, esse
+arquivo existe no sistema de arquivos do container e desaparece com ele. O <code>kubectl logs</code> não mostra
+nada, o agente não vê nada e a informação se perde. A regra de ouro é: log em <code>stdout</code>, uma linha
+por evento, e o resto é problema da infraestrutura.</p>
+
+<p>Se o container morreu e reiniciou, o runtime guarda a saída anterior ao lado da atual. É por isso que existe
+o <code>--previous</code>: ele mostra o log do container que morreu, e é a primeira coisa a tentar num
+<code>CrashLoopBackOff</code>.</p>
+
+<pre class="term">$ kubectl logs cardapio --previous
+Servindo o cardapio na porta 8080
+Precos carregados de /config/cardapio.json
+conexao com o banco: ok
+pedido entregue em 132 ms
+GET /cardapio 200 12ms</pre>
+
+<p>É uma transcrição do que o comando devolve num cluster real; o painel deste guia não roda container e não
+simula histórico, então aqui o <code>--previous</code> não tem o que mostrar. Guarde o comando: ele resolve
+mais incidente do que qualquer dashboard.</p>
+
+<h2>3. Por que kubectl logs não escala</h2>
+
+<p>Cinco motivos, e todos aparecem na primeira semana de produção. O primeiro é o <strong>nome que muda</strong>:
+pod nasce com nome gerado, e o nome de ontem não existe hoje. O segundo é a <strong>quantidade</strong>: três
+réplicas são três comandos; trinta pods são trinta comandos e nenhuma forma de ordenar as linhas por horário.</p>
+
+<p>O terceiro é o <strong>tempo</strong>: o log fica no nó e é rotacionado. Um incidente de madrugada pode ter
+sido resolvido por reinício antes de alguém olhar, e o arquivo já foi substituído. O quarto é a
+<strong>busca</strong>: não há filtro por texto, por nível, por código de erro. Você lê ou faz
+<code>grep</code> no terminal — e <code>grep</code> exige baixar o log inteiro.</p>
+
+<p>O quinto é o <strong>acesso</strong>. Para rodar <code>kubectl logs</code> é preciso permissão no cluster,
+num pod específico, num namespace específico. Quem dá suporte ao cliente não tem isso, e quem tem acaba virando
+gargalo do time. Um sistema de agregação resolve essa parte com uma conta de leitura e um painel.</p>
+
+<p>Existe uma mitigação parcial que vale conhecer: <code>kubectl logs</code> aceita um seletor de Deployment e
+prefixo por pod. É útil para uma olhada rápida, não para investigação.</p>
+
+<pre class="term">$ kubectl logs deploy/cardapio --prefix
+[pod/cardapio-6d8f89b786-88dn9/web] Servindo o cardapio na porta 8080
+[pod/cardapio-6d8f89b786-4jjxx/web] Servindo o cardapio na porta 8080
+[pod/cardapio-6d8f89b786-88dn9/web] GET /cardapio 200 12ms</pre>
+
+<p>Repare no problema escondido nessa saída: as linhas chegam intercaladas, sem ordem garantida, e cada pod
+escreve no seu ritmo. Para duas linhas, tudo bem; para mil, é ilegível. Ordenar por horário exige que alguém
+guarde o horário de cada linha — e o runtime não guarda com precisão suficiente para isso. O agente guarda.</p>
+
+<h2>4. O caminho do log até o backend</h2>
+
+<p>A agregação é uma esteira com quatro estações. A aplicação escreve em <code>stdout</code>. O runtime grava o
+arquivo no nó. Um agente que roda no nó lê o arquivo, acrescenta contexto e envia para fora. O backend guarda,
+indexa e responde a consultas.</p>
+
+<dl class="anatomy">
+<dt>stdout</dt>
+<dd>A saída padrão do processo. É por onde todo log de container deve sair: o runtime captura e grava no
+nó.</dd>
+<dt>arquivo do nó</dt>
+<dd>O que o runtime escreve em <code>/var/log/pods</code>, um diretório por pod e container. É rotacionado
+pelo kubelet.</dd>
+<dt>agente</dt>
+<dd>O pod em DaemonSet que lê os arquivos, acrescenta metadados, junta linhas e envia ao backend.</dd>
+<dt>backend</dt>
+<dd>O sistema que guarda e consulta: Loki, Elasticsearch, OpenSearch. Define retenção, busca e custo.</dd>
+<dt>multiline</dt>
+<dd>A regra que junta várias linhas de um mesmo evento — o stack trace — num registro só, antes de
+enviar.</dd>
+</dl>
+
+<p>A terceira estação é a que exige decisão de arquitetura. O agente precisa rodar em <strong>todo nó</strong>,
+porque cada nó tem os seus arquivos. Ele precisa sobreviver a reinício do nó, senão perde o intervalo. E
+precisa saber de onde veio cada linha — qual namespace, qual pod, qual container —, porque o arquivo tem o
+formato do runtime, com um cabeçalho por linha que ninguém quer ler.</p>
+
+<p>O Kubernetes tem um tipo de workload feito exatamente para isso: o DaemonSet, que garante um pod por nó.
+Quando um nó entra no cluster, o DaemonSet cria um pod nele; quando sai, o pod vai embora. É o encaixe
+perfeito, e é por isso que quase todo agente de log é distribuído como DaemonSet.</p>
+
+<p>Um detalhe que confunde: o agente não lê o log “do pod” por API. Ele lê o arquivo no disco do nó, onde estão
+os logs de todos os pods daquele nó. É uma leitura de sistema de arquivos, com posição guardada, para não
+repetir linha nem perder linha quando o agente reinicia.</p>
+
+<h2>5. O agente como DaemonSet</h2>
+
+<p>Os agentes mais comuns são o Fluent Bit, o Vector e o Promtail. Todos fazem o mesmo trabalho em três passos:
+leem os arquivos, transformam (acrescentam metadados, juntam linhas, filtram) e enviam. A diferença está no
+consumo de memória, na linguagem de configuração e no ecossistema.</p>
+
+<p>A caixa abaixo tem o DaemonSet do agente preso a um nó só, por causa de um <code>nodeSelector</code>
+esquecido. Rode, veja quantos pods existem, e então tire a restrição: o DaemonSet passa a cobrir todos os nós de
+trabalho.</p>
+
+<div class="tryk8s" data-goal="conta:pods[app=fluent-bit]=2;;texto:daemonset.apps/fluent-bit created" data-get="pods">
+  <p class="try-task">O DaemonSet está preso ao nó <code>guia-worker</code> e só cobre um nó. Apague o
+  <code>nodeSelector</code> e rode: o agente tem de rodar em todos os nós de trabalho.</p>
+<pre class="yaml" data-file="fluent-bit.yaml">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: guia-worker
+      containers:
+        - name: agente
+          image: fluent-bit:3.1
+          ports:
+            - containerPort: 2020</pre>
+<pre class="out">
+daemonset.apps/fluent-bit created
+
+NAME               READY   STATUS    RESTARTS   AGE
+fluent-bit-j9j5m   1/1     Running   0          1m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      containers:
+        - name: agente
+          image: fluent-bit:3.1
+          ports:
+            - containerPort: 2020</pre>
+</div>
+
+<p>O painel mostra dois pods, um por nó de trabalho — o nó de controle fica de fora, como num cluster de
+verdade, onde ele tem uma restrição que o DaemonSet não tolera por padrão. Se um nó novo entrar no cluster, o
+controlador cria o pod dele sozinho; se um nó sair, o pod vai junto. É essa propriedade que faz do DaemonSet a
+escolha certa, e não um Deployment com réplicas fixas.</p>
+
+<p>Duas pegadinhas de operação. A primeira: o agente precisa de permissão para ler os arquivos de log do nó, o
+que costuma significar montar <code>/var/log</code> como volume — e isso é dado sensível, então o pod do agente
+merece atenção de segurança. A segunda: se o backend estiver fora do ar, o agente precisa de buffer local, senão
+começa a descartar linha. Buffer em disco é o que separa “perdi um minuto de log” de “perdi o incidente”.</p>
+
+<h2>6. O que o agente acrescenta a cada linha</h2>
+
+<p>O arquivo no nó não sabe de Kubernetes: ele tem um cabeçalho com o nome do arquivo e a saída do processo. O
+agente é quem transforma aquilo em dado consultável, acrescentando campos como namespace, nome do pod,
+container, nome do nó e, em algumas configurações, o dono do pod — Deployment, StatefulSet, Job.</p>
+
+<p>Esses campos são o que permitem perguntar “todos os erros do Deployment cardapio na última hora” sem saber
+os nomes dos pods. Sem eles, o log é texto solto com nome de arquivo. Com eles, é uma série de eventos
+etiquetados — e aí a consulta fica parecida com um seletor de Kubernetes.</p>
+
+<p>O agente também resolve o problema do <strong>multiline</strong>. Um stack trace em Java ou Python ocupa
+trinta linhas, e o runtime grava cada uma como um evento separado, porque ele não sabe o que é uma exceção. O
+agente tem regras de junção: “linha que começa com espaço pertence à anterior”, “linha que começa com
+<code>Traceback</code> começa um novo bloco”. Sem essa regra, quem consulta vê trinta mensagens soltas e perde a
+primeira, que é a que importa.</p>
+
+<p>A configuração do agente é um arquivo próprio, que costuma morar num ConfigMap e ser montado no pod. A caixa
+abaixo tem a configuração de saída do agente apontando para a porta errada do coletor; ajuste a porta e rode.</p>
+
+<div class="tryk8s" data-goal="campo:ConfigMap/fluent-bit-config|data.port=3100;;texto:configmap/fluent-bit-config created" data-get="configmaps">
+  <p class="try-task">A saída do agente aponta para a porta <code>3200</code>, mas o coletor Loki escuta em
+  <code>3100</code>. Corrija o valor e rode.</p>
+<pre class="yaml" data-file="fluent-bit-config.yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+data:
+  host: loki.loja.test
+  port: "3200"
+  formato: json</pre>
+<pre class="out">
+configmap/fluent-bit-config created
+
+NAME                DATA   AGE
+fluent-bit-config   3      7m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+data:
+  host: loki.loja.test
+  port: "3100"
+  formato: json</pre>
+</div>
+
+<p>Porta trocada é o erro mais comum de configuração de agente, e o sintoma é sempre o mesmo: o painel do
+backend não mostra nada do cluster, e o log do próprio agente (sim, ele também tem log) repete erro de conexão.
+Quando o dashboard está vazio, a ordem de conferência é: o agente está rodando em todos os nós, ele consegue
+ler os arquivos, ele consegue alcançar o backend.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que conferir</th><th>Como</th><th>Sintoma quando falha</th></tr>
+</thead>
+<tbody>
+<tr><td>cobre todos os nós</td><td><code>kubectl get pods -l app=fluent-bit -o wide</code> contra
+<code>kubectl get nodes</code></td><td>log de um nó inteiro nunca aparece</td></tr>
+<tr><td>lê os arquivos</td><td>volume de <code>/var/log</code> montado no agente</td><td>agente roda e não
+coleta nada</td></tr>
+<tr><td>alcança o backend</td><td>log do próprio agente</td><td>painel vazio e erro de conexão
+repetido</td></tr>
+<tr><td>junta multiline</td><td>consulta de um stack trace conhecido</td><td>linhas soltas, contexto
+perdido</td></tr>
+<tr><td>tem buffer local</td><td>reinícios do agente</td><td>lacuna exatamente quando o backend caiu</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>7. Loki e ELK: as duas famílias</h2>
+
+<p>Do outro lado da esteira está o backend, e existem duas filosofias. A primeira indexa o conteúdo: cada
+palavra do log vira um termo pesquisável. É o que o Elasticsearch faz, e é o que dá a busca livre do Kibana —
+“encontre qualquer linha que contenha <code>ECONNREFUSED</code> em qualquer namespace”. A segunda indexa só os
+metadados: o texto vira um bloco comprimido, e a busca é por etiqueta (namespace, app, nível) e depois por
+filtro de texto na hora da consulta. É o Loki.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>Loki</th><th>ELK / OpenSearch</th></tr>
+</thead>
+<tbody>
+<tr><td>o que indexa</td><td>etiquetas; o texto é comprimido</td><td>o texto inteiro, palavra por palavra</td></tr>
+<tr><td>custo de armazenamento</td><td>baixo, cresce devagar</td><td>alto, cresce com o volume de linhas</td></tr>
+<tr><td>busca livre</td><td>filtro sobre etiqueta, depois texto</td><td>completa, em qualquer campo</td></tr>
+<tr><td>consulta típica</td><td>“erros do app cardapio na última hora”</td><td>“qualquer linha com este ID em qualquer
+namespace”</td></tr>
+<tr><td>operação</td><td>uma peça, com object storage</td><td>cluster com réplicas, shards e índices</td></tr>
+<tr><td>combina com</td><td>Grafana, métricas do Prometheus</td><td>Kibana, times de busca e auditoria</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A escolha raramente é técnica no começo: é o que o time já sabe operar. Para uma padaria com três serviços, o
+Loki resolve e custa pouco. Para um time que precisa cruzar log com auditoria e busca por identificador de
+pedido em qualquer campo, o Elasticsearch ganha. O erro caro é escolher ELK para “ter busca completa” e
+descobrir depois que o volume de log dobrou o custo do cluster.</p>
+
+<p>Em qualquer um dos dois, a consulta útil sempre começa por etiqueta, não por texto livre. “Namespace, app e
+nível” reduz o universo de milhões de linhas para milhares antes de qualquer busca. Quem consulta sem filtro
+espera minutos e recebe ruído.</p>
+
+<h2>8. Antes de agregar: o log que vale a pena guardar</h2>
+
+<p>Agregar log ruim só produz ruído caro. Três ajustes na aplicação valem mais que qualquer backend. O primeiro
+é <strong>estrutura</strong>: uma linha por evento, em JSON, com campos fixos — <code>nivel</code>,
+<code>msg</code>, <code>rota</code>, <code>duracao_ms</code>, <code>pedido_id</code>. Texto livre é legível por
+humano e inútil para consulta.</p>
+
+<p>O segundo é <strong>nível</strong>. <code>DEBUG</code> em produção multiplica o volume por dez e esconde o
+que importa. O terceiro é <strong>segredo</strong>: log é o lugar mais fácil de vazar senha sem perceber — URL
+com token, corpo de requisição com CPF, cabeçalho de autorização. Agente não filtra isso por você, e uma vez no
+backend, o dado fica lá pela retenção inteira.</p>
+
+<p>E há a ordem dos comandos no incidente. Antes de reiniciar o pod, leia o log: <code>kubectl logs</code> e,
+se ele já reiniciou, <code>--previous</code>. Depois de reiniciar, a evidência do container anterior continua
+disponível até o próximo reinício — mas o pod antigo, se foi apagado, levou o arquivo junto. A caixa abaixo
+mostra essa diferença de ordem em três linhas de terminal.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Servindo o cardapio;;texto:pod/cardapio deleted">
+  <p class="try-task">O pod é apagado antes de alguém ler o log, e o comando seguinte falha. Inverta a ordem:
+  leia o log primeiro e só depois apague o pod.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl delete pod cardapio
+kubectl logs cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl delete pod cardapio
+pod/cardapio deleted
+
+ana@notebook:~$ kubectl logs cardapio
+Error from server (NotFound): pods "cardapio" not found
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl logs cardapio
+kubectl delete pod cardapio</pre>
+</div>
+
+<p>Depois do conserto, a sessão mostra o log do pod e só então a confirmação de que ele foi apagado. É o
+reflexo que a agregação torna menos crítico — com log no backend, a ordem deixa de importar, porque a cópia já
+saiu do nó. Mas até o agregado estar no ar, a regra é ler antes de reiniciar.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o log que a aplicação escrevia em arquivo</h3>
+<p>O programa da Ana gravava em <code>/var/log/cardapio/erro.log</code> e nada aparecia no
+<code>kubectl logs</code>. O time passou semanas culpando o agente. O conserto foi trocar o destino do log para
+a saída padrão e deixar o arquivo para casos de depuração local. O que não sai no <code>stdout</code> não é
+coletado — a regra vale para qualquer backend.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o agente que só cobria um nó</h3>
+<p>Metade dos logs aparecia no painel, e a explicação era sempre “deve ter sido o outro pod”. Um
+<code>nodeSelector</code> esquecido no DaemonSet deixava um nó sem agente. O diagnóstico foi comparar
+<code>kubectl get pods -l app=fluent-bit -o wide</code> com <code>kubectl get nodes</code>: faltava um nó na
+lista. DaemonSet precisa cobrir todos os nós, e a conferência é essa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a busca que nunca terminava</h3>
+<p>Depois de migrar para o Elasticsearch, o time passou a consultar sem filtro de tempo e sem etiqueta. As
+consultas levavam minutos e o cluster vivia sem memória. A correção foi cultural antes de técnica: toda consulta
+começa com namespace, app e janela de tempo. Log agregado é ferramenta de recorte, não de varredura.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Onde o log do container fica guardado?</p>
+<label><input type="radio" name="q1"> no etcd, junto com o objeto do pod</label>
+<label><input type="radio" name="q1"> num arquivo no nó, escrito pelo runtime de containers</label>
+<label><input type="radio" name="q1"> na memória do kube-apiserver, até o pod ser apagado</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Por que o agente de log costuma ser um DaemonSet?</p>
+<label><input type="radio" name="q2"> porque ele precisa de um nome fixo para o Service</label>
+<label><input type="radio" name="q2"> porque só assim ele pode montar volumes</label>
+<label><input type="radio" name="q2"> porque precisa rodar em todo nó, que é onde os arquivos estão</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual é a diferença central entre Loki e ELK?</p>
+<label><input type="radio" name="q3"> o Loki indexa etiquetas e comprime o texto; o ELK indexa o texto
+inteiro</label>
+<label><input type="radio" name="q3"> o Loki só aceita logs em XML</label>
+<label><input type="radio" name="q3"> o ELK não guarda log de container, só de sistema</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: um agente por nó</h2>
+<p>Você quer que o agente de log rode em todos os nós de trabalho, com um pod por nó. Complete o
+<code>kind</code> do manifesto:</p>
+<div class="ex-code">apiVersion: apps/v1
+kind: <input aria-label="resposta 1" data-answer="DaemonSet" placeholder="...">
+metadata:
+  name: fluent-bit</div>
+<p class="ex-dica">Dica: é o workload que garante um pod por nó — nome composto, sem espaço, com “D” e “S”
+maiúsculos. Diferente do Deployment, ele não tem <code>replicas</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O log do container é um arquivo no nó, escrito pelo runtime e rotacionado pelo kubelet. Ele morre com o pod
+e com a rotação, e o que não vai para a saída padrão não é coletado. O <code>kubectl logs</code> lê esse
+arquivo para um container por vez, com <code>--previous</code> para o anterior — suficiente para o dia a dia,
+insuficiente para investigar um incidente com três réplicas e dez minutos de erro.</p>
+
+<p>A agregação é uma esteira: aplicação em <code>stdout</code>, runtime gravando no nó, agente em DaemonSet
+lendo e enriquecendo, backend guardando e respondendo. O agente acrescenta namespace, pod, container e nó, junta
+stack trace e envia com buffer. Loki indexa etiquetas e é barato; ELK indexa texto e é caro, mas busca tudo.</p>
+
+<p>Antes de agregar, ajuste a aplicação: uma linha por evento em JSON, nível controlado, nenhum segredo. E no
+incidente, leia antes de reiniciar. A próxima aula olha para a outra testemunha do cluster — os eventos — e
+mostra como transformar evento em alerta.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Log mora no nó (<code>/var/log/pods</code>) e é rotacionado; não é histórico.</li>
+  <li>Só o que vai para <code>stdout</code>/<code>stderr</code> é coletado.</li>
+  <li><code>kubectl logs</code> é inspeção: um container, agora, pelo nome do pod.</li>
+  <li><code>--previous</code> mostra o container que morreu — antes do próximo reinício.</li>
+  <li>Agente de log é DaemonSet: um por nó, com buffer local para não perder linha.</li>
+  <li>O agente acrescenta namespace, pod, container, nó e junta multiline.</li>
+  <li>Loki indexa etiqueta; ELK indexa texto. Custo e busca mudam junto.</li>
+  <li>Consulta boa começa por etiqueta e janela de tempo, nunca por texto livre.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

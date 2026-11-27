@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Custos e capacidade | Guia Kubernetes</title>
+<meta name="description" content="Custos e capacidade no Kubernetes: capacity, allocatable, requests e uso real, bin-packing, fragmentação e por que request inflado compra nó vazio e caro.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Custos e <span class="hl">capacidade</span></h1>
+<p class="intro">A conta da nuvem da padaria dobrou num mês em que o site recebeu o mesmo número de pedidos. A
+Ana olhou os gráficos: CPU em 14%, memória em 31% — e três nós comprados, dos quais um estava quase vazio.
+O culpado não era tráfego: era o <code>requests</code> que alguém tinha copiado de um tutorial, pedindo 2 GB
+para um serviço que usava 200 MB. Nesta aula a Ana aprende a diferença entre o que o nó tem, o que o cluster
+reserva e o que o programa usa de fato — e por que essa diferença é uma conta de dinheiro.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>As quatro medidas que todo mundo confunde: <code>capacity</code>, <code>allocatable</code>,
+  <code>requests</code> e uso real.</li>
+  <li>Como o agendador empacota pods num nó e por que sobra espaço sem ninguém usar.</li>
+  <li>Por que request inflado não deixa o site mais rápido — só compra máquina parada.</li>
+  <li>O peso escondido dos DaemonSets e dos pods de sistema na capacidade de cada nó.</li>
+  <li>Como ler <code>Allocated resources</code> no <code>describe node</code>.</li>
+  <li>O que medir antes de mexer em request, e quando o cluster autoscaler entra na conta.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a conta dobrou e o site não ficou mais rápido</h2>
+
+<p>O cardápio roda em três nós de 2 vCPU e 4 GB cada. No papel, isso dá 6 vCPU e 12 GB. Na prática, o
+cluster só aceita agendar um pod novo se houver <em>reserva</em> sobrando, e reserva é uma coisa que o pod
+declara — não o que ele usa. Foi aí que a conta desandou: cada réplica do site pedia 2 GB de memória, e o
+programa usava 200 MB no pico do almoço.</p>
+
+<p>Com 2 GB de reserva por pod, cada nó de 4 GB aceita dois pods do site — e o terceiro fica
+<code>Pending</code>. Para caber seis réplicas, o cluster cresceu para quatro nós. Só que a memória real
+usada continuou em 31%, porque reserva não é uso: o cluster separou o espaço, o programa nunca chegou perto
+dele, e a Ana paga pelos quatro nós do mesmo jeito.</p>
+
+<p>O inverso também custa caro. Um serviço sem <code>requests</code> não reserva nada: ele entra em qualquer
+nó, inclusive num que já está cheio de verdade. Quando a memória aperta, o kubelet escolhe quem despejar — e
+os primeiros da fila são justamente os pods sem reserva. Economizar no request é emprestar capacidade que
+pode faltar no pior momento.</p>
+
+<h2>2. Quatro números que não são a mesma coisa</h2>
+
+<p>Toda discussão de custo em Kubernetes começa com uma confusão de vocabulário. “O nó tem 4 GB” pode
+significar quatro coisas diferentes, e cada uma leva a uma conclusão diferente. A tabela abaixo é o
+mapa.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Medida</th><th>O que é</th><th>Onde ver</th><th>Quem decide</th></tr>
+</thead>
+<tbody>
+<tr><td><code>capacity</code></td><td>o total bruto da máquina</td><td><code>describe node</code>, bloco
+<code>Capacity</code></td><td>o provedor: tamanho da instância</td></tr>
+<tr><td><code>allocatable</code></td><td>o que sobra para pods depois do sistema</td><td><code>describe
+node</code>, bloco <code>Allocatable</code></td><td>kubelet e reservas do nó</td></tr>
+<tr><td><code>requests</code></td><td>o que cada pod reserva, somado por nó</td><td><code>describe
+node</code>, <code>Allocated resources</code></td><td>você, no manifesto</td></tr>
+<tr><td>uso real</td><td>quanto o programa consome de fato</td><td><code>kubectl top</code>, painel de
+métricas</td><td>o programa, em execução</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A diferença entre <code>capacity</code> e <code>allocatable</code> é a primeira surpresa: o nó reserva uma
+fatia para o próprio Kubernetes, para o sistema operacional e para o despejo de emergência. Num nó de 4 GB,
+o alocável costuma ficar entre 3,4 GB e 3,7 GB. Some a isso os DaemonSets — o agente de log, o coletor de
+métricas, o proxy de rede — que rodam em <em>todos</em> os nós e comem uma parte em cada um.</p>
+
+<dl class="anatomy">
+<dt>capacity</dt>
+<dd>O tamanho bruto do nó, como o provedor entrega.</dd>
+<dt>allocatable</dt>
+<dd>O que o agendador pode distribuir entre pods depois de descontar sistema e reservas.</dd>
+<dt>request</dt>
+<dd>A reserva que o pod declara. O agendador trata como se já estivesse em uso, mesmo com o pod
+ocioso.</dd>
+<dt>limit</dt>
+<dd>O teto que o container pode atingir. Não reserva nada; só impede passar dali.</dd>
+<dt>bin-packing</dt>
+<dd>O trabalho de encaixar pods nos nós. Reservas grandes deixam buracos que ninguém consegue
+usar.</dd>
+<dt>fragmentação</dt>
+<dd>Capacidade livre espalhada em pedaços pequenos demais para o próximo pod.</dd>
+<dt>overcommit</dt>
+<dd>Vender mais reserva do que a máquina tem, apostando que ninguém usa tudo ao mesmo tempo.</dd>
+<dt>node pool</dt>
+<dd>Um grupo de nós do mesmo tamanho e propósito. Separar pools é separar contas.</dd>
+</dl>
+
+<p>Repare no ponto que mais engana: <strong>request não é limite e não é uso</strong>. Você pode pedir
+500m de CPU e usar 50m; o nó vai considerar 500m ocupados de qualquer jeito, e nenhum outro pod entra ali
+com esse espaço. É por isso que um cluster pode estar “vazio” no gráfico e recusar pods.</p>
+
+<h2>3. Como o cluster empacota pods, e por que sobra buraco</h2>
+
+<p>O agendador não olha para uso: ele soma reservas. Cada nó tem um saldo de CPU e memória, e cada pod que
+entra desconta o próprio <code>requests</code>. Se o saldo não cobre o pedido, o nó é eliminado — e o pod vai
+para outro, ou fica <code>Pending</code> quando nenhum serve. O resultado é o clássico “tem 40% livre e o pod
+não cabe”: os 40% estão espalhados em pedaços menores que a reserva pedida.</p>
+
+<p>Pense em caixas dentro de caixas. Um nó de 4 GB com dois pods de 1,5 GB tem 1 GB livre — e um pod novo de
+1,2 GB não entra ali, mesmo que o nó esteja com metade da memória sem uso. Em três nós assim, talvez nenhum
+aceite o pod, embora a soma livre seja 3 GB. Isso é fragmentação, e ela é invisível no gráfico de
+utilização.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Request</th><th>O que o cluster faz</th><th>Efeito na conta</th></tr>
+</thead>
+<tbody>
+<tr><td>pequeno demais</td><td>encaixa em qualquer lugar, inclusive em nó apertado</td><td>barato hoje, caro no
+pico: o pod é o primeiro candidato a despejo</td></tr>
+<tr><td>honesto</td><td>reserva o que o programa costuma usar, com folga para o pico</td><td>previsível: o
+cluster cabe no tamanho que você desenhou</td></tr>
+<tr><td>grande demais</td><td>usa um nó inteiro por pod e deixa o resto vazio</td><td>você paga máquina
+parada, e o gráfico de uso nunca mostra o desperdício</td></tr>
+<tr><td>ausente</td><td>reserva zero, entra em qualquer nó, é o primeiro a sair sob pressão</td><td>barato até
+o dia em que o nó aperta e o despejo escolhe o seu pod</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O número que resolve a discussão é a razão entre reserva e uso. Se os pods de um Deployment pedem 8 GB no
+total e usam 1,5 GB, você está pagando por 6,5 GB de nada — e o gráfico de utilização, que mostra o uso, não
+denuncia isso. Quem mostra é o <code>Allocated resources</code> do nó, na próxima seção.</p>
+
+<h2>4. A caixa: o request que compra nó vazio</h2>
+
+<p>Esta caixa é a conta da Ana em miniatura. Cada réplica pede 2.500 Mi de memória — mais do que dois pods
+cabem num nó de 4 GB. O cluster tem três nós e quatro réplicas: as três primeiras acham lugar, a quarta não.
+Reduza o pedido para 1.000 Mi e rode de novo.</p>
+
+<div class="tryk8s" data-get="pods -o wide" data-goal="pronto:Deployment/cardapio=4">
+  <p class="try-task">O Deployment tem de ficar com as quatro réplicas prontas. Ajuste o
+  <code>requests.memory</code> para <code>1000Mi</code> e rode.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              memory: 2500Mi</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE   IP               NODE                 NOMINATED NODE   READINESS GATES
+cardapio-7qrqfgt76b-4tr9k   0/1     Pending   0          8m    &lt;none&gt;           &lt;none&gt;               &lt;none&gt;           &lt;none&gt;
+cardapio-7qrqfgt76b-5dhrw   1/1     Running   0          4m    10.244.226.77    guia-control-plane   &lt;none&gt;           &lt;none&gt;
+cardapio-7qrqfgt76b-jbbdg   1/1     Running   0          1m    10.244.244.25    guia-worker          &lt;none&gt;           &lt;none&gt;
+cardapio-7qrqfgt76b-mwz9p   1/1     Running   0          3m    10.244.223.206   guia-worker2         &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              memory: 1000Mi</pre>
+</div>
+
+<p>Com 2.500 Mi, o painel mostra três pods <code>Running</code> e um <code>Pending</code> — e o evento diria
+<code>0/3 nodes are available: 3 Insufficient memory</code>, porque cada nó aceita um pod só. O quarto pod não
+é um bug: é a aritmética da reserva. Com 1.000 Mi, os quatro cabem (dois num nó e um em cada um dos outros), e
+o Deployment fica pronto.</p>
+
+<p>O detalhe de dinheiro é este: com o request antigo, a solução da Ana seria <em>comprar mais um nó</em>. Com
+o request honesto, não precisa. Antes de escalar o cluster, vale sempre perguntar se o problema é falta de
+máquina ou excesso de reserva. Na maioria dos casos que chegam como “falta capacidade”, a resposta está no
+manifesto.</p>
+
+<h2>5. A caixa: a soma que passa da capacidade do cluster</h2>
+
+<p>O erro de conta mais comum não é por pod, é no total. O cluster tem três nós de 2 vCPU — 6 vCPU
+alocáveis no melhor caso. Se cada réplica pede 900m e você publica sete réplicas, o total pedido é 6.300m:
+mais CPU do que o cluster inteiro tem. Não existe ajuste de agendador que resolva isso; falta máquina, ou
+sobra pedido.</p>
+
+<div class="tryk8s" data-get="pods -o wide" data-goal="pronto:Deployment/cardapio=7">
+  <p class="try-task">As sete réplicas têm de ficar prontas. Reduza o request de CPU para <code>600m</code> e
+  rode: cada nó passa a aceitar três pods.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 7
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 900m</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE   IP               NODE                 NOMINATED NODE   READINESS GATES
+cardapio-dfn4mkdcwz-2qt9r   1/1     Running   0          6m    10.244.222.103   guia-worker          &lt;none&gt;           &lt;none&gt;
+cardapio-dfn4mkdcwz-5plfh   1/1     Running   0          28s   10.244.99.119    guia-control-plane   &lt;none&gt;           &lt;none&gt;
+cardapio-dfn4mkdcwz-7pclr   0/1     Pending   0          4m    &lt;none&gt;           &lt;none&gt;               &lt;none&gt;           &lt;none&gt;
+cardapio-dfn4mkdcwz-k7m5g   1/1     Running   0          5m    10.244.208.198   guia-worker          &lt;none&gt;           &lt;none&gt;
+cardapio-dfn4mkdcwz-qmcrc   1/1     Running   0          8m    10.244.107.178   guia-worker2         &lt;none&gt;           &lt;none&gt;
+cardapio-dfn4mkdcwz-th2zz   1/1     Running   0          9m    10.244.49.178    guia-control-plane   &lt;none&gt;           &lt;none&gt;
+cardapio-dfn4mkdcwz-w925b   1/1     Running   0          4m    10.244.152.51    guia-worker2         &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 7
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 600m</pre>
+</div>
+
+<p>Com 900m, cada nó aceita dois pods (1.800m de 2.000m) e o sétimo fica em <code>Pending</code>, com o evento
+<code>Insufficient cpu</code>. Com 600m, cada nó aceita três (1.800m) e as sete réplicas cabem. Repare que a
+mudança não deixa o site mais lento: o programa continua com a mesma CPU disponível para usar — o que mudou foi
+quanto ele <em>reserva</em> antes de usar.</p>
+
+<p>Essa é a conta que vale fazer no papel antes de publicar. Some os requests de todas as réplicas, some os
+DaemonSets (que rodam em cada nó, então multiplique pelo número de nós) e compare com a soma dos alocáveis.
+Se o total passar, ou você reduz o pedido, ou compra nó — e a primeira opção é gratuita. Se o total couber mas
+ainda assim houver <code>Pending</code>, o problema é distribuição, e é o assunto da próxima caixa.</p>
+
+<p>Um aviso sobre o número de réplicas: ele não é gratuito nem infinito. Cada réplica é uma reserva inteira,
+mesmo que o programa use pouco. Um serviço com seis réplicas de 500m custa 3 vCPU de reserva em qualquer
+cluster — e é por isso que “escalar para resolver lentidão” precisa vir acompanhado da pergunta “cabe?”.</p>
+
+<h2>6. A caixa: o nó dedicado que você paga sem usar</h2>
+
+<p>Prender um Deployment a um nó específico é útil para testar e desastroso para a conta. A caixa prende três
+réplicas ao <code>guia-worker2</code>: duas cabem, a terceira fica de fora — enquanto os outros dois nós
+ficam ociosos. Apague o <code>nodeSelector</code> e rode.</p>
+
+<div class="tryk8s" data-get="pods -o wide" data-goal="pronto:Deployment/cardapio=3">
+  <p class="try-task">As três réplicas têm de ficar prontas. Tire o <code>nodeSelector</code> do
+  <code>template</code> e rode: o agendador espalha os pods pelos nós livres.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: guia-worker2
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 800m</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE   IP               NODE           NOMINATED NODE   READINESS GATES
+cardapio-6bn2kvqjgb-9n8tw   0/1     Pending   0          9m    &lt;none&gt;           &lt;none&gt;         &lt;none&gt;           &lt;none&gt;
+cardapio-6bn2kvqjgb-jzkm8   1/1     Running   0          3m    10.244.114.98    guia-worker2   &lt;none&gt;           &lt;none&gt;
+cardapio-6bn2kvqjgb-zr9zs   1/1     Running   0          4m    10.244.127.235   guia-worker2   &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 800m</pre>
+</div>
+
+<p>Antes da correção o painel mostra duas réplicas no <code>guia-worker2</code> e uma em
+<code>Pending</code>. Depois, cada uma cai num nó diferente. O cluster é o mesmo, o custo é o mesmo, e a
+capacidade utilizável quase triplicou — porque a restrição não era falta de máquina, era falta de
+distribuição.</p>
+
+<p>Isso não quer dizer que nó dedicado seja sempre errado. Ele faz sentido quando existe um motivo físico
+(uma GPU, um disco local, um pool com licença) e quando o pool é dimensionado para a carga inteira. O erro é
+prender por hábito — “para ficar mais previsível” — sem refazer a conta: o nó dedicado é o mais caro por pod
+que existe, porque ninguém mais usa o que sobra.</p>
+
+<h2>7. A conta do describe node</h2>
+
+<p>O lugar onde a reserva vira número é o <code>describe node</code>. Ele mostra a capacidade bruta, o
+alocável, a soma dos pedidos e a lista de pods com quanto cada um reserva. Esta é uma transcrição de cluster
+real, de um nó de 2 vCPU e 4 GB com o site e o agente de logs:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe node guia-worker
+Name:               guia-worker
+Roles:              worker
+Capacity:
+  cpu:                2
+  memory:             4016336Ki
+  pods:               110
+Allocatable:
+  cpu:                1900m
+  memory:             3752672Ki
+  pods:               110
+Non-terminated Pods:          (5 in total)
+  Namespace   Name                        CPU Requests  CPU Limits  Memory Requests  Memory Limits
+  ---------   ----                        ------------  ----------  ---------------  -------------
+  kube-system coredns-7d9f8b6c4-2xk4p     100m (5%)     0 (0%)      70Mi (1%)        170Mi (4%)
+  default     cardapio-6d7f9c8b5-4jjxx     500m (26%)    1 (52%)     256Mi (6%)       512Mi (13%)
+  default     cardapio-6d7f9c8b5-4jjxx-cp  500m (26%)    1 (52%)     256Mi (6%)       512Mi (13%)
+  kube-system agente-logs-hbshx            300m (15%)    300m (15%)  200Mi (5%)       200Mi (5%)
+  kube-system kube-proxy-x8k2l             0 (0%)        0 (0%)      0 (0%)           0 (0%)
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests     Limits
+  --------           --------     ------
+  cpu                1400m (73%)  2600m (136%)
+  memory             782Mi (21%)  1594Mi (42%)
+Events:              none</pre>
+
+<p>Leia de cima para baixo e a conta aparece. O nó tem 2 vCPU e 4 GB brutos, mas só 1.900m e 3,5 GB
+alocáveis: o resto é sistema. Os cinco pods já reservam 1.400m de CPU — 73% do alocável — mesmo com o site
+usando uma fração disso na prática. Se um pod novo pedir 600m, não entra, e o evento vai dizer
+<code>Insufficient cpu</code>.</p>
+
+<p>Duas linhas merecem atenção especial. A primeira é <code>(Total limits may be over 100 percent, i.e.,
+overcommitted.)</code>: os limites somados passam de 136% da CPU do nó. Isso é normal e proposital — limites
+são teto, não reserva —, mas significa que, num pico simultâneo, os containers brigam por CPU e todos ficam
+mais lentos. A segunda é a coluna de porcentagem: 26% de CPU por réplica é o que você está pagando, não o que
+o programa consome.</p>
+
+<h2>8. Reserva e uso: por que o gráfico engana</h2>
+
+<p>Se o <code>describe node</code> diz 73% de CPU ocupada e o painel de monitoramento diz 14%, não há
+contradição: um mede reserva, o outro mede uso. O problema é que a maioria das decisões de compra é tomada
+olhando o segundo. A transcrição abaixo mostra os dois números lado a lado, no mesmo minuto:</p>
+
+<pre class="term">ana@notebook:~$ kubectl top nodes
+NAME                 CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+guia-control-plane   210m         10%      1180Mi          31%
+guia-worker          180m         9%       890Mi           23%
+guia-worker2         190m         9%       1020Mi          26%
+
+ana@notebook:~$ kubectl describe node guia-worker | grep -A4 "Allocated resources"
+  Resource           Requests     Limits
+  --------           --------     ------
+  cpu                1400m (73%)  2600m (136%)
+  memory             782Mi (21%)  1594Mi (42%)</pre>
+
+<p>9% de CPU em uso e 73% de CPU reservada. O cluster está “vazio” para quem olha o consumo e “cheio” para
+quem tenta agendar. Nesse estado, escalar o Deployment não resolve — os pods novos não têm onde entrar —, e
+comprar nó resolve, mas é caro. O caminho barato é revisar os requests: se o site usa 180m e pede 500m, o
+pedido está três vezes maior que a necessidade.</p>
+
+<p>Como achar o número honesto? Três fontes, em ordem de confiança. A primeira é o histórico de uso por pod
+no painel de métricas: pegue o pico de uma semana, não a média do dia calmo. A segunda é a recomendação do
+VPA em modo <em>Off</em>, que observa e sugere requests sem aplicar nada (o assunto da aula de autoscaling).
+A terceira é o bom senso de domínio: um servidor HTTP pequeno raramente precisa de 1 vCPU; um processo que
+carrega um relatório inteiro na memória precisa de memória, não de CPU.</p>
+
+<p>Com o número na mão, a regra é simples: <strong>request no pico típico com uma folga de 20% a 30%, limit
+acima do pico</strong>. Se o uso varia muito e você não quer pagar pelo pior caso, existe overcommit
+controlado — request baixo e limit alto —, mas com um preço: no dia em que todo mundo usar o teto ao mesmo
+tempo, os containers brigam e a latência sobe. Não é erro; é uma escolha que você faz sabendo.</p>
+
+<p>E onde entra o cluster autoscaler? Ele compra nó quando existe pod <code>Pending</code> por falta de
+recurso, e devolve nó quando sobra. Isso significa que request inflado não é só desperdício: é <em>gatilho de
+compra</em>. Cada 2 GB pedidos sem uso viram, em cluster elástico, um nó novo na conta do mês seguinte. A
+ordem certa é sempre: medir, ajustar request, e só então deixar o autoscaler crescer.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o cluster que não aceitava mais nada com 30% de uso</h3>
+<p>O time queria comprar nós porque “a capacidade acabou”. O <code>describe node</code> mostrou 85% de CPU
+reservada e 12% em uso. A causa era um request de 1 vCPU herdado de quando o serviço rodava em máquina
+dedicada. Baixar para 200m liberou espaço para o dobro de réplicas sem gastar um centavo a mais.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o serviço sem request que sumia no pico</h3>
+<p>Um serviço de relatórios rodava sem <code>requests</code> e vivia sendo reiniciado nas tardes de pico. O
+motivo: sem reserva, ele era o primeiro candidato ao despejo quando a memória do nó apertava. Declarar
+<code>memory: 400Mi</code> acabou com os reinícios — não porque o programa mudou, mas porque o cluster passou
+a protegê-lo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o pool dedicado que custava o triplo</h3>
+<p>A Ana criou um pool de nós só para o forno, com três máquinas grandes, para “não competir com o site”. O
+forno rodava duas horas por dia e usava 20% do pool. A solução foi um pool de uma máquina com
+<code>nodeSelector</code> e um Job com prazo — e o site voltou a usar os nós normais. Mesma carga, um terço
+da conta.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O agendador decide onde o pod cabe olhando o quê?</p>
+<label><input type="radio" name="q1"> o uso real de CPU e memória de cada nó</label>
+<label><input type="radio" name="q1"> a soma dos <code>requests</code> já agendados em cada nó</label>
+<label><input type="radio" name="q1"> o tamanho da imagem do container</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que significa ver 15% de uso de CPU e 80% de CPU
+reservada no mesmo nó?</p>
+<label><input type="radio" name="q2"> o nó está com defeito e precisa ser recriado</label>
+<label><input type="radio" name="q2"> os pods estão usando mais CPU do que declaram</label>
+<label><input type="radio" name="q2"> os requests estão inflados: há espaço físico, mas não há reserva
+livre</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual é o efeito de um pod sem <code>requests</code>?</p>
+<label><input type="radio" name="q3"> ele reserva zero e é o primeiro candidato a despejo sob
+pressão</label>
+<label><input type="radio" name="q3"> ele não pode ser agendado em nenhum nó</label>
+<label><input type="radio" name="q3"> ele ganha prioridade alta automaticamente</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a reserva que cabe no nó</h2>
+<p>O nó tem 1.900m alocáveis e já reserva 1.400m. Você precisa de quatro réplicas de 100m. Qual valor de
+<code>requests.cpu</code> faz as quatro caberem nesse nó?</p>
+<div class="ex-code">resources:
+  requests:
+    cpu: <input aria-label="resposta 1" data-answer="100m" placeholder="..."></div>
+<p class="ex-dica">Dica: quatro réplicas de 100m somam 400m, e 1.400m + 400m = 1.800m, abaixo dos 1.900m
+alocáveis.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Capacidade tem quatro números e eles não se substituem: <code>capacity</code> é a máquina bruta,
+<code>allocatable</code> é o que sobra para pods, <code>requests</code> é a reserva que você declara e o uso
+real é o que o programa consome. O agendador só olha a terceira — por isso um cluster pode recusar pods com
+os gráficos em 15%.</p>
+
+<p>Custo em Kubernetes é, quase sempre, custo de reserva mal calibrada. Request grande demais compra nó
+parado e, em cluster elástico, vira gatilho de compra automática. Request ausente economiza hoje e cobra no
+pico, na forma de despejo. O meio termo é medir o pico, reservar com folga modesta e revisar de tempos em
+tempos.</p>
+
+<p>Na próxima aula a Ana sai da conta e entra na arquitetura: como o Kubernetes deixa alguém <em>estender</em>
+a própria API, com CRDs e operadores — o mecanismo que faz um cluster comum ganhar recursos que ninguém
+imaginava quando ele foi escrito.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>capacity</code> é o bruto; <code>allocatable</code> é o que dá para distribuir.</li>
+  <li>O agendador soma <code>requests</code>, nunca o uso real.</li>
+  <li>Request inflado = nó vazio pago; request ausente = pod despejado primeiro.</li>
+  <li>DaemonSets e pods de sistema também reservam, em todos os nós.</li>
+  <li>O gráfico de uso não mostra fragmentação; o <code>Allocated resources</code> mostra.</li>
+  <li>Antes de comprar nó, revise request; depois, deixe o autoscaler trabalhar.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

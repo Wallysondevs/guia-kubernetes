@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prometheus | Guia Kubernetes</title>
+<meta name="description" content="Como o Prometheus descobre e coleta as métricas do cluster: pull, formato de exposição, séries, PromQL, ServiceMonitor e os limites honestos do servidor.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Prometheus</span></h1>
+<p class="intro">O <code>kubectl top</code> respondeu “agora” e o metrics-server esqueceu em cinco minutos — mas a Ana
+queria saber desde quando o cardápio estava lento. Nesta aula ela conhece o Prometheus: o servidor que vai
+<em>buscar</em> os números de cada alvo a cada intervalo, guarda a curva por semanas e responde perguntas com uma
+linguagem própria. E, no caminho, descobre que a parte mais difícil não é a consulta: é fazer o alvo ser
+descoberto.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que o Prometheus puxa as métricas em vez de recebê-las.</li>
+  <li>O que é um alvo, um scrape e uma série temporal.</li>
+  <li>Como ler o formato de exposição que a aplicação publica em <code>/metrics</code>.</li>
+  <li>Por que um Service com várias portas precisa de nome em cada uma.</li>
+  <li>O que o ServiceMonitor seleciona e por que nada avisa quando o rótulo está errado.</li>
+  <li>As cinco funções de PromQL que respondem quase tudo no dia a dia.</li>
+  <li>O que o Prometheus não faz: alta disponibilidade, log, trace e retenção longa.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a curva que ninguém tinha</h2>
+
+<p>Na terça, a Ana recebeu a terceira reclamação da semana: o site da padaria estava “arrastando” para abrir o
+cardápio. Ela rodou <code>kubectl top pods</code> e viu números baixinhos, tudo normal. Rodou de novo dez minutos
+depois e viu os mesmos números baixinhos. O metrics-server, como você viu na aula dele, guarda poucos minutos de
+medição: ele serve para decidir na hora — escalar, caber ou não caber —, não para contar história.</p>
+
+<p>A pergunta da Ana era histórica: “desde quando está lento, e o que mudou naquele dia?”. Para responder isso é
+preciso alguém que visite cada serviço de tempos em tempos, anote o número com a hora e guarde tudo por semanas.
+Esse alguém é o Prometheus. Ele não é um <code>kubectl top</code> que guarda mais: ele coleta de um jeito
+diferente, guarda num formato diferente e responde num idioma diferente. E é esse jeito diferente que decide se o
+cardápio da Ana vai aparecer num gráfico ou ficar invisível para sempre.</p>
+
+<h2>2. Pull, não push: o Prometheus vai buscar</h2>
+
+<p>A primeira decisão de projeto do Prometheus é a que mais confunde quem vem de outras ferramentas: ele
+<strong>puxa</strong>. O servidor mantém uma lista de alvos — endereços de onde dá para tirar números — e, a cada
+intervalo (<code>scrape_interval</code>, um minuto por padrão, quinze ou trinta segundos no uso comum), faz um
+<code>GET</code> em <code>http://endereço:porta/metrics</code>. A resposta é texto puro. O Prometheus lê, carimba
+com a hora e guarda. Se a resposta não vier dentro do tempo limite (<code>scrape_timeout</code>, dez segundos por
+padrão), ele anota que aquela coleta falhou e segue para o próximo alvo.</p>
+
+<p>Isso muda o que a sua aplicação precisa fazer. Ela não precisa saber o endereço do Prometheus, nem abrir
+conexão com ele, nem ter biblioteca de envio: basta responder HTTP em <code>/metrics</code> com os números certos.
+Também muda o diagnóstico, porque o sentido da falha fica claro. Se o Prometheus não consegue falar com o alvo, ele
+sabe e registra. Se o alvo está de pé mas devolve lixo, ele também vê. O que ele não vê é o que ninguém lhe contou
+que existia — e essa é a origem de quase todo problema de observabilidade.</p>
+
+<p>Repare que o pull exige um endereço estável. Um pod nasce com IP novo a cada recriação, então o alvo de um
+Deployment não é o pod: é o <strong>Service</strong>. O Prometheus descobre o Service, resolve os endpoints (os
+pods por trás) e visita cada um. É por isso que as três caixas desta aula são Services: se o Service estiver
+errado, o Prometheus não acha o alvo, mesmo com a aplicação perfeita e o pod rodando.</p>
+
+<dl class="anatomy">
+<dt>alvo (target)</dt>
+<dd>Um endereço de onde o Prometheus tira números: <code>ip:porta</code> de um pod, via Service, mais o caminho
+<code>/metrics</code>.</dd>
+<dt>scrape</dt>
+<dd>Uma coleta: o <code>GET</code> que o Prometheus faz no alvo a cada <code>scrape_interval</code>, com prazo de
+<code>scrape_timeout</code>.</dd>
+<dt>série</dt>
+<dd>Um nome de métrica mais um conjunto de etiquetas, com a lista de valores no tempo. É a unidade que o
+Prometheus guarda e que o PromQL consulta.</dd>
+<dt>ServiceMonitor</dt>
+<dd>Objeto do Prometheus Operator que diz “visite os Services com estes rótulos, nesta porta, neste caminho”.
+Não é do Kubernetes puro: é um CRD.</dd>
+<dt>remote write</dt>
+<dd>O envio das séries para outro sistema (Thanos, Mimir, VictoriaMetrics) quando a retenção local não
+basta.</dd>
+</dl>
+
+<h2>3. A caixa: a porta que precisa de nome</h2>
+
+<p>O Service do cardápio tem duas portas: a <code>80</code>, que o site usa, e a <code>9090</code>, onde a
+aplicação publica as métricas. O manifesto abaixo é aceito por qualquer um que leia YAML com atenção — e recusado
+pelo kube-apiserver, com uma frase que vale a aula inteira. Rode como está e leia o erro: o Service não é
+criado.</p>
+
+<div class="tryk8s" data-goal="campo:Service/cardapio|spec.ports.1.name=metrics;;texto:service/cardapio created">
+  <p class="try-task">O Service tem duas portas e nenhuma tem nome, então a API recusa. Dê o nome
+  <code>web</code> à porta 80 e <code>metrics</code> à 9090, e rode de novo até o Service ser criado.</p>
+<pre class="yaml" data-file="service-cardapio.yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080
+    - port: 9090
+      targetPort: 9090</pre>
+<pre class="out">
+The Service "cardapio" is invalid: spec.ports[0].name: Required value: must be specified when there are multiple ports; spec.ports[1].name: Required value: must be specified when there are multiple ports
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - name: web
+      port: 80
+      targetPort: 8080
+    - name: metrics
+      port: 9090
+      targetPort: 9090</pre>
+</div>
+
+<p>O erro do cluster é este: <code>The Service "cardapio" is invalid: spec.ports[0].name: Required value: must be
+specified when there are multiple ports</code> — e a mesma frase de novo para <code>spec.ports[1]</code>.
+Traduzindo: “quando há mais de uma porta, cada uma precisa de nome”. Não é capricho do validador. Com uma porta só,
+ninguém precisa dizer qual; com duas, “a porta de métricas” vira uma pergunta sem resposta. O nome é o que permite
+apontar para uma delas sem depender do número.</p>
+
+<p>O ServiceMonitor usa exatamente isso: no campo <code>port</code> dele você escreve o <em>nome</em> da porta, não
+o número. E o próprio kubectl usa o nome quando você quer falar com um Service pelo proxy da API, como veremos
+adiante: <code>services/cardapio:metrics/proxy</code>. Sem nome, não há como escrever esse caminho.</p>
+
+<h2>4. O formato de exposição e a série temporal</h2>
+
+<p>O que a aplicação devolve em <code>/metrics</code> é texto simples, uma amostra por linha: o nome da métrica, as
+etiquetas entre chaves e o valor. Duas linhas de comentário, começando com <code>#</code>, dão o contexto:
+<code>HELP</code> explica o que é, <code>TYPE</code> diz que tipo de número é. É esse contrato mínimo que permite
+qualquer linguagem publicar métricas — há bibliotecas de cliente para as principais.</p>
+
+<p>Dá para ver isso sem Prometheus nenhum, usando o próprio kube-apiserver como intermediário: o caminho
+<code>/api/v1/namespaces/&lt;ns&gt;/services/&lt;nome&gt;:&lt;porta&gt;/proxy/metrics</code> faz o apiserver
+conectar no Service e devolver a resposta. É o mesmo <code>GET</code> que o Prometheus faria, o que torna esse
+truque o teste de dez segundos para saber se o alvo responde:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get --raw "/api/v1/namespaces/default/services/cardapio:metrics/proxy/metrics" | head -12
+# HELP http_requests_total Total de requisicoes HTTP atendidas
+# TYPE http_requests_total counter
+http_requests_total{method="GET",path="/cardapio",status="200"} 1843
+http_requests_total{method="GET",path="/cardapio",status="500"} 7
+# HELP http_request_duration_seconds Duracao das requisicoes HTTP
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.1"} 1712
+http_request_duration_seconds_bucket{le="0.5"} 1830
+http_request_duration_seconds_bucket{le="1"} 1846
+http_request_duration_seconds_bucket{le="+Inf"} 1850
+http_request_duration_seconds_sum 251.7
+http_request_duration_seconds_count 1850</pre>
+
+<p>Cada linha com combinação de etiquetas diferente é uma <strong>série</strong>. Repare que
+<code>http_requests_total</code> já tem duas séries só nesse recorte: <code>status="200"</code> e
+<code>status="500"</code>. O Prometheus acrescenta as dele ao coletar: <code>job</code> (o nome da tarefa de
+coleta) e <code>instance</code> (de qual endereço veio). A identidade de uma série é o nome mais todas as
+etiquetas — mudar uma etiqueta cria outra série, não atualiza a mesma.</p>
+
+<p>Daí vem a palavra que assombra quem opera Prometheus: <strong>cardinalidade</strong>. O número de séries é o
+produto das combinações: duas rotas vezes três métodos vezes quatro códigos já são vinte e quatro séries; some
+<code>instance</code> e multiplique pelo número de pods. Uma etiqueta com valor único por requisição — um
+<code>user_id</code>, um <code>request_id</code> — transforma isso em milhares de séries por minuto, e o servidor
+come memória até cair. Identificador de requisição é assunto de log e de trace, não de métrica.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tipo</th><th>Como é</th><th>Exemplo</th><th>O que usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>counter</code></td><td>só cresce; zera quando o processo reinicia</td><td>requisições
+atendidas, reinícios</td><td><code>rate()</code> ou <code>increase()</code> — nunca o valor cru</td></tr>
+<tr><td><code>gauge</code></td><td>sobe e desce</td><td>memória em uso, réplicas disponíveis</td><td>o valor
+direto, <code>max_over_time()</code>, <code>avg_over_time()</code></td></tr>
+<tr><td><code>histogram</code></td><td>contadores em faixas (<code>_bucket</code>) mais soma e
+contagem</td><td>duração de requisição</td><td><code>histogram_quantile()</code> sobre
+<code>rate()</code> dos buckets</td></tr>
+<tr><td><code>summary</code></td><td>quantis já calculados pelo cliente</td><td>duração vista pela
+aplicação</td><td>o quantil pronto — e não dá para somar entre pods</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>5. A caixa: o rótulo que liga a descoberta</h2>
+
+<p>Descobrir alvo é trabalho de rótulo, e o objeto que faz essa ponte no Prometheus Operator é o
+<code>ServiceMonitor</code>. Ele não aponta para pods nem para endereços: ele aponta para <em>Services</em>, por
+meio de um seletor de rótulos. O arquivo abaixo é o da padaria — leia com calma, porque cada linha explica uma
+etapa da descoberta:</p>
+
+<pre class="file" data-file="servicemonitor-cardapio.yaml">apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cardapio
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: cardapio
+  namespaceSelector:
+    matchNames:
+      - default
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s</pre>
+
+<p>São dois níveis de seleção que confundem muita gente. Primeiro, o Prometheus do cluster escolhe quais
+ServiceMonitors ele lê — normalmente pela etiqueta <code>release: kube-prometheus-stack</code>, que é o
+<code>serviceMonitorSelector</code> dele. Depois, o ServiceMonitor escolhe quais Services visita, por
+<code>selector.matchLabels</code>. Errar o primeiro nível deixa tudo invisível; errar o segundo também. E o
+cluster, em nenhum dos dois casos, reclama.</p>
+
+<p>É esse silêncio que a caixa mostra. O Service abaixo tem a etiqueta <code>app: cardapio-web</code>, então o
+ServiceMonitor — que procura <code>app: cardapio</code> — não o encontra. Rode: o Service é criado, a tabela
+aparece, nenhum aviso. O problema não está no Kubernetes; está na costura entre dois objetos que nunca se
+encontram.</p>
+
+<div class="tryk8s" data-goal="campo:Service/cardapio|metadata.labels.app=cardapio;;texto:service/cardapio created">
+  <p class="try-task">O ServiceMonitor da padaria procura Services com o rótulo <code>app: cardapio</code>. Este
+  Service está com <code>app: cardapio-web</code>. Corrija o rótulo e rode: a API aceita nas duas versões — quem
+  muda é o Prometheus.</p>
+<pre class="yaml" data-file="service-cardapio.yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio-web
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090</pre>
+<pre class="out">
+service/cardapio created
+
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        9090/TCP   2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090</pre>
+</div>
+
+<p>Como saber que o alvo não foi descoberto, se nada reclama? Pela ausência. Quando um alvo é descoberto mas não
+responde, o Prometheus cria a série <code>up</code> com valor <code>0</code> e a razão da falha. Quando o alvo
+<em>não é descoberto</em>, não existe <code>up</code>: não há série nenhuma, e a consulta volta vazia. “Não está
+saudável” e “não está sendo observado” são diagnósticos diferentes, com consertos diferentes — e a página de
+<em>targets</em> do Prometheus é onde essa diferença aparece primeiro.</p>
+
+<h2>6. PromQL: quatro perguntas e cinco funções</h2>
+
+<p>PromQL é a linguagem de consulta do Prometheus, e ela é menor do que o nome sugere. Você escolhe séries por
+nome e etiqueta — <code>http_requests_total{job="cardapio", status=~"5.."}</code> —, pode pedir uma janela com
+<code>[5m]</code> e pode combinar o resultado com funções e agregações. Quase todo painel de verdade é feito com
+quatro perguntas: quanto tráfego, quantos erros, qual a latência e quão perto do limite estamos.</p>
+
+<p>A função que mais aparece é <code>rate()</code>, e ela existe porque <code>counter</code> só cresce. O valor
+<code>1843</code> não diz nada sozinho; o que interessa é quantas requisições por segundo aconteceram na janela.
+<code>rate(http_requests_total{job="cardapio"}[5m])</code> faz essa conta e devolve requisições por segundo. Para
+latência, o histograma obriga a uma expressão maior: pegar cada faixa (<code>le</code>), calcular a taxa de cada
+uma, somar entre os pods e pedir o quantil:</p>
+
+<pre class="term">ana@notebook:~$ curl -s --get http://prometheus.loja.test:9090/api/v1/query \
+    --data-urlencode 'query=histogram_quantile(0.9, sum by (le) (rate(http_request_duration_seconds_bucket{job="cardapio"}[5m])))' \
+  | jq -r '.data.result[].value[1]'
+0.412</pre>
+
+<p>O resultado — <code>0.412</code> — quer dizer que noventa por cento das requisições do cardápio terminaram em
+menos de 412 milissegundos naquela janela. Se a média fosse usada no lugar do quantil, o número seria menor e mais
+tranquilizador, porque a média esconde a cauda: um por cento de requisições de quatro segundos quase não mexe na
+média e irrita todo mundo que caiu nelas. Por isso a Ana monitora o p90, não a média.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sinal</th><th>Pergunta</th><th>Consulta</th><th>Quando vira alerta</th></tr>
+</thead>
+<tbody>
+<tr><td>tráfego</td><td>quantas requisições por segundo?</td>
+<td><code>sum(rate(http_requests_total{job="cardapio"}[5m]))</code></td><td>queda brusca a zero</td></tr>
+<tr><td>erros</td><td>que fração falhou?</td>
+<td><code>sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))</code></td>
+<td>acima de 5% por 10 minutos</td></tr>
+<tr><td>latência</td><td>como está a cauda?</td>
+<td><code>histogram_quantile(0.9, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))</code></td>
+<td>p90 acima do combinado</td></tr>
+<tr><td>saturação</td><td>quão perto do limite?</td>
+<td><code>sum(rate(container_cpu_usage_seconds_total{namespace="default"}[5m]))</code></td><td>uso colado no
+limite por muito tempo</td></tr>
+<tr><td>saúde</td><td>o alvo respondeu?</td><td><code>up{job="cardapio"}</code></td><td><code>up == 0</code> por
+dois minutos</td></tr>
+<tr><td>estabilidade</td><td>quantos reinícios?</td>
+<td><code>increase(kube_pod_container_status_restarts_total[15m])</code></td><td>mais de dois em quinze
+minutos</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>As três últimas linhas vêm de fontes diferentes, e vale saber de onde: <code>container_*</code> é o kubelet
+relatando o consumo de cada container; <code>kube_*</code> é o kube-state-metrics traduzindo objetos do cluster em
+números; <code>http_*</code> é a própria aplicação. Um painel bom mistura as três — a aplicação diz que está
+lenta, o kubelet diz que o container está sem CPU, o kube-state-metrics diz que faltam réplicas.</p>
+
+<h2>7. A caixa: o targetPort que aponta para o lugar errado</h2>
+
+<p>Falta o último elo, e ele é o mais fácil de errar no escuro. No Service, <code>port</code> é a porta que os
+clientes usam e <code>targetPort</code> é a porta do container. O Prometheus visita
+<code>cardapio:9090</code>; o kube-proxy encaminha para o pod, na <code>targetPort</code>. Se a aplicação escuta
+<code>9090</code> e o Service aponta para <code>80</code>, o Service existe, os endpoints existem, a tabela do
+<code>kubectl get</code> está linda — e toda coleta é recusada.</p>
+
+<div class="tryk8s" data-goal="campo:Service/cardapio|spec.ports.0.targetPort=9090;;texto:service/cardapio created">
+  <p class="try-task">A aplicação publica as métricas na porta <code>9090</code>, mas o Service encaminha para a
+  <code>80</code>. Corrija o <code>targetPort</code> e rode. A API aceita as duas versões; o que muda é a coleta
+  do Prometheus.</p>
+<pre class="yaml" data-file="service-cardapio.yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 80</pre>
+<pre class="out">
+service/cardapio created
+
+NAME       TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE
+cardapio   ClusterIP   10.96.147.79   &lt;none&gt;        9090/TCP   2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090</pre>
+</div>
+
+<p>Aqui o sintoma é diferente do da caixa anterior, e a diferença ensina. Com o rótulo errado, o alvo não existia:
+consulta vazia. Com a <code>targetPort</code> errada, o alvo existe e falha: <code>up</code> vale
+<code>0</code>, e a mensagem de erro da coleta fala de conexão recusada. O teste de dez segundos separa os dois na
+hora — o <code>kubectl get --raw ".../services/cardapio:metrics/proxy/metrics"</code> devolve a mesma recusa, o
+que prova que o problema está no caminho até o container, não no Prometheus.</p>
+
+<p>Esse é o resumo prático da aula até aqui: <strong>para o Prometheus ver o seu serviço, quatro coisas precisam
+estar certas ao mesmo tempo</strong> — o Service descoberto pelo rótulo, a porta com nome, a
+<code>targetPort</code> certa e a aplicação respondendo em <code>/metrics</code>. Nenhuma das quatro é validada
+pelo kube-apiserver. Todas aparecem, ou não, do lado do Prometheus.</p>
+
+<h2>8. O que o Prometheus não resolve</h2>
+
+<p>Ele não é um banco infinito. Por padrão guarda quinze dias (<code>--storage.tsdb.retention.time</code>) num
+disco local, e esse número é uma escolha de operação, não um limite técnico: guardar mais custa mais disco e mais
+memória. Para retenção longa ou para juntar vários clusters, o caminho é o <code>remote write</code>: o Prometheus
+continua coletando e envia as séries para um sistema próprio de longo prazo — Thanos, Mimir, VictoriaMetrics.
+Quem espera “o Prometheus guarda tudo para sempre” descobre isso no dia em que o gráfico de três meses atrás
+está vazio.</p>
+
+<p>Ele também não é alta disponibilidade sozinho. Rodar dois Prometheus coletando os mesmos alvos dá dois bancos
+iguais e independentes, não um banco confiável: quem consulta precisa escolher um, e os dois podem divergir. HA de
+verdade é assunto de camada de cima, com os sistemas de retenção longa e consulta federada.</p>
+
+<p>E ele não substitui as outras testemunhas. Métrica responde “quanto” e “quantos”, não “por quê”: o motivo de um
+erro está no log, e o caminho de uma requisição entre serviços está no trace. O Prometheus também não gosta de
+trabalho curto: um Job que roda trinta segundos pode terminar entre duas coletas e nunca ser visto; para esses
+casos existe o Pushgateway, que recebe o número do job e o mantém disponível para a coleta seguinte.</p>
+
+<p>Por fim, ele não entrega alerta. O Prometheus avalia as regras e manda o resultado ao Alertmanager, que é quem
+agrupa, roteia, inibe e silencia — a aula dele é a próxima. E vale a honestidade sobre o painel deste guia: ele
+não roda Prometheus. As caixas mostram o lado Kubernetes do problema, que é o Service que o Prometheus vai (ou não)
+descobrir; as consultas e saídas em <code>pre.term</code> são transcrições de um cluster real.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o alvo que nunca apareceu</h3>
+<p>O time subiu o serviço de encomendas com o ServiceMonitor pronto e nada no painel. A aplicação respondia, o
+Service existia, o pod estava pronto. O ServiceMonitor procurava <code>app: encomendas</code> e o Service tinha
+<code>app: encomendas-api</code>. A conferência que resolve isso em um minuto é comparar os dois lados:
+<code>kubectl get svc --show-labels</code> contra o <code>selector</code> do ServiceMonitor. Nenhum erro em lugar
+nenhum — porque não é erro, é desencontro.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o up zero que era rede</h3>
+<p>Outro serviço aparecia como alvo, mas toda coleta voltava com erro de timeout. Não era Service nem
+<code>targetPort</code>: uma NetworkPolicy no namespace bloqueava a entrada do namespace de monitoração. A
+diferença de diagnóstico importa — ali existia a série <code>up</code> valendo zero, com a razão da falha na
+etiqueta. Alvo descoberto e inacessível pede análise de rede; alvo não descoberto pede análise de rótulo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a etiqueta que derrubou o servidor</h3>
+<p>Alguém achou útil publicar <code>http_requests_total{pedido="..."}</code> com o número do pedido, para “filtrar
+depois”. Em dois dias, o Prometheus passou a consumir toda a memória do nó e reiniciou. Cada valor novo vira uma
+série nova, e séries não são grátis. O conserto foi remover a etiqueta do código e olhar pedido específico no log.
+A regra que ficou escrita no repositório: nenhuma etiqueta com valor único por evento.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. Como o Prometheus obtém as métricas de um serviço?</p>
+<label><input type="radio" name="q1"> a aplicação abre uma conexão e envia os números a cada intervalo</label>
+<label><input type="radio" name="q1"> o kubelet empurra os números para o Prometheus a cada evento</label>
+<label><input type="radio" name="q1"> ele faz um GET no <code>/metrics</code> de cada alvo descoberto</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. A consulta <code>up{job="cardapio"}</code> volta vazia. O que
+isso quer dizer?</p>
+<label><input type="radio" name="q2"> o alvo não foi descoberto — não é o mesmo que estar fora do ar</label>
+<label><input type="radio" name="q2"> o alvo está fora do ar e voltará quando responder</label>
+<label><input type="radio" name="q2"> o Prometheus está sem disco para guardar a série</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Por que um Service com duas portas precisa de nome em cada
+uma?</p>
+<label><input type="radio" name="q3"> porque o kube-proxy só aceita portas nomeadas</label>
+<label><input type="radio" name="q3"> porque o ServiceMonitor e o proxy da API apontam a porta pelo nome</label>
+<label><input type="radio" name="q3"> porque a porta 9090 é reservada para métricas</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o nome que liga os dois lados</h2>
+<p>Complete o Service e o ServiceMonitor para que a coleta aconteça na porta de métricas:</p>
+<div class="ex-code"># no Service
+  ports:
+    - name: <input aria-label="resposta 1" data-answer="metrics" placeholder="...">
+      port: 9090
+      targetPort: 9090
+
+# no ServiceMonitor
+  endpoints:
+    - port: <input aria-label="resposta 2" data-answer="metrics" placeholder="...">
+      path: /metrics</div>
+<p class="ex-dica">Dica: o valor é o mesmo nos dois lugares — é o nome da porta que o Service declarou. Sem esse
+acerto, o Prometheus não sabe qual das portas visitar.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O Prometheus puxa: mantém uma lista de alvos e visita cada um a cada <code>scrape_interval</code>, com prazo de
+<code>scrape_timeout</code>. A resposta é texto simples em <code>/metrics</code> — nome, etiquetas e valor, com
+<code>HELP</code> e <code>TYPE</code> — e cada combinação de etiquetas é uma série, que ele guarda com a hora.
+Nome mais etiquetas é a identidade: mudar uma etiqueta cria outra série.</p>
+
+<p>Descobrir o alvo é trabalho de rótulo, em dois níveis: o Prometheus escolhe os ServiceMonitors que lê, e o
+ServiceMonitor escolhe os Services que visita por <code>matchLabels</code>. O cluster não valida esse encontro,
+então o sintoma da costura errada é o silêncio: nenhuma série <code>up</code>, consulta vazia. Já o Service com
+várias portas precisa de nome em cada uma — é por esse nome que o ServiceMonitor e o proxy da API apontam.</p>
+
+<p>Com PromQL, quatro perguntas cobrem o dia a dia: tráfego com <code>rate()</code>, erros como razão entre
+contadores, latência com <code>histogram_quantile()</code> sobre os buckets e saturação comparando uso com limite.
+O Prometheus guarda quinze dias por padrão, não é HA sozinho, não guarda log nem trace, e manda os alertas para o
+Alertmanager entregar. A próxima aula é justamente essa: o que acontece depois que a regra dispara.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>O Prometheus puxa; a aplicação só precisa responder <code>/metrics</code>.</li>
+  <li>Alvo é endereço estável: o Service, não o pod.</li>
+  <li>Série = nome + etiquetas. Etiqueta de valor único é bomba de cardinalidade.</li>
+  <li><code>counter</code> pede <code>rate()</code>; <code>gauge</code> pede o valor; histograma pede
+  <code>histogram_quantile()</code>.</li>
+  <li>Service com mais de uma porta: cada uma precisa de <code>name</code>.</li>
+  <li>ServiceMonitor seleciona Services por rótulo; nada avisa quando não casa.</li>
+  <li><code>up == 0</code> é alvo fora; série ausente é alvo não descoberto.</li>
+  <li>Retenção local de 15 dias; para o resto, <code>remote write</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

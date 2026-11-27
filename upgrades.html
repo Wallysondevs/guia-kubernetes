@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upgrades | Guia Kubernetes</title>
+<meta name="description" content="O que quebra quando o cluster sobe de versão: API removida, kubectl desalinhado, a regra do ±1 e a ordem segura de atualizar — com as caixas do painel rodando de verdade.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Upgrades</span></h1>
+<p class="intro">O cluster da padaria roda Kubernetes 1.36 e a Ana recebeu o aviso: aquela versão sai de
+suporte em três meses. Ela já sabe que atualizar um Deployment é rotina. Atualizar o <em>cluster</em> é
+outra coisa: mexe no que todos os objetos usam, e o que estava funcionando pode parar de existir — não
+porque alguém errou, mas porque a API que o seu manifesto usava foi removida. Nesta aula você vê o que
+quebra, por que o <code>kubectl</code> desalinhado dá mensagens esquisitas e qual é a ordem segura de
+subir uma versão sem derrubar o site.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que existe dentro de “uma versão do Kubernetes” (não é uma peça só).</li>
+  <li>A regra de desalinhamento: quanto cada componente pode ficar atrás.</li>
+  <li>Como descobrir uma API removida <em>antes</em> de ela quebrar o seu manifesto.</li>
+  <li>A ordem segura: control plane, nós, complementos, kubectl.</li>
+  <li>O que <code>cordon</code>, <code>drain</code> e <code>uncordon</code> fazem num upgrade de nó.</li>
+  <li>Por que voltar atrás é quase impossível — e o que fazer no lugar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o aviso de fim de suporte</h2>
+
+<p>O cluster de produção da Ana roda 1.36 desde março. Funciona. Ninguém reclama. E é justamente por
+isso que o aviso é fácil de ignorar: uma versão do Kubernetes sai de suporte mais ou menos catorze meses
+depois de lançada, o que dá tempo de sobra — até o dia em que dá.<br>
+Quando isso acontece, você para de receber correção de segurança, o time de suporte não atende mais
+chamado daquela versão e, o pior, o salto fica grande: sair de 1.33 para 1.37 de uma vez não é permitido,
+porque o Kubernetes só aceita subir <strong>uma versão menor por vez</strong>.</p>
+
+<p>“Ah, então eu atualizo em um sábado à noite.” É o que todo mundo pensa antes do primeiro upgrade. O
+problema não é o comando — é que a atualização do cluster mexe no contrato da API. Um Deployment escrito
+com <code>extensions/v1beta1</code> funcionava em 2018; em 1.16 esse grupo de API saiu, e o mesmo arquivo
+passou a ser recusado com “no matches for kind”. O manifesto não mudou: o mundo mudou embaixo dele.</p>
+
+<p>Upgrade de cluster é, na prática, um projeto pequeno: inventário do que está instalado, leitura das
+notas de versão, troca de manifestos com API velha, teste em cluster de ensaio, atualização em janela
+combinada e um plano B se der errado. Esta aula é esse projeto, em ordem.</p>
+
+<h2>2. O que existe dentro de “uma versão”</h2>
+
+<p>Quando você diz “meu cluster é 1.37”, está resumindo um conjunto de programas que <em>podem</em> estar
+em versões diferentes. No plano de controle: o <code>kube-apiserver</code> (recebe os pedidos), o
+<code>etcd</code> (guarda o estado), o <code>kube-scheduler</code> e o <code>kube-controller-manager</code>.
+Em cada nó: o <code>kubelet</code> (cuida dos pods), o <code>kube-proxy</code> (cuida da rede dos
+Services) e o runtime de containers. Na sua mesa: o <code>kubectl</code>. E ainda os complementos, que
+quase ninguém lembra: CoreDNS, o plugin de rede (CNI), o controlador de Ingress, o metrics-server, os
+operadores que instalaram CRDs.</p>
+
+<p>Cada um desses pedaços tem o seu próprio relógio de atualização. O plano de controle você atualiza
+junto (é um pacote só, na maioria das distribuições). Os nós, um por vez. Os complementos, conforme o
+projeto de cada um. O <code>kubectl</code>, quando você quiser — desde que respeite a regra da próxima
+seção.</p>
+
+<dl class="anatomy">
+<dt>versão menor (minor)</dt>
+<dd>O número do meio: 1.<strong>37</strong>.1. É o que muda em um upgrade de cluster. Só se sobe uma por
+vez.</dd>
+<dt>versão de correção (patch)</dt>
+<dd>O último número: 1.37.<strong>3</strong>. Correções de bug e segurança; atualizar dentro da mesma
+menor é rotina e não muda API.</dd>
+<dt>desalinhamento (skew)</dt>
+<dd>A diferença de versão menor entre dois componentes. O Kubernetes define quanto é permitido.</dd>
+<dt>depreciação</dt>
+<dd>O aviso de que uma API ou campo vai sair. Durante a depreciação, ela ainda funciona.</dd>
+<dt>remoção</dt>
+<dd>O dia em que a API deixa de existir. Manifesto com ela é recusado na hora do
+<code>apply</code>.</dd>
+<dt>drain</dt>
+<dd>Esvaziar um nó: os pods são convidados a sair para outros nós, e o nó fica marcado para não receber
+novos.</dd>
+</dl>
+
+<h2>3. A regra do ±1: quem pode ficar atrás de quem</h2>
+
+<p>A pergunta que mais aparece é “posso atualizar o <code>kubectl</code> depois?”. Pode — dentro de um
+limite. O <code>kubectl</code> é compatível com o API server uma versão menor para trás e uma para
+frente. Mais que isso, ele começa a mandar pedidos em formatos que o servidor não entende, e você vê
+erros que parecem bugs do cluster mas são do cliente.</p>
+
+<p>O <code>kubelet</code> tem mais folga: pode ficar até três versões menores atrás do API server. É o que
+permite atualizar o plano de controle primeiro e os nós depois, com calma. O contrário não vale: um nó
+com <code>kubelet</code> mais novo que o API server não é suportado. Os complementos seguem o ritmo do
+projeto deles — CoreDNS e CNI costumam ter matriz de compatibilidade própria, e vale conferir antes.</p>
+
+<p>Num cluster recém-criado, todos os nós mostram a mesma versão. É esta a imagem que você quer ver no
+começo e no fim de um upgrade:</p>
+
+<pre class="term">$ kubectl get nodes
+NAME                 STATUS   ROLES           AGE   VERSION
+guia-control-plane   Ready    control-plane   8m    v1.37.3
+guia-worker          Ready    <none>          4m    v1.37.3
+guia-worker2         Ready    <none>          4m    v1.37.3</pre>
+
+<p>A coluna <code>VERSION</code> é a versão do <code>kubelet</code> daquele nó. Durante o upgrade, é
+normal ver duas versões diferentes por algumas horas — o primeiro nó atualizado e o segundo ainda no
+antigo. O que não é normal é a diferença persistir por dias: significa que alguém esqueceu um nó no meio
+do caminho, e o próximo upgrade vai acumular duas versões de distância.</p>
+
+<p>Detalhe que confunde: o <code>kubectl</code> da sua máquina não aparece no <code>get nodes</code>.
+Ele é um binário local, e a versão dele você vê com <code>kubectl version --client</code>. Se o time tem
+gente com <code>kubectl</code> de duas versões atrás, é aí que nascem os “aqui não dá esse erro”.</p>
+
+<h2>4. API deprecada: como descobrir antes que quebre</h2>
+
+<p>Toda API do Kubernetes segue um caminho: alfa (pode sumir sem aviso), beta (existe, mas pode mudar),
+estável (é o que você usa). Depois de estável, uma API pode ser <em>deprecada</em> — continua
+funcionando, com aviso — e só então <em>removida</em>. Entre uma coisa e outra costumam passar várias
+versões menores, e o aviso vem nos release notes. O trabalho do upgrade é achar, no seu inventário, o que
+usa algo que vai sair.</p>
+
+<p>O primeiro comando é o inventário do que o cluster conhece. Ele mostra, para cada tipo de objeto, a
+versão da API que o servidor aceita hoje:</p>
+
+<pre class="term">$ kubectl api-resources
+NAME                       SHORTNAMES   APIVERSION                     NAMESPACED   KIND
+pods                       po           v1                             true         Pod
+deployments                deploy       apps/v1                        true         Deployment
+replicasets                rs           apps/v1                        true         ReplicaSet
+statefulsets               sts          apps/v1                        true         StatefulSet
+daemonsets                 ds           apps/v1                        true         DaemonSet
+jobs                                    batch/v1                       true         Job
+cronjobs                   cj           batch/v1                       true         CronJob
+services                   svc          v1                             true         Service
+endpoints                  ep           v1                             true         Endpoints
+endpointslices                          discovery.k8s.io/v1            true         EndpointSlice
+ingresses                  ing          networking.k8s.io/v1           true         Ingress
+networkpolicies            netpol       networking.k8s.io/v1           true         NetworkPolicy
+configmaps                 cm           v1                             true         ConfigMap
+secrets                                 v1                             true         Secret
+persistentvolumeclaims     pvc          v1                             true         PersistentVolumeClaim
+persistentvolumes          pv           v1                             false        PersistentVolume
+storageclasses             sc           storage.k8s.io/v1              false        StorageClass
+horizontalpodautoscalers   hpa          autoscaling/v2                 true         HorizontalPodAutoscaler
+serviceaccounts            sa           v1                             true         ServiceAccount
+roles                                   rbac.authorization.k8s.io/v1   true         Role
+rolebindings                            rbac.authorization.k8s.io/v1   true         RoleBinding
+clusterroles                            rbac.authorization.k8s.io/v1   false        ClusterRole
+clusterrolebindings                     rbac.authorization.k8s.io/v1   false        ClusterRoleBinding
+namespaces                 ns           v1                             false        Namespace
+nodes                      no           v1                             false        Node
+events                     ev           v1                             true         Event</pre>
+
+<p>Guarde a coluna <code>APIVERSION</code>: é ela que o seu manifesto tem de usar. Se o seu arquivo diz
+<code>apps/v1beta1</code> e a tabela diz <code>apps/v1</code>, você está usando uma versão antiga que o
+servidor ainda aceita por compatibilidade — até o dia em que não aceita mais. O mesmo vale para
+<code>networking.k8s.io/v1beta1</code> de Ingress, <code>autoscaling/v2beta2</code> de HPA e
+<code>policy/v1beta1</code> de PodDisruptionBudget.</p>
+
+<p>A caixa abaixo tem o erro clássico, com a mensagem real do API server. O Deployment está declarado com
+um grupo de API que não existe mais: <code>extensions/v1beta1</code>, o endereço dos Deployments até a
+versão 1.16. Ajuste e rode.</p>
+
+<div class="tryk8s" data-get="deployments" data-goal="texto:deployment.apps/cardapio created;;campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:1.0;;pronto:Deployment/cardapio=2">
+  <p class="try-task">Troque o <code>apiVersion</code> pelo grupo que o cluster aceita hoje
+  (<code>apps/v1</code>) e rode. O painel tem de criar o Deployment com <code>2/2</code> prontos.</p>
+<pre class="yaml">apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no matches for kind "Deployment" in version "extensions/v1beta1"
+ensure CRDs are installed first
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Rodando a caixa como está, o painel devolve o mesmo erro — e é bom ler a mensagem inteira, porque
+ela nomeia o tipo e a versão. Antes de aplicar em produção, três hábitos resolvem quase tudo. Primeiro, procure no repositório as
+strings das APIs que vão sair (<code>grep -r v1beta1</code>) — inclusive nos charts de Helm e nos
+overlays do Kustomize, que às vezes guardam o <code>apiVersion</code> antigo escondido. Segundo, use uma
+ferramenta de varredura (kubent e pluto são as mais conhecidas) contra o cluster: ela lista objetos
+<em>vivos</em> que usam API deprecada, o que pega o que não está no repositório. Terceiro, escute os
+avisos: o <code>kubectl</code> moderno imprime uma linha de <em>warning</em> quando você aplica algo com
+API deprecada, e essa linha é o seu prazo.</p>
+
+<p>A mensagem que você vê no painel é esta (e é a mesma do cluster de verdade): <code>no matches for kind
+"Deployment" in version "extensions/v1beta1"</code>, seguida de <code>ensure CRDs are installed
+first</code>.</p>
+
+<p>Traduzindo: “não achei o tipo Deployment nessa versão de API”. A segunda linha é uma sugestão genérica
+do kubectl — ela fala de CRDs porque esse é o motivo comum do erro em <em>outros</em> casos. No seu, o
+motivo é o grupo de API que saiu. Conserte trocando o <code>apiVersion</code>; se o objeto também mudou de
+forma (foi o caso do Ingress na 1.22), conserte os campos junto.</p>
+
+<h2>5. A ordem segura de atualizar</h2>
+
+<p>A ordem não é capricho: cada etapa depende da anterior. Primeiro o plano de controle, porque é ele que
+fala a API nova e os nós antigos continuam compatíveis por três versões. Depois os nós, um por vez,
+porque o <code>kubelet</code> novo precisa de um API server que entenda os campos que ele manda. Depois
+os complementos, que costumam acompanhar a versão do cluster. Por último o <code>kubectl</code>, quando
+todo mundo já está na versão nova.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Componente</th><th>Quanto pode ficar atrás</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>API server / plano de controle</td><td>nada: é o primeiro a subir</td><td>define a API que todos os
+outros usam</td></tr>
+<tr><td><code>kubelet</code> dos nós</td><td>até 3 versões menores</td><td>permite atualizar nós aos poucos,
+sem parada</td></tr>
+<tr><td><code>kubectl</code></td><td>1 para trás ou 1 para frente</td><td>fora disso, manda pedidos em
+formato que o servidor não entende</td></tr>
+<tr><td>CoreDNS, CNI, Ingress</td><td>segue a matriz do projeto</td><td>cada um tem a sua compatibilidade
+declarada</td></tr>
+<tr><td>CRDs e operadores</td><td>depende do operador</td><td>o CRD pode ter versão de API removida junto
+com o cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Antes de tocar em qualquer coisa, duas providências. A primeira é ler as notas de versão da versão de
+destino e da intermediária (se você vai pular, leia todas as notas do caminho). A segunda é ter um backup
+do <code>etcd</code> — o banco do cluster — feito naquele dia. Sem backup, “voltar atrás” é uma frase sem
+plano; com backup, é um procedimento. A aula de backup fala disso em detalhe.</p>
+
+<p>Um upgrade de 1.36 para 1.37 num cluster de três nós é, em resumo: atualizar o plano de controle,
+atualizar cada <code>kubelet</code> com <code>drain</code> e <code>uncordon</code>, atualizar
+complementos, conferir tudo com <code>get nodes</code> e <code>get pods -A</code>, e só então atualizar o
+<code>kubectl</code> do time. Nada disso é feito “de uma vez” em produção.</p>
+
+<h2>6. Um nó por vez: cordon, drain e uncordon</h2>
+
+<p>Para atualizar o <code>kubelet</code> de um nó, o nó precisa estar vazio. O caminho é sempre o mesmo:
+<code>cordon</code> marca o nó como “não receba pods novos”, <code>drain</code> tira os que estão lá, você
+atualiza o software, <code>uncordon</code> devolve o nó ao serviço. Enquanto um nó está fora, os outros
+seguram a carga — e é por isso que se faz um por vez.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:cordoned;;texto:drained;;texto:Ready">
+  <p class="try-task">Coloque o nó <code>guia-worker</code> em manutenção, esvazie-o e confira a lista de
+  nós no fim. O painel tem de mostrar o nó marcado, o esvaziamento e a tabela com
+  <code>Ready</code>.</p>
+<pre class="yaml">kubectl get nodes
+kubectl cordon guia-worker</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get nodes
+NAME                 STATUS   ROLES           AGE   VERSION
+guia-control-plane   Ready    control-plane   8m    v1.37.3
+guia-worker          Ready    &lt;none&gt;          4m    v1.37.3
+guia-worker2         Ready    &lt;none&gt;          4m    v1.37.3
+
+ana@notebook:~$ kubectl cordon guia-worker
+node/guia-worker cordoned
+</pre>
+<pre class="solucao">kubectl get nodes
+kubectl cordon guia-worker
+kubectl drain guia-worker --ignore-daemonsets
+kubectl get nodes</pre>
+</div>
+
+<p>O <code>drain</code> imprime o nó marcado e depois <code>evicting pod...</code> e
+<code>node/guia-worker drained</code>. O <code>--ignore-daemonsets</code> é obrigatório quando há
+DaemonSets no nó: esses pods não podem ser movidos para outro nó (cada nó tem o seu), então o
+<code>drain</code> se recusa a continuar sem essa bandeira. O mesmo vale para pods sem controlador: o
+<code>drain</code> para e avisa, porque apagar um pod solto é perder o pod.</p>
+
+<p>Nada disso é instantâneo. Cada pod recebe um pedido de saída e tem um tempo (<code>terminationGracePeriodSeconds</code>,
+padrão 30 segundos) para fechar as conexões abertas. Um pod de banco de dados pode precisar de mais. E se
+o pod não sai, o <code>drain</code> espera — ou desiste, se o tempo estourar. Por isso a janela de
+manutenção existe: esvaziar nó com tráfego é diferente de esvaziar nó vazio.</p>
+
+<p>Tem um detalhe de segurança que muita gente descobre tarde: o <code>drain</code> respeita o
+PodDisruptionBudget. Se o PDB do site diz “pelo menos duas réplicas sempre no ar” e só existem duas, o
+<code>drain</code> fica esperando até que uma terceira apareça — e é assim que deve ser. O orçamento de
+interrupção é justamente o contrato que impede a manutenção de derrubar o serviço.</p>
+
+<h2>7. O que mais quebra: além da API</h2>
+
+<p>API removida é o campeão, mas não é o único. Quando o <code>kubelet</code> sobe para a versão nova e o
+API server ainda está na antiga, você vê erro de conexão nos logs do nó, e os pods podem ficar
+<code>Pending</code> sem motivo aparente. Quando o complemento de rede não é atualizado, os pods sobem mas
+não conversam entre si: o sintoma é timeout entre serviços, não erro no <code>get pods</code> — o que
+manda você procurar no lugar errado.</p>
+
+<p>O Ingress é o exemplo mais conhecido dessa mudança de forma. Na versão antiga, o destino era escrito
+com <code>serviceName</code> e <code>servicePort</code>; na versão atual, é um objeto
+<code>service</code> com <code>name</code> e <code>port.number</code>, e o caminho passou a exigir
+<code>pathType</code>. A caixa abaixo tem o manifesto no formato velho. Converta para o formato que o
+cluster aceita hoje e rode.</p>
+
+<div class="tryk8s" data-get="ingresses" data-goal="texto:ingress.networking.k8s.io/cardapio created;;campo:Ingress/cardapio|spec.rules.0.http.paths.0.backend.service.name=cardapio;;campo:Ingress/cardapio|spec.rules.0.http.paths.0.pathType=Prefix">
+  <p class="try-task">Troque o <code>apiVersion</code> para <code>networking.k8s.io/v1</code> e reescreva o
+  <code>backend</code> no formato novo, com <code>pathType: Prefix</code>. O painel tem de criar o Ingress
+  e mostrar a tabela.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: cardapio
+              servicePort: 80</pre>
+<pre class="out">
+error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no matches for kind "Ingress" in version "networking.k8s.io/v1beta1"
+ensure CRDs are installed first
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>A resposta é <code>ingress.networking.k8s.io/cardapio created</code> e a tabela mostra o host
+<code>loja.test</code>. Repare que o <code>pathType</code> não é enfeite: ele diz se o caminho é prefixo
+ou correspondência exata, e sem ele o objeto é recusado. Quando a API muda de grupo, quase sempre muda de
+forma também — não é só trocar uma linha do topo do arquivo.</p>
+
+<p>Os CRDs merecem um parágrafo. Quando um operador instala um tipo novo (um <code>Certificate</code>, um
+<code>Backup</code>, um <code>Application</code>), ele registra uma versão de API. Se essa versão saiu do
+cluster, a mensagem é a mesma do “no matches for kind”, mas a correção não é sua: é atualizar o operador,
+ou o CRD, na ordem que o projeto dele manda. Vale sempre conferir os operadores no inventário antes de
+subir a versão do Kubernetes.</p>
+
+<p>O segundo erro clássico no dia do upgrade é o <code>kubectl</code> desalinhado. Imagine o cluster em
+1.37 e a sua máquina com <code>kubectl</code> 1.33. Comandos simples funcionam; os que dependem de campos
+novos falham com mensagens de validação que não têm nada a ver com o seu manifesto. O time perde uma tarde
+achando que o objeto está errado, quando o problema é o binário. A conferência é de dez segundos:
+<code>kubectl version --client</code> contra a versão que o <code>get nodes</code> mostra.</p>
+
+<h2>8. Voltar atrás: o plano B que quase não existe</h2>
+
+<p>Downgrade de versão menor não é suportado. O cluster pode até subir, mas o <code>etcd</code> foi
+gravado em um formato que a versão antiga não lê — e o “voltar” deixa de ser um comando para ser uma
+restauração. Na prática, o plano B de um upgrade é: restaurar o snapshot do <code>etcd</code> feito antes
+de começar, ou recriar o cluster na versão antiga e reaplicar os manifestos. Os dois caminhos são
+demorados, e é por isso que o backup é pré-requisito, não recomendação.</p>
+
+<p>Dentro da mesma versão menor, a vida é mais fácil: um patch pode ser revertido com o mesmo procedimento
+de instalação do pacote, e o formato de dados é o mesmo. Atualizar de <code>1.37.1</code> para
+<code>1.37.3</code> é manutenção de rotina; de <code>1.36</code> para <code>1.37</code> é projeto. Trate
+os dois de forma diferente — inclusive na conversa com o time.</p>
+
+<p>E vale dizer o óbvio: atualizar cedo é mais barato que atualizar tarde. Um cluster sempre uma versão
+atrás do lançamento atual tem um caminho curto e conhecido; um cluster três versões atrás tem que fazer
+três upgrades em sequência, cada um com a sua janela, e não pode pular nenhum. A dívida técnica do
+Kubernetes tem prazo de validade impresso na nota de lançamento.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<p>Depois de um upgrade, o sintoma costuma aparecer longe da causa. Esta tabela é o atalho para não
+procurar no lugar errado:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Onde conferir</th></tr>
+</thead>
+<tbody>
+<tr><td>pipeline falha no <code>apply</code> com “no matches for kind”</td><td>API removida no manifesto</td><td><code>kubectl api-resources</code>
+e o <code>apiVersion</code> do arquivo</td></tr>
+<tr><td>pods <code>Pending</code> logo após o upgrade</td><td>nó ainda com <code>kubelet</code> antigo ou nó
+em manutenção</td><td><code>get nodes</code> e eventos do pod</td></tr>
+<tr><td>serviços com timeout entre si</td><td>complemento de rede desatualizado</td><td>versão do CNI e dos
+pods em <code>kube-system</code></td></tr>
+<tr><td>comando do <code>kubectl</code> com erro de validação estranho</td><td>cliente fora da regra do
+±1</td><td><code>kubectl version --client</code> contra <code>get nodes</code></td></tr>
+<tr><td>objeto de operador não é reconhecido</td><td>CRD em versão removida</td><td>versão do operador e
+dos CRDs instalados</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="cenario">
+<h3>Cenário 1: o manifesto que funcionava ontem</h3>
+<p>A Ana atualizou o cluster de 1.36 para 1.37 e, na segunda, o pipeline falhou aplicando o Ingress. O
+arquivo estava igual havia dois anos. O que mudou foi o grupo de API (<code>networking.k8s.io/v1beta1</code>
+saiu) e a forma do <code>backend</code>: agora é <code>service.name</code> e
+<code>service.port.number</code>, não <code>serviceName</code> e <code>servicePort</code>. Corrigir o
+manifesto é rápido; descobrir por que o erro aparece só agora é o que custa tempo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o nó que ficou atrás</h3>
+<p>O upgrade terminou e o <code>get nodes</code> mostra dois nós em 1.37 e um em 1.36. Ninguém percebe,
+porque tudo funciona. Três meses depois, começa o próximo upgrade: o nó atrasado precisa de duas
+atualizações, e o <code>kubelet</code> dele já está no limite de desalinhamento. A conferência de versão
+no fim do upgrade não é formalidade — é o que evita o problema composto.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o complemento esquecido</h3>
+<p>Plano de controle e nós atualizados, tudo verde, e os serviços começam a falhar com timeout. O
+controlador de Ingress ainda é a versão antiga, incompatível com a API nova do cluster. Complemento não
+aparece no <code>get nodes</code> e não aparece no <code>get pods -A</code> se estiver em outro namespace
+— é o tipo de coisa que só entra no inventário se alguém lembrar de listar. Anote os complementos junto com
+a versão de cada um.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que acontece ao aplicar um manifesto com API
+removida?</p>
+<label><input type="radio" name="q1"> o cluster converte sozinho para a versão nova</label>
+<label><input type="radio" name="q1"> o objeto é criado, mas sem status</label>
+<label><input type="radio" name="q1"> o API server recusa com “no matches for kind … in version
+…”</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Qual é a ordem segura de um upgrade?</p>
+<label><input type="radio" name="q2"> plano de controle, nós um por vez, complementos, kubectl</label>
+<label><input type="radio" name="q2"> kubectl, nós, plano de controle, complementos</label>
+<label><input type="radio" name="q2"> todos ao mesmo tempo, para não haver desalinhamento</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Para que serve o <code>drain</code> antes de atualizar
+um nó?</p>
+<label><input type="radio" name="q3"> para apagar o nó e criar outro no lugar</label>
+<label><input type="radio" name="q3"> para esvaziar o nó, movendo os pods para os outros antes da
+manutenção</label>
+<label><input type="radio" name="q3"> para reiniciar o <code>kubelet</code> sem perder pods</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o manifesto de 2018</h2>
+<p>Um colega mandou este trecho para o repositório: <code>apiVersion: extensions/v1beta1</code>,
+<code>kind: Deployment</code>, com <code>spec.selector.matchLabels.app: cardapio</code>. Ele funciona no
+cluster atual? O que você muda? Depois responda: qual é o grupo de API que o cluster de hoje aceita para
+Deployment?</p>
+<div class="ex-code">apiVersion: <input aria-label="resposta 1" data-answer="apps/v1" placeholder="..."></div>
+<p class="ex-dica">Dica: <code>kubectl api-resources</code> mostra a coluna <code>APIVERSION</code> de cada
+tipo. Deployment está em <code>apps/v1</code> desde a 1.9.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>“Versão do cluster” é um conjunto de programas com relógios diferentes: plano de controle, kubelet de
+cada nó, complementos e o seu <code>kubectl</code>. A regra de desalinhamento permite kubelet até três
+versões atrás e <code>kubectl</code> uma para cada lado — mais que isso, os erros que aparecem não têm
+nada a ver com o problema real.</p>
+
+<p>O que quebra num upgrade quase sempre é uma API que saiu. Descubra antes com
+<code>kubectl api-resources</code>, com uma varredura do repositório e com as notas de versão; o erro
+“no matches for kind … in version …” é a versão tardia dessa descoberta. A ordem segura é plano de
+controle, nós um por vez (com <code>cordon</code>, <code>drain</code> e <code>uncordon</code>),
+complementos, e o <code>kubectl</code> no fim.</p>
+
+<p>Voltar atrás não é um comando: é restaurar um backup do <code>etcd</code> ou recriar o cluster. Por
+isso o backup do dia é pré-requisito, e por isso atualizar cedo — uma versão por vez, com janela e plano
+B — sai muito mais barato do que deixar três versões acumularem.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Uma versão menor por vez; patch dentro da mesma versão é rotina.</li>
+  <li><code>kubectl</code> ±1, <code>kubelet</code> até 3 atrás, API server primeiro.</li>
+  <li><code>kubectl api-resources</code> é o inventário das APIs vivas.</li>
+  <li><code>cordon</code> marca, <code>drain</code> esvazia, <code>uncordon</code> devolve.</li>
+  <li>Sem backup do <code>etcd</code>, não existe plano B.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

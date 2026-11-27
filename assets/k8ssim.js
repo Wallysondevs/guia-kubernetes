@@ -1461,7 +1461,11 @@
       if (args[0] === "can-i") {
         var verboAcao = args[1] || "", recurso = (args[2] || "").split(".")[0];
         var quem = (args.filter(function (a) { return a.indexOf("--as=") === 0; })[0] || "").replace("--as=", "");
-        var r = C.podeFazer ? C.podeFazer(c, quem, verboAcao, recurso, nsAtual(ctx)) : null;
+        var f = C.podeFazer || (window.K8sSim && window.K8sSim.podeFazer);
+        window.K8S_GRUPOS = args.filter(function (a) { return a.indexOf("--as-group=") === 0; })
+          .map(function (a) { return a.replace("--as-group=", ""); });
+        var r = f ? f(c, quem, verboAcao, recurso, nsAtual(ctx)) : null;
+        window.K8S_GRUPOS = [];
         return r ? (r.permitido ? "yes" : "no") : "no";
       }
       return "kubectl auth: use can-i";
@@ -1900,7 +1904,7 @@
         return partes[1] === s.name && (s.namespace || "default") === partes[0];
       }
       if (s.kind === "User") return s.name === quem;
-      if (s.kind === "Group") return quem === s.name;
+      if (s.kind === "Group") return quem === s.name || (window.K8S_GRUPOS || []).indexOf(s.name) >= 0;
       return false;
     });
   }

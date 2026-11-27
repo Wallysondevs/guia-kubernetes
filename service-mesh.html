@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service mesh | Guia Kubernetes</title>
+<meta name="description" content="Service mesh no Kubernetes: mTLS, retry, roteamento e telemetria sem tocar no código, sidecar versus ambient, injeção por namespace e o custo de complexidade.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Service <span class="hl">mesh</span></h1>
+<p class="intro">A padaria da Ana cresceu: o cardápio conversa com o serviço de preços, que conversa com o de
+estoque, que chama o de pagamento. Cada um resolveu o próprio problema de rede do seu jeito — um tem retry
+escrito à mão, outro não tem timeout, um terceiro usa HTTP puro dentro do cluster. Quando o pagamento ficou
+lento, ninguém sabia dizer qual serviço estava tentando quantas vezes. Um <em>service mesh</em> resolve isso
+tirando a rede da aplicação e colocando num lugar só. Nesta aula a Ana entende o que ele resolve, como ele
+funciona por dentro e, principalmente, quanto custa mantê-lo.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que um mesh resolve que Service, Ingress e NetworkPolicy não resolvem.</li>
+  <li>Como o tráfego passa a ser interceptado — o tal do <em>sidecar</em>.</li>
+  <li>O que muda no modo <em>ambient</em>, sem um proxy por pod.</li>
+  <li>Como ligar a injeção num namespace e como conferir que ela funcionou.</li>
+  <li>O custo de recursos e de complexidade que vem junto.</li>
+  <li>Quando <strong>não</strong> usar mesh — e o que fazer no lugar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: doze serviços, doze jeitos de falhar</h2>
+
+<p>Com três serviços, a rede é detalhe. Com doze, ela vira o assunto. O cardápio chama preços com timeout de
+dez segundos; preços chama estoque sem timeout nenhum; estoque tem retry de três tentativas. Quando o estoque
+oscila, o cardápio espera dez segundos, o preço espera para sempre, e o cliente vê a página girando. Ninguém
+sabe disso olhando um serviço só.</p>
+
+<p>O time já tentou resolver no código: uma biblioteca de resiliência em cada linguagem, com configuração
+própria. Funcionou até entrarem dois serviços novos — um em outra linguagem, outro escrito por um time que não
+sabia da biblioteca. A rede do cluster virou arqueologia.</p>
+
+<p>O service mesh parte de outra ideia: se toda chamada entre serviços passa por um proxy, o proxy pode
+cuidar de TLS, retry, timeout, métricas e roteamento. A aplicação volta a falar HTTP simples, e a política de
+rede fica num lugar central, versionada como configuração. O código não muda; muda o caminho por onde ele
+passa.</p>
+
+<h2>2. O que o mesh tira do código</h2>
+
+<p>Vale separar o que já existe do que o mesh acrescenta. O Service dá um nome estável para um conjunto de
+pods e balanceia conexões. O Ingress publica um serviço para fora. A NetworkPolicy diz quem pode falar com
+quem, em nível de pacote. Nenhum dos três faz TLS automático entre serviços, retry consciente de falha,
+roteamento por cabeçalho ou métricas por rota.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Necessidade</th><th>Sem mesh</th><th>Com mesh</th></tr>
+</thead>
+<tbody>
+<tr><td>TLS entre serviços</td><td>cada app gera e troca certificado</td><td>o proxy negocia mTLS e troca
+certificado sozinho</td></tr>
+<tr><td>Retry e timeout</td><td>biblioteca em cada linguagem, valores diferentes</td><td>política central,
+igual para todos</td></tr>
+<tr><td>Roteamento fino</td><td>código com <code>if</code> de versão ou dois Services</td><td>regra que manda
+5% do tráfego para a versão nova</td></tr>
+<tr><td>Telemetria</td><td>cada app instrumentado à mão</td><td>latência, erro e volume por rota, de
+graça</td></tr>
+<tr><td>Autorização entre serviços</td><td>token na aplicação</td><td>política de identidade no
+proxy</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A linha do TLS merece destaque porque é o motivo número um de adoção. Dentro do cluster, durante muito
+tempo se assumiu que “a rede interna é confiável”. Um mesh muda isso: todo tráfego entre pods vira TLS mútuo,
+com certificado de curta duração emitido pelo plano de controle. Quem espiona a rede vê bytes cifrados, e quem
+tenta se passar por outro serviço não tem o certificado certo.</p>
+
+<p>O que o mesh <em>não</em> faz: não conserta aplicação lenta, não substitui observabilidade de negócio, não
+resolve banco mal indexado e não impede que um serviço chame outro em loop. Ele melhora o comportamento da
+rede; não muda a lógica.</p>
+
+<dl class="anatomy">
+<dt>plano de dados</dt>
+<dd>Quem carrega o tráfego: os proxies. É onde a política vira conexão de verdade.</dd>
+<dt>plano de controle</dt>
+<dd>Quem distribui configuração e certificados para os proxies. Roda como Deployment no cluster
+(por exemplo, <code>istiod</code>).</dd>
+<dt>sidecar</dt>
+<dd>Proxy injetado no mesmo pod da aplicação, compartilhando rede e ciclo de vida.</dd>
+<dt>injeção</dt>
+<dd>O ato de adicionar o proxy ao pod. Costuma ser por etiqueta no namespace ou anotação no pod.</dd>
+<dt>mTLS</dt>
+<dd>TLS mútuo: os dois lados apresentam certificado. É o que dá identidade ao tráfego.</dd>
+<dt>ambient</dt>
+<dd>Modo sem sidecar por pod: um proxy por nó (ztunnel) cuida do TLS, e um proxy opcional por namespace
+(waypoint) cuida de L7.</dd>
+<dt>VirtualService</dt>
+<dd>Recurso (CRD do mesh) que descreve roteamento: match por cabeçalho, peso entre versões, retry.</dd>
+<dt>PeerAuthentication</dt>
+<dd>Recurso que define se o mTLS é exigido, permitido ou desligado num namespace.</dd>
+</dl>
+
+<p>Repare que os dois últimos itens são CRDs — o assunto da aula anterior. É por isso que instalar um mesh
+significa instalar um conjunto de tipos novos na API: <code>VirtualService</code>,
+<code>DestinationRule</code>, <code>PeerAuthentication</code>, <code>AuthorizationPolicy</code>. Eles não
+existem num cluster comum, e é por isso que o painel desta aula não os aceita.</p>
+
+<h2>3. Sidecar e ambient: dois jeitos de interceptar</h2>
+
+<p>No modo clássico, cada pod ganha um container a mais: o proxy. Ele compartilha a rede do pod, então tudo o
+que o app envia para fora passa por ele. Para isso funcionar, o pod precisa de uma regra de redirecionamento
+que manda o tráfego de saída para a porta do proxy. É por isso que o pod passa a mostrar
+<code>READY 2/2</code>: dois containers, dois checks.</p>
+
+<p>O modo <em>ambient</em> muda a unidade: em vez de um proxy por pod, existe um proxy por nó — o
+<code>ztunnel</code> — que cuida do TLS e da identidade sem entrar no pod. Para regras de camada 7 (rota por
+cabeçalho, retry, transformação), entra um <em>waypoint</em>, um proxy por namespace ou por serviço. O
+resultado é o mesmo para quem consome, com menos containers e menos memória gasta em cada
+pod.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>Sidecar</th><th>Ambient</th></tr>
+</thead>
+<tbody>
+<tr><td>Onde o proxy roda</td><td>dentro de cada pod</td><td>um por nó, mais waypoint quando
+precisa</td></tr>
+<tr><td>Impacto no pod</td><td>container extra, <code>2/2</code>, mais memória</td><td>nenhum container
+extra</td></tr>
+<tr><td>Camada 7</td><td>sempre disponível</td><td>só onde existe waypoint</td></tr>
+<tr><td>Atualização</td><td>recria pods para trocar a versão do proxy</td><td>atualiza o nó, sem tocar nos
+pods</td></tr>
+<tr><td>Depuração</td><td>logs do proxy ao lado do app</td><td>logs no nó e no waypoint</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A escolha, na prática, é entre transparência e peso. Sidecar é mais fácil de entender — o proxy está ali, no
+mesmo pod, com log e métrica próprios —, e cobra em memória e em reinício a cada atualização. Ambient reduz o
+peso, mas exige mais maturidade do time: o lugar onde as coisas acontecem deixa de estar dentro do pod que você
+conhece.</p>
+
+<h2>4. O caminho de uma chamada, com mesh</h2>
+
+<p>Vale seguir um pedido do começo ao fim para entender onde o mesh age. O cardápio faz uma chamada HTTP para
+<code>precos</code>. O DNS do cluster resolve o nome para o IP do Service. O kube-proxy encaminha para um pod
+de preços. Até aqui é Kubernetes puro.</p>
+
+<p>Com sidecar, a chamada nem sai do pod do cardápio do jeito que foi escrita: a regra de redirecionamento
+captura a conexão e entrega ao proxy local, que abre uma conexão TLS com o proxy do pod de destino, apresenta
+o certificado do cardápio, verifica o certificado de preços, e só então encaminha a requisição para o
+<code>localhost:8080</code> do app de destino. O app de preços recebe uma requisição HTTP comum, de
+<code>127.0.0.1</code>, sem saber que veio cifrada.</p>
+
+<p>É nesse caminho que a política se aplica. Um retry é o proxy do cardápio tentando de novo antes de devolver
+erro. Um timeout é o proxy cortando a conexão. O roteamento por cabeçalho é o proxy de destino escolhendo entre
+duas versões. E a métrica de latência é medida duas vezes: na saída e na chegada — o que permite separar
+“demora da rede” de “demora do serviço”.</p>
+
+<p>O plano de controle fica de fora do caminho dos dados. Ele distribui configuração e certificados, e os
+proxies continuam funcionando com a última configuração conhecida se ele cair. Isso é importante: o mesh é
+resiliente ao próprio plano de controle, mas não é resiliente a uma configuração errada — e uma regra de
+roteamento mal escrita se espalha por todos os proxies em segundos.</p>
+
+<h2>5. A caixa: ligar a injeção no namespace</h2>
+
+<p>O jeito mais comum de ligar o mesh é por namespace. Você marca o namespace com uma etiqueta, o plano de
+controle percebe, e todo pod criado dali em diante nasce com o proxy. Os pods que já existiam <em>não</em>
+mudam: injeção acontece na criação.</p>
+
+<div class="tryk8s" data-get="namespace padaria -o yaml" data-goal="texto:istio-injection: enabled">
+  <p class="try-task">O namespace está com a injeção desligada. Troque o valor da etiqueta
+  <code>istio-injection</code> para <code>enabled</code> e rode: o painel mostra o namespace em YAML.</p>
+<pre class="yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+  labels:
+    istio-injection: disabled</pre>
+<pre class="out">
+namespace/padaria created
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    istio-injection: disabled
+  name: padaria
+spec:
+  finalizers:
+    - kubernetes
+status:
+  phase: Active
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+  labels:
+    istio-injection: enabled</pre>
+</div>
+
+<p>Antes da correção, o YAML mostra <code>istio-injection: disabled</code> e nenhum pod novo recebe proxy. Com
+<code>enabled</code>, o controlador de injeção passa a alterar a criação de pods naquele namespace — não no
+cluster inteiro. Esse detalhe é o que permite adoção gradual: liga num namespace de teste, mede, depois
+expande.</p>
+
+<p>Existem duas formas de desligar num caso específico. Uma anotação no pod ou no template do Deployment, com
+valor <code>"false"</code>, vence a etiqueta do namespace. É o que se usa em Jobs de migração, que não precisam
+de proxy e travariam esperando um sidecar que não faz nada. A outra é criar o pod antes da etiqueta — e aí ele
+simplesmente não tem proxy, o que costuma confundir quem acabou de ligar o
+mesh.</p>
+
+<h2>6. A caixa: o pod com o proxy ao lado</h2>
+
+<p>Com a injeção ligada, o pod passa a ter dois containers. O segundo não é opcional nem decorativo: ele
+precisa estar pronto para o pod ser considerado pronto, e é ele que responde na porta de saúde do proxy. Esta
+caixa mostra o pod com um proxy mal configurado — nome e portas errados.</p>
+
+<div class="tryk8s" data-get="pod cardapio -o yaml" data-goal="campo:Pod/cardapio|spec.containers.1.name=istio-proxy;;campo:Pod/cardapio|spec.containers.1.readinessProbe.httpGet.port=15021">
+  <p class="try-task">O container do proxy tem de se chamar <code>istio-proxy</code>, escutar na porta
+  <code>15090</code> e ter a verificação de prontidão em <code>15021</code>. Corrija e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+    - name: proxy
+      image: proxyv2:1.24
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+pod/cardapio created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      name: web
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+    - image: proxyv2:1.24
+      imagePullPolicy: IfNotPresent
+      name: proxy
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.3.71
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+    - name: istio-proxy
+      image: proxyv2:1.24
+      ports:
+        - containerPort: 15090
+      readinessProbe:
+        httpGet:
+          path: /healthz/ready
+          port: 15021</pre>
+</div>
+
+<p>Antes, o YAML mostra o segundo container chamado <code>proxy</code> e brigando pela porta 8080 com a
+aplicação. Depois, ele tem o nome que o mesh espera e as portas certas: <code>15090</code> para métricas e
+<code>15021</code> para a verificação de saúde. As outras duas portas do proxy — <code>15001</code> e
+<code>15006</code> — são as de entrada e saída do redirecionamento, e não aparecem declaradas no
+manifesto.</p>
+
+<p>Duas consequências práticas de haver dois containers. A primeira: o <code>kubectl logs</code> passa a exigir
+o <code>-c</code> quando o pod tem mais de um container; sem isso, o comando reclama de ambiguidade. A segunda:
+um proxy que não fica pronto deixa o pod <code>0/2</code> e o Service deixa de mandar tráfego — mesmo com a
+aplicação saudável. É a causa mais comum de “meu pod está rodando mas não recebe requisição” em cluster com
+mesh.</p>
+
+<h2>7. A caixa: o preço do proxy</h2>
+
+<p>Nada disso é de graça. Cada sidecar reserva CPU e memória próprias — em geral 100m e 128 Mi —, e essa
+reserva entra na conta de capacidade da aula anterior. Com muitas réplicas, o mesh passa a ser um dos maiores
+consumidores do cluster. A caixa exagera o valor de propósito para o efeito ficar visível.</p>
+
+<div class="tryk8s" data-get="pods -o wide" data-goal="pronto:Deployment/cardapio=6">
+  <p class="try-task">As seis réplicas têm de ficar prontas. O proxy está pedindo 900m de CPU por pod; reduza
+  para <code>100m</code> e rode.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 200m
+        - name: istio-proxy
+          image: proxyv2:1.24
+          resources:
+            requests:
+              cpu: 900m</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE   IP               NODE                 NOMINATED NODE   READINESS GATES
+cardapio-jbc42k9vfm-4dh4p   2/2     Running   0          9m    10.244.182.48    guia-worker          &lt;none&gt;           &lt;none&gt;
+cardapio-jbc42k9vfm-8pn2n   0/2     Pending   0          6m    &lt;none&gt;           &lt;none&gt;               &lt;none&gt;           &lt;none&gt;
+cardapio-jbc42k9vfm-ghg9f   0/2     Pending   0          7m    &lt;none&gt;           &lt;none&gt;               &lt;none&gt;           &lt;none&gt;
+cardapio-jbc42k9vfm-n22jl   2/2     Running   0          3m    10.244.209.115   guia-control-plane   &lt;none&gt;           &lt;none&gt;
+cardapio-jbc42k9vfm-r862z   0/2     Pending   0          2m    &lt;none&gt;           &lt;none&gt;               &lt;none&gt;           &lt;none&gt;
+cardapio-jbc42k9vfm-vwbpl   2/2     Running   0          2m    10.244.22.5      guia-worker2         &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 200m
+        - name: istio-proxy
+          image: proxyv2:1.24
+          resources:
+            requests:
+              cpu: 100m</pre>
+</div>
+
+<p>Com 900m por proxy, cada pod pede 1.100m e só um cabe por nó: três rodam, três ficam
+<code>Pending</code>. Com 100m, cada pod pede 300m e as seis réplicas cabem. Repare que o <code>READY</code>
+dos pods que rodam é <code>2/2</code> — dois containers, dois checks.</p>
+
+<p>A conta que vale fazer antes de adotar mesh: número de pods × reserva do proxy. Um cluster com 200 pods e
+sidecar de 100m/128Mi reserva 20 vCPU e 25 GB só para proxies. Em cluster grande, isso é a diferença entre
+ambient e sidecar — e é o argumento honesto de quem migra.</p>
+
+<h2>8. O que aparece no cluster</h2>
+
+<p>Com o mesh instalado, o cluster ganha um namespace de sistema e os pods passam a mostrar dois containers. A
+primeira transcrição é de um cluster real com Istio, mostrando os dois lados:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods -n istio-system
+NAME                     READY   STATUS    RESTARTS   AGE
+istiod-7b9c6f5d4d-8xl2q  1/1     Running   0          12d
+
+ana@notebook:~$ kubectl get pods -n padaria
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-6d7f9c8b5-4jjxx    2/2     Running   0          3d
+precos-5cbfb4c44d-kd4wm     2/2     Running   0          3d
+
+ana@notebook:~$ kubectl describe pod cardapio-6d7f9c8b5-4jjxx -n padaria
+...
+Containers:
+  web:
+    Image:          cardapio:1.0
+    Port:           8080/TCP
+    Ready:          True
+  istio-proxy:
+    Image:          proxyv2:1.24.3
+    Port:           15090/TCP
+    Ready:          True
+    Restart Count:  0
+    Environment:
+      ISTIO_META_CLUSTER_ID:  Kubernetes
+...</pre>
+
+<p>Três leituras. O plano de controle é um pod comum, no namespace <code>istio-system</code> — se ele cai, a
+configuração para de ser distribuída, mas o tráfego continua com a última. Os pods da aplicação têm
+<code>2/2</code>, e o segundo container é o proxy. E o <code>describe</code> mostra os dois containers lado a
+lado, cada um com sua imagem e seu estado.</p>
+
+<p>A segunda transcrição é o caso que mais gera chamado: um pod que não tem proxy nenhum, num namespace que
+parece configurado.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get ns --show-labels
+NAME          STATUS   AGE   LABELS
+default       Active   32d   kubernetes.io/metadata.name=default
+padaria       Active   12d   istio-injection=enabled,kubernetes.io/metadata.name=padaria
+relatorios    Active   8d    kubernetes.io/metadata.name=relatorios
+
+ana@notebook:~$ kubectl get pods -n relatorios
+NAME                          READY   STATUS    RESTARTS   AGE
+relatorio-diario-2xk4p        1/1     Running   0          4d</pre>
+
+<p>O namespace <code>relatorios</code> não tem a etiqueta. O pod está <code>1/1</code>, funciona, e não passa
+pelo mesh — não tem TLS automático, não aparece nas métricas de tráfego do mesh, não obedece às regras de
+roteamento. Não é erro: é adoção parcial, e é o estado mais comum em cluster de verdade. O perigo é esquecer
+disso e concluir que a política cobre tudo.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: retry de todo mundo</h3>
+<p>O cardápio tinha retry de três tentativas e o mesh também configurava três. Quando o pagamento ficou lento,
+cada requisição virou nove tentativas, e o serviço de pagamento recebeu uma avalanche. O conserto foi tirar o
+retry da aplicação e deixar só o do mesh. Duas camadas de resiliência se multiplicam, não se somam.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a porta que ficou fora do mesh</h3>
+<p>Um serviço de relatórios abria conexão direta com o banco na 5432. Depois do mTLS obrigatório, a conexão
+passou a falhar: o banco não falava TLS de mesh, e a porta estava na lista de exclusão. O ajuste foi excluir a
+5432 do redirecionamento, não desligar o mTLS. Exclusão de porta é a válvula de escape para protocolos que não
+são HTTP.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: ambient no cluster grande</h3>
+<p>Com 300 pods e sidecar de 128 Mi, o time gastava 37 GB só de proxies. Migrando para ambient, a reserva por
+pod sumiu e sobrou um proxy por nó, mais um waypoint para as regras de camada 7. O ganho não foi de latência:
+foi de memória — e de tempo de reinício a cada atualização do proxy.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que o mesh acrescenta que o Service e o Ingress não
+fazem?</p>
+<label><input type="radio" name="q1"> descobrir pods por etiqueta</label>
+<label><input type="radio" name="q1"> publicar um serviço para fora do cluster</label>
+<label><input type="radio" name="q1"> mTLS, retry, roteamento fino e métricas por rota, fora do
+código</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Por que um pod com sidecar aparece como
+<code>2/2</code>?</p>
+<label><input type="radio" name="q2"> porque tem a aplicação e o proxy, cada um com seu check de
+prontidão</label>
+<label><input type="radio" name="q2"> porque tem duas réplicas dentro do mesmo pod</label>
+<label><input type="radio" name="q2"> porque o mesh duplica o container para dar alta disponibilidade</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Um pod num namespace sem a etiqueta de injeção está
+<code>1/1</code> e funciona. O que isso significa?</p>
+<label><input type="radio" name="q3"> o mesh está desligado no cluster inteiro</label>
+<label><input type="radio" name="q3"> ele não passa pelo mesh: sem mTLS nem regras de
+roteamento</label>
+<label><input type="radio" name="q3"> ele usa o modo ambient automaticamente</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o valor que liga a injeção</h2>
+<p>Para que todo pod novo do namespace <code>padaria</code> nasça com proxy, a etiqueta
+<code>istio-injection</code> precisa de um valor específico. Complete.</p>
+<div class="ex-code">metadata:
+  name: padaria
+  labels:
+    istio-injection: <input aria-label="resposta 1" data-answer="enabled" placeholder="..."></div>
+<p class="ex-dica">Dica: é o oposto de <code>disabled</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Service mesh é uma camada de infraestrutura que intercepta o tráfego entre serviços e aplica política fora
+do código: mTLS, retry, timeout, roteamento fino e telemetria. Ele tem dois planos — dados (proxies) e controle
+(quem distribui configuração e certificado) — e dois modelos: sidecar, com um proxy por pod, e ambient, com um
+proxy por nó e waypoint para camada 7.</p>
+
+<p>A adoção começa por namespace, com uma etiqueta, e é incremental por natureza: pods criados antes não ganham
+proxy. O preço é real: memória e CPU por pod, mais uma camada de complexidade para depurar, mais CRDs para
+gerenciar e a tentação de empilhar resiliência em cima da que o app já tinha.</p>
+
+<p>A regra honesta: use mesh quando houver muitos serviços, times diferentes e exigência de segurança ou
+observabilidade uniforme. Com três serviços e um time, um pouco de biblioteca e boas práticas de Service
+resolvem melhor — e custam menos. Na próxima trilha do guia, o assunto muda de camada: segurança de acesso ao
+cluster, com RBAC, identidades e permissões.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Mesh é política de rede fora do código: mTLS, retry, rota, métrica.</li>
+  <li>Sidecar = proxy por pod (<code>2/2</code>); ambient = proxy por nó.</li>
+  <li>Injeção por etiqueta no namespace; pods antigos não mudam.</li>
+  <li>O proxy reserva recursos: multiplique pela quantidade de pods.</li>
+  <li>Retry no app + retry no mesh = tentativas multiplicadas.</li>
+  <li>VirtualService, PeerAuthentication e afins são CRDs do mesh.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

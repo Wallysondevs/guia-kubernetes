@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Volumes | Guia Kubernetes</title>
+<meta name="description" content="Referência de volumes no Kubernetes: emptyDir, hostPath, configMap, secret, projected e PVC, o campo que muda em cada um e quando usar cada tipo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Volumes</span></h1>
+<p class="intro">A Ana chega nesta página com uma pergunta só: “qual é o volume que eu quero?”. O pod já está
+escrito, o container já roda, e falta dizer de onde vem o arquivo — se é uma pasta temporária, um diretório do
+nó, um ConfigMap, um Secret ou um disco que sobrevive ao pod. A resposta está na tabela da seção 4; o resto da
+página explica o que cada linha significa, com o campo exato que muda de um tipo para o outro.</p>
+
+<h2>1. Para que serve esta página (e o que ela não cobre)</h2>
+
+<p>Um container tem o seu próprio sistema de arquivos, e tudo o que ele escreve fora de um volume desaparece
+quando o container morre. Volume é a resposta para duas necessidades diferentes: guardar dado que precisa
+sobreviver ao container, e entregar ao container um arquivo que veio de fora — configuração, credencial,
+certificado.</p>
+
+<p>Esta página é a consulta dos tipos: qual campo usar, o que acontece quando o pod morre e quando cada um é a
+escolha certa. Ela não ensina a criar PVC do zero, não fala de StorageClass em detalhe e não repete as aulas
+de <code>emptyDir</code> e <code>hostPath</code>, que contam a história completa.</p>
+
+<p>O que fica de fora, de propósito: o ciclo de vida do PV, o <em>binding</em> entre PV e PVC, as classes de
+armazenamento dinâmicas, o StatefulSet com <code>volumeClaimTemplates</code> e o volume de
+<code>serviceAccountToken</code> em detalhe. No fim há o link de cada um.</p>
+
+<p>Uma frase para não esquecer: <strong>volume é do pod, não do container</strong>. Um pod com dois containers
+pode montar o mesmo volume nos dois, e é assim que um container escreve o arquivo e o outro lê — o padrão que
+o guia chama de sidecar.</p>
+
+<h2>2. O essencial em 10 linhas</h2>
+
+<ol>
+  <li>Todo volume aparece em dois lugares: <code>spec.volumes</code> (o que montar) e
+  <code>volumeMounts</code> (onde montar, dentro do container).</li>
+  <li>O elo entre os dois é o <code>name</code>, um apelido seu — não é o nome do ConfigMap nem do PVC.</li>
+  <li>Cada item de <code>spec.volumes</code> tem <code>name</code> e <strong>um</strong> tipo
+  (<code>emptyDir</code>, <code>hostPath</code>, <code>configMap</code>…). Dois tipos no mesmo item é
+  inválido.</li>
+  <li><code>emptyDir</code> nasce vazio com o pod e morre com ele; sobrevive a reinício de container.</li>
+  <li><code>hostPath</code> aponta para uma pasta do nó — e prende o pod àquele nó.</li>
+  <li><code>configMap</code> e <code>secret</code> montam um arquivo por chave e atualizam sozinhos, com
+  atraso.</li>
+  <li><code>projected</code> junta várias fontes numa pasta só.</li>
+  <li><code>persistentVolumeClaim</code> aponta para um PVC, e o PVC é quem pede o disco.</li>
+  <li><code>mountPath</code> é o caminho dentro do container; <code>subPath</code> monta um arquivo em vez da
+  pasta.</li>
+  <li><code>subPath</code> não recebe atualização — é a pegadinha que mais aparece em produção.</li>
+</ol>
+
+<p>Se o seu caso é “configuração que muda sem reiniciar”, a resposta é volume de ConfigMap sem
+<code>subPath</code>. Se é “dado que precisa sobreviver ao pod”, a resposta é PVC. Todo o resto é variação
+dessas duas.</p>
+
+<p>Se ainda estiver em dúvida, três perguntas resolvem. Primeira: o dado precisa existir depois que o pod
+morrer? Sim leva a PVC, não leva a <code>emptyDir</code>. Segunda: o dado é lido de um objeto do cluster
+(ConfigMap ou Secret)? Então o volume é desse objeto, e você não escolhe onde ele mora. Terceira: o dado é
+um arquivo do próprio nó, como o log do sistema? Só aí o <code>hostPath</code> entra, e ele vem com o preço de
+prender o pod àquela máquina.</p>
+
+<h2>3. Anatomia: as duas listas do manifesto</h2>
+
+<p>O volume mora em dois blocos do mesmo manifesto, e entender essa separação resolve metade das dúvidas. O
+<code>spec.volumes</code> declara a origem; o <code>spec.containers[].volumeMounts</code> declara o destino.
+Esta é a anatomia dos campos que aparecem nos dois.</p>
+
+<dl class="anatomy">
+<dt><code>volumes[].name</code></dt>
+<dd>o apelido do volume, escolhido por você. Vale dentro do pod e é o que o <code>volumeMounts</code> usa para
+achar a origem. Precisa ser único no pod e seguir as regras de nome do Kubernetes.</dd>
+<dt><code>volumes[].emptyDir</code></dt>
+<dd>pasta temporária criada quando o pod é agendado e apagada quando o pod é removido. Aceita
+<code>medium: Memory</code> e <code>sizeLimit</code>. É o tipo mais simples: <code>emptyDir: {}</code>.</dd>
+<dt><code>volumes[].hostPath</code></dt>
+<dd>um caminho do nó (<code>path</code>) e, opcionalmente, um <code>type</code> que diz o que esperar ali
+(<code>DirectoryOrCreate</code>, <code>File</code>, <code>Socket</code>…). O conteúdo é o do nó, não o do
+cluster.</dd>
+<dt><code>volumes[].configMap</code> / <code>volumes[].secret</code></dt>
+<dd>o <code>name</code> do ConfigMap, ou o <code>secretName</code> do Secret. Aceitam <code>items</code>
+(quais chaves, com que nome de arquivo), <code>defaultMode</code> e <code>optional</code>.</dd>
+<dt><code>volumes[].persistentVolumeClaim</code></dt>
+<dd>o <code>claimName</code> do PVC, no mesmo namespace do pod. É o único tipo em que o dado sobrevive ao pod
+e ao nó.</dd>
+<dt><code>volumeMounts[].mountPath</code></dt>
+<dd>o caminho absoluto dentro do container. O diretório é criado se não existir; o que já estiver ali é
+escondido enquanto a montagem durar.</dd>
+<dt><code>volumeMounts[].subPath</code></dt>
+<dd>monta um item dentro de <code>mountPath</code> em vez da pasta inteira. Serve para um arquivo só, e é o
+motivo de “o arquivo não atualiza” na maioria dos casos.</dd>
+</dl>
+
+<p>Um detalhe que confunde e vale gravar: o <code>name</code> em <code>spec.volumes</code> e o
+<code>name</code> em <code>volumeMounts</code> têm de ser <em>iguais</em>, e nenhum dos dois precisa ser igual
+ao nome do objeto de origem. Você pode ter o volume <code>config</code> apontando para o ConfigMap
+<code>cardapio</code>, montado em <code>/etc/cardapio</code>. Três nomes, três papéis.</p>
+
+<h2>4. Os tipos do dia a dia</h2>
+
+<p>A tabela abaixo é o coração da página: cada linha é um tipo de volume, o campo que o declara e o que
+acontece com o conteúdo quando o pod deixa de existir. O “quando usar” é a parte prática — se você está em
+dúvida entre dois, comece pela linha que descreve o seu dado.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tipo</th><th>Campo no manifesto</th><th>O dado sobrevive a</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>emptyDir</code></td><td><code>emptyDir: {}</code></td><td>reinício de container, não ao pod</td><td>rascunho, cache, arquivo trocado entre containers do mesmo pod</td></tr>
+<tr><td><code>hostPath</code></td><td><code>hostPath: {path: …}</code></td><td>ao pod, enquanto o nó existir</td><td>agente que precisa ver o disco do nó (DaemonSet); evitar para dado de aplicação</td></tr>
+<tr><td><code>configMap</code></td><td><code>configMap: {name: …}</code></td><td>nada — é leitura do objeto</td><td>arquivo de configuração, JSON, YAML, script</td></tr>
+<tr><td><code>secret</code></td><td><code>secret: {secretName: …}</code></td><td>nada — é leitura do objeto</td><td>senha em arquivo, certificado, chave privada</td></tr>
+<tr><td><code>projected</code></td><td><code>projected: {sources: […]}</code></td><td>nada — é leitura das fontes</td><td>juntar ConfigMap, Secret e token do ServiceAccount numa pasta</td></tr>
+<tr><td><code>persistentVolumeClaim</code></td><td><code>persistentVolumeClaim: {claimName: …}</code></td><td>ao pod, ao nó e ao container</td><td>banco, upload de cliente, qualquer dado que não pode sumir</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A segunda tabela é a versão “copiar e colar”: o trecho mínimo de cada tipo, do jeito que ele aparece dentro
+de <code>spec.volumes</code>. Repare que só o nome do campo muda — o resto da estrutura é sempre uma lista com
+<code>name</code> e um tipo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tipo</th><th>Trecho mínimo</th><th>O que costuma faltar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>emptyDir</code></td><td><code>- name: dados<br>  emptyDir: {}</code></td><td>nada; <code>{}</code> já é válido</td></tr>
+<tr><td><code>hostPath</code></td><td><code>- name: dados<br>  hostPath:<br>    path: /srv/dados<br>    type: DirectoryOrCreate</code></td><td>o <code>type</code>, que evita erro quando a pasta não existe</td></tr>
+<tr><td><code>configMap</code></td><td><code>- name: config<br>  configMap:<br>    name: cardapio</code></td><td>o <code>name</code> do ConfigMap, não o do volume</td></tr>
+<tr><td><code>secret</code></td><td><code>- name: senhas<br>  secret:<br>    secretName: senhas</code></td><td>o campo é <code>secretName</code>, não <code>name</code></td></tr>
+<tr><td><code>projected</code></td><td><code>- name: tudo<br>  projected:<br>    sources:<br>      - configMap:<br>          name: cardapio</code></td><td>a lista <code>sources</code>, que é obrigatória</td></tr>
+<tr><td><code>persistentVolumeClaim</code></td><td><code>- name: dados<br>  persistentVolumeClaim:<br>    claimName: dados-padaria</code></td><td>o PVC existir no mesmo namespace</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma observação sobre <code>configMap</code> e <code>secret</code>: os dois aceitam <code>items</code>,
+<code>defaultMode</code> e <code>optional</code>, e a sintaxe é idêntica — muda só o nome do campo que aponta
+para o objeto. Já o <code>projected</code> é um contêiner de fontes: cada item de <code>sources</code> tem o
+mesmo formato de um volume normal, e o conjunto aparece numa pasta só.</p>
+
+<p>Quando o pod está no ar, o <code>kubectl describe pod</code> mostra o tipo de cada volume no bloco
+<code>Volumes</code>. É a forma mais rápida de conferir o que você montou, sem reler o YAML: aparece
+<code>Type: EmptyDir</code>, <code>Type: HostPath</code>, <code>Type: ConfigMap</code>,
+<code>Type: Secret</code>, <code>Type: Projected</code> ou <code>Type: PersistentVolumeClaim</code>, com o nome
+do objeto de origem logo abaixo quando existe um. Se o <code>Type</code> não é o que você esperava, o problema
+está no manifesto, não no cluster.</p>
+
+<p>Vale saber também que o Kubernetes não apaga o conteúdo de um <code>hostPath</code> nem de um PVC quando o
+pod é removido. No <code>hostPath</code>, o arquivo simplesmente fica lá, no nó, para o próximo pod que montar o
+mesmo caminho — inclusive de outra aplicação. No PVC, o dado fica até alguém apagar o claim. É por isso que
+“volume persistente” não é sinônimo de “backup”: persistir é sobreviver ao pod, não sobreviver a um erro de
+deploy que apaga o objeto.</p>
+
+<h2>5. Os campos que mais confundem</h2>
+
+<p>Estas são as confusões que aparecem em toda revisão de manifesto. Nenhuma é difícil; todas custam tempo
+quando passam batido.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Confusão</th><th>O que é</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>mountPath</code> × <code>subPath</code></td><td><code>mountPath</code> é a pasta; <code>subPath</code>
+escolhe um item de dentro do volume para montar naquele caminho</td><td>use <code>subPath</code> só para um
+arquivo; sem ele, a pasta inteira aparece</td></tr>
+<tr><td><code>subPath</code> e atualização</td><td>volume de ConfigMap atualiza; com <code>subPath</code>, o
+arquivo fica congelado até o container reiniciar</td><td>se precisa de atualização, monte a pasta e aponte o
+programa para o arquivo dentro dela</td></tr>
+<tr><td><code>readOnly</code></td><td>marca a montagem como somente leitura, dentro do
+<code>volumeMounts</code></td><td>use em ConfigMap e Secret; evita que o programa sobrescreva a
+configuração</td></tr>
+<tr><td><code>defaultMode</code></td><td>permissão dos arquivos montados, em octal (o padrão é
+<code>420</code>, que é <code>0644</code>)</td><td>o valor é decimal no YAML; <code>0644</code> com zero à
+esquerda é inválido</td></tr>
+<tr><td><code>medium: Memory</code></td><td>o <code>emptyDir</code> passa a viver na memória RAM do nó</td><td>é
+rápido e conta contra a memória do pod: combine com <code>sizeLimit</code></td></tr>
+<tr><td><code>accessModes</code></td><td>o que o PVC pede: <code>ReadWriteOnce</code>,
+<code>ReadOnlyMany</code>, <code>ReadWriteMany</code>, <code>ReadWriteOncePod</code></td><td>quem decide o que
+o disco aceita é o PV; pedir um modo que ele não tem deixa o PVC em <code>Pending</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A linha do <code>defaultMode</code> merece uma frase a mais, porque o erro é silencioso: o campo é um número
+em decimal, e <code>0644</code> escrito assim vira octal inválido no YAML — o correto é <code>420</code>. Na
+prática, quase ninguém precisa mexer: o padrão serve para a maioria dos arquivos de configuração.</p>
+
+<p>Um uso que vale conhecer antes de escolher o tipo: dois containers no mesmo pod, um escrevendo e outro
+lendo. O volume é declarado uma vez e montado nos dois, cada um no caminho que o seu programa espera. Com
+<code>emptyDir</code> isso funciona bem para arquivo temporário; com ConfigMap e Secret não faz sentido, porque
+os dois são somente leitura na prática. E há o caso do <code>initContainer</code> que baixa ou gera o arquivo
+antes do programa principal começar: ele monta o mesmo volume, escreve, termina, e o container principal já
+encontra tudo pronto.</p>
+
+<p>Já a linha do <code>subPath</code> é a que mais aparece em produção, e quase sempre com a mesma história: o
+time monta <code>config.json</code> com <code>subPath</code> para não sobrescrever a pasta inteira, edita o
+ConfigMap, e o arquivo não muda. O volume é atualizado no disco do nó, mas a montagem daquele arquivo
+específico não é refeita. A solução é montar a pasta ou reiniciar o pod.</p>
+
+<h2>6. Erros e mensagens</h2>
+
+<p>Erro de volume se divide em dois mundos. O primeiro é o manifesto inválido, que o API server recusa na
+hora: nome repetido, montagem apontando para volume que não existe. O segundo é a montagem que falha depois,
+no nó, e aparece como evento — o pod fica em <code>ContainerCreating</code> e o motivo está no
+<code>describe</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>Causa</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>volumeMounts[0].name: Not found: "dados"</code></td><td>o container monta um volume que não está em
+<code>spec.volumes</code></td><td>declarar o volume ou corrigir o <code>name</code></td></tr>
+<tr><td><code>Duplicate value: "dados"</code></td><td>dois volumes com o mesmo <code>name</code> no mesmo
+pod</td><td>renomear um dos dois</td></tr>
+<tr><td><code>MountVolume.SetUp failed … configmap "cardapio" not found</code></td><td>o objeto de origem não
+existe no namespace do pod</td><td>criar no namespace certo ou corrigir a referência</td></tr>
+<tr><td><code>hostPath type check failed: /srv/dados is not a directory</code></td><td>o <code>type</code> do
+<code>hostPath</code> não bate com o que existe no nó</td><td>usar <code>DirectoryOrCreate</code> ou criar a
+pasta no nó</td></tr>
+<tr><td><code>pod has unbound immediate PersistentVolumeClaims</code></td><td>o PVC não encontrou PV: falta
+classe, tamanho ou modo de acesso compatível</td><td><code>kubectl describe pvc</code> e conferir
+<code>storageClassName</code> e <code>accessModes</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O primeiro caso é o mais comum de todos, e a mensagem é generosa: ela diz qual container, qual posição da
+lista e qual nome não foi achado. Esta é a resposta de um cluster real para um manifesto com a montagem
+sobrando:</p>
+
+<pre class="term">$ kubectl apply -f web.yaml
+The Pod "web" is invalid: spec.containers[0].volumeMounts[0].name: Not found: "dados"</pre>
+
+<p>O segundo caso é o que engana: o <code>apply</code> passa, o pod aparece no <code>get</code> e fica em
+<code>ContainerCreating</code>. O motivo não está no status; está no evento. A transcrição abaixo é de um
+cluster real, com o ConfigMap ausente:</p>
+
+<pre class="term">$ kubectl describe pod web
+...
+Events:
+  Type     Reason       Age   From     Message
+  ----     ------       ----  ----     -------
+  Warning  FailedMount  12s   kubelet  MountVolume.SetUp failed for volume "config" : configmap "cardapio" not found</pre>
+
+<p>Repare na estrutura da mensagem: <em>volume</em> (o apelido do pod), <em>tipo</em> e <em>nome procurado</em>.
+É o suficiente para saber se o problema é o namespace, o nome ou o objeto que nunca foi criado. Para PVC, o
+caminho é parecido, mas o evento fala de <code>FailedScheduling</code> e de claim não vinculado — e aí a
+investigação começa no <code>describe pvc</code>, não no pod.</p>
+
+<h2>7. Duas coisas para praticar agora</h2>
+
+<p>A primeira caixa troca um volume de disco por um de memória, com limite. A segunda troca um
+<code>emptyDir</code> por um PVC — a decisão que separa “rascunho” de “dado que não pode sumir”.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/relatorio|spec.volumes.0.emptyDir.medium=Memory;;campo:Pod/relatorio|spec.volumes.0.emptyDir.sizeLimit=64Mi;;texto:Running">
+  <p class="try-task">O relatório é lido e descartado em segundos. Troque o <code>hostPath</code> por um
+  <code>emptyDir</code> em memória, com <code>sizeLimit: 64Mi</code>, mantendo a montagem em
+  <code>/dados</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: relatorio
+spec:
+  containers:
+    - name: relatorio
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      hostPath:
+        path: /srv/dados
+        type: DirectoryOrCreate</pre>
+<pre class="out">
+pod/relatorio created
+
+NAME        READY   STATUS    RESTARTS   AGE
+relatorio   1/1     Running   0          2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: relatorio
+spec:
+  containers:
+    - name: relatorio
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Mi</pre>
+</div>
+
+<p>O painel mostra o pod em <code>Running</code> e guarda os dois campos do <code>emptyDir</code>. A pergunta
+que vale fazer antes de usar <code>medium: Memory</code>: esse dado pode ser perdido num reinício do nó? Se a
+resposta for sim, é o tipo certo; se for não, o caminho é PVC.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/estoque|spec.volumes.0.persistentVolumeClaim.claimName=dados-padaria;;campo:Pod/estoque|spec.containers.0.volumeMounts.0.mountPath=/dados;;texto:Running">
+  <p class="try-task">O estoque não pode perder o arquivo quando o pod reiniciar. Troque o
+  <code>emptyDir</code> pelo PVC <code>dados-padaria</code>, mantendo a montagem em <code>/dados</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: estoque
+spec:
+  containers:
+    - name: estoque
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      emptyDir: {}</pre>
+<pre class="out">
+pod/estoque created
+
+NAME      READY   STATUS    RESTARTS   AGE
+estoque   1/1     Running   0          3m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: estoque
+spec:
+  containers:
+    - name: estoque
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /dados
+  volumes:
+    - name: dados
+      persistentVolumeClaim:
+        claimName: dados-padaria</pre>
+</div>
+
+<p>Só essa troca já muda a natureza do dado: o PVC pertence ao namespace e sobrevive ao pod, ao nó e ao
+Deployment. O que ele <em>não</em> faz é criar o disco sozinho — quem cria é o PV, ou a StorageClass quando
+existe uma. Um PVC apontando para uma classe que não existe fica em <code>Pending</code>, e o pod fica em
+<code>Pending</code> atrás dele.</p>
+
+<h2>8. Para ir além</h2>
+
+<p>Cada tipo desta referência tem uma aula com a história completa, o manifesto comentado e os tropeços. A
+ordem abaixo é a de leitura, não a alfabética.</p>
+
+<ul>
+  <li><a href="volumes-emptyDir.html">emptyDir</a> — o ciclo de vida, <code>medium: Memory</code> e o que o
+  volume não é.</li>
+  <li><a href="configmap-como-volume.html">ConfigMap como volume</a> — um arquivo por chave,
+  <code>items</code> e permissões.</li>
+  <li><a href="hostPath.html">hostPath</a> — o caso legítimo do agente por nó e o preço da
+  portabilidade.</li>
+  <li><a href="pv-e-pvc.html">PV e PVC</a> — a oferta, o pedido e o encontro dos dois.</li>
+  <li><a href="storageclass.html">StorageClass</a> — quando o disco é criado sob demanda.</li>
+  <li><a href="statefulset.html">StatefulSet</a> — <code>volumeClaimTemplates</code>, um disco por
+  réplica.</li>
+  <li><a href="sidecar.html">Sidecar e multi-container</a> — o mesmo volume montado em dois containers.</li>
+  <li><a href="ref-configmap-secret.html">ConfigMap e Secret</a> — os campos dos objetos que viram
+  volume.</li>
+</ul>
+
+<p>Duas leituras de apoio, quando o assunto encosta em outra área: <a href="requests-limits.html">Requests e
+limits</a> explica por que <code>medium: Memory</code> conta contra a memória do pod, e
+<a href="pod-pending.html">Pod em Pending</a> cobre o caso do pod que não sobe porque o PVC não vinculou.</p>
+
+<h2>Resumo</h2>
+
+<p>Volume é do pod, não do container, e aparece sempre em dois blocos: <code>spec.volumes</code> diz o que
+montar, <code>volumeMounts</code> diz onde. O elo é o <code>name</code>, um apelido que não precisa ser igual
+ao nome do objeto de origem.</p>
+
+<p>Para dado temporário, <code>emptyDir</code>; para pasta do nó, <code>hostPath</code>; para configuração e
+credencial, <code>configMap</code> e <code>secret</code>, que atualizam sozinhos; para juntar fontes,
+<code>projected</code>; para dado que não pode sumir, <code>persistentVolumeClaim</code>. Em todos, o que muda
+é o campo do tipo — a estrutura é sempre <code>name</code> mais um tipo.</p>
+
+<p><code>subPath</code> monta um arquivo e congela a atualização; <code>readOnly</code> protege a origem;
+<code>defaultMode</code> é decimal. Erro de manifesto aparece no <code>apply</code> com o caminho exato; erro
+de montagem aparece como evento e deixa o pod em <code>ContainerCreating</code>. Nos dois casos, o
+<code>describe</code> é o primeiro lugar a olhar.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>spec.volumes</code> + <code>volumeMounts</code>, ligados pelo <code>name</code>.</li>
+  <li>Cada volume tem <code>name</code> e um tipo só; nome repetido é inválido.</li>
+  <li><code>emptyDir</code> morre com o pod; <code>hostPath</code> prende o pod ao nó; PVC sobrevive a
+  tudo.</li>
+  <li><code>secret</code> usa <code>secretName</code>; <code>configMap</code> usa <code>name</code>.</li>
+  <li><code>subPath</code> não atualiza; <code>readOnly</code> não deixa o programa escrever por
+  cima.</li>
+  <li>Montagem que falha vira evento <code>FailedMount</code> e pod em
+  <code>ContainerCreating</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

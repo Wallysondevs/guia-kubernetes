@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admissão e validação | Guia Kubernetes</title>
+<meta name="description" content="O caminho do apply até o etcd: autenticação, autorização, admissão mutante e validadora, o que o servidor valida sozinho e por que uma política barra o seu manifesto.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Admissão e <span class="hl">validação</span></h1>
+<p class="intro">A Ana digita <code>kubectl apply</code> e o manifesto volta com um erro. Ela não sabe se o
+problema é o kubectl, o arquivo, o cluster ou alguma regra que alguém instalou. Nesta aula ela percorre o
+caminho inteiro de um apply: quem autentica, quem autoriza, quem altera o objeto no meio do caminho, quem
+valida e só então quem grava no etcd. No fim, ela olha a mensagem de erro e sabe dizer de qual porta veio o
+não — e o que fazer em cada caso.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>As etapas entre o <code>kubectl apply</code> e o objeto existir no etcd.</li>
+  <li>Autenticação: quem é você para o cluster.</li>
+  <li>Autorização: o que o RBAC permite e como é um erro <code>Forbidden</code>.</li>
+  <li>Admissão mutante: o que o servidor acrescenta e o que um webhook injeta.</li>
+  <li>Validação: os erros <code>is invalid</code> que vêm do próprio tipo do objeto.</li>
+  <li>Admissão validadora: políticas que recusam manifesto por regra do time.</li>
+  <li>Como descobrir quem barrou lendo a mensagem.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o manifesto que “volta”</h2>
+
+<p>O time da Ana copiou um manifesto de um tutorial e rodou o apply. A resposta foi uma linha vermelha,
+comprida, em inglês. O primeiro reflexo foi revisar o YAML linha por linha: estava idêntico ao do tutorial. O
+segundo foi culpar o cluster. O terceiro, mais produtivo, foi perguntar <em>onde</em> aquele manifesto foi
+recusado — porque o mesmo texto de erro significa coisas diferentes dependendo de quem o escreveu.</p>
+
+<p>Essa é a confusão que a aula desfaz. Entre o seu terminal e o disco do etcd existem seis portas, e cada uma
+recusa por um motivo próprio: o kubectl pode recusar antes de enviar; o cluster pode não saber quem você é;
+pode saber e não deixar; pode deixar e alterar o objeto; pode deixar e recusar o conteúdo; e pode deixar o
+conteúdo e ainda consultar uma política instalada pelo time. Só depois de todas é que o objeto é gravado.</p>
+
+<p>Quem entende essas portas para de adivinhar. A pergunta deixa de ser “por que o Kubernetes não aceita o meu
+arquivo?” e passa a ser “qual das seis recusou, e com base em quê?”. As duas primeiras são sobre identidade e
+permissão; as duas seguintes sobre o conteúdo; as duas últimas sobre regras que alguém escreveu.</p>
+
+<p>Todas as mensagens de erro deste guia vêm de um destes seis lugares. Quando você aprender a reconhecer o
+formato de cada um, o diagnóstico fica mais rápido do que ler o manifesto inteiro.</p>
+
+<h2>2. O caminho do apply até o etcd</h2>
+
+<p>O kubectl faz três coisas antes de enviar: lê o arquivo, monta o objeto e confere o que ele consegue conferir
+sozinho — YAML válido, campos conhecidos do tipo, tipos de dados. Se algo falha aqui, a mensagem é do kubectl e
+o cluster nem é consultado. É o caso de <code>error: error parsing</code> e de <code>error: must specify one of
+-f and -k</code>.</p>
+
+<p>Depois vem a autenticação: o cluster descobre quem está falando. Em seguida a autorização: o RBAC diz se
+aquele usuário pode criar <code>deployments</code> naquele namespace. Só então começa a admissão, que é o
+pedaço que esta aula detalha — primeiro a fase mutante, depois a validação do tipo, depois a fase validadora.
+No fim, o objeto vai para o etcd e os controladores começam a reagir a ele.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Etapa</th><th>Pergunta</th><th>Quem responde</th><th>Erro típico</th></tr>
+</thead>
+<tbody>
+<tr><td>kubectl</td><td>o arquivo é válido?</td><td>o seu terminal</td><td><code>error parsing</code></td></tr>
+<tr><td>autenticação</td><td>quem é você?</td><td>certificado, token, ServiceAccount</td><td><code>Unauthorized</code></td></tr>
+<tr><td>autorização</td><td>você pode fazer isso?</td><td>RBAC</td><td><code>Forbidden</code></td></tr>
+<tr><td>admissão mutante</td><td>o objeto precisa de ajuste?</td><td>padrões e webhooks mutantes</td><td>raramente falha</td></tr>
+<tr><td>validação</td><td>o conteúdo faz sentido para o tipo?</td><td>o API server</td><td><code>is invalid</code></td></tr>
+<tr><td>admissão validadora</td><td>o time permite este objeto?</td><td>políticas e webhooks</td><td><code>admission webhook ... denied</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A caixa abaixo começa num erro da etapa de validação: um Deployment com <code>replicas: -1</code>. O objeto
+nunca chega ao etcd, e a mensagem diz exatamente qual campo e qual regra foram violados.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/cardapio|spec.replicas=2;;texto:deployment.apps/cardapio created">
+  <p class="try-task">O número de réplicas está negativo e o API server recusa o objeto. Corrija para
+  <code>2</code> e rode.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: -1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.replicas: Invalid value: -1: must be greater than or equal to 0
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p><code>spec.replicas: Invalid value: -1: must be greater than or equal to 0</code>. Três pedaços: o caminho
+do campo, o valor que você mandou e a regra. Esse formato é sempre do API server, e é o mesmo que aparece em
+campo obrigatório faltando, nome inválido e tipo errado.</p>
+
+<h2>3. Autenticação: quem é você</h2>
+
+<p>O cluster não tem sessão de navegador nem senha de tela. Ele sabe quem você é pelo que o kubectl apresenta:
+um certificado de cliente, um token de uma conta de serviço ou um token emitido por um provedor de identidade
+(no caso de nuvem). O nome que aparece nos erros vem dali — <code>User "ana"</code> ou
+<code>system:serviceaccount:default:cardapio</code>.</p>
+
+<p>Esse nome é o que o RBAC usa, e é por isso que ele importa tanto. Quando o erro diz <code>User
+"system:serviceaccount:producao:cardapio" cannot get resource "secrets"</code>, não é o seu usuário que errou:
+é o pod. A diferença entre “eu, no terminal” e “a aplicação, dentro do cluster” é a origem de metade dos erros
+de permissão em produção.</p>
+
+<p>A configuração fica no kubeconfig: o endereço do cluster, a autoridade certificadora, o certificado do
+usuário e o contexto. O comando <code>kubectl config current-context</code> diz em qual cluster você está —
+e é o primeiro comando de quem desconfia que está mexendo no lugar errado. Muita gente já aplicou o manifesto
+em produção achando que estava no teste; o RBAC não impede, porque o usuário era legítimo.</p>
+
+<p>Se a etapa de autenticação falha, a mensagem é curta: <code>error: You must be logged in to the
+server</code> ou <code>Unauthorized</code>. Não há o que corrigir no manifesto: o problema é o certificado,
+o token vencido ou o contexto apontando para um cluster que não existe mais.</p>
+
+<h2>4. Autorização: o RBAC diz sim ou não</h2>
+
+<p>Autenticado o usuário, o cluster pergunta às regras: este usuário pode <code>create</code> recurso
+<code>deployments</code> no namespace <code>padaria</code>? Quem responde é o RBAC, com Roles e RoleBindings.
+A resposta é binária e a recusa é explícita: o objeto nem entra na fase de admissão, porque não há por que
+validar o conteúdo de algo que você não pode criar.</p>
+
+<pre class="term">$ kubectl get secrets -n producao
+Error from server (Forbidden): secrets is forbidden: User "ana" cannot list resource "secrets" in API group
+"" in the namespace "producao"</pre>
+
+<p>Leia com calma: <code>Forbidden</code> é 403; <code>User "ana"</code> é quem; <code>cannot list resource
+"secrets"</code> é o verbo e o recurso; e o namespace está no fim. Se a intenção era ler, faltou uma Role com
+o verbo <code>get</code> e <code>list</code> para <code>secrets</code>, e um RoleBinding ligando essa Role ao
+seu usuário. Sem os dois, não há permissão.</p>
+
+<p>O detalhe que confunde no começo é que a autorização não tem opinião sobre o conteúdo. Um Secret sem
+<code>data</code>, um Deployment com imagem inexistente e um YAML perfeito recebem o mesmo tratamento: se você
+pode criar o tipo, passa; se não pode, não passa. É por isso que a mensagem de <code>Forbidden</code> nunca
+fala de campo.</p>
+
+<p>A caixa abaixo mostra a configuração do outro lado: um ServiceAccount e um RoleBinding ligando esse
+ServiceAccount a uma ClusterRole pronta. O manifesto do pod não pode listar os Secrets com permissão de
+edição; com <code>view</code>, pode ler o que precisa e nada mais.</p>
+
+<div class="tryk8s" data-goal="campo:RoleBinding/cardapio-leitura|roleRef.name=view;;texto:rolebinding.rbac.authorization.k8s.io/cardapio-leitura created" data-get="rolebindings">
+  <p class="try-task">O RoleBinding dá ao ServiceAccount o papel <code>edit</code>, que pode apagar coisas. Troque
+  o <code>roleRef.name</code> para <code>view</code> e rode.</p>
+<pre class="yaml" data-file="rbac.yaml">apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cardapio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cardapio-leitura
+subjects:
+  - kind: ServiceAccount
+    name: cardapio
+roleRef:
+  kind: ClusterRole
+  name: edit
+  apiGroup: rbac.authorization.k8s.io</pre>
+<pre class="out">
+serviceaccount/cardapio created
+rolebinding.rbac.authorization.k8s.io/cardapio-leitura created
+
+NAME               AGE
+cardapio-leitura   3m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cardapio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cardapio-leitura
+subjects:
+  - kind: ServiceAccount
+    name: cardapio
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io</pre>
+</div>
+
+<p>O painel não aplica RBAC de verdade — ele guarda o objeto e mostra a tabela. Num cluster real, a partir do
+momento em que esse RoleBinding existe, qualquer requisição feita com a identidade
+<code>system:serviceaccount:default:cardapio</code> passa a ser autorizada a ler, e a autorização acontece
+antes de qualquer validação de conteúdo.</p>
+
+<h2>5. Admissão mutante: o que o servidor acrescenta</h2>
+
+<p>Passou a autorização, o objeto entra na admissão. A primeira fase é a mutante — o nome vem de mutação: o
+objeto pode ser alterado antes de ser validado e gravado. Duas coisas acontecem ali. A primeira é o
+preenchimento de padrões: campos que você omitiu recebem o valor que o tipo define. A segunda são os webhooks
+mutantes, plugins que o time instala e que podem injetar coisas.</p>
+
+<p>Os padrões você já viu sem perceber. Um Service sem <code>targetPort</code> recebe a própria
+<code>port</code>. Um Deployment sem <code>strategy</code> recebe <code>RollingUpdate</code> com
+<code>maxSurge</code> e <code>maxUnavailable</code> em 25%. Um Pod sem <code>restartPolicy</code> recebe
+<code>Always</code>. Um container sem <code>imagePullPolicy</code> recebe a política que depende da tag. Nada
+disso estava no seu arquivo, e tudo isso aparece no objeto que o cluster guarda.</p>
+
+<p>É por isso que comparar o seu YAML com o <code>kubectl get -o yaml</code> mostra diferenças: elas não são
+erro, são o servidor trabalhando. E é por isso que “eu não escrevi isso” quase sempre tem a mesma resposta: o
+padrão do tipo, ou um webhook mutante do time.</p>
+
+<p>Webhooks mutantes são comuns em cluster de empresa. O injetor do Istio acrescenta um container de proxy em
+todo pod que nasce. O cert-manager injeta um volume com o certificado. Um injetor de configuração acrescenta
+variáveis de ambiente com o nome do time. Quando você abre um pod e vê um container que não escreveu, o
+responsável é esta fase.</p>
+
+<dl class="anatomy">
+<dt>admissão</dt>
+<dd>A fase entre a autorização e o etcd, em que o objeto pode ser alterado (mutante) e depois julgado
+(validadora).</dd>
+<dt>webhook mutante</dt>
+<dd>Plugin que altera o objeto: injeta container, volume, variável ou etiqueta. Não recusa; raramente
+falha.</dd>
+<dt>webhook validador</dt>
+<dd>Plugin que diz sim ou não. É ele que produz a mensagem <code>denied the request</code>.</dd>
+<dt>política</dt>
+<dd>A regra que o time escreveu e instalou como webhook: imagem do registro interno, limites obrigatórios,
+etiqueta presente.</dd>
+<dt>isenção</dt>
+<dd>Namespace ou grupo de usuários que a política não avalia. Costuma incluir <code>kube-system</code> e os
+namespaces de plataforma.</dd>
+</dl>
+
+<p>Ela raramente falha, porque raramente recusa: mutação não é veto. Quando um webhook mutante está fora do ar
+e a política dele é <code>Fail</code>, aí sim o objeto é recusado — e a mensagem fala de admissão, não de
+validação.</p>
+
+<h2>6. Validação: o que o tipo recusa</h2>
+
+<p>Depois das mutações, o API server valida o objeto contra o esquema do tipo. Aqui moram os erros
+<code>is invalid</code>, e eles são os mais previsíveis de todos: campo obrigatório ausente, tipo errado, valor
+fora da lista aceita, número fora da faixa, nome com formato inválido. Não há nada de política do time aqui —
+é o contrato do próprio recurso.</p>
+
+<p>Um exemplo de lista fechada: o <code>type</code> de um Service só aceita quatro valores. Escrever
+<code>ClusterIp</code> com “p” minúsculo é um erro de digitação que o servidor trata como valor inválido, e a
+mensagem lista os valores aceitos — o que é uma dádiva. A caixa abaixo tem o caso.</p>
+
+<div class="tryk8s" data-goal="campo:Service/cardapio|spec.type=ClusterIP;;texto:service/cardapio created">
+  <p class="try-task">O <code>type</code> está escrito <code>ClusterIp</code>, com “p” minúsculo, e o servidor
+  recusa. Corrija para um dos valores aceitos e rode.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: ClusterIp
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+The Service "cardapio" is invalid: spec.type: Unsupported value: "ClusterIp": supported values: "ClusterIP", "ExternalName", "LoadBalancer", "NodePort"
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  type: ClusterIP
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>A mensagem é <code>spec.type: Unsupported value: "ClusterIp": supported values: "ClusterIP",
+"ExternalName", "LoadBalancer", "NodePort"</code>. “Unsupported value” é o irmão de “Invalid value”: um fala
+de valor fora de uma lista, o outro de valor que não obedece a uma regra. Nos dois casos, o conserto está no
+seu arquivo — e a lista dos aceitos está na própria mensagem.</p>
+
+<p>Vale conhecer os quatro formatos de erro de validação, porque eles cobrem quase tudo:
+<code>Required value</code> (campo obrigatório sem valor), <code>Invalid value</code> (valor que não obedece à
+regra), <code>Unsupported value</code> (valor fora da lista) e <code>Forbidden</code> (campo que não pode ser
+usado naquele contexto — por exemplo, <code>replicas</code> num DaemonSet). O último é do API server, não do
+RBAC, mesmo usando a mesma palavra.</p>
+
+<p>Uma armadilha: campos desconhecidos. O API server descarta o que não conhece, a menos que a validação
+estrita esteja ligada. É assim que um <code>containerPorts</code> no plural passa sem erro e sem efeito. Se um
+campo parece não funcionar, confira a grafia em <code>kubectl explain</code>.</p>
+
+<h2>7. Admissão validadora: as regras do time</h2>
+
+<p>A última porta antes do etcd é a admissão validadora. Aqui não há padrão sendo preenchido: há políticas que
+dizem não. Elas vêm de webhooks que o time instala — Kyverno, OPA Gatekeeper, políticas escritas em casa — e
+representam regras que o Kubernetes não tem: toda imagem tem de vir do registro interno, todo pod tem de
+declarar limites de memória, todo objeto tem de ter a etiqueta do time, nenhum Service pode ser
+<code>LoadBalancer</code> sem aprovação.</p>
+
+<p>É a fase que mais surpreende quem está começando, porque o manifesto está perfeito do ponto de vista do
+Kubernetes. A mensagem, porém, não esconde a origem: ela nomeia o webhook. Um exemplo de cluster com política
+instalada, transcrito do formato real de recusa:</p>
+
+<pre class="term">$ kubectl apply -f cardapio.yaml
+Error from server: admission webhook "policy.loja.test" denied the request: container "web" must set
+resources.limits.memory</pre>
+
+<p>“Denied the request” é diferente de “is invalid”. O primeiro diz que alguém com autoridade recusou; o
+segundo, que o objeto não obedece ao próprio tipo. E o nome do webhook no meio da mensagem é a pista de quem
+procurar: a política do time, não o Kubernetes.</p>
+
+<p>Políticas validadoras têm dois modos de falha, e a escolha é do time. No modo <code>Fail</code>, a recusa
+bloqueia o apply. No modo <code>Warn</code>, ela deixa passar e devolve um aviso — útil para introduzir uma
+regra nova sem quebrar o que já existe. No modo <code>Audit</code>, ninguém vê nada na hora e a violação
+aparece num relatório. Se o seu apply passa e o time reclama depois, provavelmente você está no terceiro
+modo.</p>
+
+<p>Há também o caso oposto, igualmente comum: a política está no modo <code>Fail</code> mas o namespace está
+isento. Muitas instalações isentam <code>kube-system</code> e os namespaces de plataforma, e o time descobre
+que a regra “não vale” exatamente onde ela mais importava. Isenção é decisão de projeto, não detalhe.</p>
+
+<h2>8. Quem barrou? Lendo a mensagem</h2>
+
+<p>Com as seis etapas na cabeça, o diagnóstico vira um reflexo de dez segundos: olhe o começo da mensagem e
+descubra a porta. <code>error parsing</code> é kubectl. <code>Unauthorized</code> é autenticação.
+<code>Forbidden</code> com <code>User ... cannot</code> é RBAC. <code>is invalid</code> é validação do tipo.
+<code>admission webhook ... denied</code> é política instalada. E quando não há erro nenhum, mas o objeto não
+aparece, a pergunta muda de assunto: os controladores ainda não agiram.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Começo da mensagem</th><th>Quem recusou</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>error parsing</code></td><td>o kubectl, antes de enviar</td><td>corrigir o YAML</td></tr>
+<tr><td><code>Unauthorized</code></td><td>autenticação</td><td>renovar credencial, conferir o contexto</td></tr>
+<tr><td><code>Forbidden ... cannot</code></td><td>RBAC</td><td>pedir Role e RoleBinding para o verbo e recurso</td></tr>
+<tr><td><code>... is invalid: campo: motivo</code></td><td>validação do tipo</td><td>corrigir o campo citado</td></tr>
+<tr><td><code>admission webhook ... denied</code></td><td>política do time</td><td>cumprir a regra ou pedir isenção</td></tr>
+<tr><td><code>Internal error ...</code></td><td>falha do cluster</td><td>não é o seu manifesto: avisar quem opera</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas leituras ajudam a fechar o diagnóstico. A primeira é o namespace: <code>Forbidden</code> cita o
+namespace da requisição, e um <code>-n</code> errado produz um erro de permissão que parece problema de
+política. A segunda é o verbo: RBAC fala em <code>get</code>, <code>list</code>, <code>create</code>,
+<code>patch</code>, <code>delete</code>; validação nunca fala em verbo. Se a mensagem tem um verbo, é
+autorização.</p>
+
+<p>E quando a mensagem não se encaixa em nenhuma das seis: leia o começo e o fim. O começo diz quem falou; o
+fim, o motivo. O meio costuma ser caminho de campo, que só interessa depois de você saber de quem é o erro.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o apply que funcionava e parou</h3>
+<p>O manifesto da Ana aplicava todas as manhãs havia meses. Um dia passou a ser recusado com
+<code>admission webhook ... denied</code>. O time tinha instalado uma política nova na madrugada, exigindo
+limites de memória. O manifesto nunca teve limites; a regra é que passou a existir. O conserto foi no
+manifesto, mas a lição é sobre o erro: se a mensagem nomeia um webhook, o Kubernetes não é o autor da
+recusa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o ServiceAccount sem permissão de ler o ConfigMap</h3>
+<p>O pod subia e morria ao ler a configuração. O log dizia <code>Forbidden</code>, e o nome citado era o do
+ServiceAccount do pod, não o da Ana. Ele não tinha permissão de <code>get</code> em
+<code>configmaps</code>. Diagnóstico errado comum: culpar a aplicação. A correção foi uma Role mínima e um
+RoleBinding — e a lição foi separar “eu, no terminal” de “a aplicação, no cluster”.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a réplica negativa que ninguém digitou</h3>
+<p>Um template de Helm gerava <code>replicas: -1</code> quando a variável de ambiente vinha vazia e o cálculo
+dava errado. O apply falhava com <code>must be greater than or equal to 0</code> e o time revisava o values.
+O caminho foi outro: <code>kubectl apply --dry-run=server</code> no pipeline, que reproduz a validação sem
+gravar, e um teste que impede o pull request de passar com réplica negativa.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual é a ordem das etapas depois que o kubectl envia o
+objeto?</p>
+<label><input type="radio" name="q1"> validação, autorização, autenticação, admissão</label>
+<label><input type="radio" name="q1"> autenticação, autorização, admissão mutante, validação, admissão
+validadora</label>
+<label><input type="radio" name="q1"> admissão validadora, autenticação, validação, autorização</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que a fase mutante faz?</p>
+<label><input type="radio" name="q2"> recusa o objeto quando ele viola uma política do time</label>
+<label><input type="radio" name="q2"> grava o objeto no etcd e avisa os controladores</label>
+<label><input type="radio" name="q2"> preenche padrões e permite que webhooks alterem o objeto antes da
+validação</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. A mensagem começa com <code>Error from server
+(Forbidden)</code>. O que aconteceu?</p>
+<label><input type="radio" name="q3"> o RBAC não autorizou o verbo e o recurso para aquele usuário</label>
+<label><input type="radio" name="q3"> o YAML tinha indentação errada</label>
+<label><input type="radio" name="q3"> um campo obrigatório ficou de fora</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o papel que só lê</h2>
+<p>Você quer que o ServiceAccount do pod leia objetos sem poder alterá-los. Complete o RoleBinding com o papel
+pronto que dá só leitura:</p>
+<div class="ex-code">roleRef:
+  kind: ClusterRole
+  name: <input aria-label="resposta 1" data-answer="view" placeholder="...">
+  apiGroup: rbac.authorization.k8s.io</div>
+<p class="ex-dica">Dica: são três papéis prontos conhecidos: <code>cluster-admin</code> faz tudo,
+<code>edit</code> cria e apaga, e o que só lê tem nome curto em inglês.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Um apply atravessa seis portas: o kubectl confere o formato, a autenticação diz quem é você, a autorização
+diz o que você pode, a admissão mutante preenche padrões e deixa webhooks alterarem o objeto, a validação
+confere o contrato do tipo e a admissão validadora aplica as políticas do time. Só depois o objeto vai para o
+etcd, e os controladores começam a trabalhar nele.</p>
+
+<p>Cada porta tem um formato de erro. <code>error parsing</code> é kubectl; <code>Unauthorized</code> é
+credencial; <code>Forbidden ... cannot</code> é RBAC; <code>is invalid: campo: motivo</code> é validação do
+tipo; <code>admission webhook ... denied</code> é política instalada. Ler o começo da mensagem economiza mais
+tempo do que ler o manifesto inteiro.</p>
+
+<p>Os padrões que aparecem no objeto e não no seu arquivo vêm da fase mutante — <code>targetPort</code>,
+<code>strategy</code>, <code>restartPolicy</code>, <code>imagePullPolicy</code> —, e os containers que você não
+escreveu também. A próxima aula olha para um componente que se instala como qualquer outro e que muita gente
+esquece: o metrics-server, sem o qual o <code>kubectl top</code> e o HPA ficam cegos.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Ordem: kubectl, autenticação, autorização, mutante, validação, validadora, etcd.</li>
+  <li><code>Forbidden</code> é RBAC; <code>is invalid</code> é o contrato do tipo.</li>
+  <li><code>denied the request</code> vem de uma política instalada, não do Kubernetes.</li>
+  <li>A fase mutante preenche padrões e injeta containers — o objeto cresce sem você.</li>
+  <li>Política tem modo: <code>Fail</code> bloqueia, <code>Warn</code> avisa, <code>Audit</code> registra.</li>
+  <li>Se a mensagem cita um verbo, é autorização; se cita um campo, é validação.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

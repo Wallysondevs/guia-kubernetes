@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Volumes projetados | Guia Kubernetes</title>
+<meta name="description" content="projected: juntar ConfigMap, Secret, downwardAPI e token de ServiceAccount num diretório só. As fontes, as permissões, as colisões e quando isso resolve um problema real.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Volumes <span class="hl">projetados</span></h1>
+<p class="intro">Todo <code>kubectl describe pod</code> já mostrou isso para a Ana e ela nunca entendeu: um
+volume chamado <code>kube-api-access-xxxxx</code>, do tipo <em>Projected</em>. Nesta aula ela descobre o que é
+um volume projetado — a possibilidade de juntar ConfigMap, Secret, dados do próprio pod e token de conta de
+serviço num diretório só —, aprende as quatro fontes, o que acontece quando duas delas escrevem o mesmo
+arquivo e por que isso resolve um problema que três volumes separados não resolvem.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um volume <code>projected</code> e o que ele já faz em todo pod.</li>
+  <li>As quatro fontes: <code>configMap</code>, <code>secret</code>, <code>downwardAPI</code> e
+  <code>serviceAccountToken</code>.</li>
+  <li>Como expor o nome, o namespace e as etiquetas do pod como arquivos.</li>
+  <li>Permissões, <code>items</code> e o que acontece quando duas fontes colidem.</li>
+  <li>Por que o token de ServiceAccount é projetado e não guardado num Secret.</li>
+  <li>Quando vale juntar tudo e quando três volumes separados são mais claros.</li>
+</ul>
+</div>
+
+<h2>1. A cena: três volumes e uma pasta</h2>
+
+<p>O site da padaria precisava de três coisas ao subir: a tabela de preços (que vinha de um ConfigMap), a
+senha do banco (de um Secret) e o próprio nome do pod, para assinar as linhas de log e as métricas. A Ana
+resolveu do jeito óbvio: três volumes, três montagens, em três pastas diferentes — <code>/config</code>,
+<code>/etc/padaria</code> e <code>/etc/podinfo</code>.</p>
+
+<p>Funcionou, e ficou feio. O programa passou a ter três caminhos para ler, o manifesto ficou com seis blocos
+repetidos e o time de plantão precisava lembrar de três pastas. Quando entrou mais um arquivo de configuração,
+virou quatro pastas. Foi aí que ela viu, no <code>describe</code> de um pod, um volume diferente de todos os
+que ela tinha escrito: <code>Projected</code>.</p>
+
+<p>Aquele volume é do próprio Kubernetes. Todo pod ganha um, chamado
+<code>kube-api-access-&lt;código&gt;</code>, que junta num diretório só o token da conta de serviço, a cadeia de
+certificados do cluster e o namespace — tudo o que o programa precisa para falar com o servidor de API. É o
+mesmo recurso que a Ana precisava: várias fontes de dados, uma pasta, uma montagem.</p>
+
+<p>O <code>describe</code> de qualquer pod mostra esse volume, e a leitura vale ouro para entender a
+mecânica:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe pod web
+Volumes:
+  kube-api-access-t6csd:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true</pre>
+
+<p>Leia as linhas de baixo: um único volume, três fontes. <code>ConfigMapName</code> é a cadeia de
+certificados do cluster, <code>DownwardAPI</code> diz que ele expõe o namespace do pod e
+<code>TokenExpirationSeconds</code> é o prazo do token. É o mesmo padrão de manifesto que você vai escrever
+nesta aula — só que escrito pelo próprio Kubernetes.</p>
+
+<h2>2. O que é um volume projetado</h2>
+
+<p>Um volume <code>projected</code> não guarda dados: ele <em>projeta</em>. Você declara uma lista de
+<code>sources</code> e o kubelet escreve o conteúdo de todas elas no mesmo diretório, como se fossem arquivos
+de uma pasta comum. Cada fonte continua sendo o que é — ConfigMap, Secret, informação do pod, token —, mas o
+container vê um diretório único.</p>
+
+<p>A vantagem é dupla. Para o manifesto, é menos repetição: um <code>volume</code>, um
+<code>volumeMount</code>. Para o programa, é um caminho só: ele lê <code>/etc/padaria/preco</code>,
+<code>/etc/padaria/senha</code> e <code>/etc/padaria/namespace</code> sem saber de onde cada um veio. Aliás,
+é exatamente assim que as bibliotecas de cliente do Kubernetes encontram o token: elas procuram um caminho
+fixo e ele está lá porque o volume projetado padrão montou.</p>
+
+<dl class="anatomy">
+<dt>projected</dt>
+<dd>O tipo de volume que junta várias fontes num diretório só.</dd>
+<dt>sources</dt>
+<dd>A lista obrigatória de fontes. Cada item é um <code>configMap</code>, <code>secret</code>,
+<code>downwardAPI</code> ou <code>serviceAccountToken</code>.</dd>
+<dt>downwardAPI</dt>
+<dd>A fonte que expõe informação do próprio pod: nome, namespace, etiquetas, limites de recurso.</dd>
+<dt>fieldRef</dt>
+<dd>O seletor de um campo do pod, como <code>metadata.name</code> ou <code>metadata.namespace</code>.</dd>
+<dt>serviceAccountToken</dt>
+<dd>A fonte que gera um token de conta de serviço com público e prazo definidos.</dd>
+<dt>audience</dt>
+<dd>Para quem o token vale. Um token com público próprio não serve para outro sistema.</dd>
+<dt>defaultMode</dt>
+<dd>Permissões dos arquivos do volume, em octal. Pode ser sobrescrito por fonte.</dd>
+</dl>
+
+<h2>3. As quatro fontes</h2>
+
+<p>São quatro, e cada uma responde a uma pergunta diferente. A tabela abaixo é o mapa; o resto da aula
+percorre cada uma.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Fonte</th><th>O que traz</th><th>Exemplo de uso</th></tr>
+</thead>
+<tbody>
+<tr><td><code>configMap</code></td><td>as chaves de um ConfigMap, um arquivo por chave</td><td>tabela de preços,
+arquivo de configuração</td></tr>
+<tr><td><code>secret</code></td><td>as chaves de um Secret, decodificadas</td><td>senha do banco, certificado</td></tr>
+<tr><td><code>downwardAPI</code></td><td>dados do próprio pod</td><td>nome do pod no log, namespace no
+relatório</td></tr>
+<tr><td><code>serviceAccountToken</code></td><td>token de conta de serviço com prazo</td><td>falar com a API do
+cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Todas as fontes aceitam <code>items</code>, com <code>key</code> (para ConfigMap e Secret) e
+<code>path</code> (o nome do arquivo). No <code>downwardAPI</code>, o <code>items</code> é obrigatório: cada
+item diz qual <code>fieldRef</code> vai virar qual <code>path</code>. E todas podem receber um
+<code>mode</code> próprio, quando você quer permissões diferentes por arquivo.</p>
+
+<h2>4. Juntando ConfigMap e Secret</h2>
+
+<p>A caixa começa com o manifesto bagunçado da cena: dois volumes separados, duas pastas. A missão é juntar
+tudo num volume projetado, mantendo a leitura em <code>/etc/padaria</code>. O programa não muda uma linha —
+muda o manifesto.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.volumes.0.projected.sources.0.configMap.name=cardapio;;campo:Pod/web|spec.volumes.0.projected.sources.1.secret.name=banco;;campo:Pod/web|spec.containers.0.volumeMounts.0.mountPath=/etc/padaria;;texto:Running">
+  <p class="try-task">Troque os dois volumes por um volume <code>projected</code> com as fontes
+  <code>configMap: cardapio</code> e <code>secret: banco</code>, montado em <code>/etc/padaria</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: banco
+data:
+  senha: czNuaDQ=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:2.0
+      volumeMounts:
+        - name: config
+          mountPath: /etc/padaria
+        - name: segredos
+          mountPath: /etc/padaria
+  volumes:
+    - name: config
+      configMap:
+        name: cardapio
+    - name: segredos
+      secret:
+        secretName: banco</pre>
+<pre class="out">
+configmap/cardapio created
+secret/banco created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: banco
+data:
+  senha: czNuaDQ=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:2.0
+      volumeMounts:
+        - name: tudo
+          mountPath: /etc/padaria
+  volumes:
+    - name: tudo
+      projected:
+        sources:
+          - configMap:
+              name: cardapio
+          - secret:
+              name: banco</pre>
+</div>
+
+<p>O detalhe que faz a diferença está no que <em>sai</em> do manifesto: uma montagem só. No estado inicial, as
+duas montagens apontam para o mesmo <code>mountPath</code>, e o Kubernetes não junta o conteúdo de dois
+volumes no mesmo caminho — ele monta um e o outro fica inacessível (ou o pod nem sobe, dependendo da ordem).
+Não é um merge: é sobreposição, e sobreposição é sempre um erro.</p>
+
+<p>Com <code>projected</code>, o merge é explícito e acontece dentro do volume. O diretório
+<code>/etc/padaria</code> passa a ter dois arquivos: <code>preco</code>, vindo do ConfigMap, e
+<code>senha</code>, vindo do Secret. Cada fonte mantém a regra de sempre: uma chave, um arquivo, nome da chave
+como nome do arquivo.</p>
+
+<h2>5. O downwardAPI: o pod falando de si</h2>
+
+<p>A terceira fonte é a mais subestimada. O <code>downwardAPI</code> expõe informação do próprio pod como
+arquivo: nome, namespace, etiquetas, anotações, limites de CPU e memória. É o que permite que a mesma imagem
+rode em dez ambientes diferentes e saiba onde está, sem variável injetada por fora.</p>
+
+<p>Os campos mais usados em <code>fieldRef.fieldPath</code> são <code>metadata.name</code>,
+<code>metadata.namespace</code>, <code>metadata.labels</code> e <code>metadata.annotations</code>. Para
+recurso, existe o <code>resourceFieldRef</code>, que expõe <code>limits.cpu</code> e
+<code>limits.memory</code> — útil quando o programa quer dimensionar o próprio pool de conexões pelo limite que
+recebeu.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.volumes.0.projected.sources.2.downwardAPI.items.0.fieldRef.fieldPath=metadata.namespace;;campo:Pod/web|spec.volumes.0.projected.sources.2.downwardAPI.items.0.path=namespace;;campo:Pod/web|spec.volumes.0.projected.sources.2.downwardAPI.items.1.fieldRef.fieldPath=metadata.name;;texto:Running">
+  <p class="try-task">Acrescente ao volume projetado uma fonte <code>downwardAPI</code> que escreva o namespace
+  no arquivo <code>namespace</code> e o nome do pod no arquivo <code>pod</code>. A pasta
+  <code>/etc/padaria</code> já tem preço e senha.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: banco
+data:
+  senha: czNuaDQ=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:2.0
+      volumeMounts:
+        - name: tudo
+          mountPath: /etc/padaria
+  volumes:
+    - name: tudo
+      projected:
+        sources:
+          - configMap:
+              name: cardapio
+          - secret:
+              name: banco</pre>
+<pre class="out">
+configmap/cardapio created
+secret/banco created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: banco
+data:
+  senha: czNuaDQ=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:2.0
+      volumeMounts:
+        - name: tudo
+          mountPath: /etc/padaria
+  volumes:
+    - name: tudo
+      projected:
+        sources:
+          - configMap:
+              name: cardapio
+          - secret:
+              name: banco
+          - downwardAPI:
+              items:
+                - path: namespace
+                  fieldRef:
+                    fieldPath: metadata.namespace
+                - path: pod
+                  fieldRef:
+                    fieldPath: metadata.name</pre>
+</div>
+
+<p>Repare na ordem dos campos do item: primeiro o <code>path</code> (o nome do arquivo dentro da pasta),
+depois o <code>fieldRef</code> com o <code>fieldPath</code> (o dado do pod). É o inverso do ConfigMap, onde
+<code>key</code> vem antes de <code>path</code>. Trocar isso é erro de validação — e, como o validador aponta
+o campo exato, sai do susto rápido.</p>
+
+<p>Depois de aplicar, a pasta fica assim, com os dois arquivos novos ao lado dos que já existiam:</p>
+
+<pre class="term">/ # ls /etc/padaria
+namespace  pod  preco  senha
+
+/ # cat /etc/padaria/namespace
+default</pre>
+
+<p>Quatro arquivos, três fontes, um volume. E note que o <code>cat</code> do namespace devolve
+<code>default</code> — o mesmo valor que apareceria em <code>metadata.namespace</code>, sem ninguém precisar
+injetar variável nenhuma.</p>
+
+<p>O uso clássico é o log. Um programa que escreve <code>{"pod": "...", "ns": "..."}</code> em cada linha
+permite que a busca no agregador de logs encontre tudo de um pod específico. Sem isso, você tem linhas soltas
+de três réplicas com a mesma aparência e nenhuma forma de separar. Com o arquivo ali, é uma leitura no start e
+o nome entra em todas as linhas.</p>
+
+<h2>6. O token projetado</h2>
+
+<p>A quarta fonte é a que explica o volume esquisito do <code>describe</code>. O <code>serviceAccountToken</code>
+gera um token novo para o pod, com dois parâmetros que importam: <code>audience</code> (para quem aquele token
+vale) e <code>expirationSeconds</code> (quanto tempo ele dura). O kubelet renova antes de vencer, e o arquivo
+no volume acompanha — como todo volume projetado.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/web|spec.volumes.0.projected.sources.1.serviceAccountToken.audience=padaria;;campo:Pod/web|spec.volumes.0.projected.sources.1.serviceAccountToken.expirationSeconds=3600;;campo:Pod/web|spec.volumes.0.projected.sources.1.serviceAccountToken.path=token;;texto:Running">
+  <p class="try-task">O serviço vai chamar um sistema interno que exige um token próprio. Acrescente a fonte
+  <code>serviceAccountToken</code> com <code>audience: padaria</code>, <code>expirationSeconds: 3600</code> e
+  <code>path: token</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:2.0
+      volumeMounts:
+        - name: tudo
+          mountPath: /etc/padaria
+  volumes:
+    - name: tudo
+      projected:
+        sources:
+          - configMap:
+              name: cardapio</pre>
+<pre class="out">
+configmap/cardapio created
+pod/web created
+
+NAME   READY   STATUS    RESTARTS   AGE
+web    1/1     Running   0          9m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  preco: "4.50"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:2.0
+      volumeMounts:
+        - name: tudo
+          mountPath: /etc/padaria
+  volumes:
+    - name: tudo
+      projected:
+        sources:
+          - configMap:
+              name: cardapio
+          - serviceAccountToken:
+              audience: padaria
+              expirationSeconds: 3600
+              path: token</pre>
+</div>
+
+<p>Aqui vale a honestidade sobre o painel: ele guarda o manifesto e mostra o pod em <code>Running</code>, mas
+não fabrica token nenhum — não há servidor de API emitindo credencial na simulação. Num cluster de verdade, o
+arquivo <code>/etc/padaria/token</code> existe com um JWT de verdade, válido por uma hora e renovado sozinho.
+O que você aprende aqui é a forma do manifesto e o motivo dela existir.</p>
+
+<p>E o motivo é segurança. Antes, o token de uma conta de serviço era um Secret permanente, criado
+automaticamente, com prazo infinito e sem público definido: quem copiasse aquele objeto tinha acesso para
+sempre. O token projetado tem prazo, tem público e é rotacionado — três propriedades que um segredo estático
+nunca teve.</p>
+
+<h2>7. Permissões, colisões e o que mais dá errado</h2>
+
+<p>O <code>defaultMode</code> do volume projetado vale para todos os arquivos; cada fonte pode sobrescrever com
+o seu próprio <code>defaultMode</code>, e cada <code>item</code> pode ter o seu <code>mode</code>. Para segredo
+em pasta compartilhada, o ajuste comum é <code>0400</code> no Secret e <code>0444</code> no ConfigMap.</p>
+
+<p>A colisão é o erro silencioso. Duas fontes escrevendo o mesmo <code>path</code> produzem um resultado
+indefinido na prática: uma sobrescreve a outra, e você descobre na madrugada. A regra é simples e vale como
+disciplina: cada fonte escreve em nomes diferentes. Se as chaves colidem, use <code>items</code> para renomear
+na hora de projetar — <code>preco</code> do ConfigMap pode virar <code>preco.txt</code>, e o
+<code>preco</code> do Secret continua sendo o dele.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Situação</th><th>O que acontece</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td>duas fontes, mesmo <code>path</code></td><td>uma sobrescreve a outra</td><td>renomear com
+<code>items</code></td></tr>
+<tr><td>fonte sem <code>sources</code></td><td>erro de validação no apply</td><td><code>sources</code> é
+obrigatório e não pode ser vazio</td></tr>
+<tr><td><code>downwardAPI</code> sem <code>items</code></td><td>erro de validação</td><td>cada campo precisa de
+<code>path</code> e <code>fieldRef</code></td></tr>
+<tr><td>ConfigMap ou Secret ausente</td><td>pod parado antes de criar o container</td><td>criar a fonte antes, ou
+marcar como opcional</td></tr>
+<tr><td>fonte opcional com <code>optional: true</code></td><td>a pasta monta sem aquela fonte</td><td>usar quando o
+arquivo é enfeite</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma palavra sobre o <code>optional: true</code>. Ele parece um detalhe de conveniência e é, na verdade,
+uma decisão sobre falhar cedo ou tarde: com a fonte opcional, a pasta monta sem o arquivo e o programa
+descobre na primeira leitura, com o erro que ele mesmo escreveu; sem ela, o pod nem sobe e o erro é do
+Kubernetes, na cara, antes de qualquer linha de código rodar. Para configuração obrigatória, prefira falhar
+antes — pod parado é mais fácil de diagnosticar que programa lendo arquivo vazio.</p>
+
+<p>A penúltima linha é a que mais aparece em produção. O pod não falha: ele espera. Sem log, sem erro na
+aplicação, só um <code>ContainerCreating</code> que não anda. O motivo está no evento
+<code>FailedMount</code> do <code>describe</code>, e a causa costuma ser ordem: o manifesto aplicou o pod antes
+do ConfigMap.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Critério</th><th>Um volume projetado</th><th>Vários volumes separados</th></tr>
+</thead>
+<tbody>
+<tr><td>manifesto</td><td>um volume, uma montagem</td><td>um volume e uma montagem por fonte</td></tr>
+<tr><td>caminho no programa</td><td>uma pasta só</td><td>uma pasta por assunto</td></tr>
+<tr><td>permissões</td><td>por item, dentro da mesma pasta</td><td>por volume inteiro</td></tr>
+<tr><td>leitura de plantão</td><td>precisa saber que é projetado</td><td>cada pasta diz o que é</td></tr>
+<tr><td>quando preferir</td><td>programa que lê tudo de um diretório</td><td>assuntos independentes, times
+diferentes</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Não existe resposta certa universal. Programa legado que exige cinco arquivos em <code>/etc/app</code>
+ganha muito com projetado. Configuração e credencial de assuntos diferentes, mantidas por times diferentes,
+ficam mais claras em volumes separados — quem mexe no ConfigMap não precisa abrir o manifesto do Secret.</p>
+
+<h2>8. Quando isso resolve um problema real</h2>
+
+<p>Três situações aparecem sempre. A primeira é o programa que só sabe ler de uma pasta: montar tudo em
+<code>/etc/padaria</code> evita gambiarra de caminho no código. A segunda é a identidade: o pod precisa saber o
+próprio nome e o namespace para log e métrica, e o <code>downwardAPI</code> entrega isso sem
+<code>env</code> e sem template. A terceira é o token com público próprio, para integrar com um sistema que
+recusa o token padrão do cluster.</p>
+
+<p>Há ainda um quarto caso, mais sutil: reduzir a superfície. Um volume projetado monta <em>exatamente</em> os
+arquivos listados. Se o ConfigMap tem dez chaves e o programa só precisa de duas, o <code>items</code> de cada
+fonte corta o resto — e o container não vê o que não precisa ver. É o mesmo raciocínio de permissão mínima,
+aplicado a arquivos.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o nome do pod que ninguém sabia</h3>
+<p>Três réplicas escreviam log idêntico e o plantão não conseguia dizer qual delas estava lenta. A solução
+foi um <code>downwardAPI</code> projetando <code>metadata.name</code> em <code>/etc/padaria/pod</code> e o
+programa passando a incluir esse nome em cada linha. Nenhuma mudança de infraestrutura, nenhuma variável nova
+no Deployment: só o arquivo e a leitura dele.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a colisão que ninguém viu</h3>
+<p>ConfigMap e Secret tinham a chave <code>config</code>, e as duas fontes foram projetadas na mesma pasta. O
+programa passou a ler o valor do Secret em vez do ConfigMap, e um preço virou senha no relatório. O conserto
+foi renomear com <code>items</code> — <code>config</code> virou <code>config.json</code> numa fonte e
+<code>config.secret</code> na outra. Desde então, o time projeta com nomes que dizem a origem.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o token que durou para sempre</h3>
+<p>Um script antigo usava o token de um Secret permanente para chamar a API do cluster. Quando a política da
+empresa passou a exigir credencial de curta duração, o time trocou o Secret por
+<code>serviceAccountToken</code> com <code>expirationSeconds: 3600</code> e público próprio. O script não
+mudou: ele já lia o token do arquivo. Mudou a fonte, e a credencial passou a expirar sozinha.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que o volume <code>projected</code> faz?</p>
+<label><input type="radio" name="p1"> copia os arquivos para dentro da imagem</label>
+<label><input type="radio" name="p1"> criptografa o conteúdo das fontes</label>
+<label><input type="radio" name="p1"> junta várias fontes num diretório só, com uma montagem</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Qual fonte expõe o nome do pod como arquivo?</p>
+<label><input type="radio" name="p2"> <code>downwardAPI</code> com <code>fieldRef</code></label>
+<label><input type="radio" name="p2"> <code>configMap</code> com <code>items</code></label>
+<label><input type="radio" name="p2"> <code>serviceAccountToken</code> com <code>audience</code></label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Duas fontes projetam arquivos com o mesmo <code>path</code>.
+O que fazer?</p>
+<label><input type="radio" name="p3"> nada: o Kubernetes soma os dois conteúdos</label>
+<label><input type="radio" name="p3"> renomear com <code>items</code>, para não haver colisão</label>
+<label><input type="radio" name="p3"> montar em dois <code>mountPath</code> iguais</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o campo do caminho</h2>
+<p>No <code>downwardAPI</code>, cada item precisa dizer o campo do pod e o nome do arquivo. Qual é o nome do
+campo que diz <em>qual dado do pod</em> será exposto?</p>
+<div class="ex-code">- path: namespace<br>  <input aria-label="resposta 1" data-answer="fieldRef" placeholder="...">:<br>    fieldPath: metadata.namespace</div>
+<p class="ex-dica">Dica: é a mesma palavra usada para selecionar campos do pod em variáveis de ambiente.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Volume projetado é a resposta para “preciso de vários arquivos numa pasta só”. Você declara um volume
+<code>projected</code> com a lista de <code>sources</code> e uma única montagem; o kubelet escreve o conteúdo
+de todas as fontes no mesmo diretório. As quatro fontes são <code>configMap</code>, <code>secret</code>,
+<code>downwardAPI</code> e <code>serviceAccountToken</code>.</p>
+
+<p>O <code>downwardAPI</code> expõe dados do pod (nome, namespace, etiquetas) como arquivos e é obrigatório
+com <code>items</code>. O token projetado tem público e prazo, é renovado sozinho e substituiu o Secret
+permanente de conta de serviço. Permissões vêm do <code>defaultMode</code>, ajustáveis por fonte e por item, e
+duas fontes com o mesmo caminho se sobrescrevem — renomeie com <code>items</code>.</p>
+
+<p>A última aula deste bloco é a que organiza tudo o que veio antes: uma checklist de boas práticas de
+configuração — o que nunca pode entrar num ConfigMap, como nomear objetos, quando versionar e por que tornar
+imutável o que não muda.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>projected</code> junta fontes; o <code>sources</code> é obrigatório.</li>
+  <li>Fontes: <code>configMap</code>, <code>secret</code>, <code>downwardAPI</code>,
+  <code>serviceAccountToken</code>.</li>
+  <li><code>downwardAPI</code> sempre com <code>items</code> (<code>path</code> + <code>fieldRef</code>).</li>
+  <li>Token projetado tem <code>audience</code> e <code>expirationSeconds</code>.</li>
+  <li>Mesmo <code>path</code> em duas fontes = colisão; renomeie.</li>
+  <li>Todo pod já tem um volume projetado: o <code>kube-api-access-…</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

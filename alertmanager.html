@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alertmanager | Guia Kubernetes</title>
+<meta name="description" content="Alertmanager na prática: agrupamento, rotas, inibição e silêncios para o plantão não ser acordado por ruído, e como rodar o Alertmanager no cluster com a config num ConfigMap.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Alertmanager</span></h1>
+<p class="intro">O banco da padaria reiniciou às 3h07 e o celular da Ana recebeu quarenta e sete mensagens em
+quatro minutos: uma por alerta, uma por instância, uma por serviço que dependia do banco, e mais três de
+“voltou ao normal”. Ela levantou, olhou o painel, viu tudo verde e não conseguiu dormir de novo. O
+problema não estava no Prometheus, que detectou direitinho. Estava no <strong>Alertmanager</strong>, a peça
+que decide <em>quem</em> é avisado, <em>quantas</em> vezes e <em>quando</em> — e que, sem configuração, é
+uma torneira aberta de notificações.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o Alertmanager faz depois que o alerta dispara — e o que ele não faz.</li>
+  <li>Agrupamento: <code>group_by</code>, <code>group_wait</code>, <code>group_interval</code> e
+  <code>repeat_interval</code>.</li>
+  <li>Roteamento por árvore de rotas, com <code>matchers</code> e <code>continue</code>.</li>
+  <li>Inibição: um alerta que cala os outros enquanto a causa está de pé.</li>
+  <li>Silêncio: o botão do plantão para uma janela de manutenção.</li>
+  <li>Rodar o Alertmanager no cluster, com a configuração num ConfigMap e o Service na porta 9093.</li>
+</ul>
+</div>
+
+<h2>1. A cena: quarenta e sete mensagens, um problema</h2>
+
+<p>A regra que disparou era simples e correta: “se o banco não responde há dois minutos, avise”. O banco
+reiniciou, e a regra disparou para cada instância, cada tabela monitorada e cada serviço que consultava o
+banco. Como ninguém tinha configurado nada além do endereço de e-mail, o Alertmanager tratou cada alerta
+como um evento independente e mandou todos na hora.</p>
+
+<p>O estrago não é o susto: é a perda de confiança. Depois de duas noites assim, a pessoa de plantão começa
+a ignorar o celular, e o alerta que importa — o disco enchendo, o pagamento parado — passa junto com o
+ruído. Configurar o Alertmanager é, na prática, decidir o que <em>não</em> merece acordar ninguém.</p>
+
+<p>Vale separar as responsabilidades desde já. O <strong>Prometheus</strong> (ou qualquer outra fonte)
+avalia as regras e diz “este alerta está ativo”. O <strong>Alertmanager</strong> recebe esses alertas e
+decide o destino: agrupa, espera, roteia, inibe, silencia e entrega. Ele não consulta métrica, não conhece
+seu cluster e não sabe se o pod existe. É um carteiro com regras de triagem.</p>
+
+<h2>2. O que o Alertmanager faz (e o que não faz)</h2>
+
+<p>A analogia que ajuda: pense na recepção de um prédio. O Prometheus é o sensor de fumaça, que grita “tem
+fumaça no terceiro andar”. O Alertmanager é o porteiro, que decide se aquilo vira uma ligação para os
+bombeiros, um aviso no grupo do condomínio ou nada — porque o terceiro andar já está em obras avisadas e
+alguém registrou isso na portaria.</p>
+
+<p>O sensor não sabe de obras; o porteiro não sabe medir fumaça. Cada um faz a sua parte, e o desenho
+funciona porque a fronteira é clara. Quando alguém tenta colocar regra de negócio no Alertmanager (“só
+avise se o faturamento caiu”), o resultado é uma configuração confusa e difícil de testar.</p>
+
+<dl class="anatomy">
+<dt>alerta</dt>
+<dd>O aviso que chega do Prometheus, com nome, etiquetas (<code>alertname</code>, <code>severity</code>,
+<code>instance</code>…) e o instante em que começou.</dd>
+<dt>receiver</dt>
+<dd>O destino final: e-mail, Slack, webhook, PagerDuty. Cada um tem um nome, e as rotas apontam para
+nomes.</dd>
+<dt>route</dt>
+<dd>A regra que decide o destino, comparando as etiquetas do alerta. As rotas formam uma árvore, com uma
+raiz que precisa de <code>receiver</code> padrão.</dd>
+<dt>group_by</dt>
+<dd>As etiquetas usadas para juntar alertas num mesmo aviso. <code>[alertname, cluster]</code> manda um
+aviso por combinação.</dd>
+<dt>inhibit_rule</dt>
+<dd>Regra de silenciamento automático: se um alerta grave está ativo, ele cala os alertas derivados
+enquanto durar.</dd>
+<dt>silence</dt>
+<dd>Uma janela em que alertas que casam com certas etiquetas não são notificados. Tem início, fim, autor e
+justificativa.</dd>
+</dl>
+
+<p>Uma coisa que o Alertmanager <em>não</em> faz: guardar histórico de alertas para consulta. Ele não é
+banco de dados de observabilidade; é trânsito. O histórico fica no Prometheus (ou no sistema de métricas),
+e o que o Alertmanager guarda são os silêncios e o estado dos grupos em memória — motivo pelo qual, ao
+reiniciar sem volume, os silêncios somem.</p>
+
+<h2>3. Agrupamento: um aviso em vez de cinquenta</h2>
+
+<p>Agrupar é a primeira defesa contra o ruído, e ela é feita com uma pergunta: <em>o que precisa estar junto
+numa mesma mensagem?</em> Se a resposta é “todos os alertas do mesmo serviço”, o <code>group_by</code> é
+<code>[service]</code>. Se é “cada alerta, separado”, você escolhe <code>[alertname]</code> — e aí volta o
+problema das quarenta e sete mensagens, porque instâncias diferentes do mesmo banco têm etiquetas
+diferentes.</p>
+
+<p>Além do agrupamento, existem três intervalos que controlam o ritmo. Eles são a diferença entre um
+plantão que dorme e um que levanta a cada trinta segundos.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Padrão</th><th>O que controla</th></tr>
+</thead>
+<tbody>
+<tr><td><code>group_wait</code></td><td><code>30s</code></td><td>quanto esperar, depois do primeiro alerta, para ver se chegam outros do mesmo grupo antes de enviar</td></tr>
+<tr><td><code>group_interval</code></td><td><code>5m</code></td><td>intervalo mínimo entre dois envios do mesmo grupo, quando chegam alertas novos</td></tr>
+<tr><td><code>repeat_interval</code></td><td><code>4h</code></td><td>de quanto em quanto tempo reenviar um alerta que continua ativo</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>group_wait</code> é o mais subestimado dos três. Com trinta segundos, o Alertmanager segura o
+primeiro alerta por meia dúzia de batidas do coração e junta o que chegar nesse intervalo: no caso da Ana,
+as quarenta e sete mensagens viram <em>uma</em>, com uma lista dentro. Numa pane de rede, onde tudo falha em
+dois segundos, é o que separa uma notificação de um bombardeio.</p>
+
+<p>O <code>repeat_interval</code> é o outro extremo: alerta ativo que ninguém resolveu precisa continuar
+lembrando, mas quatro horas é um ritmo razoável para o plantão. Diminuir para quinze minutos porque “é
+crítico” costuma ter efeito contrário: a pessoa aprende a ignorar. Se um alerta precisa de mais urgência que
+isso, o problema é o roteamento — ele deve ir para outra pessoa, não repetir mais vezes.</p>
+
+<h2>4. Roteamento: cada alerta no seu dono</h2>
+
+<p>A configuração de rotas é uma árvore. A raiz precisa de um <code>receiver</code> — o destino de tudo o
+que não casar com nenhuma rota filha — e as filhas refinam. Cada filha declara <code>matchers</code>, que
+comparam etiquetas do alerta com igualdade (<code>=</code>) ou expressão regular
+(<code>=~</code>).</p>
+
+<pre class="file" data-file="alertmanager.yml">route:
+  receiver: plantao
+  group_by: [alertname, servico]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity = "critical"
+        - servico = "pagamento"
+      receiver: celular-ana
+      group_wait: 10s
+    - matchers:
+        - servico =~ "cardapio|estoque"
+      receiver: equipe-loja
+      continue: true
+receivers:
+  - name: plantao
+  - name: celular-ana
+  - name: equipe-loja</pre>
+
+<p>Duas ideias merecem atenção. A primeira: a rota filha <em>herda</em> o que não declarar. Se ela não tem
+<code>group_by</code>, usa o da raiz; se não tem <code>repeat_interval</code>, idem. Isso permite escrever
+pouco e manter coerência.</p>
+
+<p>A segunda: por padrão, o alerta que casa com uma filha para ali. Com <code>continue: true</code>, ele
+continua descendo e pode ser notificado por mais de uma rota — útil quando o pagamento precisa avisar o
+celular da Ana <strong>e</strong> o grupo da loja. Usar <code>continue</code> sem necessidade é a receita
+para notificação duplicada.</p>
+
+<p>Todo <code>receiver</code> citado numa rota precisa existir na lista <code>receivers</code>. Se o nome não
+existir, o Alertmanager recusa a configuração na hora de carregar e continua rodando com a anterior — um
+detalhe que a seção 8 mostra na prática.</p>
+
+<h2>5. Inibição: quando um alerta cala o outro</h2>
+
+<p>Inibição é a parte mais elegante do Alertmanager e a menos usada. A ideia: quando existe um alerta que
+explica os demais, os demais não precisam ser enviados. O banco caiu? Então “site sem resposta”, “consulta
+lenta” e “erro 500 no pagamento” são consequências, não causas.</p>
+
+<pre class="file" data-file="alertmanager.yml">inhibit_rules:
+  - source_matchers:
+      - alertname = "BancoFora"
+    target_matchers:
+      - severity =~ "warning|critical"
+    equal: [servico, cluster]</pre>
+
+<p>Leia de baixo para cima: a regra só inibe alertas que tenham os mesmos valores em <code>equal</code>.
+Sem <code>equal</code>, um banco fora na produção calaria alertas do ambiente de teste — e o teste quebrado
+passaria despercebido. Com <code>equal: [servico, cluster]</code>, a inibição fica no contexto certo.</p>
+
+<p>Inibição não é permanente e não precisa de ninguém: dura enquanto o alerta de origem estiver ativo. É
+diferente de silêncio, que tem hora para acabar e um humano por trás. E é diferente de rota: rota muda o
+destino, inibição impede o envio.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mecanismo</th><th>Quem cria</th><th>Quanto dura</th><th>Use quando</th></tr>
+</thead>
+<tbody>
+<tr><td>rota</td><td>quem escreve a config</td><td>para sempre, até mudar a config</td><td>cada time/alerta tem um destino diferente</td></tr>
+<tr><td>inibição</td><td>quem escreve a config</td><td>enquanto o alerta de origem estiver ativo</td><td>uma causa conhecida gera vários sintomas</td></tr>
+<tr><td>silêncio</td><td>o plantão, na hora</td><td>a janela definida (<code>endsAt</code>)</td><td>manutenção planejada, deploy, teste de tiro</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>6. Silêncio: o botão do plantão</h2>
+
+<p>Silêncio é uma janela com etiquetas, autor e motivo. Ele não mexe no arquivo de configuração: é criado
+pela interface web (porta 9093) ou pela linha de comando, com <code>amtool</code>, e fica guardado no
+Alertmanager. Como ele guarda essa informação em disco, reiniciar o pod sem volume persistente apaga os
+silêncios — e os alertas voltam a tocar no meio da manutenção.</p>
+
+<p>A disciplina que evita desastre é curta: todo silêncio tem <code>endsAt</code>, todo silêncio tem
+comentário, e silêncio criado por causa de um deploy some quando o deploy termina. Silêncio sem prazo é
+alerta desligado com outro nome.</p>
+
+<p>Na configuração, o que existe é o oposto — as regras que garantem que um silêncio não engula o que não
+devia, e o caminho para a pessoa que criou o silêncio aparecer no aviso. O Alertmanager inclui as etiquetas
+<code>silenced</code> e <code>inhibited</code> na notificação, e é por isso que vale mandar o
+<code>createdBy</code> junto: quando o alerta volta, alguém pergunta “quem silenciou isso?” e a resposta está
+no próprio aviso.</p>
+
+<h2>7. A configuração mora num ConfigMap</h2>
+
+<p>No cluster, a config do Alertmanager não fica dentro da imagem: fica num ConfigMap, montado em
+<code>/etc/alertmanager</code>. O processo lê <code>/etc/alertmanager/alertmanager.yml</code>, e o nome do
+arquivo importa — é o padrão do <code>--config.file</code>.</p>
+
+<p>A caixa abaixo tem o ConfigMap e o Deployment. O Deployment está apontando para um ConfigMap que não
+existe e montando o diretório errado. Conserte as duas coisas e rode.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="objeto:ConfigMap/alertmanager-config;;campo:Deployment/alertmanager|spec.template.spec.volumes.0.configMap.name=alertmanager-config;;campo:Deployment/alertmanager|spec.template.spec.containers.0.volumeMounts.0.mountPath=/etc/alertmanager;;texto:Running">
+  <p class="try-task">Crie o ConfigMap <code>alertmanager-config</code> com a chave
+  <code>alertmanager.yml</code> e aponte o volume para ele, montado em <code>/etc/alertmanager</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.28.1
+          ports:
+            - containerPort: 9093
+          volumeMounts:
+            - name: config
+              mountPath: /etc/config
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-yml</pre>
+<pre class="out">
+deployment.apps/alertmanager created
+
+NAME                            READY   STATUS    RESTARTS   AGE
+alertmanager-ck7c5wth6w-dgzmc   1/1     Running   0          46s
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+data:
+  alertmanager.yml: |
+    route:
+      receiver: plantao
+      group_by: [alertname, servico]
+      group_wait: 30s
+      repeat_interval: 4h
+    receivers:
+      - name: plantao
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.28.1
+          ports:
+            - containerPort: 9093
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config</pre>
+</div>
+
+<p>Repare que o manifesto tem dois documentos separados por <code>---</code>: um ConfigMap e um Deployment.
+O painel aplica os dois e mostra os pods. E repare no detalhe que mais causa problema no mundo real: o pod
+fica <code>Running</code> mesmo apontando para um ConfigMap inexistente? Não — no cluster de verdade ele
+fica em <code>ContainerCreating</code> com o evento <code>configmap "alertmanager-yml" not found</code>. O
+painel do guia valida o manifesto e agenda o pod, mas não simula a montagem do volume; por isso a prova aqui
+é a estrutura do objeto, conferida pelo botão Verificar.</p>
+
+<h2>8. O Alertmanager rodando no cluster</h2>
+
+<p>Com a config no lugar, o pod sobe e escreve no log o que carregou. Esta é a transcrição do começo de um
+Alertmanager real, com a configuração vinda do ConfigMap:</p>
+
+<pre class="term">level=info msg="Starting Alertmanager" version="(version=0.28.1, branch=HEAD)"
+level=info msg="Loading configuration file" file=/etc/alertmanager/alertmanager.yml
+level=info msg="Completed loading of configuration file" file=/etc/alertmanager/alertmanager.yml
+level=info msg="Listening on" address=[::]:9093
+level=info msg="Listening on" address=0.0.0.0:9094
+level=info msg="Starting notification pipeline"</pre>
+
+<p>As duas portas contam a história: <strong>9093</strong> é a web, a API e a interface; <strong>9094</strong>
+é o canal de conversa entre réplicas do próprio Alertmanager. Numa instalação com mais de uma réplica, cada
+uma aponta para as outras e o estado (silêncios e notificações já enviadas) se propaga por ali — é o que
+evita que duas réplicas mandem o mesmo e-mail.</p>
+
+<p>Também vale saber que a configuração <strong>não é recarregada sozinha</strong>. Você edita o ConfigMap, o
+kubelet atualiza o arquivo dentro do pod em cerca de um minuto, e o Alertmanager continua com a config
+antiga até alguém mandar recarregar (um <code>POST /-/reload</code>, com
+<code>--web.enable-lifecycle</code>, ou um sinal). Em produção, isso costuma ser um container auxiliar que
+observa o ConfigMap e chama o reload — o mesmo padrão de sidecar da aula anterior.</p>
+
+<p>Tem um caminho mais rápido, e ele é ótimo para o dia a dia: criar o ConfigMap pela linha de comando,
+quando a config é pequena. A caixa abaixo faz isso e lê o resultado de volta.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="objeto:ConfigMap/alertmanager-config;;texto:route: plantao">
+  <p class="try-task">Crie o ConfigMap com o nome certo (<code>alertmanager-config</code>) e a chave
+  <code>route</code> valendo <code>plantao</code>. Depois leia o objeto com <code>-o yaml</code>.</p>
+<pre class="yaml">kubectl create configmap alertmanager-cfg --from-literal=route=plantao
+kubectl get configmap alertmanager-cfg -o yaml</pre>
+<pre class="out">
+ana@notebook:~$ kubectl create configmap alertmanager-cfg --from-literal=route=plantao
+configmap/alertmanager-cfg created
+
+ana@notebook:~$ kubectl get configmap alertmanager-cfg -o yaml
+apiVersion: v1
+data:
+  route: plantao
+kind: ConfigMap
+metadata:
+  name: alertmanager-cfg
+  namespace: default
+spec: {}
+</pre>
+<pre class="solucao">kubectl create configmap alertmanager-config --from-literal=route=plantao
+kubectl get configmap alertmanager-config -o yaml</pre>
+</div>
+
+<p>O <code>-o yaml</code> responde a pergunta “o que está gravado no cluster?”, que é diferente de “o que eu
+quis gravar”. Ver esse bloco <code>data</code> com a chave e o valor é a conferência mais barata que existe:
+se a chave estiver com outro nome, o arquivo montado no container vai ter outro nome, e o Alertmanager não
+vai encontrar a configuração que você escreveu.</p>
+
+<h2>9. Quando o alerta não chega</h2>
+
+<p>O sintoma é o pior possível: nada acontece. Nem notificação, nem erro visível. Nesse caso, o caminho é de
+trás para frente, a partir de quem deveria entregar.</p>
+
+<p>Primeiro: o Prometheus consegue falar com o Alertmanager? A config do Prometheus tem uma seção
+<code>alerting</code> com os endereços; o alvo é o Service na porta 9093. Se o Service estiver apontando para
+a porta errada do pod, a conexão é recusada e o Prometheus registra isso no próprio log (transcrição):</p>
+
+<pre class="term">level=warn component=notifier msg="Error sending alert" err="Post \"http://alertmanager:9093/api/v2/alerts\": dial tcp 10.96.12.7:9093: connect: connection refused"</pre>
+
+<p>Segundo: o Service alcança os pods certos? Se o <code>selector</code> não casar com as etiquetas do pod,
+o Service fica sem endpoints, e a conexão vai para lugar nenhum. Terceiro: as rotas casam com o alerta? Um
+alerta com <code>severity: warning</code> que só casa com uma rota de <code>critical</code> cai na raiz — e
+a raiz tem o <code>receiver</code> padrão, que pode ser um e-mail que ninguém lê.</p>
+
+<p>A caixa abaixo é o caso do Service. O Alertmanager escuta na 9093, e o Service está encaminhando para a
+80 — o erro clássico de quem copiou o modelo do nginx.</p>
+
+<div class="tryk8s" data-goal="campo:Service/alertmanager|spec.ports.0.targetPort=9093;;campo:Service/alertmanager|spec.selector.app=alertmanager;;texto:9093/TCP">
+  <p class="try-task">Corrija o <code>targetPort</code> para 9093 e o <code>selector</code> para casar com a
+  etiqueta do pod (<code>app: alertmanager</code>). A tabela tem de mostrar <code>9093/TCP</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+spec:
+  selector:
+    app: alert-manager
+  ports:
+    - port: 9093
+      targetPort: 80</pre>
+<pre class="out">
+service/alertmanager created
+
+NAME           TYPE        CLUSTER-IP    EXTERNAL-IP   PORT(S)    AGE
+alertmanager   ClusterIP   10.96.241.4   &lt;none&gt;        9093/TCP   4m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+spec:
+  selector:
+    app: alertmanager
+  ports:
+    - port: 9093
+      targetPort: 9093</pre>
+</div>
+
+<p>Com o Service certo, <code>alertmanager:9093</code> resolve dentro do cluster e o Prometheus entrega. Vale
+lembrar que esse endereço é interno: ninguém de fora chega nele sem um Ingress ou um
+<code>port-forward</code> — e é bom que seja assim, porque a interface do Alertmanager deixa qualquer um
+criar um silêncio.</p>
+
+<h2>10. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o silêncio que sobreviveu ao deploy</h3>
+<p>A Ana silenciou “tudo do serviço cardapio” por duas horas para um deploy. O deploy falhou, ela foi
+consertar, e o silêncio continuou valendo — o site ficou fora do ar por quarenta minutos sem ninguém ser
+avisado. A correção não é parar de usar silêncio: é silenciar pela etiqueta certa e sempre com
+<code>endsAt</code> curto.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a inibição que calou o ambiente errado</h3>
+<p>Uma regra de inibição sem <code>equal</code> deixou o banco de teste fora e calou os alertas de produção
+do mesmo serviço — o inverso do que se queria. O conserto foi acrescentar <code>equal: [cluster]</code> e
+testar a regra com um alerta de mentira. Inibição é a única das três que age sem humano no meio, então é a
+que mais precisa de revisão.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o Alertmanager que reiniciava e esquecia</h3>
+<p>O Deployment subia sem volume, e cada reinício apagava os silêncios guardados. Numa madrugada de
+manutenção, o pod foi reagendado e os alertas voltaram a tocar no meio da janela. A solução foi um volume
+para o diretório de dados e, mais tarde, uma réplica extra com as duas conversando na 9094.</p>
+</div>
+
+<h2>11. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o Alertmanager decide?</p>
+<label><input type="radio" name="q1"> se a métrica passou do limite e o alerta deve existir</label>
+<label><input type="radio" name="q1"> quem é avisado, quantas vezes e quando, depois que o alerta chega</label>
+<label><input type="radio" name="q1"> qual pod deve ser reiniciado quando o alerta dispara</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Para que serve o <code>group_wait</code>?</p>
+<label><input type="radio" name="q2"> para repetir o alerta a cada quatro horas enquanto ele durar</label>
+<label><input type="radio" name="q2"> para definir quem recebe cada alerta</label>
+<label><input type="radio" name="q2"> para esperar alguns segundos e juntar alertas do mesmo grupo antes de
+enviar</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual mecanismo tem autor, motivo e hora de acabar?</p>
+<label><input type="radio" name="q3"> o silêncio</label>
+<label><input type="radio" name="q3"> a inibição</label>
+<label><input type="radio" name="q3"> o <code>repeat_interval</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a rota do pagamento</h2>
+<p>Complete a rota para que alertas com <code>severity: critical</code> do serviço <code>pagamento</code>
+vão para o receiver <code>celular-ana</code>.</p>
+<div class="ex-code">  routes:
+    - matchers:
+        - severity = "critical"
+        - servico = "pagamento"
+      <input aria-label="resposta 1" data-answer="receiver" placeholder="...">: celular-ana</div>
+<p class="ex-dica">Dica: é o mesmo campo da raiz, que aponta para um nome que precisa existir na lista
+<code>receivers</code>. Sem ele, a config não carrega.</p>
+</div>
+
+<h2>12. Resumo</h2>
+
+<p>O Alertmanager é a peça que transforma “o alerta disparou” em “alguém foi avisado de forma útil”. Ele
+recebe alertas, agrupa por etiquetas, espera o <code>group_wait</code> para juntar o que chega junto, roteia
+pela árvore de rotas até um <code>receiver</code>, inibe derivados quando a causa está de pé e respeita os
+silêncios que o plantão criar.</p>
+
+<p>Os três mecanismos não competem: rota escolhe o destino, inibição cala o sintoma enquanto a causa durar,
+silêncio abre uma janela com autor e prazo. Configurar os três é o que separa o plantão que dorme do plantão
+que desliga o celular.</p>
+
+<p>No cluster, a config vive num ConfigMap montado em <code>/etc/alertmanager</code>, o Service aponta para
+a 9093 e as réplicas conversam na 9094. A config não recarrega sozinha, e os silêncios moram no disco do pod
+— dois motivos para tratar esse componente com volume e reload, não com reinício no escuro. Na <a href="tracing.html">aula de tracing</a>
+a Ana vai além do alerta: quando o problema é lentidão em uma requisição específica, quem responde é o
+trace.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Prometheus decide <em>se</em> alerta; Alertmanager decide <em>quem</em>, <em>quantas vezes</em> e
+  <em>quando</em>.</li>
+  <li><code>group_wait</code> junta, <code>group_interval</code> espaça, <code>repeat_interval</code>
+  lembra.</li>
+  <li>Rota muda o destino; inibição cala por causa conhecida; silêncio tem prazo e autor.</li>
+  <li>Use <code>equal</code> nas inibições, ou o ambiente errado fica mudo.</li>
+  <li>A config vem de ConfigMap e não recarrega sozinha: precisa de reload.</li>
+  <li>Service na 9093, réplicas na 9094; sem volume, os silêncios somem no reinício.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

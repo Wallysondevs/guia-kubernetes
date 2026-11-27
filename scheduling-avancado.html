@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scheduling avançado | Guia Kubernetes</title>
+<meta name="description" content="Scheduling avançado: pod affinity e anti-affinity, topologySpreadConstraints, topologyKey, maxSkew e como diagnosticar o pod que fica Pending sem explicação óbvia.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Scheduling <span class="hl">avançado</span></h1>
+<p class="intro">Numa terça-feira o nó <code>guia-worker</code> reiniciou por manutenção e o cardápio da Ana
+caiu pela metade. As quatro réplicas estavam todas ali: o agendador tinha escolhido o nó “com menos pods”, e
+no empate ele sempre começava pelo mesmo. O site não tinha proteção nenhuma contra a queda de um nó, embora
+tivesse quatro cópias. Nesta aula a Ana aprende a opinar não só sobre <em>onde</em> cada pod cai, mas sobre
+<em>com quem</em> ele cai e <em>quão espalhado</em> o conjunto fica — e a ler o <code>Pending</code> que
+nenhum evento parece explicar.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>As quatro camadas que decidem onde um pod cai, e qual delas resolve cada problema.</li>
+  <li><code>podAffinity</code> e <code>podAntiAffinity</code>: regras sobre outros pods, não sobre nós.</li>
+  <li>O que é <code>topologyKey</code> e por que ele é o eixo de qualquer regra de topologia.</li>
+  <li><code>topologySpreadConstraints</code>: <code>maxSkew</code>, <code>whenUnsatisfiable</code> e o que
+  muda na prática.</li>
+  <li>Como ler um evento de agendamento com vários motivos diferentes na mesma frase.</li>
+  <li>Por que uma regra de topologia pode reduzir a capacidade que você já pagou.</li>
+</ul>
+</div>
+
+<h2>1. A cena: quatro réplicas no mesmo nó</h2>
+
+<p>Quatro cópias parecem proteção, mas só são proteção se estiverem em lugares diferentes. O agendador do
+Kubernetes não tem preferência por espalhar quando os nós estão igualmente vazios: ele ordena os candidatos
+por quantidade de pods e, no empate, escolhe sempre o mesmo. Com o cluster recém-criado, as quatro réplicas
+do cardápio foram para o nó que veio primeiro na ordem.</p>
+
+<p>O resultado apareceu na manutenção: o nó saiu, os quatro pods saíram junto, e o site ficou fora do ar
+mesmo com três nós saudáveis ao lado. Nada estava configurado errado — nada estava configurado, o que é
+pior. O Kubernetes não adivinha que você quer alta disponibilidade; ele obedece ao que está escrito.</p>
+
+<p>As aulas anteriores mostraram como escolher o nó por etiqueta e como reservar um nó com taint. Aqui o
+assunto é o que falta: as regras que falam de <em>outros pods</em> e as que falam da <em>forma</em> da
+distribuição. São três ferramentas — afinidade entre pods, anti-afinidade e espalhamento por topologia — e
+todas giram em torno de uma ideia só: topologia.</p>
+
+<h2>2. As quatro camadas de decisão</h2>
+
+<p>Antes de escrever YAML, vale separar as perguntas. Cada ferramenta do agendador responde a uma pergunta
+diferente, e usar a errada gera <code>Pending</code> ou, pior, um cluster que parece saudável e cai
+inteiro.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Ferramenta</th><th>Pergunta</th><th>Escopo</th><th>Quando falha</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nodeSelector</code></td><td>em qual nó, por igualdade de etiqueta</td><td>o nó</td><td>nenhum
+nó tem a etiqueta</td></tr>
+<tr><td><code>nodeAffinity</code></td><td>em qual conjunto de nós, por expressão</td><td>o nó</td><td>nenhum
+nó casa com as expressões obrigatórias</td></tr>
+<tr><td>taint / toleration</td><td>quem tem permissão de entrar</td><td>o nó</td><td>o pod não tolera a
+mancha</td></tr>
+<tr><td><code>podAffinity</code> / <code>podAntiAffinity</code></td><td>com quais pods eu quero (ou não
+quero) ficar</td><td>os outros pods</td><td>a regra obrigatória não pode ser satisfeita</td></tr>
+<tr><td><code>topologySpreadConstraints</code></td><td>quão desequilibrado o conjunto pode ficar</td><td>a
+distribuição</td><td><code>maxSkew</code> estourado com <code>DoNotSchedule</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare que as três primeiras olham para o nó: “este nó serve?”. As duas últimas olham para o conjunto: “onde
+estão os outros pods deste serviço?”. É por isso que nenhuma quantidade de <code>nodeSelector</code> resolve o
+problema da Ana: prender cada réplica a um nó específico exigiria saber de antemão quantas réplicas existem e
+onde cada uma deve morar — e isso muda a cada <code>scale</code>.</p>
+
+<p>A ordem em que o agendador aplica também importa. Primeiro ele filtra: tira os nós sem recurso, sem a
+etiqueta, com mancha não tolerada, ou que violam uma regra obrigatória de afinidade. Depois ele pontua os que
+sobraram. Só existe <code>Pending</code> quando o filtro elimina todos — e é por isso que a mensagem do evento
+lista um motivo por nó, não um motivo só.</p>
+
+<h2>3. Afinidade entre pods: com quem eu quero ficar</h2>
+
+<p><code>podAffinity</code> diz “agende este pod num nó que já tem pods com estas etiquetas”. O caso clássico é
+o cache local: o serviço de relatórios fica mais rápido se estiver no mesmo nó que o cache que ele consulta.
+<code>podAntiAffinity</code> é o contrário: “não agende num nó que já tem pods com estas etiquetas” — o caso
+clássico é justamente o da Ana, separar réplicas do mesmo serviço.</p>
+
+<p>As duas regras usam a mesma estrutura: um <code>labelSelector</code>, que escolhe os pods de referência, e
+um <code>topologyKey</code>, que define o que conta como “perto”. Se o <code>topologyKey</code> é
+<code>kubernetes.io/hostname</code>, perto significa “no mesmo nó”. Se é
+<code>topology.kubernetes.io/zone</code>, perto significa “na mesma zona de disponibilidade” — e aí a regra
+passa a valer para um conjunto de nós, não para um.</p>
+
+<dl class="anatomy">
+<dt>topologyKey</dt>
+<dd>A etiqueta do nó que define o domínio. <code>kubernetes.io/hostname</code> para nó,
+<code>topology.kubernetes.io/zone</code> para zona.</dd>
+<dt>labelSelector</dt>
+<dd>Quais pods entram na conta: só os que casam com estas etiquetas.</dd>
+<dt>requiredDuringScheduling…</dt>
+<dd>Regra obrigatória. Se não der para cumprir, o pod fica <code>Pending</code>.</dd>
+<dt>preferredDuringScheduling…</dt>
+<dd>Preferência com <code>weight</code> de 1 a 100. O agendador tenta; se não der, agenda de
+qualquer jeito.</dd>
+<dt>maxSkew</dt>
+<dd>A diferença máxima permitida entre o domínio mais cheio e o mais vazio.</dd>
+<dt>whenUnsatisfiable</dt>
+<dd><code>DoNotSchedule</code> (obrigatório) ou <code>ScheduleAnyway</code> (só uma
+preferência).</dd>
+<dt>minDomains</dt>
+<dd>Quantos domínios precisam existir para a regra valer. Evita exigir espalhamento onde há um nó
+só.</dd>
+<dt>spread</dt>
+<dd>A distribuição final dos pods entre os domínios de topologia.</dd>
+</dl>
+
+<p>Duas armadilhas de leitura. A primeira: <code>podAntiAffinity</code> olha para os pods que
+<em>existem</em>, não para os que você vai criar. Com três réplicas e três nós, funciona; com quatro réplicas e
+três nós, a quarta não entra — e o Deployment fica eternamente incompleto. A segunda: afinidade entre pods é
+uma regra cara de avaliar. Em cluster grande, o agendador precisa listar pods em cada nó candidato, e isso
+aparece na latência de agendamento. Para espalhar, o mecanismo moderno é o próximo assunto.</p>
+
+<h2>4. Espalhamento por topologia: o jeito moderno</h2>
+
+<p><code>topologySpreadConstraints</code> é a ferramenta criada para o problema da Ana, e ela é mais simples de
+raciocinar que anti-afinidade porque fala em números, não em proibição. Você declara três coisas: o eixo
+(<code>topologyKey</code>), o desequilíbrio aceitável (<code>maxSkew</code>) e o que fazer quando não der
+(<code>whenUnsatisfiable</code>).</p>
+
+<p>Com <code>maxSkew: 1</code> em <code>hostname</code>, o cluster aceita que um nó tenha no máximo um pod a
+mais que outro. Quatro réplicas em três nós ficam 2-1-1: a diferença é 1, então passa. Cinco réplicas ficam
+2-2-1: também passa. Se você tentar sete numa topologia de três nós com <code>maxSkew: 1</code>, o sétimo
+espera — e a diferença entre isso e a anti-affinity obrigatória é que o spread continua aceitando pods nos
+nós já ocupados, desde que o desequilíbrio não cresça.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>podAntiAffinity</code></th><th><code>topologySpreadConstraints</code></th></tr>
+</thead>
+<tbody>
+<tr><td>Como pensa</td><td>proíbe compartilhar domínio</td><td>limita a diferença entre domínios</td></tr>
+<tr><td>Com 4 réplicas e 3 nós</td><td>a quarta fica <code>Pending</code></td><td>distribui 2-1-1 e todas
+rodam</td></tr>
+<tr><td>Custo para o agendador</td><td>alto: lista pods por nó candidato</td><td>baixo: conta por
+domínio</td></tr>
+<tr><td>Quando usar</td><td>nunca dois iguais no mesmo nó (banco, cache quente)</td><td>disponibilidade geral
+de um Deployment</td></tr>
+<tr><td>Efeito colateral</td><td>réplicas a mais ficam presas</td><td>pode deixar o cluster
+desequilibrado em tamanho de nó</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O detalhe que mais confunde no começo é o <code>labelSelector</code> do spread. Ele precisa casar com os
+pods que você quer contar — em geral, o mesmo <code>app</code> do Deployment. Se ele não casar com ninguém, a
+regra não tem o que medir e é ignorada em silêncio: nenhum erro, nenhum aviso, pods empilhados como antes.
+Isso vale para afinidade, anti-afinidade e spread.</p>
+
+<h2>5. A caixa: a zona que o cluster não tem</h2>
+
+<p>A regra mais comum de topologia é “espalhe por zona de disponibilidade”. Só que essa etiqueta existe em
+cluster de nuvem, não em cluster local: kind e minikube não têm zona. Quem copia o manifesto de produção para
+o notebook vê o pod ficar <code>Pending</code> sem entender, porque a mensagem fala de afinidade de nó.</p>
+
+<div class="tryk8s" data-get="pod cardapio" data-goal="texto:Running;;campo:Pod/cardapio|spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.0.matchExpressions.0.key=kubernetes.io/hostname">
+  <p class="try-task">O pod exige a zona <code>zona-a</code>, que nenhum nó tem. Troque a chave para
+  <code>kubernetes.io/hostname</code> e os valores para <code>guia-worker</code> e
+  <code>guia-worker2</code>. Rode até o pod ficar <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values:
+                  - zona-a
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   0/1     Pending   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                  - guia-worker
+                  - guia-worker2
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>Antes da correção, o pod fica em <code>Pending</code> e o evento diz
+<code>0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector</code>. A frase não
+distingue “etiqueta não existe” de “valor não bate”: para o agendador, as duas coisas são o mesmo fracasso. O
+primeiro passo do diagnóstico é sempre perguntar quais etiquetas o nó tem de verdade.</p>
+
+<p>Depois da correção, o pod cai num dos dois nós de trabalho. Vale notar que a escolha entre os dois é do
+agendador — a regra só define o conjunto permitido. Se você precisa de um nó específico, use
+<code>hostname</code> com um valor só; se precisa de um grupo, use a etiqueta que marca o grupo. É a mesma
+lógica de conjunto que você viu em <a href="node-selector-affinity.html">Selector e affinity</a>, agora com o
+eixo explícito.</p>
+
+<h2>6. A caixa: o seletor que não casa com ninguém</h2>
+
+<p>Esta caixa tem um erro que o cluster não acusa: o <code>labelSelector</code> do espalhamento aponta para
+<code>app: cardapioo</code>, com um “o” a mais. A regra fica registrada no objeto, o agendador não encontra
+nenhum pod para contar e a distribuição volta a ser a de antes — sem aviso, sem evento.</p>
+
+<div class="tryk8s" data-get="deployment cardapio -o yaml" data-goal="campo:Deployment/cardapio|spec.template.spec.topologySpreadConstraints.0.labelSelector.matchLabels.app=cardapio">
+  <p class="try-task">Corrija o <code>labelSelector</code> para <code>app: cardapio</code> e rode. O painel
+  mostra o Deployment em YAML, com o bloco de espalhamento inteiro.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: cardapioo
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  namespace: default
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 3
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: cardapio
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - image: cardapio:1.0
+          imagePullPolicy: IfNotPresent
+          name: web
+          resources:
+            limits: {}
+            requests: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: cardapioo
+          maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+status:
+  availableReplicas: 3
+  conditions:
+    - reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+  readyReplicas: 3
+  replicas: 3
+  unavailableReplicas: 0
+  updatedReplicas: 3
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: cardapio
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>Sobre o painel, uma nota honesta: ele guarda a regra e mostra o objeto em YAML, mas quem aplica
+anti-afinidade e espalhamento é o agendador real — o simulador não modela essas contas. É por isso que a
+conferência aqui é o campo, e o efeito aparece na transcrição da seção 8. Nas caixas que envolvem apenas
+recursos e etiquetas de nó, o painel agenda de verdade, como você viu na seção anterior.</p>
+
+<p>Essa diferença entre “está no manifesto” e “está funcionando” é a razão de o seletor errado passar tanto
+tempo despercebido. A regra aparece no <code>describe</code> e no <code>-o yaml</code>, bonita, e não faz
+nada. Quando o assunto é disponibilidade, vale conferir três coisas: o seletor casa com os pods, o
+<code>topologyKey</code> existe nos nós, e o número de réplicas cabe na topologia disponível.</p>
+
+<h2>7. A caixa: a topologia que come capacidade</h2>
+
+<p>Restringir o conjunto de nós permitidos tem preço, e o preço é capacidade. A caixa limita o cardápio a dois
+nós de trabalho — nada absurdo — e pede 1.500m de CPU por réplica. Cada nó de 2 vCPU aceita uma réplica só, e
+as outras duas ficam <code>Pending</code>, mesmo com o terceiro nó do cluster vazio.</p>
+
+<div class="tryk8s" data-get="pods -o wide" data-goal="pronto:Deployment/cardapio=4">
+  <p class="try-task">As quatro réplicas têm de ficar prontas. Reduza o request de CPU para <code>800m</code>
+  e rode.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - guia-worker
+                      - guia-worker2
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 1500m</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE   IP              NODE           NOMINATED NODE   READINESS GATES
+cardapio-jz67khtq8s-j9hgv   0/1     Pending   0          2m    &lt;none&gt;          &lt;none&gt;         &lt;none&gt;           &lt;none&gt;
+cardapio-jz67khtq8s-rd97k   1/1     Running   0          6m    10.244.193.81   guia-worker2   &lt;none&gt;           &lt;none&gt;
+cardapio-jz67khtq8s-v5kjn   1/1     Running   0          1m    10.244.201.52   guia-worker    &lt;none&gt;           &lt;none&gt;
+cardapio-jz67khtq8s-vbtz7   0/1     Pending   0          7m    &lt;none&gt;          &lt;none&gt;         &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - guia-worker
+                      - guia-worker2
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              cpu: 800m</pre>
+</div>
+
+<p>Com 1.500m, o painel mostra duas réplicas rodando — uma em cada nó permitido — e duas em
+<code>Pending</code>. Com 800m, cada nó aceita duas e as quatro ficam prontas. O cluster não cresceu; o que
+mudou foi o tamanho de cada caixa.</p>
+
+<p>A lição vale para qualquer restrição de topologia: <strong>restringir o conjunto permitido reduz a
+capacidade efetiva</strong>. Se você espalha por zona e tem duas zonas, sua capacidade é a das duas zonas, não
+a do cluster inteiro. Antes de culpar o agendador, faça a conta com o conjunto que sobrou — é a mesma conta da
+aula de capacidade, com menos nós disponíveis.</p>
+
+<h2>8. O Pending que ninguém explica</h2>
+
+<p>Quando várias restrições se juntam, a mensagem do agendador deixa de ser uma frase e vira uma lista. Cada
+nó é rejeitado por um motivo diferente, e o evento resume os motivos com contagem. Esta é uma transcrição de
+cluster real, de um pod com afinidade de nó e um nó manchado:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe pod cardapio-6d7f9c8b5-2xk4p
+Name:         cardapio-6d7f9c8b5-2xk4p
+Namespace:    default
+Node:         &lt;none&gt;
+Status:       Pending
+...
+Events:
+  Type     Reason            Age   From               Message
+  ----     ------            ----  ----               -------
+  Warning  FailedScheduling  25s   default-scheduler  0/3 nodes are available: 1 Insufficient cpu, 2 node(s) had untolerated taint {forno: true}. preemption: 0/3 nodes are available: 1 Preemption is not helpful for scheduling, 2 Preemption is not helpful for scheduling.</pre>
+
+<p>A leitura correta é por partes. <code>0/3 nodes are available</code> diz que nenhum nó passou no filtro.
+Depois vêm os motivos, separados por vírgula e com contagem: <strong>1</strong> nó foi eliminado por falta de
+CPU e <strong>2</strong> por mancha não tolerada. Se você só ler a primeira parte, vai aumentar
+<code>requests</code> ou trocar de nó — e o problema pode estar inteiro na mancha dos outros dois.</p>
+
+<p>O segundo bloco, depois de <code>preemption:</code>, responde outra pergunta: “dava para despejar alguém
+para abrir espaço?”. <code>Preemption is not helpful</code> significa que nem despejando um pod de prioridade
+menor o pod entraria — normalmente porque o problema não é recurso, é etiqueta, mancha ou regra de afinidade.
+Quando a preempção resolveria, a mensagem é outra e o assunto é a aula de prioridade.</p>
+
+<p>A segunda transcrição mostra o caso clássico de anti-afinidade obrigatória com uma réplica a mais do que a
+topologia permite. É a mesma armadilha da abertura da aula, agora com o evento na mão:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE   IP            NODE                 NOMINATED NODE   READINESS GATES
+cardapio-7b9c6f5d4d-4jjxx   1/1     Running   0          6m    10.244.1.12   guia-worker          &lt;none&gt;           &lt;none&gt;
+cardapio-7b9c6f5d4d-8xl2q   1/1     Running   0          6m    10.244.2.19   guia-worker2         &lt;none&gt;           &lt;none&gt;
+cardapio-7b9c6f5d4d-kd4wm   1/1     Running   0          6m    10.244.3.71   guia-control-plane   &lt;none&gt;           &lt;none&gt;
+cardapio-7b9c6f5d4d-nxfdg   0/1     Pending   0          6m    &lt;none&gt;        &lt;none&gt;               &lt;none&gt;           &lt;none&gt;
+
+ana@notebook:~$ kubectl describe pod cardapio-7b9c6f5d4d-nxfdg
+...
+Events:
+  Type     Reason            Age   From               Message
+  ----     ------            ----  ----               -------
+  Warning  FailedScheduling  30s   default-scheduler  0/3 nodes are available: 3 node(s) didn't satisfy existing pods anti-affinity rules.</pre>
+
+<p>Três réplicas rodando, uma em cada nó, e a quarta parada. A mensagem é específica: não é falta de recurso,
+é a regra de anti-afinidade que você mesmo escreveu. Duas saídas legítimas: reduzir as réplicas para o número
+de domínios, ou trocar <code>required</code> por <code>preferred</code> — aí a quarta entra em algum nó,
+assumindo o risco de dividir o domínio com outra.</p>
+
+<p>E quando nem o evento resolve? Três conferências em ordem. Primeiro, as etiquetas reais dos nós
+(<code>kubectl get nodes --show-labels</code>) — a etiqueta que você assumiu pode não existir. Segundo, as
+manchas (<code>kubectl describe node</code>, campo <code>Taints</code>). Terceiro, se o pod tem
+<code>nodeName</code> fixo: nesse caso o agendador nem participa, e a mensagem muda de autor.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o spread que deixou o cluster torto</h3>
+<p>A Ana espalhou o cardápio por zona com <code>maxSkew: 1</code> e <code>DoNotSchedule</code>. Funcionou — até
+o dia em que uma zona ficou com nós menores, e o spread passou a recusar pods ali por falta de CPU, não por
+desequilíbrio. A mensagem misturava os dois motivos. A solução foi <code>minDomains</code> e um pool de nós do
+mesmo tamanho por zona.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a preferência que virou obrigação</h3>
+<p>Para não travar publicação, o time trocou todas as regras de <code>required</code> para
+<code>preferred</code>. O <code>Pending</code> sumiu e a disponibilidade também: em noite de pico, o
+agendador voltou a empilhar réplicas no mesmo nó porque “preferir” não é garantia. Preferência serve para
+otimizar, não para proteger.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a afinidade que colou o cache no lugar errado</h3>
+<p>O serviço de relatórios tinha <code>podAffinity</code> obrigatória com o cache, em <code>hostname</code>.
+Quando o cache cresceu e virou três réplicas, a afinidade passou a exigir “um nó que tenha cache” e o
+relatório ficou preso ao primeiro nó que atendia. O conserto foi usar <code>preferred</code> com
+<code>weight: 50</code> e aceitar rodar longe do cache quando não houver lugar.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que o <code>topologyKey</code> define?</p>
+<label><input type="radio" name="q1"> quantas réplicas o Deployment deve ter</label>
+<label><input type="radio" name="q1"> qual imagem será usada no pod</label>
+<label><input type="radio" name="q1"> qual etiqueta do nó define o domínio de topologia (nó, zona…)</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Quatro réplicas, três nós e
+<code>podAntiAffinity</code> <em>obrigatória</em> em <code>hostname</code>. O que acontece?</p>
+<label><input type="radio" name="q2"> três rodam, uma fica <code>Pending</code></label>
+<label><input type="radio" name="q2"> duas rodam em cada nó, balanceadas</label>
+<label><input type="radio" name="q2"> as quatro rodam, uma delas no control-plane</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. O evento diz
+<code>1 Insufficient cpu, 2 node(s) had untolerated taint</code>. Qual é a leitura?</p>
+<label><input type="radio" name="q3"> o cluster tem um nó só e ele está cheio</label>
+<label><input type="radio" name="q3"> cada nó foi rejeitado por um motivo diferente; é preciso resolver os
+dois</label>
+<label><input type="radio" name="q3"> o pod está com a imagem errada</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o eixo da topologia</h2>
+<p>Você quer que as réplicas fiquem em nós diferentes. Complete o campo que define que “perto” significa “no
+mesmo nó”.</p>
+<div class="ex-code">topologySpreadConstraints:
+  - maxSkew: 1
+    <input aria-label="resposta 1" data-answer="topologyKey" placeholder="...">: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule</div>
+<p class="ex-dica">Dica: é o campo que aparece também em <code>podAntiAffinity</code> e vale
+<code>kubernetes.io/hostname</code> ou <code>topology.kubernetes.io/zone</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O agendador decide em duas fases: filtra os nós que servem e pontua os que sobraram. As ferramentas
+avançadas mudam o filtro e a pontuação de dois jeitos: falando de <em>outros pods</em>
+(<code>podAffinity</code> e <code>podAntiAffinity</code>) ou falando da <em>forma da distribuição</em>
+(<code>topologySpreadConstraints</code>). Todas giram em torno do <code>topologyKey</code>, que define o que
+conta como “perto”.</p>
+
+<p>Anti-afinidade obrigatória protege contra dois iguais no mesmo domínio, ao custo de travar réplicas quando
+elas passam do número de domínios. Espalhamento por topologia faz o mesmo trabalho com números
+(<code>maxSkew</code>), aceitando desequilíbrio controlado e custando menos ao agendador. Preferência não é
+proteção: <code>preferred</code> melhora a chance, não garante nada.</p>
+
+<p>E o <code>Pending</code> que ninguém explica quase sempre tem três suspeitos: etiqueta que não existe no
+nó, mancha não tolerada e seletor que não casa com pod nenhum. O evento lista os motivos por nó — leia a lista
+inteira antes de mexer em qualquer coisa.</p>
+
+<p>Na próxima aula o assunto é o outro lado da capacidade: em vez de reservar e espalhar à mão, deixar o
+cluster crescer e encolher sozinho — com HPA, VPA e autoscaler de nós, e com as contas que fazem “subir
+réplica” não resolver o problema.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>nodeSelector</code> e <code>nodeAffinity</code> falam do nó; afinidade entre pods fala dos
+  outros pods.</li>
+  <li><code>topologyKey</code> é o eixo: <code>kubernetes.io/hostname</code> (nó) ou
+  <code>topology.kubernetes.io/zone</code> (zona).</li>
+  <li><code>required</code> garante e pode travar; <code>preferred</code> só tenta.</li>
+  <li><code>maxSkew</code> limita a diferença entre domínios; <code>DoNotSchedule</code> torna isso
+  obrigatório.</li>
+  <li>Seletor que não casa com pod nenhum desliga a regra em silêncio.</li>
+  <li>Restringir a topologia reduz a capacidade efetiva: faça a conta antes.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

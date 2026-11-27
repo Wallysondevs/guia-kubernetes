@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Autoscaling avançado | Guia Kubernetes</title>
+<meta name="description" content="Autoscaling avançado: behavior do HPA com policies e estabilização, VPA e suas recomendações, cluster autoscaler e por que subir réplica às vezes não resolve nada.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Autoscaling <span class="hl">avançado</span></h1>
+<p class="intro">No almoço de sábado o cardápio da Ana recebeu três vezes mais pedidos e o HPA fez o que
+prometia: subiu de duas para doze réplicas. O site continuou lento. Pior: quatro dessas réplicas ficaram em
+<code>Pending</code>, porque não havia nó para tanta gente. O problema não era o número de pods — era o banco,
+que aceitava dez conexões por vez. Nesta aula a Ana aprende a parte do autoscaling que os tutoriais pulam: as
+réguas de subida e descida, o ajuste de recursos que o VPA faz, o autoscaler que compra nó e, principalmente,
+como descobrir que o gargalo não está no lugar onde você está escalando.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Quem escala o quê: HPA (réplicas), VPA (requests) e cluster autoscaler (nós).</li>
+  <li>A conta que o HPA faz e o efeito da tolerância de 10%.</li>
+  <li><code>behavior</code> a fundo: <code>policies</code>, <code>periodSeconds</code>,
+  <code>selectPolicy</code> e as janelas de estabilização.</li>
+  <li>VPA: modos, recomendação em <em>Off</em> e por que ele briga com o HPA de CPU.</li>
+  <li>Quando o cluster autoscaler entra e por que ele demora minutos, não segundos.</li>
+  <li>Como diagnosticar “subi réplica e não resolveu”.</li>
+</ul>
+</div>
+
+<h2>1. A cena: doze réplicas e o site ainda lento</h2>
+
+<p>O gráfico do almoço é sempre o mesmo: a fila de pedidos cresce, a CPU do cardápio sobe, o HPA entra em
+ação. Naquele sábado ele subiu de duas para doze réplicas em três minutos — e a latência continuou em quatro
+segundos por requisição. A Ana conferiu o cluster e encontrou duas surpresas: quatro pods em
+<code>Pending</code> e o banco com o painel vermelho de “too many connections”.</p>
+
+<p>Autoscaling não é mágica de performance: é a repetição automática de uma decisão que você tomaria à mão —
+“preciso de mais cópias”. Se a lentidão não vem da falta de cópias, escalar só espalha o problema. E se as
+cópias novas não têm onde rodar, você pagou o tempo de espera sem ganhar capacidade nenhuma.</p>
+
+<p>Por isso a aula tem duas metades. A primeira é mecânica: como o HPA decide, como amaciar a decisão, como o
+VPA calcula request e como o cluster autoscaler compra nó. A segunda é diagnóstico: dado que você já escala,
+como saber se está escalando a coisa certa. A segunda metade vale mais em produção.</p>
+
+<h2>2. Quem escala o quê</h2>
+
+<p>Existem três autoscalers no ecossistema e eles mexem em camadas diferentes. Confundir as camadas é o
+primeiro erro: aumentar réplicas num serviço que não cabe no cluster, ou comprar nós para um problema que era
+de request, custa caro e não resolve.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Autoscaler</th><th>O que muda</th><th>Gatilho</th><th>Tempo típico</th><th>Risco</th></tr>
+</thead>
+<tbody>
+<tr><td>HPA</td><td>número de réplicas de um workload</td><td>métrica acima ou abaixo do alvo</td><td>segundos a
+minutos</td><td>escalar o gargalo errado</td></tr>
+<tr><td>VPA</td><td><code>requests</code> de cada container</td><td>histórico de uso do próprio
+pod</td><td>minutos a horas</td><td>recriar pods ao aplicar</td></tr>
+<tr><td>cluster autoscaler</td><td>número de nós do cluster</td><td>pod <code>Pending</code> por falta de
+recurso</td><td>minutos</td><td>nó ocioso no dia seguinte</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A ordem em que eles conversam é intuitiva quando você pensa em camadas. O HPA pede mais réplicas. O
+agendador tenta colocar cada réplica e, se não houver reserva, deixa o pod <code>Pending</code>. O cluster
+autoscaler vê esse <code>Pending</code> e compra um nó. Quando o nó entra, o agendador coloca o pod. O VPA
+trabalha em outro eixo: ele não muda quantidade, muda o tamanho da caixa de cada pod.</p>
+
+<p>Repare que o cluster autoscaler não olha CPU: ele olha <code>Pending</code>. Um pod que não cabe porque
+pede 64 vCPU vai fazer o autoscaler tentar comprar um nó de 64 vCPU — e falhar, porque o grupo de nós não tem
+esse tamanho. É por isso que a mensagem <code>Insufficient cpu</code> acompanhada de erro do autoscaler
+costuma significar “seu request está fora da realidade”, não “falta cluster”.</p>
+
+<dl class="anatomy">
+<dt>alvo (target)</dt>
+<dd>O valor de métrica que o HPA quer manter, em porcentagem do request (utilização) ou em valor
+absoluto.</dd>
+<dt>tolerância</dt>
+<dd>Faixa de 10% em torno do alvo em que o HPA não faz nada, para evitar oscilação.</dd>
+<dt>desiredReplicas</dt>
+<dd>Quantas réplicas o HPA calcula: <code>ceil(réplicas atuais × métrica atual / alvo)</code>.</dd>
+<dt>behavior</dt>
+<dd>As regras que amaciam a decisão: quanto pode mudar por período, qual política vence e por quanto tempo
+uma mudança precisa se sustentar.</dd>
+<dt>stabilizationWindowSeconds</dt>
+<dd>Janela em que o HPA olha o passado e escolhe o menor número de réplicas pedido. Padrão de 300 s na
+descida.</dd>
+<dt>VPA</dt>
+<dd>Vertical Pod Autoscaler: ajusta <code>requests</code> (e às vezes limits) com base no uso
+observado.</dd>
+<dt>node group</dt>
+<dd>Grupo de nós iguais que o cluster autoscaler pode aumentar ou diminuir.</dd>
+<dt>scale from zero</dt>
+<dd>Comprar o primeiro nó de um grupo que estava em zero — o caso em que a primeira réplica espera
+minutos.</dd>
+</dl>
+
+<p>Um detalhe de vocabulário que evita confusão em reunião: “escalar” sozinho não quer dizer nada. Escalar
+horizontalmente é mudar o número de réplicas (HPA); verticalmente é mudar o tamanho de cada uma (VPA); e
+elástico é mudar o número de máquinas (cluster autoscaler).</p>
+
+<h2>3. A conta do HPA e a tolerância que evita susto</h2>
+
+<p>O HPA não olha um pod: ele olha a média. Se o alvo é 60% de CPU e a média das réplicas está em 120%, ele
+calcula <code>ceil(2 × 120 / 60) = 4</code> réplicas. Se a média cai para 30%, ele calcula
+<code>ceil(4 × 30 / 60) = 2</code>. A conta é simples de propósito — e é por isso que ela depende tanto do
+<code>requests</code>: a porcentagem é sempre relativa ao que o pod reservou.</p>
+
+<p>A tolerância de 10% é o primeiro amortecedor. Com alvo em 60%, qualquer média entre 54% e 66% é considerada
+“no lugar” e o HPA não faz nada. Sem isso, o número de réplicas ficaria mudando a cada ciclo de quinze
+segundos, o que gera pods nascendo e morrendo sem necessidade — e cada mudança custa tempo de preparo.</p>
+
+<p>O segundo amortecedor é o <code>behavior</code>, e é aqui que as aulas introdutórias param. Ele permite
+dizer três coisas: quanto pode mudar por período, qual política vence quando duas discordam e por quanto tempo
+uma mudança precisa se sustentar antes de ser aplicada. A tabela abaixo é o mapa dessas
+configurações.</p>
+
+<h2>4. O bloco behavior, campo por campo</h2>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>O que faz</th><th>Valor comum</th></tr>
+</thead>
+<tbody>
+<tr><td><code>scaleUp.stabilizationWindowSeconds</code></td><td>olha o passado e escolhe o maior pedido — subir
+é urgente, então costuma ser 0</td><td><code>0</code> a <code>30</code></td></tr>
+<tr><td><code>scaleDown.stabilizationWindowSeconds</code></td><td>olha o passado e escolhe o menor pedido —
+descer devagar evita liga-desliga</td><td><code>300</code></td></tr>
+<tr><td><code>policies[].type</code></td><td><code>Pods</code> (quantidade fixa) ou <code>Percent</code>
+(porcentagem das réplicas atuais)</td><td><code>Percent</code></td></tr>
+<tr><td><code>policies[].periodSeconds</code></td><td>a janela em que a política vale</td><td><code>15</code> a
+<code>60</code></td></tr>
+<tr><td><code>selectPolicy</code></td><td>com várias políticas, qual vence: <code>Max</code> (a mais
+permissiva), <code>Min</code> (a mais conservadora) ou <code>Disabled</code></td><td><code>Max</code> para
+subir, <code>Min</code> para descer</td></tr>
+<tr><td><code>behavior.scaleDown.selectPolicy: Disabled</code></td><td>trava a descida automática por
+completo</td><td>útil em janela de pico</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A leitura prática: em <code>scaleUp</code>, você quer liberdade — janela zero e política permissiva, para o
+pico ser atendido rápido. Em <code>scaleDown</code>, você quer freio — janela longa e política conservadora,
+para não devolver capacidade que a fila ainda vai usar. Essa assimetria é a razão de o campo ser dividido em
+dois blocos em vez de um só.</p>
+
+<p>Há uma armadilha de leitura nos nomes: <code>stabilizationWindowSeconds</code> não é “espera antes de agir”.
+É “quanto tempo de histórico eu considero”. Na descida, o HPA pega todas as recomendações dos últimos 300
+segundos e escolhe a <em>menor</em> — ou seja, ele só desce se, durante cinco minutos, todas as contas pediram
+menos. Na subida é o contrário: escolhe a maior, e por isso uma janela curta responde rápido.</p>
+
+<h2>5. VPA: o autoscaler que mexe no tamanho da caixa</h2>
+
+<p>O Vertical Pod Autoscaler resolve outro problema: o request mal calibrado. Ele observa o uso real de cada
+container e recomenda (ou aplica) novos valores de <code>requests.cpu</code> e
+<code>requests.memory</code>. É a ferramenta para a conta da aula anterior — aquela em que o serviço pedia 2 GB
+e usava 200 MB.</p>
+
+<p>Ele tem quatro modos. Em <code>Off</code>, só calcula e publica a recomendação, sem tocar em nada: é o modo
+mais seguro e o melhor primeiro passo. Em <code>Initial</code>, aplica a recomendação apenas quando o pod é
+criado. Em <code>Recreate</code>, ajusta os pods existentes recriando-os — com interrupção. E em
+<code>InPlaceOrRecreate</code>, tenta redimensionar sem recriar quando o cluster suporta, e recria se
+precisar.</p>
+
+<p>Esta é uma transcrição de cluster real, de um VPA em modo <code>Off</code> depois de uma semana
+observando:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe vpa cardapio
+Name:         cardapio
+Namespace:    default
+Spec:
+  Target Ref:  Deployment/cardapio
+  Update Policy:
+    Update Mode:  Off
+Status:
+  Conditions:
+    Type              Status  Reason
+    RecommendationProvided  True  Recommendation is provided
+  Recommendation:
+    Container Recommendations:
+      Container Name:  web
+      Lower Bound:
+        Cpu:     100m
+        Memory:  180Mi
+      Target:
+        Cpu:     220m
+        Memory:  260Mi
+      Uncapped Target:
+        Cpu:     220m
+        Memory:  260Mi
+      Upper Bound:
+        Cpu:     600m
+        Memory:  700Mi</pre>
+
+<p>O bloco que interessa é o <code>Target</code>: 220m de CPU e 260 Mi de memória. É o que o VPA colocaria no
+manifesto se estivesse em modo ativo. <code>Lower Bound</code> e <code>Upper Bound</code> são a faixa em que
+ele considera seguro trabalhar — e a distância entre eles mostra quanto o uso varia. Um serviço com uso estável
+tem faixa estreita; um com picos tem faixa larga, e aí o target fica mais perto do piso.</p>
+
+<p>Duas regras de convivência. A primeira: <strong>não use VPA e HPA de CPU no mesmo Deployment</strong>. O HPA
+decide réplicas com base na porcentagem do request; se o VPA muda o request, a porcentagem muda sozinha e os
+dois ficam perseguindo um ao outro. A combinação aceitável é VPA de memória com HPA de CPU, ou VPA em
+<code>Off</code> servindo de consultoria. A segunda: VPA em modo que aplica recria pods. Em serviço com estado,
+isso é uma janela de indisponibilidade que precisa ser planejada.</p>
+
+<h2>6. A caixa: o HPA que não nasce</h2>
+
+<p>Antes de qualquer sutileza, existe a validação. O HPA exige que <code>maxReplicas</code> seja maior ou igual
+a <code>minReplicas</code> — e recusa o objeto inteiro quando a regra é violada. É o tipo de erro que aparece
+depois de alguém ajustar o mínimo para o horário de pico e esquecer do máximo.</p>
+
+<div class="tryk8s" data-get="hpa cardapio" data-goal="texto:created;;campo:HorizontalPodAutoscaler/cardapio|spec.maxReplicas=10">
+  <p class="try-task">O <code>minReplicas: 5</code> é maior que o <code>maxReplicas: 3</code>. Corrija o
+  máximo para 10 e rode: o HPA tem de ser criado.</p>
+<pre class="yaml">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 5
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60</pre>
+<pre class="out">
+The HorizontalPodAutoscaler "cardapio" is invalid: spec.minReplicas: Invalid value: 5: must be less than or equal to maxReplicas
+</pre>
+<pre class="solucao">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 5
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60</pre>
+</div>
+
+<p>O erro é <code>The HorizontalPodAutoscaler "cardapio" is invalid: spec.minReplicas: Invalid value: 5: must
+be less than or equal to maxReplicas</code>. Ele aponta o campo <code>minReplicas</code> porque foi ali que o
+servidor encontrou a inconsistência, mas o problema é a relação entre os dois: com mínimo 5 e máximo 3, não
+existe número válido de réplicas.</p>
+
+<p>Vale notar que a validação só pega o que é impossível. Ela não avisa que <code>maxReplicas: 10</code> num
+Deployment de 900m de request não cabe em três nós — isso é conta de capacidade, não de schema. O HPA vai
+tentar, os pods vão ficar <code>Pending</code>, e o cluster autoscaler (se existir) vai tentar comprar nó.</p>
+
+<h2>7. A caixa: o behavior ao contrário</h2>
+
+<p>Aqui o erro é de configuração, não de sintaxe: as janelas estão trocadas. Subir tem estabilização de cinco
+minutos — então o pico espera — e descer tem janela zero, então o HPA devolve capacidade no primeiro minuto
+calmo. O resultado é o pior dos dois mundos: site lento no pico e liga-desliga depois.</p>
+
+<div class="tryk8s" data-get="hpa cardapio -o yaml" data-goal="campo:HorizontalPodAutoscaler/cardapio|spec.behavior.scaleUp.stabilizationWindowSeconds=0;;campo:HorizontalPodAutoscaler/cardapio|spec.behavior.scaleDown.stabilizationWindowSeconds=300">
+  <p class="try-task">Inverta as janelas: <code>scaleUp</code> com 0 e <code>scaleDown</code> com 300. Rode e
+  confira o YAML do HPA no painel.</p>
+<pre class="yaml">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 12
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 30</pre>
+<pre class="out">
+horizontalpodautoscaler.autoscaling/cardapio created
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+  namespace: default
+spec:
+  behavior:
+    scaleDown:
+      policies:
+        - periodSeconds: 30
+          type: Percent
+          value: 50
+      stabilizationWindowSeconds: 0
+    scaleUp:
+      policies:
+        - periodSeconds: 15
+          type: Percent
+          value: 100
+      stabilizationWindowSeconds: 300
+  maxReplicas: 12
+  minReplicas: 2
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+</pre>
+<pre class="solucao">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cardapio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cardapio
+  minReplicas: 2
+  maxReplicas: 12
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 30</pre>
+</div>
+
+<p>Com as janelas invertidas, o HPA olha cinco minutos de histórico para decidir <em>subir</em>: um pico de
+trinta segundos é diluído e a decisão chega tarde. E olha zero segundos para descer: qualquer respiro vira
+corte de réplicas, que voltam na próxima onda. O ciclo clássico — subir, descer, subir — aparece no gráfico
+como uma serra.</p>
+
+<p>Com as janelas na ordem certa, o comportamento fica o que se espera: reage em segundos para cima e espera
+cinco minutos de calmaria para baixo. A política de 100% a cada 15 segundos permite dobrar o número de réplicas
+por ciclo — o que é rápido, mas não instantâneo: de 2 para 12 são quatro ciclos, quase um minuto.</p>
+
+<h2>8. “Subi réplica e não resolveu”</h2>
+
+<p>Agora a parte que dói. Existem cinco motivos comuns para escalar e não melhorar, e todos deixam rastro. O
+primeiro é o pod não caber: réplicas novas ficam <code>Pending</code> e o cluster autoscaler, se existir,
+demora minutos para resolver. O segundo é o gargalo estar fora do serviço escalado: banco, cache, fila,
+serviço de terceiros. O terceiro é a métrica errada — escalar por CPU quando a fila cresce e a CPU fica
+baixa.</p>
+
+<p>O quarto é o request mentiroso: com request de 100m e uso de 100m, o HPA vê 100% e sobe; mas o programa está
+limitado pelo <code>limit</code> de 100m e cada pod continua lento. O quinto é o efeito colateral de escalar
+algo que compartilha recurso: doze réplicas abrindo conexão com um banco que aceita dez pioram a
+situação.</p>
+
+<p>A caixa abaixo reproduz o primeiro motivo — a réplica que sobe e não cabe. O Deployment pede oito
+réplicas de 1.500 Mi num cluster de três nós de 4 GB: cada nó aceita duas, sobram duas em
+<code>Pending</code>. Reduza o request para 1.000 Mi e rode.</p>
+
+<div class="tryk8s" data-get="pods -o wide" data-goal="pronto:Deployment/cardapio=8">
+  <p class="try-task">As oito réplicas têm de ficar prontas. Ajuste <code>requests.memory</code> para
+  <code>1000Mi</code> e rode.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 8
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              memory: 1500Mi</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE   IP               NODE                 NOMINATED NODE   READINESS GATES
+cardapio-mbqmt4rx9r-55kcm   1/1     Running   0          9m    10.244.11.39     guia-control-plane   &lt;none&gt;           &lt;none&gt;
+cardapio-mbqmt4rx9r-885bd   0/1     Pending   0          9m    &lt;none&gt;           &lt;none&gt;               &lt;none&gt;           &lt;none&gt;
+cardapio-mbqmt4rx9r-bmbtb   0/1     Pending   0          2m    &lt;none&gt;           &lt;none&gt;               &lt;none&gt;           &lt;none&gt;
+cardapio-mbqmt4rx9r-gmz22   1/1     Running   0          48s   10.244.178.112   guia-worker          &lt;none&gt;           &lt;none&gt;
+cardapio-mbqmt4rx9r-nvzg2   1/1     Running   0          8m    10.244.22.85     guia-worker2         &lt;none&gt;           &lt;none&gt;
+cardapio-mbqmt4rx9r-tth8k   1/1     Running   0          1m    10.244.208.163   guia-control-plane   &lt;none&gt;           &lt;none&gt;
+cardapio-mbqmt4rx9r-vn5cf   1/1     Running   0          2m    10.244.121.63    guia-worker          &lt;none&gt;           &lt;none&gt;
+cardapio-mbqmt4rx9r-vzj94   1/1     Running   0          10m   10.244.124.103   guia-worker2         &lt;none&gt;           &lt;none&gt;
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 8
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          resources:
+            requests:
+              memory: 1000Mi</pre>
+</div>
+
+<p>Antes da correção, o painel mostra seis pods <code>Running</code> e dois <code>Pending</code> — o HPA
+“funcionou”, o site não ganhou capacidade. Depois, as oito réplicas rodam. Em cluster elástico, é nesse
+intervalo que o cluster autoscaler entra: ele vê o <code>Pending</code>, compra um nó, e a réplica só começa a
+servir quando o nó fica pronto — minutos depois do pico.</p>
+
+<p>Esta transcrição de cluster real mostra o mesmo caso com o autoscaler de nó no meio:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get hpa
+NAME       REFERENCE             TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+cardapio   Deployment/cardapio   212%/60%        2         12        12         41d
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-6d7f9c8b5-4jjxx    1/1     Running   0          3m
+cardapio-6d7f9c8b5-8xl2q    1/1     Running   0          3m
+cardapio-6d7f9c8b5-kd4wm    0/1     Pending   0          2m
+cardapio-6d7f9c8b5-nxfdg    0/1     Pending   0          2m
+cardapio-6d7f9c8b5-p4tzr    1/1     Running   0          2m
+cardapio-6d7f9c8b5-q9wjc    0/1     Pending   0          1m
+
+ana@notebook:~$ kubectl get events --sort-by=.lastTimestamp
+LAST SEEN   TYPE      REASON              OBJECT                              MESSAGE
+1m          Warning   FailedScheduling    pod/cardapio-6d7f9c8b5-q9wjc        0/6 nodes are available: 6 Insufficient memory.
+50s         Normal    TriggeredScaleUp    pod/cardapio-6d7f9c8b5-kd4wm        pod triggered scale-up: [{pool-padaria 3-&gt;5}]
+40s         Normal    SuccessfulRescale   horizontalpodautoscaler/cardapio    New size: 12; reason: cpu resource utilization above target</pre>
+
+<p>A leitura completa conta a história: o HPA bateu no teto de 12 réplicas porque a CPU média ficou em 212% do
+alvo, três pods não couberam, e o autoscaler de nó acionou a compra de dois nós. Note que o HPA <em>não</em> sabe de nó nenhum: para ele, réplica é réplica. Quem percebe o <code>Pending</code> é o autoscaler de
+cluster.</p>
+
+<p>E por que a CPU ficou em 212% mesmo com doze réplicas? Provavelmente porque a carga não é divisível: se
+cada requisição precisa de uma consulta cara ao banco, mais réplicas só aumentam a fila de consultas. Escalar
+horizontalmente funciona quando o trabalho é paralelizável e a dependência aguenta. Quando não é, o caminho é
+cache, fila com consumidor controlado ou otimização — não mais réplicas.</p>
+
+<p>O roteiro para esse diagnóstico tem quatro perguntas, nesta ordem: as réplicas novas ficaram
+<code>Running</code>? se não, é capacidade de nó. A latência caiu com mais réplicas? se não, é dependência ou
+trabalho não paralelo. A métrica do HPA representa o que dói? se não, troque a métrica. O
+<code>requests</code> está honesto? se não, o porcentual mente.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o HPA que media a coisa errada</h3>
+<p>A padaria tinha picos de fila no fim de semana, com CPU em 35%. O HPA de CPU nunca subia — e estava certo,
+pelo número dele. O time trocou a métrica para tamanho de fila, com um adaptador, e o autoscaling passou a
+acontecer no momento certo. Escalar pelo que dói é a regra; CPU é só o padrão mais fácil.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o VPA que recriou o banco no almoço</h3>
+<p>Um VPA em modo <code>Recreate</code> foi instalado num StatefulSet de banco. Ao aplicar a recomendação, ele
+recriou as réplicas e o serviço ficou fora por dois minutos, no meio do almoço. A correção foi mudar para
+<code>Off</code>, ler a recomendação e aplicar o request à mão numa janela combinada.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o autoscaler que comprava nó para pod que nunca caberia</h3>
+<p>Um Job pedia 64 vCPU por pod, herdado de um teste. O cluster autoscaler tentou comprar um nó grande, não
+achou tamanho no grupo, e desistiu; o Job ficou <code>Pending</code> por horas. O conserto não foi no
+autoscaler: foi no request, que caiu para 2 vCPU e o Job rodou no nó que já existia.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O cluster autoscaler reage a quê?</p>
+<label><input type="radio" name="q1"> média de CPU acima do alvo do HPA</label>
+<label><input type="radio" name="q1"> pods em <code>Pending</code> por falta de recurso</label>
+<label><input type="radio" name="q1"> uso de memória acima do limite</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Por que não usar VPA ativo e HPA de CPU no mesmo
+Deployment?</p>
+<label><input type="radio" name="q2"> porque o HPA deixa de existir quando o VPA é criado</label>
+<label><input type="radio" name="q2"> porque o VPA não funciona com Deployment</label>
+<label><input type="radio" name="q2"> porque o VPA muda o request e a porcentagem do HPA muda
+junto</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O HPA subiu de 2 para 12 réplicas e a latência não
+melhorou. Qual é a primeira conferência?</p>
+<label><input type="radio" name="q3"> se as réplicas novas ficaram <code>Running</code></label>
+<label><input type="radio" name="q3"> se o cluster tem zona de disponibilidade</label>
+<label><input type="radio" name="q3"> se o <code>apiVersion</code> do HPA está em <code>v2</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a janela que evita liga-desliga</h2>
+<p>O HPA precisa esperar cinco minutos de calmaria antes de reduzir réplicas. Complete o nome do campo, dentro
+de <code>behavior.scaleDown</code>.</p>
+<div class="ex-code">behavior:
+  scaleDown:
+    <input aria-label="resposta 1" data-answer="stabilizationWindowSeconds" placeholder="...">: 300</div>
+<p class="ex-dica">Dica: é o campo que diz por quanto tempo o HPA olha o histórico antes de decidir.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Três autoscalers, três camadas: o HPA muda o número de réplicas, o VPA muda o tamanho de cada pod e o
+cluster autoscaler muda o número de nós. Eles conversam numa ordem previsível — HPA pede, o agendador tenta,
+o <code>Pending</code> aciona a compra de nó — e cada um tem seu tempo: segundos, minutos e minutos.</p>
+
+<p>O <code>behavior</code> é o que separa um autoscaling que funciona de um que fica em serra: subir com janela
+zero e política permissiva, descer com janela de cinco minutos e política conservadora. A tolerância de 10% e
+a conta <code>ceil(réplicas × métrica / alvo)</code> explicam o resto do comportamento.</p>
+
+<p>O VPA é consultor antes de ser executor: em <code>Off</code>, ele publica a recomendação que resolve aquele
+request inflado da aula de custos. E o diagnóstico de “subi réplica e não resolveu” tem quatro perguntas —
+ficou <code>Running</code>, a latência caiu, a métrica representa a dor, o request está honesto —, e a
+resposta mais comum é que o gargalo não estava no serviço escalado.</p>
+
+<p>Na próxima aula a Ana olha a camada que fica entre os serviços: o service mesh, com mTLS, retry e
+roteamento — e o preço de complexidade que vem junto.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>HPA escala réplicas; VPA escala requests; cluster autoscaler escala nós.</li>
+  <li>O HPA calcula <code>ceil(réplicas × métrica / alvo)</code> e ignora variações de até 10%.</li>
+  <li><code>scaleUp</code> com janela curta; <code>scaleDown</code> com 300 s e política conservadora.</li>
+  <li>VPA aplicando request + HPA de CPU = os dois brigando.</li>
+  <li>Cluster autoscaler olha <code>Pending</code>, não CPU — e demora minutos.</li>
+  <li>Escalar não resolve gargalo em banco, fila ou trabalho não paralelo.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

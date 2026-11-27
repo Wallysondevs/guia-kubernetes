@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troubleshooting | Guia Kubernetes</title>
+<meta name="description" content="Troubleshooting em produção: o método em quatro perguntas (get, describe, events, logs), os cinco padrões que explicam quase toda queda e o que não fazer sob pressão.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Troubleshooting</span></h1>
+<p class="intro">São três da manhã e o telefone da Ana toca: o cardápio está fora do ar. Ela abre o notebook
+com sono, digita <code>kubectl get pods</code> e vê quarenta linhas, três delas em vermelho. O impulso é
+apagar o pod vermelho e ver no que dá. Ela já fez isso uma vez e o problema voltou dez minutos depois, porque
+o pod não era a causa — era o sintoma. Esta aula é sobre o método que substitui o chute: quatro perguntas na
+ordem certa, cinco padrões que explicam quase tudo, e a disciplina de anotar o que você viu antes de mexer em
+qualquer coisa.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que a ordem <code>get</code> → <code>describe</code> → <code>events</code> → <code>logs</code>
+  economiza tempo.</li>
+  <li>O que cada comando responde e o que ele <em>não</em> responde.</li>
+  <li>Os cinco padrões que cobrem a maior parte dos incidentes.</li>
+  <li>Como usar a linha do tempo e o histórico de rollout a seu favor.</li>
+  <li>O que não fazer sob pressão — e por que reiniciar é o último recurso.</li>
+  <li>O que registrar para que o próximo plantão não comece do zero.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o alerta das três da manhã</h2>
+
+<p>Em produção, o problema chega pronto: um alerta, uma reclamação, um gráfico caindo. Você não viu o que
+aconteceu, não tem o terminal de quando quebrou e não pode ficar experimentando à vontade — cada minuto custa
+pedido perdido. É o oposto do laboratório das aulas anteriores, onde errar era barato.</p>
+
+<p>Três coisas mudam o jogo. A primeira é que existem <em>várias cópias</em> de cada coisa: um pod com
+problema pode ser um entre seis, e a diferença entre “um” e “todos” é o diagnóstico inteiro. A segunda é que o
+cluster guarda pouca memória do passado: evento antigo expira, log antigo gira, e quem chega tarde vê só o
+presente. A terceira é que o sintoma que o cliente sente está longe da causa: “o site está lento” pode ser um
+pod em outro nó, um Service sem endpoint ou o banco recusando conexão.</p>
+
+<p>O método existe para não depender de sorte. Ele começa largo (o que está ruim, e desde quando) e termina
+estreito (o que o programa escreveu no log antes de morrer). Cada passo responde uma pergunta e descarta uma
+família de hipóteses. Quem pula direto para o log perde o contexto; quem pula direto para o reinício perde a
+evidência.</p>
+
+<h2>2. O método em quatro perguntas</h2>
+
+<p>A ordem não é decorativa: ela vai do mais barato e mais amplo para o mais caro e mais específico. O
+<code>get</code> custa um segundo e mostra o escopo. O <code>describe</code> custa dois e mostra o estado de um
+objeto com os eventos dele. O <code>get events</code> mostra a linha do tempo do namespace. O
+<code>logs</code> só faz sentido depois que você sabe <em>qual</em> container olhar e <em>se</em> ele chegou a
+rodar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Comando</th><th>Pergunta que responde</th><th>O que descarta</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kubectl get pods -o wide</code></td><td>quantos, em que estado, em que nó, desde
+quando</td><td>diz se é um pod ou o serviço inteiro; mostra <code>Pending</code>, <code>0/1</code>,
+<code>RESTARTS</code></td></tr>
+<tr><td><code>kubectl describe pod</code></td><td>por que este objeto está assim</td><td>falta de recurso,
+taint, imagem, probe, último estado do container</td></tr>
+<tr><td><code>kubectl get events</code></td><td>o que aconteceu, em que ordem, em todo o
+namespace</td><td>mudanças recentes, falha de agendamento, reinícios, erros de volume e de
+Service</td></tr>
+<tr><td><code>kubectl logs</code></td><td>o que o programa viu antes de falhar</td><td>erro de aplicação,
+configuração faltando, timeout de dependência</td></tr>
+</tbody>
+</table>
+</div>
+
+<dl class="anatomy">
+<dt>sintoma</dt>
+<dd>O que o cliente sente: erro, lentidão, página em branco. Não é a causa e quase nunca está no mesmo
+lugar.</dd>
+<dt>escopo</dt>
+<dd>Quantos objetos e usuários são afetados. “Um pod” e “todos os pods” levam a caminhos opostos.</dd>
+<dt>linha do tempo</dt>
+<dd>A ordem dos fatos: o deploy das 22h40, o primeiro erro às 22h43, o alerta às 22h50. Sem ela, tudo
+parece ter acontecido junto.</dd>
+<dt>evento</dt>
+<dd>Registro curto que o cluster grava quando tenta fazer algo e falha — ou consegue. Expira em cerca de
+uma hora por padrão.</dd>
+<dt>mitigação</dt>
+<dd>O que devolve o serviço ao ar agora: rollback, mais réplica, tráfego desviado. Não precisa ser a
+solução.</dd>
+<dt>causa raiz</dt>
+<dd>O motivo que, se corrigido, impede a volta do problema. Pode ser encontrada depois, com o serviço no
+ar.</dd>
+<dt>rollout</dt>
+<dd>A publicação de uma versão nova. É a mudança mais comum por trás de incidentes — e a mais fácil de
+reverter.</dd>
+</dl>
+
+<p>Uma regra prática que vale para todo plantão: <strong>mitigar primeiro, entender depois</strong>. Se o
+rollback devolve o serviço em quarenta segundos, faça o rollback e investigue com calma. O contrário — entender
+primeiro, com o site fora do ar — é o jeito mais caro de aprender.</p>
+
+<h2>3. A caixa: a ordem na prática</h2>
+
+<p>A caixa abaixo é um terminal. O manifesto é uma lista de comandos, um por linha, e o painel mostra a
+sessão como se você estivesse no cluster. Rode como está: o pod nasce, o <code>get</code> mostra o resumo e o
+<code>log</code> mostra o programa. Falta o passo do meio.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Events:;;texto:Conditions:">
+  <p class="try-task">Acrescente <code>kubectl describe pod cardapio</code> e
+  <code>kubectl get events</code> entre o <code>get pods</code> e o <code>logs</code>. A sessão tem de mostrar
+  <code>Conditions:</code> e <code>Events:</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods
+kubectl logs cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio:1.0
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+
+ana@notebook:~$ kubectl logs cardapio
+Servindo o cardapio na porta 8080
+Precos carregados de /config/cardapio.json
+conexao com o banco: ok
+pedido entregue em 132 ms
+GET /cardapio 200 12ms
+GET /saude 200 1ms
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods
+kubectl describe pod cardapio
+kubectl get events
+kubectl logs cardapio</pre>
+</div>
+
+<p>Repare no que cada resposta dá e no que ela cala. O <code>get pods</code> diz que o pod está
+<code>Running</code> e <code>1/1</code> — não há nada de errado ali, e isso já é informação: o problema, se
+existir, não é de agendamento. O <code>describe</code> abre o objeto e termina com os eventos. O
+<code>get events</code> repete os eventos em formato de tabela, com o objeto de origem na coluna
+<code>OBJECT</code>. O <code>logs</code>, por fim, mostra o que o programa escreveu.</p>
+
+<p>Nessa ordem, você nunca lê log de container que não subiu, nunca procura evento de um pod que não existe e
+nunca confunde “o pod está reiniciando” com “o pod nunca foi agendado”. São três erros de principiante que
+custam minutos preciosos.</p>
+
+<h2>4. A caixa: o deploy que não entra</h2>
+
+<p>O padrão número um de incidente é a mudança recente. Alguém publicou, e a publicação não terminou. O
+sintoma no <code>get pods</code> é sutil: os pods antigos continuam rodando, e nenhum pod novo aparece. A
+causa costuma estar no manifesto, e o <code>apply</code> conta na hora — desde que você leia a
+resposta.</p>
+
+<div class="tryk8s" data-get="deployments" data-goal="texto:created;;campo:Deployment/cardapio|spec.template.metadata.labels.app=cardapio">
+  <p class="try-task">O rótulo do <code>template</code> está com um “o” a menos que o <code>selector</code>.
+  Rode, leia o erro, corrija e rode de novo.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapi
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value: {"app":"cardapi"}: `selector` does not match template `labels`
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>A mensagem é <code>The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value:
+{"app":"cardapi"}: `selector` does not match template `labels`</code>. Ela mostra os dois lados: o seletor
+procura <code>app: cardapio</code> e o template entrega <code>app: cardapi</code>. O cluster recusa o objeto
+inteiro, então não existe “meio deploy”: ou ele é válido e entra na fila, ou nada acontece.</p>
+
+<p>Esse erro aparece no <code>apply</code>, e é a razão pela qual o primeiro comando de qualquer incidente
+deveria ser o que mostra o estado <em>e</em> o que mostra a última tentativa de mudança. Se o deploy foi feito
+por uma esteira automática, a mensagem está no log dela; se foi na mão, está no histórico do terminal de quem
+publicou. Procurar essa saída antes de olhar o cluster economiza o primeiro quarto de hora.</p>
+
+<h2>5. A caixa: a versão que o cluster não conhece</h2>
+
+<p>O segundo erro de manifesto mais comum é copiar um exemplo da internet com a <code>apiVersion</code> errada.
+O sintoma é o mesmo do anterior — nenhum pod novo — mas a mensagem é diferente e aponta para outro lugar: o
+cluster nem sabe o que aquele arquivo quer dizer.</p>
+
+<div class="tryk8s" data-get="deployments" data-goal="texto:created;;pronto:Deployment/cardapio=2">
+  <p class="try-task">O <code>apiVersion</code> está como <code>v1</code>. Corrija para <code>apps/v1</code> e
+  rode: o Deployment tem de ser criado com duas réplicas prontas.</p>
+<pre class="yaml">apiVersion: v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no matches for kind "Deployment" in version "v1"
+ensure CRDs are installed first
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>A resposta é <code>error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no
+matches for kind "Deployment" in version "v1"</code>, seguida de <code>ensure CRDs are installed first</code>.
+A segunda linha confunde quem não espera por ela: o kubectl está dizendo “procurei um tipo chamado Deployment na
+versão v1 e não achei; se for um recurso instalado por um operador, instale a definição primeiro”. Em outras
+palavras, ele não sabe diferenciar “você errou a versão” de “falta instalar um recurso novo”.</p>
+
+<p>A lição vale para os dois casos: <strong>quando o cluster diz que não conhece o tipo, o problema está no
+topo do arquivo</strong> — <code>apiVersion</code> e <code>kind</code>. Pod é <code>v1</code>, Deployment é
+<code>apps/v1</code>, Job é <code>batch/v1</code>, Ingress é <code>networking.k8s.io/v1</code>. Na próxima
+aula desta trilha você vê o caso em que a segunda linha é literal: o tipo realmente foi instalado por
+alguém.</p>
+
+<h2>6. Os cinco padrões que explicam quase tudo</h2>
+
+<p>Depois de alguns plantões, dá para notar que os incidentes se repetem em poucas formas. Cinco perguntas
+cobrem a maior parte deles, e cada uma tem um primeiro comando. A tabela é a parte da aula que vale imprimir e
+colar no monitor.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Padrão</th><th>Sinal típico</th><th>Primeiro comando</th><th>O que olhar</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Mudou alguma coisa?</td><td>funcionava ontem; alerta logo depois de uma publicação</td><td><code>kubectl rollout history deploy/cardapio</code></td><td>quantas revisões, qual foi a última, se o
+rollout terminou</td></tr>
+<tr><td>2. É um ou são todos?</td><td>um pod vermelho entre seis, ou todos ao mesmo tempo</td><td><code>kubectl get pods -o wide</code></td><td>nó em comum, idade, <code>READY</code>, distribuição</td></tr>
+<tr><td>3. Está pronto mas sem tráfego?</td><td>pods <code>1/1</code> e cliente com erro 502</td><td><code>kubectl get endpoints cardapio</code></td><td>lista vazia, IPs faltando, seletor do Service</td></tr>
+<tr><td>4. Bateu no teto?</td><td>restart subindo, requisição lenta, pod morto por memória</td><td><code>kubectl describe pod</code></td><td><code>Last State</code>, <code>Reason: OOMKilled</code>, limites e
+requests</td></tr>
+<tr><td>5. Dependência externa?</td><td>erros de conexão nos logs, timeouts, tudo lento de uma vez</td><td><code>kubectl logs deploy/cardapio</code></td><td>mensagem de timeout, DNS, autenticação, banco</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O padrão 1 resolve sozinho mais da metade dos casos, e a ação é quase sempre a mesma: reverter. O padrão 2
+separa “defeito local” de “defeito sistêmico” — se todos os pods de um Deployment estão ruins, o problema não
+é de pod, é de imagem, configuração ou dependência. O padrão 3 é o mais enganoso, porque o pod parece
+saudável e o cliente vê erro; o culpado costuma ser um seletor, uma readiness ou um Service no namespace
+errado.</p>
+
+<p>O padrão 4 é o único em que o reinício pode ser útil — e mesmo assim como paliativo. Memória estourando
+volta a estourar se o consumo crescer com o tempo; aumentar limite compra tempo, não conserta vazamento. E o
+padrão 5 é onde o Kubernetes costuma ser inocente: o cluster fez o que podia, e quem não respondeu foi o
+banco, o DNS ou o serviço de terceiros.</p>
+
+<h2>7. O que o describe conta em produção</h2>
+
+<p>Em produção, você raramente vê o pod no momento da morte. O que sobra é o <code>describe</code>, e ele
+guarda o suficiente para reconstruir a cena. A transcrição abaixo é de um cluster real — três nós, mesmo
+namespace — de um pod que reiniciava a cada poucos minutos:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe pod cardapio-6d7f9c8b5-2xk4p
+Name:         cardapio-6d7f9c8b5-2xk4p
+Namespace:    default
+Node:         guia-worker/192.0.2.21
+Status:       Running
+IP:           10.244.3.71
+
+Containers:
+  web:
+    Image:          cardapio:1.0
+    State:          Running
+      Started:      Sat, 28 Nov 2026 03:11:02 +0000
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+    Ready:          True
+    Restart Count:  7
+    Limits:
+      memory:  256Mi
+    Requests:
+      memory:  128Mi
+
+Events:
+  Type     Reason     Age                  From     Message
+  ----     ------     ----                 ----     -------
+  Warning  Unhealthy  2m (x12 over 26m)    kubelet  Readiness probe failed: HTTP probe failed with statuscode: 502
+  Normal   Killing    2m (x3 over 20m)     kubelet  Container web failed liveness probe, will be restarted</pre>
+
+<p>Três linhas entregam o caso. <code>Restart Count: 7</code> diz que o problema é recorrente, não um
+tropeço. <code>Reason: OOMKilled</code> com <code>Exit Code: 137</code> diz que o container foi morto por
+memória — 137 é 128 + 9, o sinal de morte forçada. E <code>Limits: memory: 256Mi</code> mostra o teto que o
+programa estourou. A pergunta seguinte deixa de ser “por que o pod reinicia” e passa a ser “por que o
+cardápio passou a usar mais de 256 MB”.</p>
+
+<p>Repare que o evento de readiness aparece junto: com o pod morrendo de memória, a verificação de prontidão
+falha, e o painel do cliente mostra erro. Se você olhasse só o gráfico, concluiria “problema de rede”. O
+<code>describe</code> evita essa conclusão errada porque mostra as duas coisas no mesmo lugar.</p>
+
+<p>Quando o pod está em <code>Pending</code>, o mesmo comando mostra outra seção: os eventos de agendamento.
+Vale abrir <a href="pod-pending.html">Pod em Pending</a> e <a href="describe-diagnostico.html">Diagnóstico com
+describe</a> para revisar a leitura linha por linha. Aqui o ponto é outro: em produção, o
+<code>describe</code> é a única memória que sobra do momento da falha.</p>
+
+<h2>8. A linha do tempo: rollout e eventos</h2>
+
+<p>Incidente tem ordem. O deploy das 22h40, o primeiro erro às 22h43, o alerta às 22h50. Reconstruir essa
+ordem é metade do diagnóstico, e o cluster guarda as duas peças: o histórico de revisões do Deployment e os
+eventos do namespace. Esta é outra transcrição de cluster real, do caso clássico “o rollout não
+termina”:</p>
+
+<pre class="term">ana@notebook:~$ kubectl rollout history deployment/cardapio
+deployment.apps/cardapio
+REVISION  CHANGE-CAUSE
+1         kubectl apply --filename=cardapio.yaml
+2         kubectl set image deployment/cardapio web=cardapio:2.0
+
+ana@notebook:~$ kubectl rollout status deployment/cardapio --timeout=30s
+Waiting for deployment "cardapio" rollout to finish: 1 out of 3 new replicas have been updated...
+error: timed out waiting for the condition
+
+ana@notebook:~$ kubectl get events --sort-by=.lastTimestamp
+LAST SEEN   TYPE      REASON              OBJECT                          MESSAGE
+3m          Normal    ScalingReplicaSet   deployment/cardapio             Scaled up replica set cardapio-7b9c6f5d4d to 1
+2m          Warning   FailedScheduling    pod/cardapio-7b9c6f5d4d-kd4wm   0/3 nodes are available: 3 Insufficient memory.
+1m          Warning   FailedScheduling    pod/cardapio-7b9c6f5d4d-8xl2q   0/3 nodes are available: 3 Insufficient memory.</pre>
+
+<p>A história fica clara sem adivinhação: a revisão 2 trocou a imagem, o Deployment tentou subir o pod novo, e
+o pod novo não coube em nó nenhum porque a versão nova pede mais memória do que sobra. O rollout espera para
+sempre, os pods antigos continuam servindo, e o serviço <em>não</em> cai — o que costuma esconder o problema
+até alguém tentar escalar ou até um pod antigo morrer.</p>
+
+<p>Duas lições práticas. A primeira: <code>rollout status</code> com <code>--timeout</code> é o comando que
+transforma “acho que está publicando” em “não terminou, e aqui está o motivo”. A segunda: ordem importa nos
+eventos. <code>--sort-by=.lastTimestamp</code> põe a linha do tempo em sequência; sem isso, você lê os eventos
+na ordem em que o etcd devolveu, que raramente é a ordem em que aconteceram.</p>
+
+<p>E o que <strong>não</strong> fazer sob pressão: apagar o pod para “ver se volta” (perde o estado e o
+<code>describe</code>), editar o Deployment no cluster (cria divergência com o arquivo e com o Git), reiniciar
+todos os pods (transforma um incidente parcial num incidente total) e escalar réplicas antes de saber o
+gargalo (enche o nó, e os pods novos ficam <code>Pending</code>). Nenhuma dessas ações é proibida para sempre;
+todas são ruins como <em>primeira</em> ação.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o alerta que era o deploy das 11h</h3>
+<p>O gráfico de erros subiu às 11h07 e o último deploy tinha sido às 11h05. A Ana rodou
+<code>rollout history</code>, viu a revisão nova e fez <code>rollout undo</code>. Em quarenta segundos o
+serviço voltou. Só depois, com calma, ela abriu o diff da revisão e encontrou uma variável de ambiente com o
+nome errado. Mitigar primeiro, entender depois.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pod único que morria de memória</h3>
+<p>Um Job de relatório reiniciava a cada dez minutos, com <code>OOMKilled</code> no histórico. Aumentar o
+limite de 256Mi para 512Mi resolveu — o relatório carrega o mês inteiro na memória e 256Mi nunca foi
+suficiente. Aqui o paliativo era a cura, porque não havia vazamento: havia um limite herdado de outro
+serviço.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: os seis pods fora do ar ao mesmo tempo</h3>
+<p>Às 4h, todos os pods ficaram <code>0/1</code> juntos e os logs mostravam timeout de conexão com o banco. O
+cluster estava saudável; o banco tinha entrado em manutenção. O sinal de que não era o Kubernetes estava no
+escopo: quando <em>tudo</em> falha junto, a causa costuma ser algo compartilhado — dependência, DNS, rede ou
+credencial expirada.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual é a ordem do método?</p>
+<label><input type="radio" name="q1"> logs, depois <code>get</code>, depois <code>describe</code></label>
+<label><input type="radio" name="q1"> <code>get</code>, <code>describe</code>, <code>events</code>,
+<code>logs</code></label>
+<label><input type="radio" name="q1"> <code>describe</code>, reiniciar o pod, olhar de novo</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que <code>Reason: OOMKilled</code> com
+<code>Exit Code: 137</code> quer dizer?</p>
+<label><input type="radio" name="q2"> o programa terminou normalmente</label>
+<label><input type="radio" name="q2"> a imagem não foi encontrada</label>
+<label><input type="radio" name="q2"> o container passou do limite de memória e foi morto pelo
+cluster</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Três pods de um Deployment estão <code>1/1</code> e o
+cliente recebe 502. Qual padrão investigar primeiro?</p>
+<label><input type="radio" name="q3"> os endpoints do Service e a readiness</label>
+<label><input type="radio" name="q3"> o histórico de rollout da revisão 1</label>
+<label><input type="radio" name="q3"> a versão do kubelet em cada nó</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o comando que mostra os eventos do pod</h2>
+<p>Você tem um pod chamado <code>cardapio</code> e quer ver o motivo do último reinício, com os eventos no
+fim da saída. Complete o comando.</p>
+<div class="ex-code">kubectl <input aria-label="resposta 1" data-answer="describe" placeholder="..."> pod cardapio</div>
+<p class="ex-dica">Dica: é o comando que abre o objeto inteiro e termina com a lista <code>Events:</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Troubleshooting em produção não é adivinhação nem talento: é ordem. O <code>get</code> mostra escopo, o
+<code>describe</code> mostra o estado de um objeto com seus eventos, o <code>get events</code> mostra a
+sequência do namespace e o <code>logs</code> mostra a versão do programa. Cada passo descarta hipóteses, e o
+conjunto leva menos tempo do que qualquer tentativa e erro.</p>
+
+<p>Os cinco padrões — mudança recente, escopo, pod pronto sem tráfego, teto de recurso e dependência externa —
+cobrem a maior parte dos incidentes. E a disciplina que sustenta tudo: mitigar primeiro, anotar o que viu,
+mexer uma coisa por vez e só então procurar a causa raiz.</p>
+
+<p>Na próxima aula o assunto muda de lado: em vez de apagar incêndio, a Ana olha a conta e a capacidade do
+cluster — quanto cada pedido reserva, quanto sobra em cada nó e por que pedir demais custa dinheiro
+parado.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Ordem: <code>get</code> → <code>describe</code> → <code>events</code> → <code>logs</code>.</li>
+  <li>Um pod ou todos? Essa pergunta define metade do caminho.</li>
+  <li><code>rollout history</code> e <code>rollout undo</code> são a mitigação mais rápida que existe.</li>
+  <li><code>OOMKilled</code> + <code>137</code> = memória; <code>Pending</code> + <code>FailedScheduling</code>
+  = não coube.</li>
+  <li>Não apague o pod como primeira ação: você perde a evidência.</li>
+  <li>Anote linha do tempo e hipótese; o próximo plantão agradece.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

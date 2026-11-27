@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Helm | Guia Kubernetes</title>
+<meta name="description" content="Helm para quem nunca programou: chart, release e values, o primeiro helm install, o que o chart instala de verdade e onde o Helm guarda o estado das releases.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Helm</span></h1>
+<p class="intro">O site da Ana tem sete manifestos: Deployment, Service, ConfigMap, Secret, Ingress, HPA e um
+Job de migração. Funciona no ambiente de teste. Para produção, três linhas mudam — a imagem, o número de
+réplicas e o endereço do banco — e a Ana copia a pasta inteira, edita as três linhas à mão e reza para não
+ter esquecido nenhuma. Na terceira cópia, o Service de produção apontava para o ConfigMap de teste. O
+<strong>Helm</strong> existe para acabar com essa cópia: um pacote só, com os valores de cada ambiente
+separados do resto.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O problema concreto que o Helm resolve — e o que ele não resolve.</li>
+  <li>O que é um <em>chart</em>, uma <em>release</em> e um <em>values</em>.</li>
+  <li>O primeiro <code>helm install</code>, e por que o nome da release importa.</li>
+  <li>Revisões: <code>upgrade</code>, histórico e <code>rollback</code>.</li>
+  <li>O que o chart instala de verdade: os manifestos renderizados.</li>
+  <li>Onde o Helm guarda o estado e quando vale usar <code>kubectl apply</code> no lugar dele.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o mesmo site em três ambientes</h2>
+
+<p>Teste, homologação e produção rodam o mesmo site. As diferenças são pequenas e previsíveis: em teste uma
+réplica e a imagem <code>cardapio:1.0</code>; em homologação duas réplicas e a mesma imagem; em produção
+quatro réplicas, a imagem promovida, mais memória e um banco diferente. Sete manifestos por ambiente, vinte e
+um arquivos, todos parecidos.</p>
+
+<p>Copiar e editar funciona até o dia em que não funciona. Ninguém revisa vinte e um arquivos com atenção; a
+diferença de um espaço em branco não aparece no diff; e quando o time corrige um bug no Deployment de teste,
+a correção não chega nos outros dois. O sintoma clássico é o “funciona em homologação” seguido de um erro de
+digitação em produção.</p>
+
+<p>A ideia do Helm é separar duas coisas que a cópia mistura: a <strong>receita</strong> (quais objetos
+existem, com que estrutura) e os <strong>ingredientes de cada ambiente</strong> (imagem, réplicas, endereços).
+A receita é escrita uma vez; cada ambiente informa só os seus valores. E, de brinde, o Helm guarda o
+histórico do que foi instalado — o que permite voltar atrás com um comando.</p>
+
+<h2>2. O que é o Helm</h2>
+
+<p>O Helm se apresenta como “o gerenciador de pacotes do Kubernetes”, e a comparação com um gerenciador de
+pacotes de sistema ajuda: ele instala um conjunto de arquivos com nome, versão e dependências, e mantém
+registro do que instalou. A diferença é que o pacote aqui são manifestos e o “instalado” são objetos no
+cluster.</p>
+
+<p>Três palavras aparecem em toda conversa e vale fixar antes de qualquer comando. O <strong>chart</strong> é
+a receita: uma pasta com <code>Chart.yaml</code>, <code>values.yaml</code> e <code>templates/</code>. A
+<strong>release</strong> é a instalação de um chart no cluster, com nome próprio — o mesmo chart pode virar
+três releases, uma por ambiente. E <strong>values</strong> são os valores que entram na receita, mudando o
+resultado sem mudar o texto dos templates.</p>
+
+<dl class="anatomy">
+<dt>chart</dt>
+<dd>O pacote: pasta com metadados, valores padrão e templates. Tem nome e versão próprios.</dd>
+<dt>release</dt>
+<dd>Uma instalação nomeada de um chart, num namespace. É a release que tem histórico de revisões.</dd>
+<dt>revision</dt>
+<dd>O número da versão da release. Instalar é a revisão 1; cada <code>upgrade</code> soma uma.</dd>
+<dt>values</dt>
+<dd>Os valores que preenchem os templates. Vêm em cascata: padrão do chart, arquivos e
+<code>--set</code>.</dd>
+<dt>repository</dt>
+<dd>Um endereço onde charts publicados ficam guardados, como uma prateleira de pacotes.</dd>
+<dt>template</dt>
+<dd>Um arquivo de manifesto com buracos (marcados com <code>{{ }}</code>) que o Helm preenche com
+values.</dd>
+</dl>
+
+<p>Se você já viu Helm 2 em algum lugar, uma diferença importa: não existe mais o <strong>Tiller</strong>, o
+programa que rodava no cluster com poder quase total. No Helm 3, o cliente fala direto com o API server com
+as suas permissões, e o estado das releases fica em Secrets no namespace. Isso tirou do Helm o papel de
+“componente privilegiado do cluster”, o que é uma boa notícia para quem cuida de segurança.</p>
+
+<h2>3. O problema que o Helm resolve</h2>
+
+<p>Vale ser concreto, porque “gerenciador de pacotes” é uma frase que não diz muito a quem nunca usou um. A
+tabela compara a vida sem e com o Helm no caso da padaria.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Situação</th><th>Sem Helm</th><th>Com Helm</th></tr>
+</thead>
+<tbody>
+<tr><td>mesmo site em três ambientes</td><td>três pastas de manifestos copiados</td><td>um chart, três arquivos de valores</td></tr>
+<tr><td>mudar a imagem em produção</td><td>editar o YAML no lugar certo e rezar</td><td>mudar uma linha nos values e <code>upgrade</code></td></tr>
+<tr><td>saber o que está instalado</td><td>procurar objetos por etiqueta</td><td><code>helm list</code> e <code>helm history</code></td></tr>
+<tr><td>voltar atrás</td><td>editar tudo de volta à mão</td><td><code>helm rollback</code></td></tr>
+<tr><td>corrigir um bug em todos</td><td>corrigir em três pastas</td><td>corrigir no chart e subir a versão</td></tr>
+<tr><td>reaproveitar algo pronto</td><td>copiar YAML de um blog</td><td><code>helm install</code> de um chart do repositório</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O que o Helm <em>não</em> resolve: ele não valida se o seu manifesto faz sentido, não cuida da saúde dos
+pods e não substitui o kubectl. Se o chart tiver um Deployment com seletor errado, o Helm vai entregar o
+Deployment errado ao cluster — o erro é o mesmo, só muda quem apertou o botão.</p>
+
+<p>E ele não é a única resposta: existe o Kustomize, que faz sobreposição de YAML puro sem template. A
+diferença de filosofia é real, e a aula de Kustomize volta a ela. Por ora, guarde: Helm brilha quando você
+distribui algo que outras pessoas vão instalar com valores diferentes; Kustomize brilha quando o seu time
+mantém os próprios manifestos.</p>
+
+<h2>4. O primeiro helm install</h2>
+
+<p>A forma do comando é <code>helm install NOME DO-CHART</code>. O primeiro argumento é o nome da release — e
+essa é a decisão que mais confunde quem começa, porque é um nome que você inventa, não o nome do chart. Na
+padaria, o chart se chama <code>cardapio</code> e a release de produção também: os objetos criados ganham
+nomes derivados da release.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:NAME: cardapio;;texto:STATUS: deployed">
+  <p class="try-task">Falta o nome da release. Instale o chart <code>./cardapio</code> com o nome
+  <code>cardapio</code> e confira o bloco de resposta.</p>
+<pre class="yaml">helm install ./cardapio
+helm list</pre>
+<pre class="out">
+ana@notebook:~$ helm install ./cardapio
+NAME: ./cardapio
+LAST DEPLOYED: Fri Nov 27 15:50:21 2026
+NAMESPACE: default
+STATUS: deployed
+REVISION: 1
+NOTES:
+O cardápio está no ar em http://./cardapio.loja.test
+
+ana@notebook:~$ helm list
+NAME         NAMESPACE   REVISION   UPDATED               STATUS     CHART    APP VERSION
+./cardapio   default     1          2026-11-27 15:50:21   deployed   -0.1.0   1.0.0
+</pre>
+<pre class="solucao">helm install cardapio ./cardapio
+helm list</pre>
+</div>
+
+<p>A resposta traz o nome, a data, o namespace, o status e a revisão. <code>STATUS: deployed</code> quer
+dizer que o Helm entregou tudo ao cluster e considerou a release instalada; <code>REVISION: 1</code> é a
+primeira versão dessa release. As notas (<code>NOTES</code>) vêm de um arquivo do chart e costumam trazer o
+endereço do serviço recém-instalado.</p>
+
+<p>Se você rodar sem nome, o Helm usa o primeiro argumento como nome — e a release fica com um nome esquisito,
+derivado do caminho do chart. Ela funciona, mas aparece na listagem como <code>./cardapio</code> e ninguém
+sabe o que é. Escolher um nome curto e estável, igual ao do serviço, é o padrão que evita dor de cabeça.</p>
+
+<h2>5. A release: revisão, histórico e rollback</h2>
+
+<p>Instalar é o começo. Toda mudança depois disso é <code>helm upgrade</code>, e cada uma soma uma revisão.
+É esse histórico que dá ao Helm um superpoder que o <code>kubectl apply</code> não tem: voltar para uma
+revisão anterior sabendo exatamente o que estava lá.</p>
+
+<p>A caixa abaixo tem só um <code>install</code>. Troque por um <code>upgrade</code> e veja a revisão subir
+para 2.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:REVISION: 2;;texto:upgraded">
+  <p class="try-task">A release já está instalada. Suba uma nova versão com <code>helm upgrade</code> e
+  repare no número da revisão.</p>
+<pre class="yaml">helm install cardapio ./cardapio
+helm list</pre>
+<pre class="out">
+ana@notebook:~$ helm install cardapio ./cardapio
+NAME: cardapio
+LAST DEPLOYED: Fri Nov 27 15:50:21 2026
+NAMESPACE: default
+STATUS: deployed
+REVISION: 1
+NOTES:
+O cardápio está no ar em http://cardapio.loja.test
+
+ana@notebook:~$ helm list
+NAME       NAMESPACE   REVISION   UPDATED               STATUS     CHART              APP VERSION
+cardapio   default     1          2026-11-27 15:50:21   deployed   ./cardapio-0.1.0   1.0.0
+</pre>
+<pre class="solucao">helm upgrade cardapio ./cardapio
+helm list</pre>
+</div>
+
+<p>O histórico completo, num cluster de verdade, é uma tabela como esta (transcrição):</p>
+
+<pre class="term">$ helm history cardapio
+REVISION  UPDATED                  STATUS      CHART           APP VERSION  DESCRIPTION
+1         2026-11-20 09:12:44 UTC  superseded  cardapio-0.3.0  1.3.0        Install complete
+2         2026-11-24 18:03:10 UTC  superseded  cardapio-0.3.1  1.4.0        Upgrade complete
+3         2026-11-27 15:50:21 UTC  deployed    cardapio-0.3.1  1.4.0        Upgrade complete</pre>
+
+<p>Leia as colunas: cada revisão guarda o chart usado, a versão da aplicação e uma descrição. As antigas
+ficam <code>superseded</code> (substituídas) e a atual <code>deployed</code>. Com isso,
+<code>helm rollback cardapio 1</code> volta o cluster ao estado da primeira revisão e cria a revisão 4 com o
+conteúdo da 1 — o histórico nunca reescreve o passado, o que é ótimo para auditoria.</p>
+
+<p>O <code>helm list</code> também mostra o essencial de cada release instalada. Esta é a saída de um cluster
+com três ambientes (transcrição):</p>
+
+<pre class="term">$ helm list -A
+NAME        NAMESPACE     REVISION  UPDATED                  STATUS    CHART           APP VERSION
+cardapio    padaria-prod  3         2026-11-27 15:50:21 UTC  deployed  cardapio-0.3.1  1.4.0
+cardapio    padaria-teste 1         2026-11-26 11:02:37 UTC  deployed  cardapio-0.3.0  1.3.0
+relatorio   padaria-prod  2         2026-11-27 08:15:02 UTC  deployed  relatorio-0.1.2 0.9.1</pre>
+
+<p>Repare que existem duas releases chamadas <code>cardapio</code>, em namespaces diferentes. Isso é
+normal e é assim que o Helm separa ambientes: o nome da release é único <em>dentro do namespace</em>. Como
+os objetos também vivem no namespace, não há conflito de nomes entre teste e produção.</p>
+
+<h2>6. O que o chart instala de verdade</h2>
+
+<p>Aqui está o ponto que separa quem entendeu de quem só decorou comandos: o Helm não tem nada de mágico. Ele
+lê os templates, preenche os buracos com os values e entrega ao cluster manifestos YAML comuns — os mesmos
+que você escreveria à mão. Se o chart tem um Deployment e um Service, o resultado são um Deployment e um
+Service.</p>
+
+<p>Por isso é possível (e recomendado) pedir ao Helm que mostre o resultado antes de aplicar:
+<code>helm template</code> imprime os manifestos renderizados, e <code>helm install --dry-run</code> faz o
+mesmo com o contexto da release. É a maneira mais barata de descobrir que o seu template gerou
+<code>replicas: 0</code> em produção.</p>
+
+<p>A caixa abaixo é o resultado renderizado do chart da padaria — o que o Helm entregaria ao cluster. Ele
+está com uma réplica só e com o Service apontando para a porta errada. Conserte e rode.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="pronto:Deployment/cardapio=2;;campo:Service/cardapio|spec.ports.0.targetPort=8080;;texto:Running">
+  <p class="try-task">Ajuste para duas réplicas e faça o Service apontar para a porta que o site escuta
+  (8080). É o mesmo manifesto que o chart produz com os values de produção.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 80</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>O painel do guia aplica os dois documentos e mostra os pods; a verificação confere as réplicas prontas e a
+porta do Service. Vale dizer o que ele <em>não</em> faz: ele não executa o Helm nem renderiza templates — os
+comandos <code>helm</code> têm resposta simulada, e o que você vê aqui é o manifesto final, aplicado como
+qualquer outro. É a parte que importa para entender o que um chart entrega.</p>
+
+<h2>7. Onde o estado mora</h2>
+
+<p>Se não existe mais Tiller, onde fica o registro das releases? Em <strong>Secrets</strong> no namespace da
+release, com nomes que começam por <code>sh.helm.release.v1.</code>. Cada revisão vira um Secret separado,
+contendo o chart e os values usados. Isso explica três comportamentos que surpreendem:</p>
+
+<p>O primeiro: quem tem permissão de ler Secrets no namespace consegue ver os values da release — inclusive
+os que você passou por <code>--set</code> com senha. Values não é lugar de segredo; para isso existem os
+objetos de Secret e os cofres externos.</p>
+
+<p>O segundo: apagar o namespace apaga as releases junto, porque o registro mora ali. E o terceiro: migrar
+uma release de namespace não é um comando, é um procedimento — o histórico está preso ao namespace
+antigo.</p>
+
+<p>Do lado das permissões, o Helm usa a sua credencial do <code>kubeconfig</code>. Se você pode criar
+Deployments, pode instalar charts que criam Deployments. Isso significa que instalar um chart de terceiro é
+dar a ele as suas permissões: vale ler os templates antes, com <code>helm template</code>, como você leria
+qualquer manifesto que cai de paraquedas no cluster.</p>
+
+<h2>8. Helm ou kubectl apply?</h2>
+
+<p>Os dois convivem, e saber qual usar em cada momento evita discussão de time. A regra prática é sobre
+quem consome aquele conjunto de manifestos.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Situação</th><th>Ferramenta</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>um manifesto que você edita e aplica</td><td><code>kubectl apply</code></td><td>simples, direto, sem intermediário</td></tr>
+<tr><td>algo que outras pessoas vão instalar com valores próprios</td><td>Helm</td><td>o chart é o contrato; os values são a entrada</td></tr>
+<tr><td>software de terceiro (banco, proxy, monitoramento)</td><td>Helm</td><td>alguém já empacotou e mantém as atualizações</td></tr>
+<tr><td>três ambientes com poucas diferenças</td><td>Helm ou Kustomize</td><td>depende se você quer template ou sobreposição</td></tr>
+<tr><td>experimento de cinco minutos</td><td><code>kubectl</code></td><td>criar chart para testar é desperdício</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma armadilha comum é misturar os dois no mesmo objeto: instalar a release com Helm e depois editar o
+Deployment com <code>kubectl edit</code>. O Helm não sabe da edição, o próximo <code>upgrade</code> desfaz a
+sua mudança sem avisar, e alguém passa a tarde tentando entender por que o ajuste “não pega”. Se a release é
+do Helm, mude pelos values e dê <code>upgrade</code>.</p>
+
+<h2>9. Instalando um chart de terceiro</h2>
+
+<p>Até aqui a Ana instalou o próprio chart, numa pasta local. Metade do uso real do Helm é o contrário: pegar
+algo que outra pessoa empacotou. O caminho tem três passos e nenhum mistério.</p>
+
+<p>Primeiro, adicionar o repositório — a prateleira de onde os charts vêm:
+<code>helm repo add bitnami https://charts.bitnami.com/bitnami</code>. Segundo, atualizar o índice local com
+<code>helm repo update</code>, que baixa a lista de charts e versões disponíveis. Terceiro, procurar e
+instalar: <code>helm search repo</code> lista o que existe, e <code>helm install meu-banco bitnami/postgresql
+--version 16.4.1 --namespace padaria --create-namespace</code> instala a versão escolhida num namespace
+próprio.</p>
+
+<p>Antes de instalar, dois comandos economizam arrependimento: <code>helm show values bitnami/postgresql</code>
+imprime todos os valores que aquele chart aceita (é a documentação real dele) e
+<code>helm template meu-banco bitnami/postgresql</code> mostra os manifestos que seriam criados. Num chart
+grande, a lista de values tem centenas de linhas — e é normal: você sobrescreve cinco e deixa o resto no
+padrão de quem escreveu.</p>
+
+<p>Fixar a versão com <code>--version</code> não é preciosismo. Sem ela, o Helm usa a última disponível, e um
+<code>upgrade</code> feito meses depois pode pular três versões de uma vez. Em produção, a versão do chart é
+tão parte da receita quanto a versão da imagem.</p>
+
+<h2>10. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a release que ninguém sabia que existia</h3>
+<p>Um serviço antigo tinha sido instalado com Helm por alguém que saiu do time. Quando o novo Deployment foi
+aplicado com <code>kubectl apply</code>, os dois brigaram pelo mesmo nome de objeto e o resultado foi um
+rollout eterno. O desempate veio de <code>helm list -A</code>: quem instala com Helm registra a release, e
+isso é a documentação mínima de que aquilo existe.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o rollback que salvou a madrugada</h3>
+<p>Um upgrade mudou a imagem para uma versão com um bug que só aparecia com carga. Em vez de caçar o
+manifesto anterior, a Ana rodou <code>helm rollback cardapio</code>, sem número, que volta para a última
+revisão que funcionou. O cluster voltou em menos de um minuto, e a investigação ficou para o dia
+seguinte.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a senha no --set</h3>
+<p>Alguém instalou um chart passando a senha do banco com <code>--set senha=...</code>. Funcionou — e a senha
+ficou gravada em claro no Secret de histórico da release, visível para qualquer um com permissão de leitura
+no namespace. A correção foi mover a senha para um Secret criado à parte e referenciado pelo chart.</p>
+</div>
+
+<h2>11. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que é uma release?</p>
+<label><input type="radio" name="q1"> a pasta com os templates do chart</label>
+<label><input type="radio" name="q1"> uma instalação nomeada de um chart, com histórico de revisões</label>
+<label><input type="radio" name="q1"> o arquivo de valores padrão do chart</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Em <code>helm install cardapio ./cardapio</code>, o que é o
+primeiro argumento?</p>
+<label><input type="radio" name="q2"> o nome do chart</label>
+<label><input type="radio" name="q2"> o namespace onde instalar</label>
+<label><input type="radio" name="q2"> o nome da release, que você escolhe</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Onde o Helm 3 guarda o registro das releases?</p>
+<label><input type="radio" name="q3"> em Secrets no namespace da release</label>
+<label><input type="radio" name="q3"> num programa chamado Tiller, rodando no cluster</label>
+<label><input type="radio" name="q3"> dentro da imagem do chart, no registro de imagens</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: instalar e subir uma versão</h2>
+<p>Complete os comandos para instalar o chart <code>./cardapio</code> como release <code>cardapio</code> e
+depois subir uma nova revisão.</p>
+<div class="ex-code">helm install <input aria-label="resposta 1" data-answer="cardapio" placeholder="..."> ./cardapio
+helm <input aria-label="resposta 2" data-answer="upgrade" placeholder="..."> cardapio ./cardapio</div>
+<p class="ex-dica">Dica: o mesmo nome aparece nas duas linhas, mas em papéis diferentes — na primeira é o nome
+da release que você está criando; na segunda, a release que você está atualizando.</p>
+</div>
+
+<h2>12. Resumo</h2>
+
+<p>Helm é o gerenciador de pacotes do Kubernetes. O <strong>chart</strong> é a receita (metadados, values
+padrão e templates), a <strong>release</strong> é a instalação nomeada num namespace e a
+<strong>revisão</strong> é o número que sobe a cada mudança. Instalar é
+<code>helm install NOME ./chart</code>; mudar é <code>helm upgrade</code>; voltar é
+<code>helm rollback</code>.</p>
+
+<p>O que o Helm entrega ao cluster são manifestos comuns, gerados pelos templates com os values. Por isso
+<code>helm template</code> e <code>--dry-run</code> existem: ver antes de aplicar. O estado das releases mora
+em Secrets no namespace — motivo pelo qual values não é lugar de segredo e por que apagar o namespace apaga o
+histórico.</p>
+
+<p>Use Helm quando distribui algo que outras pessoas instalam com valores próprios; use
+<code>kubectl apply</code> para o manifesto solto do dia a dia. E não misture os dois no mesmo objeto: se a
+release é do Helm, a mudança passa pelos values. Na <a href="helm-chart.html">aula seguinte</a> a Ana abre o chart por dentro: o que é
+<code>Chart.yaml</code>, como o template vira manifesto e por que a renderização às vezes quebra.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>chart = receita; release = instalação nomeada; revision = versão da release.</li>
+  <li><code>helm install NOME ./chart</code>: o primeiro argumento é o nome que você inventa.</li>
+  <li><code>helm list -A</code> mostra as releases; <code>helm history</code>, as revisões.</li>
+  <li><code>helm template</code> mostra o manifesto renderizado antes de aplicar.</li>
+  <li>Sem Tiller: o estado fica em Secrets <code>sh.helm.release.v1.*</code> no namespace.</li>
+  <li>Não edite com <code>kubectl</code> o que o Helm instalou: o próximo upgrade desfaz.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

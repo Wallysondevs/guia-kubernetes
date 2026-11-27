@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deployments | Guia Kubernetes</title>
+<meta name="description" content="Consulta do Deployment: replicas, selector, strategy, minReadySeconds e revisionHistoryLimit em tabela, o mapa Deployment → ReplicaSet → Pod e os erros traduzidos.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Deployments</span></h1>
+<p class="intro">O Deployment é o objeto que a Ana usa para manter o site da padaria no ar, e o manifesto
+dele tem seis campos que importam. Só que o Deployment não roda nada: ele cria um ReplicaSet, que cria os
+pods. Quando algo dá errado, é essa hierarquia que explica o nome comprido dos pods e a coluna
+<code>READY</code> que não fecha. Esta página é a consulta dos campos e do mapa — com os erros de validação
+traduzidos e duas caixas para treinar o conserto.</p>
+
+<div class="note">
+<strong>Como usar esta página</strong>
+<ul>
+  <li>A tabela 1 é o manifesto; a tabela 2, a estratégia de atualização; a tabela 3, o mapa até o
+  pod.</li>
+  <li><code>selector</code> é o campo que não se muda depois de criado — leia a seção 5 antes de
+  editar.</li>
+  <li>Os erros da seção 6 vêm com o campo exato; procure pela mensagem que o seu terminal
+  mostrou.</li>
+</ul>
+</div>
+
+<h2>1. Para que serve esta página (e o que ela não cobre)</h2>
+
+<p>Esta é a folha de consulta do <code>kind: Deployment</code>. Ela responde “qual é o padrão deste campo?”,
+“o que acontece se eu mudar a estratégia?” e “por que o pod tem um sufixo esquisito no nome?”. Também
+traduz as mensagens de validação — quase todas falam de <code>selector</code>, <code>labels</code> e
+<code>replicas</code>, que são os três campos desta página.</p>
+
+<p>Ela não substitui a aula <a href="deployment.html">Deployment</a>, que conta a história do objeto com
+calma, nem <a href="rolling-update.html">Rolling update</a>, que mostra a troca de versão acontecendo. Para
+réplicas e escala manual, a referência é <a href="replicas-e-scaling.html">Réplicas e escala</a>; para
+voltar atrás, <a href="rollback.html">Rollback</a>. Aqui o formato é de consulta: tabela, exemplo,
+mensagem.</p>
+
+<p>Uma confusão de nomes que vale desfazer: “deployment” em português é “implantação”, e o objeto
+carrega esse nome porque a ideia original era descrever uma entrega de software. Mas ele não entrega nada:
+ele mantém um estado. Quem empacota imagem é o build; quem sobe é o cluster; quem garante que continue
+assim é o controlador que mora dentro do Deployment.</p>
+
+<p>Uma coisa que vale dizer de saída: o Deployment existe para uma promessa só — “N cópias deste modelo
+devem existir, sempre”. Tudo o mais que você vê nele (estratégia, revisões, <code>minReadySeconds</code>) é
+serviço de apoio a essa promessa. Se você guardar essa frase, os campos param de parecer arbitrários.</p>
+
+<h2>2. O essencial em 10 linhas</h2>
+
+<ul>
+  <li><code>replicas</code> é quantas cópias; o padrão é 1.</li>
+  <li><code>selector.matchLabels</code> escolhe os pods que são deste Deployment — e é imutável.</li>
+  <li><code>template</code> é o molde do pod; dentro dele vai o <code>spec</code> do pod inteiro.</li>
+  <li>As etiquetas do template precisam casar com o <code>selector</code>, senão o <code>apply</code>
+  recusa.</li>
+  <li><code>strategy.type</code> é <code>RollingUpdate</code> (padrão) ou <code>Recreate</code>.</li>
+  <li><code>maxSurge</code> e <code>maxUnavailable</code> controlam a troca, com 25% de padrão cada.</li>
+  <li><code>minReadySeconds</code> é a carência antes de considerar um pod disponível; padrão 0.</li>
+  <li><code>revisionHistoryLimit</code> guarda revisões antigas para rollback; padrão 10.</li>
+  <li>O Deployment cria um ReplicaSet por versão; o nome do pod leva o hash do template.</li>
+  <li><code>kubectl get deploy</code> mostra <code>READY</code> como “prontas/desejadas”.</li>
+</ul>
+
+<p>A segunda linha é a que mais causa problema na prática. O <code>selector</code> não é um filtro
+opcional: é a identidade do Deployment. Depois de criado, ele não pode ser alterado — a API recusa —, porque
+mudar o seletor significaria “este Deployment agora é dono de outros pods”, e o controlador não teria como
+distinguir o que era seu do que passou a ser. Se você errou o seletor, o caminho é apagar e recriar (ou
+criar com outro nome).</p>
+
+<p>Outra distinção que aparece na tabela e no dia a dia: <code>kubectl scale</code> muda o
+<code>replicas</code> de um Deployment existente, sem tocar no template. Ele e o <code>apply</code> chegam
+ao mesmo campo por caminhos diferentes — o primeiro por comando, o segundo por arquivo. Se você usa os dois
+ao mesmo tempo com números diferentes, o último a rodar ganha; num fluxo com GitOps, o arquivo costuma
+ganhar sempre que a esteira roda.</p>
+
+<p>E a última linha é a que se lê todo dia: <code>READY 2/2</code> quer dizer duas réplicas prontas de duas
+desejadas. <code>0/2</code> com pods em <code>Pending</code> é falta de recurso; <code>1/2</code> com
+<code>RESTARTS</code> subindo é programa morrendo. A tabela diz o número; o <code>describe</code> diz o
+motivo.</p>
+
+<h2>3. Anatomia do Deployment</h2>
+
+<dl class="anatomy">
+<dt>replicas</dt>
+<dd>Quantas cópias do pod devem existir. Padrão 1. O controlador cria e apaga pods até chegar nesse
+número.</dd>
+<dt>selector</dt>
+<dd>Como o Deployment reconhece os pods que são dele: um mapa de etiquetas. Precisa casar com
+<code>template.metadata.labels</code> e não pode ser alterado depois da criação.</dd>
+<dt>template</dt>
+<dd>O molde do pod: <code>metadata.labels</code> e <code>spec</code> completo (containers, resources,
+volumes). É o mesmo <code>spec</code> de um pod solto.</dd>
+<dt>strategy</dt>
+<dd>Como os pods são trocados quando o template muda: <code>RollingUpdate</code> (padrão, aos poucos) ou
+<code>Recreate</code> (derruba todos e recria).</dd>
+<dt>minReadySeconds</dt>
+<dd>Quantos segundos um pod novo precisa ficar pronto antes de contar como disponível. Padrão 0, que é
+otimista demais para produção.</dd>
+<dt>revisionHistoryLimit</dt>
+<dd>Quantos ReplicaSets antigos ficam guardados para rollback. Padrão 10; o que passar disso é
+apagado.</dd>
+</dl>
+
+<p>Repare que existem <em>dois</em> <code>metadata</code> e <em>dois</em> <code>spec</code> num Deployment:
+o do Deployment e o do template. O <code>metadata.labels</code> de fora é organização (etiquetar o próprio
+Deployment); o <code>metadata.labels</code> de dentro é identidade dos pods e precisa casar com o
+<code>selector</code>. É a mesma armadilha de nível que você viu no ConfigMap: indentação é contrato.</p>
+
+<p>Há dois campos que não estão no <code>spec</code> e aparecem no <code>describe</code>. O primeiro é o
+<code>progressDeadlineSeconds</code> (padrão 600): se a atualização não progride em dez minutos, a condição
+<code>Progressing</code> vira <code>False</code> com motivo <code>ProgressDeadlineExceeded</code> — e é
+isso que faz o <code>kubectl rollout status</code> terminar com erro em vez de esperar para sempre. O
+segundo é a anotação <code>deployment.kubernetes.io/revision</code>, que numera as versões e é o que o
+<code>rollout history</code> lista.</p>
+
+<h2>4. Os campos em tabela</h2>
+
+<p>O manifesto tem seis campos de decisão. A coluna “padrão” é o que o servidor preenche quando você omite
+— e a coluna “quando mexer” é a que evita mudança desnecessária.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Padrão</th><th>O que faz</th><th>Quando mexer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>replicas</code></td><td>1</td><td>quantas cópias do pod</td><td>quase sempre: o padrão quase nunca
+serve</td></tr>
+<tr><td><code>selector.matchLabels</code></td><td>obrigatório</td><td>identifica os pods do
+Deployment</td><td>na criação; depois é imutável</td></tr>
+<tr><td><code>template</code></td><td>obrigatório</td><td>o molde do pod</td><td>a cada nova versão da
+aplicação</td></tr>
+<tr><td><code>strategy.type</code></td><td><code>RollingUpdate</code></td><td>como trocar os
+pods</td><td>quando a aplicação não aceita duas versões juntas</td></tr>
+<tr><td><code>minReadySeconds</code></td><td>0</td><td>carência antes de contar como
+disponível</td><td>quando o pod “sobe” antes de estar pronto</td></tr>
+<tr><td><code>revisionHistoryLimit</code></td><td>10</td><td>quantas revisões guardar</td><td>para liberar
+espaço ou guardar mais histórico</td></tr>
+<tr><td><code>progressDeadlineSeconds</code></td><td>600</td><td>limite para a atualização
+progredir</td><td>quando o deploy é lento de propósito</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A estratégia tem campos próprios, e eles só valem quando o tipo é <code>RollingUpdate</code>. Os dois
+números são percentuais ou absolutos, e é comum ver <code>25%</code> escrito assim mesmo, com o sinal de
+porcentagem.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo da estratégia</th><th>Padrão</th><th>O que faz</th><th>Efeito prático</th></tr>
+</thead>
+<tbody>
+<tr><td><code>type</code></td><td><code>RollingUpdate</code></td><td>troca aos poucos ou de uma vez</td><td><code>Recreate</code>
+derruba todos antes de subir os novos</td></tr>
+<tr><td><code>maxSurge</code></td><td>25%</td><td>quantos pods <em>extras</em> podem existir durante a
+troca</td><td>mais surge, mais rápido e mais recurso usado</td></tr>
+<tr><td><code>maxUnavailable</code></td><td>25%</td><td>quantos pods podem ficar indisponíveis durante a
+troca</td><td>zero significa “nunca menos que o desejado”</td></tr>
+<tr><td><code>progressDeadlineSeconds</code></td><td>600</td><td>tempo máximo sem progresso</td><td>estourou,
+a condição vira <code>False</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A escolha entre as duas estratégias é uma decisão sobre a aplicação, não sobre o Kubernetes.
+<code>RollingUpdate</code> pressupõe que duas versões conseguem conviver por alguns minutos: banco
+compatível, contrato de API estável, sessão que não se perde. Se a versão nova muda uma coluna do banco de
+forma incompatível, conviver é pior do que cair — e aí a estratégia certa é <code>Recreate</code>, que
+derruba tudo e sobe tudo, aceitando alguns segundos de indisponibilidade em troca de não misturar
+versões.</p>
+
+<p>Dois detalhes que valem a consulta. Primeiro: <code>maxSurge</code> e <code>maxUnavailable</code> não
+podem ser zero ao mesmo tempo — se fossem, não haveria como trocar nada, e a API recusa. Segundo: os
+percentuais são arredondados para cima no <code>maxSurge</code> e para baixo no
+<code>maxUnavailable</code>, sempre a favor de manter capacidade. Com 3 réplicas e 25%, você vê 1 pod extra
+e 0 indisponíveis — o que, na prática, é uma troca um a um.</p>
+
+<h2>5. O mapa: Deployment → ReplicaSet → Pod</h2>
+
+<p>Três níveis, três responsabilidades. Entender quem cria quem é o que explica o nome comprido, o número
+de ReplicaSets antigos e o comportamento do rollback.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Objeto</th><th>Nome típico</th><th>Responsabilidade</th><th>Quem cria</th></tr>
+</thead>
+<tbody>
+<tr><td>Deployment</td><td><code>cardapio</code></td><td>quantas réplicas e qual versão, sempre</td><td>você
+(<code>apply</code>)</td></tr>
+<tr><td>ReplicaSet</td><td><code>cardapio-6d9c8f7b5b</code></td><td>contar pods de <em>uma</em> versão do
+template</td><td>o controlador do Deployment</td></tr>
+<tr><td>Pod</td><td><code>cardapio-6d9c8f7b5b-4xj2q</code></td><td>rodar o container</td><td>o controlador do
+ReplicaSet</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O sufixo do ReplicaSet é o <code>pod-template-hash</code>: um resumo do template. Muda a imagem, muda o
+hash, muda o nome do ReplicaSet — e é assim que o Deployment sabe que a versão é outra. O pod carrega o
+mesmo hash como etiqueta, e é por isso que <code>kubectl get pods --show-labels</code> mostra
+<code>pod-template-hash=6d9c8f7b5b</code> em cada pod.</p>
+
+<p>Quando você atualiza o template, o Deployment cria um ReplicaSet novo com o hash novo, sobe pods nele e
+escala o antigo para zero — sem apagar, porque o ReplicaSet antigo é o que permite o rollback. O
+<code>revisionHistoryLimit</code> é o que decide quantos desses antigos ficam guardados: com 10, você pode
+voltar até dez versões; com 0, perde o histórico e o <code>rollout undo</code> responde que não há para onde
+voltar.</p>
+
+<p>Toda mudança no template cria uma revisão nova: trocar a imagem, mudar uma variável, ajustar um
+resource. O <code>kubectl set image</code> e o <code>kubectl rollout restart</code> fazem o mesmo por
+comando — o segundo só acrescenta uma anotação com a data no template, o que basta para o hash mudar. Em
+todos os casos, o resultado é um ReplicaSet novo e um antigo em zero, e o <code>rollout history</code>
+lista a numeração.</p>
+
+<p>Um detalhe de leitura que confunde no começo: o <code>get pods</code> não mostra de qual Deployment
+cada pod veio. O vínculo está nas <code>ownerReferences</code>, dentro do pod, e no nome — que carrega o
+nome do ReplicaSet. Quando há dois Deployments no mesmo namespace, é comum a pessoa olhar a lista de pods e
+não saber de quem é cada linha; o <code>-l app=…</code> resolve, e o <code>--show-labels</code> mostra o
+hash.</p>
+
+<p>Na prática, é esse desenho que explica dois comportamentos que assustam. O primeiro: apagar um pod não
+muda nada, porque o ReplicaSet conta e recria. O segundo: <code>kubectl edit deployment</code> numa
+réplica não muda o pod existente — o controlador compara o template com o que existe e faz uma nova versão.
+Quem manda é o template, não o pod.</p>
+
+<h2>6. Erros e mensagens</h2>
+
+<p>As mensagens do Deployment quase sempre citam <code>selector</code>, <code>labels</code> ou
+<code>replicas</code>. A tabela traduz as que aparecem no primeiro mês de uso.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>O que significa</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>spec.selector: Required value</code></td><td>o Deployment não diz quais pods são
+dele</td><td>acrescente <code>selector.matchLabels</code></td></tr>
+<tr><td><code>spec.template.metadata.labels: Invalid value: null</code></td><td>o template não tem
+etiquetas</td><td>acrescente as mesmas etiquetas do seletor</td></tr>
+<tr><td><code>`selector` does not match template `labels`</code></td><td>o seletor e o template discordam em
+alguma chave</td><td>compare chave por chave, inclusive maiúsculas</td></tr>
+<tr><td><code>spec.replicas: Invalid value: "2": must be an integer</code></td><td>o número foi escrito entre
+aspas</td><td>use <code>replicas: 2</code>, sem aspas</td></tr>
+<tr><td><code>spec.replicas: Invalid value: -1: must be greater than or equal to 0</code></td><td>número
+negativo</td><td>use 0 para pausar, nunca negativo</td></tr>
+<tr><td><code>spec.strategy.type: Unsupported value: "Rolling"</code></td><td>o tipo não é um dos
+dois</td><td>use <code>RollingUpdate</code> ou <code>Recreate</code></td></tr>
+<tr><td><code>no matches for kind "Deployment" in version "v1"</code></td><td>a versão está
+errada</td><td>use <code>apiVersion: apps/v1</code></td></tr>
+<tr><td><code>field is immutable</code> (no <code>apply</code> de seletor)</td><td>tentou mudar o seletor de um
+Deployment existente</td><td>apague e recrie, ou use outro nome</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Quando o <code>apply</code> volta com <code>unchanged</code> em vez de <code>configured</code>, não é
+erro: quer dizer que o objeto do cluster já era idêntico ao do arquivo. É a resposta que confirma que o seu
+manifesto e a realidade estão alinhados — e, num fluxo de deploy, é o sinal verde de que nada mudou desde a
+última vez.</p>
+
+<p>A linha <code>field is immutable</code> merece um aviso prático: ela aparece quando você tenta mudar o
+<code>selector</code> de um Deployment que já existe. O <code>apply</code> falha, o Deployment continua como
+estava, e nada é perdido. O conserto é apagar e recriar — e, se você quiser que os pods antigos continuem
+rodando durante a troca, apaga com <code>--cascade=orphan</code> e recria em seguida com o seletor novo.</p>
+
+<p>Num cluster de verdade, a leitura da hierarquia se faz com três <code>get</code> seguidos. Repare como
+o nome do pod carrega o nome do ReplicaSet, e o do ReplicaSet carrega o do Deployment:</p>
+
+<pre class="term">$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           3d
+
+$ kubectl get replicasets
+NAME                  DESIRED   CURRENT   READY   AGE
+cardapio-6d9c8f7b5b   2         2         2       3d
+cardapio-5b7f9c6d4f   0         0         0       5d
+
+$ kubectl get pods -l app=cardapio
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-6d9c8f7b5b-4xj2q   1/1     Running   0          3d
+cardapio-6d9c8f7b5b-9p7wl   1/1     Running   0          3d</pre>
+
+<p>Repare também que o <code>get replicasets</code> não pede <code>-n</code> nem filtro: são todos os
+ReplicaSets do namespace, inclusive os de outros Deployments. Num cluster com dez aplicações, a lista fica
+longa — e o <code>-l</code> com a etiqueta do Deployment é o que a organiza.</p>
+
+<p>Duas leituras. O ReplicaSet antigo (<code>cardapio-5b7f9c6d4f</code>) aparece com <code>DESIRED 0</code>
+e <code>READY 0</code>: ele existe para o rollback, não para rodar. E a coluna <code>UP-TO-DATE</code> do
+Deployment conta quantos pods já usam o template atual — durante uma atualização, é ela que mostra o
+progresso, enquanto <code>AVAILABLE</code> mostra quantos estão prontos para atender.</p>
+
+<p>O acompanhamento oficial da troca é o <code>rollout status</code>, e o detalhe fica no
+<code>describe</code>, nas linhas <code>NewReplicaSet</code> e <code>OldReplicaSets</code>:</p>
+
+<pre class="term">$ kubectl rollout status deployment/cardapio
+Waiting for deployment "cardapio" rollout to finish: 1 out of 2 new replicas have been updated...
+Waiting for deployment "cardapio" rollout to finish: 1 old replicas are pending termination...
+deployment "cardapio" successfully rolled out
+
+$ kubectl describe deployment cardapio | tail -n 12
+Conditions:
+  Type           Status  Reason
+  Available      True    MinimumReplicasAvailable
+  Progressing    True    NewReplicaSetAvailable
+OldReplicaSets:  cardapio-5b7f9c6d4f (0/0 replicas created)
+NewReplicaSet:   cardapio-6d9c8f7b5b (2/2 replicas created)
+Events:
+  Type    Reason             Age   From                   Message
+  Normal  ScalingReplicaSet  30s   deployment-controller  Scaled up replica set cardapio-6d9c8f7b5b from 0 to 2</pre>
+
+<h2>7. Duas coisas para praticar agora</h2>
+
+<p>A primeira caixa monta o mínimo que funciona — e o inicial esquece o par que anda junto:
+<code>selector</code> e as etiquetas do template. A segunda conserta um valor de estratégia escrito de
+memória, com a palavra quase certa.</p>
+
+<div class="tryk8s" data-goal="objeto:Deployment/cardapio;;pronto:Deployment/cardapio=2;;campo:Deployment/cardapio|spec.selector.matchLabels.app=cardapio" data-get="deployments">
+  <p class="try-task">O Deployment do cardápio não tem seletor nem etiquetas no template. Acrescente os
+  dois — a etiqueta <code>app: cardapio</code> nos dois lugares — e rode: duas réplicas prontas.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.selector: Required value; spec.template.metadata.labels: Invalid value: null: `selector` does not match template `labels`
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<div class="tryk8s" data-goal="objeto:Deployment/vitrine;;pronto:Deployment/vitrine=2;;campo:Deployment/vitrine|spec.strategy.type=RollingUpdate" data-get="deployments">
+  <p class="try-task">A estratégia da vitrine foi escrita como <code>Rolling</code> e o servidor recusou.
+  Troque pelo valor aceito e rode: o Deployment tem de existir com duas réplicas prontas.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vitrine
+spec:
+  replicas: 2
+  strategy:
+    type: Rolling
+  selector:
+    matchLabels:
+      app: vitrine
+  template:
+    metadata:
+      labels:
+        app: vitrine
+    spec:
+      containers:
+        - name: web
+          image: vitrine:1.0</pre>
+<pre class="out">
+The Deployment "vitrine" is invalid: spec.strategy.type: Unsupported value: "Rolling": supported values: "Recreate", "RollingUpdate"
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vitrine
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: vitrine
+  template:
+    metadata:
+      labels:
+        app: vitrine
+    spec:
+      containers:
+        - name: web
+          image: vitrine:1.0</pre>
+</div>
+
+<p>No painel, o <code>get deployments</code> mostra <code>READY</code>, <code>UP-TO-DATE</code>,
+<code>AVAILABLE</code> e <code>AGE</code> — e, no código inicial da primeira caixa, nada aparece, porque o
+objeto nem chegou a ser criado. É a diferença entre “a lista está vazia” e “o objeto existe com zero
+prontas”: as duas coisas parecem iguais na tela e são problemas diferentes.</p>
+
+<p>Nas duas caixas, a meta confere <code>pronto:Deployment/…=2</code>: não basta o objeto existir, as duas
+réplicas precisam estar prontas. É a diferença entre “apliquei” e “está no ar” — e é a mesma diferença que
+separa <code>UP-TO-DATE</code> de <code>AVAILABLE</code> na tabela do <code>get</code>.</p>
+
+<h2>8. Para ir além</h2>
+
+<ul>
+  <li><a href="deployment.html">Deployment</a> — a aula completa, com a auto-cura acontecendo.</li>
+  <li><a href="replicas-e-scaling.html">Réplicas e escala</a> — <code>scale</code>, o número e o
+  status.</li>
+  <li><a href="rolling-update.html">Rolling update</a> — a troca de versão passo a passo.</li>
+  <li><a href="deployment-estrategias.html">Estratégias de rollout</a> — <code>Recreate</code>,
+  <code>maxSurge</code> e <code>maxUnavailable</code> na prática.</li>
+  <li><a href="rollback.html">Rollback</a> — <code>undo</code> e o histórico de revisões.</li>
+  <li><a href="revisions.html">Revisões</a> — o que é uma revisão e quando ela nasce.</li>
+  <li><a href="ref-pods.html">Pods</a> — o <code>spec</code> que vai dentro do
+  <code>template</code>.</li>
+</ul>
+
+<h2>Resumo</h2>
+
+<p>Deployment = N réplicas de um template, sempre. <code>replicas</code> (padrão 1) diz quantas;
+<code>selector.matchLabels</code> identifica os pods e é imutável; <code>template</code> é o molde do pod e
+precisa casar com o seletor. <code>strategy.type</code> é <code>RollingUpdate</code> (padrão) ou
+<code>Recreate</code>, com <code>maxSurge</code> e <code>maxUnavailable</code> de 25% cada;
+<code>minReadySeconds</code> (0) e <code>revisionHistoryLimit</code> (10) completam o desenho.</p>
+
+<p>O Deployment não roda pods: ele cria um ReplicaSet por versão, com o <code>pod-template-hash</code> no
+nome, e o ReplicaSet cria os pods. O antigo fica em zero, guardado para rollback. <code>READY</code> é
+prontas/desejadas; <code>UP-TO-DATE</code> é quantas já usam o template atual; <code>AVAILABLE</code> é
+quantas atendem. E as mensagens de erro falam de <code>selector</code>, <code>labels</code> e
+<code>replicas</code> — os três campos que, se estiverem certos, deixam o resto fácil.</p>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

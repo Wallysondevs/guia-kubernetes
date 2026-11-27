@@ -1,0 +1,664 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multiambiente | Guia Kubernetes</title>
+<meta name="description" content="Projeto guiado: o mesmo manifesto em dev e produção com overlays do Kustomize — prefixo, imagem, réplicas e ConfigMap por ambiente, e o acidente de aplicar dev em produção.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Multiambiente</span></h1>
+<p class="intro">A Ana tem um site só e uma pasta só de manifestos. Funciona até o dia em que ela precisa
+testar uma versão nova sem mexer na loja que está vendendo — e descobre que “testar” significa editar o
+arquivo de produção, rodar e desfazer na mão. Nos próximos minutos você vai montar os dois ambientes a
+partir de uma base única, vai ver o que muda em cada um, e vai provocar de propósito o acidente clássico:
+aplicar o manifesto de desenvolvimento por cima da produção.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Por que um manifesto só não serve para dois ambientes.</li>
+  <li>O que é a base e o que é overlay, no Kustomize.</li>
+  <li>O que muda entre dev e produção: réplicas, imagem, ConfigMap e nome/namespace.</li>
+  <li>Como o prefixo do overlay impede que dev sobrescreva produção.</li>
+  <li>O ConfigMap errado: o erro que não dá erro e aparece dentro do programa.</li>
+  <li>O que o painel faz e o que ele não faz quando o assunto é Kustomize.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>No fim desta página existem dois Deployments no cluster, nascidos do mesmo arquivo de base:
+<code>loja-prod</code>, com três réplicas, imagem <code>loja:1.0</code> e o ConfigMap
+<code>config-prod</code>; e <code>loja-dev</code>, com uma réplica, imagem <code>loja:dev</code> e o
+ConfigMap <code>config-dev</code>. As diferenças moram em dois arquivos pequenos de overlay, não numa
+segunda cópia do manifesto.</p>
+
+<p>A imagem mental é a de uma <em>receita de bolo com uma ficha de ajuste</em>. A receita é uma só: farinha,
+ovo, açúcar, forno. A ficha diz “na cozinha de teste, meia receita e forno de casa; na loja da esquina,
+receita dobrada e forno industrial”. A receita não é reescrita; ela é lida junto com a ficha. Quando a
+receita muda — mais um ovo —, os dois ambientes ganham o ovo, e a ficha continua valendo.</p>
+
+<p>No Kubernetes a receita é a pasta <code>base/</code> e a ficha é <code>overlays/dev/</code> ou
+<code>overlays/prod/</code>. Quem lê as duas e produz o manifesto final é o Kustomize, que já vem dentro do
+kubectl. Você vai colar o resultado dele nas caixas — porque o painel do guia não lê pastas — e vai ver o
+cluster aceitar (ou recusar) cada versão como aceitaria o seu.</p>
+
+<h2>2. O cenário da padaria</h2>
+
+<p>A Ana tem um arquivo <code>loja.yaml</code> com Deployment e Service. Versionado, com imagem
+<code>loja:1.0</code> e três réplicas. É o arquivo de produção. Para testar uma mudança, ela copiava o
+arquivo, mudava a imagem para <code>loja:dev</code>, aplicava, testava e “desfazia” — desfazer era editar de
+volta na mão.</p>
+
+<p>Um sábado, a mudança era no cálculo do frete. Ela testou, aprovou e esqueceu de voltar a imagem. Na
+segunda, produção estava rodando a imagem de desenvolvimento: banco de teste, sem os pedidos reais, tabela
+de frete pela metade. Ninguém percebeu até o primeiro cliente perguntar por que o pedido dele não
+aparecia.</p>
+
+<p>O problema não foi distração, foi desenho. Com <em>um</em> arquivo que serve para dois papéis, o ambiente
+vira estado mental — e estado mental não é versionado. O conserto tem duas partes: separar o que é receita
+do que é ajuste, e fazer o ajuste mudar o <em>nome</em> do objeto, para que um ambiente não consiga
+sobrescrever o outro nem por acidente.</p>
+
+<h2>3. Antes de começar</h2>
+
+<p>Três ideias sustentam tudo o que vem a seguir. A primeira: a base não sabe em que ambiente está. Ela tem
+o Deployment, o Service, os seletores, as portas — o que é igual nos dois mundos. A segunda: o overlay não
+repete a base; ele diz só o que muda. A terceira: aplicar é uma operação por <em>nome</em>. Se o objeto de
+dev se chama igual ao de produção, ele não “convive” com produção — ele substitui.</p>
+
+<p>Essa terceira ideia é a mais importante da página e a menos intuitiva. O Kubernetes não tem “modo de
+teste”. Ele tem objetos com nome e namespace. Dois objetos com o mesmo nome no mesmo namespace são o mesmo
+objeto, e o segundo <code>apply</code> sobrescreve o primeiro com um discreto <code>configured</code>.</p>
+
+<dl class="anatomy">
+<dt>resources</dt>
+<dd>A lista do que entra no resultado. No overlay, o caminho da base mais os arquivos próprios, como o
+<code>config-dev.yaml</code>.</dd>
+<dt>namePrefix</dt>
+<dd>Põe um prefixo no nome de todos os objetos do resultado: <code>namePrefix: dev-</code> transforma
+<code>loja</code> em <code>dev-loja</code>. É a rede de proteção contra sobrescrever produção.</dd>
+<dt>namespace</dt>
+<dd>Alternativa mais forte: joga todos os objetos num namespace separado. Precisa existir antes do
+apply.</dd>
+<dt>images</dt>
+<dd>Troca a imagem e a tag sem editar a base: <code>newTag: dev</code> num overlay, <code>newTag: 1.0</code>
+no outro.</dd>
+<dt>replicas</dt>
+<dd>Ajusta o número de réplicas por nome de Deployment. Uma réplica em dev, três em produção.</dd>
+<dt>configMapGenerator</dt>
+<dd>Gera o ConfigMap do ambiente a partir de literais ou arquivos, com sufixo de hash no nome.</dd>
+</dl>
+
+<p>Há uma aula inteira sobre a ferramenta (<a href="kustomize-intro.html">Kustomize</a>); o que você faz
+aqui é a mão na massa dela, com dois ambientes de verdade. O contrato cabe numa frase: a base não sabe
+onde roda, e o overlay não repete o que a base já diz. Quando você se pegar copiando o Deployment inteiro
+para dentro do overlay, a divisão está errada.</p>
+
+<h2>4. Passo 1 — o overlay de dev, com valores de dev</h2>
+
+<p>Comece pelo ambiente que ninguém vê. O manifesto abaixo já tem o nome certo (<code>loja-dev</code>) e o
+ConfigMap do ambiente, mas os valores são de produção: três réplicas e <code>loja:1.0</code>. É o que
+acontece quando o overlay só troca o nome e esquece o resto. Rode, veja o ambiente de teste nascer do
+tamanho de produção e conserte.</p>
+
+<div class="tryk8s" data-get="deploy" data-goal="campo:Deployment/loja-dev|spec.replicas=1;;campo:Deployment/loja-dev|spec.template.spec.containers.0.image=loja:dev;;pronto:Deployment/loja-dev=1">
+  <p class="try-task">Ajuste o <code>loja-dev</code> para o ambiente de desenvolvimento:
+  <code>replicas: 1</code> e imagem <code>loja:dev</code>. Rode e confira uma réplica pronta.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-dev
+data:
+  MODO: "sim"
+  BANCO: "postgres://banco.dev.svc.cluster.local:5432/padaria"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja-dev
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja-dev
+  template:
+    metadata:
+      labels:
+        app: loja-dev
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+          envFrom:
+            - configMapRef:
+                name: config-dev</pre>
+<pre class="out">
+configmap/config-dev created
+deployment.apps/loja-dev created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+loja-dev   3/3     3            3           9m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-dev
+data:
+  MODO: "sim"
+  BANCO: "postgres://banco.dev.svc.cluster.local:5432/padaria"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loja-dev
+  template:
+    metadata:
+      labels:
+        app: loja-dev
+    spec:
+      containers:
+        - name: loja
+          image: loja:dev
+          envFrom:
+            - configMapRef:
+                name: config-dev</pre>
+</div>
+
+<p>Duas linhas, o ambiente inteiro. No mundo do Kustomize, elas não ficam no manifesto: ficam no
+<code>kustomization.yaml</code> do overlay. Este é o overlay de dev, do jeito que aparece num repositório de
+verdade:</p>
+
+<pre class="term"># overlays/dev/kustomization.yaml
+resources:
+  - ../../base
+  - config-dev.yaml
+namePrefix: ""
+images:
+  - name: loja
+    newTag: dev
+replicas:
+  - name: loja
+    count: 1</pre>
+
+<p>O <code>kubectl kustomize overlays/dev</code> lê esse arquivo, vai na base, troca a tag, troca as réplicas
+e imprime o YAML final — o mesmo que você colou na caixa. Note o <code>namePrefix</code> vazio: aqui o nome
+do objeto já nasce com <code>-dev</code> na base do repositório da Ana, então o overlay não precisa
+prefixar. No próximo passo você vê por que a escolha importa.</p>
+
+<h2>5. Passo 2 — o ConfigMap de cada ambiente</h2>
+
+<p>Configuração é a parte do manifesto que mais muda entre ambientes, e a que menos aparece. A URL do banco,
+o modo de teste, o nome da loja, o limite de pedidos: tudo isso mora em ConfigMap, e o Deployment só
+aponta para um nome. Errar esse nome é o erro mais silencioso de todos — o pod sobe, o programa roda, e a
+variável simplesmente não existe.</p>
+
+<p>Na caixa, o <code>loja-prod</code> aponta para <code>config-dev</code>: configuração de teste dentro da
+loja. Nada falha na criação. A missão é criar o ConfigMap de produção e fazer o Deployment ler dele.</p>
+
+<div class="tryk8s" data-get="deploy" data-goal="objeto:ConfigMap/config-prod;;campo:ConfigMap/config-prod|data.MODO=nao;;campo:Deployment/loja-prod|spec.template.spec.containers.0.envFrom.0.configMapRef.name=config-prod">
+  <p class="try-task">Crie o ConfigMap <code>config-prod</code> com <code>MODO: "nao"</code> e
+  <code>BANCO</code> apontando para <code>banco.prod.svc.cluster.local</code>. Depois troque o
+  <code>configMapRef</code> do <code>loja-prod</code> para <code>config-prod</code>. Rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-dev
+data:
+  MODO: "sim"
+  BANCO: "postgres://banco.dev.svc.cluster.local:5432/padaria"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-prod
+data:
+  MODO: "sim"
+  BANCO: "postgres://banco.dev.svc.cluster.local:5432/padaria"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja-prod
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja-prod
+  template:
+    metadata:
+      labels:
+        app: loja-prod
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+          envFrom:
+            - configMapRef:
+                name: config-dev</pre>
+<pre class="out">
+configmap/config-dev created
+configmap/config-prod created
+deployment.apps/loja-prod created
+
+NAME        READY   UP-TO-DATE   AVAILABLE   AGE
+loja-prod   3/3     3            3           3m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-dev
+data:
+  MODO: "sim"
+  BANCO: "postgres://banco.dev.svc.cluster.local:5432/padaria"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-prod
+data:
+  MODO: "nao"
+  BANCO: "postgres://banco.prod.svc.cluster.local:5432/padaria"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja-prod
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja-prod
+  template:
+    metadata:
+      labels:
+        app: loja-prod
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+          envFrom:
+            - configMapRef:
+                name: config-prod</pre>
+</div>
+
+<p>Repare no detalhe que faz diferença: o ConfigMap de produção existe, mas o Deployment continuaria lendo o
+de dev se você não trocasse a linha. Os dois objetos estariam “certos” isoladamente, e a loja estaria em
+modo de teste. É por isso que a conferência é em dois lugares — o ConfigMap e o <code>configMapRef</code> —
+e não só no primeiro.</p>
+
+<p>No repositório, esse pedaço é o <code>configMapGenerator</code> do overlay de produção. Cada ambiente
+gera o seu, com os valores do ambiente:</p>
+
+<pre class="term"># overlays/prod/kustomization.yaml
+resources:
+  - ../../base
+namespace: prod
+images:
+  - name: loja
+    newTag: 1.0
+replicas:
+  - name: loja
+    count: 3
+configMapGenerator:
+  - name: config
+    literals:
+      - MODO=nao
+      - BANCO=postgres://banco.prod.svc.cluster.local:5432/padaria</pre>
+
+<p>O gerador cria o ConfigMap com um sufixo de hash no nome (algo como <code>config-7f2d4b</code>), e o
+Kustomize reescreve a referência no Deployment para casar. O efeito colateral é bem-vindo: quando a
+configuração muda, o nome muda, e o pod reinicia sozinho para ler o valor novo — em vez de continuar
+rodando com o antigo até alguém lembrar.</p>
+
+<h2>6. Passo 3 — o acidente: dev aplicado por cima de produção</h2>
+
+<p>Agora o motivo desta página existir. O manifesto abaixo tem dois documentos: o primeiro é produção, com
+três réplicas e <code>loja:1.0</code>; o segundo é o mesmo site em modo de desenvolvimento, uma réplica e
+<code>loja:dev</code>. Só que os dois têm o mesmo nome: <code>loja</code>. Rode e leia as duas linhas de
+resposta do <code>apply</code>.</p>
+
+<div class="tryk8s" data-get="deploy" data-goal="campo:Deployment/loja|spec.template.spec.containers.0.image=loja:1.0;;campo:Deployment/loja|spec.replicas=3;;objeto:Deployment/loja-dev;;conta:deployments=2">
+  <p class="try-task">Renomeie o segundo Deployment para <code>loja-dev</code> (mudando também as
+  etiquetas do seletor e do template para <code>app: loja-dev</code>), mantendo o primeiro como
+  <code>loja</code>. Rode e confira os dois ambientes convivendo, com produção intacta.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+  template:
+    metadata:
+      labels:
+        app: loja
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loja
+  template:
+    metadata:
+      labels:
+        app: loja
+    spec:
+      containers:
+        - name: loja
+          image: loja:dev</pre>
+<pre class="out">
+deployment.apps/loja created
+deployment.apps/loja configured
+
+NAME   READY   UP-TO-DATE   AVAILABLE   AGE
+loja   1/1     1            1           8m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+  template:
+    metadata:
+      labels:
+        app: loja
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loja-dev
+  template:
+    metadata:
+      labels:
+        app: loja-dev
+    spec:
+      containers:
+        - name: loja
+          image: loja:dev</pre>
+</div>
+
+<p>A saída do motor, no estado inicial, é esta — e ela é a definição de “erro que não parece erro”:</p>
+
+<pre class="term">$ kubectl apply -f tudo.yaml
+deployment.apps/loja created
+deployment.apps/loja configured</pre>
+
+<p><code>configured</code> é o kubectl avisando que <em>alterou um objeto que já existia</em>. Depois do
+apply, existe um Deployment só, com uma réplica e a imagem de desenvolvimento: produção foi substituída e o
+<code>get deploy</code> não mostra nada de anormal. Quem não olha a segunda linha da saída não percebe.</p>
+
+<p>A correção é a que o Kustomize faz sozinho quando o overlay declara <code>namePrefix</code>: dev vira
+<code>loja-dev</code>, produção continua <code>loja</code>, e os dois convivem. O prefixo não é estética —
+é o que impede que um ambiente apague o outro.</p>
+
+<dl class="anatomy">
+<dt>base/loja.yaml</dt>
+<dd>Deployment e Service sem nome de ambiente. É a receita comum.</dd>
+<dt>overlays/dev/</dt>
+<dd><code>namePrefix: dev-</code>, <code>newTag: dev</code>, <code>count: 1</code> e o
+<code>config-dev.yaml</code>.</dd>
+<dt>overlays/prod/</dt>
+<dd><code>namePrefix: prod-</code> (ou <code>namespace: prod</code>), <code>newTag: 1.0</code>,
+<code>count: 3</code> e o <code>config-prod.yaml</code>.</dd>
+<dt>resultado</dt>
+<dd>Dois conjuntos de objetos com nomes distintos. O <code>apply</code> de um nunca toca no
+outro.</dd>
+</dl>
+
+<h2>7. Conferindo com o painel</h2>
+
+<p>Com dois ambientes no mesmo cluster, o hábito que salva é ler a saída inteira do <code>apply</code>:
+<code>created</code> é objeto novo, <code>configured</code> é objeto que já existia e foi alterado. A
+palavra é discreta, mas é o aviso mais importante do terminal.</p>
+
+<p>Depois do apply, o <code>get deployments</code> conta a história:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Forma de aplicar</th><th>O que faz</th><th>Quando usar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kubectl apply -f loja.yaml</code></td><td>aplica um arquivo como está</td><td>manifesto único, sem
+overlay</td></tr>
+<tr><td><code>kubectl apply -k overlays/prod</code></td><td>lê a pasta, roda o Kustomize e aplica o
+resultado</td><td>o dia a dia de multiambiente</td></tr>
+<tr><td><code>kubectl kustomize overlays/prod</code></td><td>imprime o resultado, sem aplicar</td><td>revisar,
+ou colar no painel</td></tr>
+<tr><td><code>kubectl diff -k overlays/prod</code></td><td>mostra o que mudaria no cluster</td><td>antes de
+qualquer apply em produção</td></tr>
+</tbody>
+</table>
+</div>
+
+<pre class="term">$ kubectl get deployments
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+loja       3/3     3            3           8m
+loja-dev   1/1     1            1           2m
+
+$ kubectl get configmap
+NAME          DATA   AGE
+config-dev    2      8m
+config-prod   2      3m</pre>
+
+<p>Dois Deployments, dois ConfigMaps, e nada compartilhado entre eles. Se você vir um só Deployment com o
+<code>READY</code> menor do que esperava, o suspeito é o nome repetido — e o conserto é no manifesto, não no
+cluster.</p>
+
+<p>Sobre namespace, uma nota que o painel obriga. Os exercícios desta página rodam no namespace
+<code>default</code>, então a separação é feita por nome. Num cluster de verdade, o caminho mais forte é
+separar por namespace, com o overlay declarando <code>namespace: prod</code>; aí o acidente do passo
+anterior vira um erro imediato:</p>
+
+<pre class="term">Error from server (NotFound): error when creating "STDIN": namespaces "prod" not found</pre>
+
+<p>Essa saída veio do motor, com um manifesto que pedia um namespace que não existia. Ela é feia e é ótima:
+o apply falha, ninguém perde produção e você aprende que o namespace precisa existir antes. As duas redes de
+proteção — prefixo e namespace — servem para transformar um erro silencioso em erro barulhento.</p>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Cinco tropeços, todos com a mesma raiz: ambiente não é um recurso do Kubernetes. Quem existe é objeto,
+nome e namespace.</p>
+
+<p><strong>1. Nome repetido entre ambientes.</strong> O <code>apply</code> responde
+<code>configured</code> e um ambiente substitui o outro. Conserto: prefixo no overlay, ou namespace
+separado.</p>
+
+<p><strong>2. Namespace inexistente.</strong> <code>namespaces "prod" not found</code>. Conserto: criar o
+Namespace antes do objeto, no mesmo arquivo e na ordem certa.</p>
+
+<p><strong>3. ConfigMap do ambiente errado.</strong> O Deployment aponta para <code>config-dev</code> em
+produção. Nada falha; o site roda em modo de teste. Conserto: conferir o <code>configMapRef</code> no
+manifesto final, não na memória.</p>
+
+<p><strong>4. <code>kubectl apply -k</code> no painel.</strong> O motor responde
+<code>error: must specify one of -f and -k</code>, porque não há pasta com <code>kustomization.yaml</code>
+para ler. Conserto: rodar o Kustomize na sua máquina e colar o resultado.</p>
+
+<p><strong>5. Overlay que não muda nada.</strong> O <code>images</code> ficou de fora, e dev roda
+<code>loja:1.0</code> igual a produção. O teste aprova tudo, sempre. Conserto: conferir a tag no
+<code>get deployment -o yaml</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Onde olhar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>configured</code> no apply de um ambiente novo</td><td>nome repetido: o objeto já
+existia</td><td>o <code>metadata.name</code> dos dois overlays</td></tr>
+<tr><td><code>namespaces "prod" not found</code></td><td>Namespace não criado</td><td>a ordem dos documentos no
+arquivo</td></tr>
+<tr><td>site em modo de teste em produção</td><td><code>configMapRef</code> apontando para o ConfigMap de
+dev</td><td>o <code>envFrom</code> do Deployment</td></tr>
+<tr><td>tag igual nos dois ambientes</td><td><code>images</code> ausente no overlay</td><td>o
+<code>kustomization.yaml</code> do overlay</td></tr>
+<tr><td><code>must specify one of -f and -k</code></td><td><code>apply -k</code> no painel, que não lê
+pastas</td><td>o texto do comando que você rodou</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>Você tem dois ambientes nascidos de uma base, e as diferenças cabem numa lista curta: réplicas, imagem,
+ConfigMap e nome (ou namespace). Todo o resto — Deployment, Service, seletores, portas — é igual, e por isso
+mora na base. O overlay é o lugar onde o ambiente aparece, e ele deve ser pequeno: se crescer, a divisão
+está errada.</p>
+
+<p>A parte mais valiosa foi o acidente do passo 3. Aplicar dois manifestos com o mesmo nome não dá erro:
+dá <code>configured</code>, e produção vira dev sem que ninguém perceba. Prefixo e namespace existem para
+que esse erro seja impossível, não para deixar o YAML mais bonito.</p>
+
+<p>E a fronteira do painel, sem rodeio: ele não roda Kustomize. Não há pasta, então <code>apply -k</code>
+responde com erro de argumento e <code>kubectl kustomize</code> nem é comando conhecido ali. O que o motor
+prova é o resultado: objetos em <code>default</code>, nomes, réplicas, imagem e ConfigMap. As saídas de
+<code>kustomization.yaml</code> desta página são transcrição de um repositório de verdade, e o texto diz
+quando são.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Valor</th><th>Em desenvolvimento</th><th>Em produção</th></tr>
+</thead>
+<tbody>
+<tr><td>nome do Deployment</td><td><code>loja-dev</code></td><td><code>loja</code></td></tr>
+<tr><td>réplicas</td><td>1</td><td>3</td></tr>
+<tr><td>imagem</td><td><code>loja:dev</code></td><td><code>loja:1.0</code></td></tr>
+<tr><td>ConfigMap</td><td><code>config-dev</code>, <code>MODO: "sim"</code></td><td><code>config-prod</code>, <code>MODO: "nao"</code></td></tr>
+<tr><td>quem apaga sem medo</td><td>todo mundo do time</td><td>só com janela e aviso</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="cenario">
+<h3>Cenário 1: o <code>configured</code> que ninguém leu</h3>
+<p>O time aplicou o overlay de dev no cluster de produção para “testar rapidinho uma coisa”. A saída tinha
+duas linhas: <code>created</code> para o ConfigMap novo e <code>configured</code> para o Deployment. Na
+segunda linha estava o estrago: a imagem de produção virou <code>loja:dev</code>. O conserto foi de hábito —
+ler as duas linhas do apply e nunca aplicar overlay de dev em cluster de produção.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a configuração que ninguém trocou</h3>
+<p>O overlay de produção apontava para <code>config-prod</code>, mas o arquivo <code>config-prod.yaml</code>
+nunca entrou na lista de <code>resources</code>. O Deployment aplicou, os pods subiram, e o site abriu sem a
+URL do banco — variável ausente não é erro, é string vazia. O <code>kubectl diff -k</code> antes do apply
+mostraria o ConfigMap faltando na lista.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o dev que virou produção por um dia</h3>
+<p>Um dia alguém precisou de mais réplicas para testar carga e mudou o overlay de dev para três. Semanas
+depois, a conta do cluster não fechava, e o dev era o culpado. Nada estava errado tecnicamente; faltava
+alguém olhar. Overlay é código: revisar o diff do <code>kustomization.yaml</code> é revisar
+infraestrutura.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="1"><p class="mc-q">1. O que fica na <code>base/</code> do Kustomize?</p>
+<label><input type="radio" name="q1"> o que é igual em todos os ambientes</label>
+<label><input type="radio" name="q1"> só o Deployment, nunca o ConfigMap</label>
+<label><input type="radio" name="q1"> os valores de produção, sempre</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O <code>apply</code> responde
+<code>deployment.apps/loja configured</code> ao aplicar o manifesto de dev. O que aconteceu?</p>
+<label><input type="radio" name="q2"> o cluster criou um objeto novo chamado loja</label>
+<label><input type="radio" name="q2"> nada: é só um aviso de rotina</label>
+<label><input type="radio" name="q2"> o objeto que já existia foi sobrescrito pelos valores de dev</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Qual comando imprime o manifesto final de um overlay sem
+aplicar nada?</p>
+<label><input type="radio" name="q3"> <code>kubectl apply -k overlays/prod</code></label>
+<label><input type="radio" name="q3"> <code>kubectl kustomize overlays/prod</code></label>
+<label><input type="radio" name="q3"> <code>kubectl get -k overlays/prod</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: separando os ambientes</h2>
+<p>Complete a chave do <code>kustomization.yaml</code> que faz o objeto de dev nascer com outro nome, sem
+tocar em produção:</p>
+<div class="ex-code"><input aria-label="resposta 1" data-answer="namePrefix" placeholder="...">: dev-</div>
+<p class="ex-dica">Dica: o valor entra na frente do <code>metadata.name</code> de todos os objetos do
+resultado — e é o que evita o <code>configured</code> no objeto de produção.</p>
+</div>
+
+<h2>Resumo</h2>
+
+<p>Multiambiente é uma base e vários overlays. A base tem o que é comum — Deployment, Service, seletores,
+portas. Cada overlay tem só o que muda: réplicas, imagem, ConfigMap e nome (ou namespace). O Kustomize junta
+as duas coisas, e <code>kubectl kustomize</code> mostra o resultado antes de você aplicar.</p>
+
+<p>A regra que evita o desastre é simples e não é óbvia: ambientes diferentes precisam de nomes diferentes.
+Dois objetos com o mesmo nome no mesmo namespace são o mesmo objeto, e o segundo apply responde
+<code>configured</code> — discreto, educado e capaz de trocar a imagem de produção. Prefixo no overlay ou
+namespace separado resolvem; não fazer nenhum dos dois é apostar na memória de quem aplica.</p>
+
+<p>E o painel: ele aplica o resultado, prova nomes, réplicas, imagens e ConfigMaps, mas não lê pastas nem
+roda Kustomize — <code>apply -k</code> ali é erro de argumento. O fluxo é o de verdade: gerar o YAML com o
+Kustomize, revisar com <code>diff</code> e colar o resultado para conferir no painel. Na próxima página o
+assunto é o outro lado disso: montar o cluster inteiro na sua máquina, com três nós, para testar tudo isso
+sem tocar em nada de ninguém.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Base = o que é igual; overlay = o que muda por ambiente.</li>
+  <li>Os quatro valores: réplicas, imagem, ConfigMap, nome/namespace.</li>
+  <li><code>configured</code> no apply significa “sobrescrevi um objeto que já existia”.</li>
+  <li><code>namePrefix</code> ou <code>namespace</code> impedem um ambiente de apagar o outro.</li>
+  <li>Namespace precisa existir antes do objeto: <code>namespaces "prod" not found</code>.</li>
+  <li><code>kubectl kustomize</code> imprime; <code>apply -k</code> aplica; <code>diff -k</code> compara.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

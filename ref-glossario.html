@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossário | Guia Kubernetes</title>
+<meta name="description" content="Glossário do Guia Kubernetes: 40 termos do dia a dia, cada um com a tradução em uma frase, onde aparece e o link da aula em que você aprende.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Glossário</span></h1>
+<p class="intro">A Ana está lendo um erro do cluster e aparece uma palavra que ela nunca viu: <em>eviction</em>.
+Ela abre esta página para saber, em uma frase, o que é — e em qual aula aquilo foi explicado. São quarenta
+termos, os que mais aparecem no guia, cada um com a tradução curta, o lugar onde ele vive e o link para a
+história completa.</p>
+
+<h2>1. Para que serve esta página (e o que ela não cobre)</h2>
+
+<p>Kubernetes tem nome para tudo, e muitos deles são palavras comuns usadas com significado técnico:
+<em>service</em>, <em>job</em>, <em>claim</em>, <em>taint</em>. Esta página é o dicionário de bolso: uma frase
+por termo, sem rodeio, e o link para quem quiser o contexto.</p>
+
+<p>Ela não substitui as aulas e não ensina a usar nada. Se você chegou aqui com uma dúvida pontual — “o que é
+um ReplicaSet mesmo?” —, leia a linha e siga; se quer entender o assunto, o link da terceira coluna leva para a
+página em que o termo aparece com manifesto, exemplo e tropeço.</p>
+
+<p>O que fica de fora: termos de nuvem específicos de um provedor, nomes de ferramentas externas (Helm,
+Prometheus, Argo) e siglas de comunidade. O guia é sobre o Kubernetes em si, e o glossário segue a mesma
+regra.</p>
+
+<p>Uma dica de uso: procure com Ctrl+F pelo termo em inglês. O guia mantém o nome original porque é ele que
+aparece no terminal e na documentação — traduzir “Deployment” para “Implantação” ajudaria na leitura e
+atrapalharia na hora de digitar o comando.</p>
+
+<h2>2. O essencial em 10 linhas</h2>
+
+<ol>
+  <li>São cinco famílias: onde as coisas rodam, o que roda, o que atende, como se configura e o que dá
+  errado.</li>
+  <li><strong>Pod</strong> é a unidade; <strong>container</strong> é o que está dentro; <strong>nó</strong> é
+  onde ele roda.</li>
+  <li><strong>Deployment</strong> mantém pods vivos; <strong>Service</strong> dá um endereço fixo para
+  eles.</li>
+  <li><strong>ConfigMap</strong> e <strong>Secret</strong> guardam configuração fora da imagem.</li>
+  <li><strong>Volume</strong> guarda arquivo; <strong>PVC</strong> pede disco que sobrevive ao pod.</li>
+  <li><strong>Label</strong> etiqueta; <strong>selector</strong> escolhe por etiqueta. Quase todo erro de
+  “não funciona” começa aí.</li>
+  <li><strong>requests</strong> reserva, <strong>limits</strong> limita; <strong>QoS</strong> é a classe que sai
+  dos dois.</li>
+  <li><strong>Probe</strong> pergunta se está vivo e pronto; <strong>eviction</strong> é o nó expulsando pod sob
+  pressão.</li>
+  <li><strong>RBAC</strong> decide quem pode o quê; <strong>RoleBinding</strong> é a ligação entre permissão e
+  pessoa.</li>
+  <li>Termo em inglês no terminal é o mesmo termo em inglês na documentação: aprenda o nome e a tradução
+  junto.</li>
+</ol>
+
+<p>Se você só puder guardar uma coisa desta página, guarde a diferença entre os três primeiros: o
+<strong>nó</strong> é a máquina, o <strong>pod</strong> é o pacote que o cluster agenda nela, e o
+<strong>container</strong> é o processo que roda dentro do pacote. Todo o resto do vocabulário se apoia nesses
+três.</p>
+
+<h2>3. Anatomia: como ler uma entrada</h2>
+
+<p>Cada linha das quatro tabelas segue o mesmo desenho: o termo em inglês, a tradução em uma frase e o lugar
+onde ele aparece no guia. A anatomia da tabela é esta:</p>
+
+<dl class="anatomy">
+<dt>termo</dt>
+<dd>a palavra como ela aparece no terminal, no manifesto ou na mensagem de erro. Sempre em inglês, sempre com
+a inicial maiúscula quando é nome de recurso (<code>Deployment</code>, <code>ConfigMap</code>).</dd>
+<dt>em uma frase</dt>
+<dd>a definição curta, escrita para quem nunca programou. Não tenta ser completa: tenta ser suficiente para
+você reconhecer o termo na próxima vez.</dd>
+<dt>aula</dt>
+<dd>o link para a página em que o termo é ensinado com manifesto, exemplo e erro. É a coluna que transforma o
+glossário em índice.</dd>
+<dt>recurso × campo</dt>
+<dd>nome com maiúscula (<code>Service</code>) é um objeto que existe no cluster; nome em minúscula
+(<code>spec</code>, <code>requests</code>) é um campo dentro do manifesto. Confundir os dois é metade dos erros
+de YAML.</dd>
+</dl>
+
+<p>Essa última linha vale o preço da página. O cluster recusa um <code>kind: service</code> em minúsculas e
+aceita <code>kind: Service</code>; aceita <code>spec.type: NodePort</code> e recusa
+<code>spec.Type: NodePort</code>. A regra é a da linguagem: nome de tipo começa com maiúscula, nome de campo
+começa com minúscula.</p>
+
+<h2>4. Onde as coisas rodam</h2>
+
+<p>Os dez termos desta tabela descrevem o chão: a máquina, o pacote e as etiquetas que dizem quem é quem. Sem
+eles, nada do resto faz sentido — e três deles (<code>node</code>, <code>pod</code>, <code>container</code>) são
+a base de toda conversa sobre Kubernetes.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Termo</th><th>Em uma frase</th><th>Aula</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cluster</code></td><td>o conjunto de máquinas mais o plano de controle, vistos como um sistema
+só</td><td><a href="o-que-e-kubernetes.html">O que é Kubernetes</a></td></tr>
+<tr><td><code>node</code></td><td>uma máquina, física ou virtual, que roda pods</td><td><a href="cluster-node-pod.html">Cluster, node e pod</a></td></tr>
+<tr><td><code>control plane</code></td><td>os componentes que guardam o estado e decidem o que criar: API
+server, etcd, scheduler e controllers</td><td><a href="primeiro-cluster.html">O primeiro cluster</a></td></tr>
+<tr><td><code>kubelet</code></td><td>o agente que roda em cada nó e cuida dos containers daquele nó</td><td><a href="cluster-node-pod.html">Cluster, node e pod</a></td></tr>
+<tr><td><code>pod</code></td><td>a menor unidade que o cluster agenda: um ou mais containers com rede e ciclo
+de vida próprios</td><td><a href="primeiro-pod.html">O primeiro pod</a></td></tr>
+<tr><td><code>container</code></td><td>o processo isolado que roda dentro do pod, criado a partir de uma
+imagem</td><td><a href="containers-e-imagens.html">Containers e imagens</a></td></tr>
+<tr><td><code>imagem</code></td><td>o pacote de arquivos e o comando que o container executa, com nome e
+tag</td><td><a href="containers-e-imagens.html">Containers e imagens</a></td></tr>
+<tr><td><code>namespace</code></td><td>a divisão lógica que separa nomes e permissões dentro do mesmo
+cluster</td><td><a href="namespaces.html">Namespaces</a></td></tr>
+<tr><td><code>label</code></td><td>o par chave e valor que etiqueta um objeto para ser encontrado</td><td><a href="labels-e-selectors.html">Labels e selectors</a></td></tr>
+<tr><td><code>selector</code></td><td>a consulta por labels que decide quais objetos entram num conjunto</td><td><a href="labels-e-selectors.html">Labels e selectors</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O termo que mais confunde é <code>control plane</code>: ele não é uma máquina, é um conjunto de programas.
+Em cluster local de estudo, todos rodam no mesmo nó — e é por isso que a Ana vê <code>guia-control-plane</code>
+na lista de nós, um nome que descreve o papel, não o hardware.</p>
+
+<p>Esta é a lista de nós de um cluster local de três máquinas, numa transcrição de cluster real — repare no
+nome do primeiro e no papel que ele descreve:</p>
+
+<pre class="term">$ kubectl get nodes
+NAME                 STATUS   ROLES           AGE   VERSION
+guia-control-plane   Ready    control-plane   12d   v1.31.4
+guia-worker          Ready    &lt;none&gt;          12d   v1.31.4
+guia-worker2         Ready    &lt;none&gt;          12d   v1.31.4</pre>
+
+<p>“Control plane” é papel, não modelo de máquina: num cluster de estudo ele divide o hardware com os workers,
+e num cluster de produção costuma ser um conjunto separado, que ninguém agenda pod de aplicação.</p>
+
+<p>Outro que engana é <code>label</code>: ela não é decoração. É o que liga o Deployment aos pods, o Service aos
+pods e o ReplicaSet ao que ele conta. Um pod sem a label certa existe, roda e não recebe tráfego — e ninguém vê
+erro nenhum.</p>
+
+<h2>5. O que roda e o que atende</h2>
+
+<p>Esta tabela é a das cargas de trabalho e da rede. Os controladores (<code>Deployment</code>,
+<code>StatefulSet</code>, <code>DaemonSet</code>, <code>Job</code>) garantem que algo exista; os objetos de rede
+(<code>Service</code>, <code>Ingress</code>, <code>Endpoint</code>) fazem esse algo ser alcançável.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Termo</th><th>Em uma frase</th><th>Aula</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Deployment</code></td><td>o controlador que mantém N réplicas de um pod e troca a versão sem parar
+o serviço</td><td><a href="deployment.html">Deployment</a></td></tr>
+<tr><td><code>ReplicaSet</code></td><td>o objeto que o Deployment cria para garantir o número de réplicas</td><td><a href="replicas-e-scaling.html">Réplicas e escala</a></td></tr>
+<tr><td><code>StatefulSet</code></td><td>o controlador para aplicação com identidade fixa e um disco por
+réplica</td><td><a href="statefulset.html">StatefulSet</a></td></tr>
+<tr><td><code>DaemonSet</code></td><td>o controlador que roda um pod em cada nó do cluster</td><td><a href="daemonset.html">DaemonSet</a></td></tr>
+<tr><td><code>Job</code></td><td>o controlador que roda até terminar com sucesso, e não fica de pé depois</td><td><a href="job.html">Job</a></td></tr>
+<tr><td><code>CronJob</code></td><td>o Job que roda por agenda, no formato de cinco campos de horário</td><td><a href="cronjob.html">CronJob</a></td></tr>
+<tr><td><code>Service</code></td><td>o endereço estável que distribui tráfego entre os pods de um
+selector</td><td><a href="service-clusterip.html">Service ClusterIP</a></td></tr>
+<tr><td><code>Ingress</code></td><td>a regra de HTTP que manda host e caminho para um Service</td><td><a href="ingress.html">Ingress</a></td></tr>
+<tr><td><code>Endpoint</code></td><td>o par de IP e porta de um pod pronto para receber tráfego</td><td><a href="endpoints.html">Endpoints</a></td></tr>
+<tr><td><code>rollout</code></td><td>o processo de trocar a versão de um Deployment com os pods sendo
+substituídos aos poucos</td><td><a href="rolling-update.html">Rolling update</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O <code>ReplicaSet</code> é o termo invisível: você quase nunca o escreve, e ele aparece em todo nome de pod
+criado por Deployment (<code>cardapio-6d8f89b786-88dn9</code> tem o hash do ReplicaSet no meio). Quem apaga um
+ReplicaSet na mão vê o Deployment recriá-lo em segundos — o controlador repõe o que falta.</p>
+
+<p>A prova está no comando que lista os endpoints. Sem label casando, a resposta é a lista vazia; com as
+labels certas, aparece um IP por pod pronto:</p>
+
+<pre class="term">$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                       AGE
+cardapio   10.244.1.7:8080,10.244.2.6:8080   3d</pre>
+
+<p>Dois pods, dois IPs, uma linha. Se o Service existe e essa lista está vazia, o problema é de label ou de
+prontidão — não é de rede, e não adianta reiniciar nada.</p>
+
+<p>A dupla <code>Service</code> e <code>Endpoint</code> também confunde. O Service é a regra (“mande para quem
+tem a label app=cardapio”); o Endpoint é a lista concreta de IPs que atendem à regra naquele instante. Pod sem
+label, pod não pronto ou seletor errado produzem o mesmo sintoma: Service existe, Endpoint vazio, cliente sem
+resposta.</p>
+
+<h2>6. Configuração, números e o que dá errado</h2>
+
+<p>Aqui estão os termos que aparecem dentro do manifesto — os dois objetos de configuração, os volumes e os
+números que o agendador e o kernel usam — e, na segunda tabela, os estados que aparecem quando algo dá errado.
+É a família com mais campos e a que mais gera dúvida de “onde eu coloco isso”.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Termo</th><th>Em uma frase</th><th>Aula</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ConfigMap</code></td><td>o objeto que guarda configuração em texto, fora da imagem</td><td><a href="configmap.html">ConfigMap</a></td></tr>
+<tr><td><code>Secret</code></td><td>o objeto que guarda credencial em base64 — codificação, não criptografia</td><td><a href="secret.html">Secret</a></td></tr>
+<tr><td><code>volume</code></td><td>o armazenamento declarado no pod e montado dentro do container</td><td><a href="ref-volumes.html">Volumes</a></td></tr>
+<tr><td><code>emptyDir</code></td><td>o volume temporário que nasce com o pod e é apagado com ele</td><td><a href="volumes-emptyDir.html">emptyDir</a></td></tr>
+<tr><td><code>PersistentVolume</code></td><td>o disco oferecido ao cluster, independente de qualquer pod</td><td><a href="pv-e-pvc.html">PV e PVC</a></td></tr>
+<tr><td><code>PersistentVolumeClaim</code></td><td>o pedido de disco que o pod faz e que o cluster tenta
+atender</td><td><a href="pv-e-pvc.html">PV e PVC</a></td></tr>
+<tr><td><code>StorageClass</code></td><td>o modelo que cria disco sob demanda quando um PVC chega</td><td><a href="storageclass.html">StorageClass</a></td></tr>
+<tr><td><code>requests</code></td><td>a reserva de CPU e memória que o agendador usa para escolher o nó</td><td><a href="requests-limits.html">Requests e limits</a></td></tr>
+<tr><td><code>limits</code></td><td>o teto de CPU e memória que o kernel aplica ao container</td><td><a href="requests-limits.html">Requests e limits</a></td></tr>
+<tr><td><code>QoS</code></td><td>a classe do pod — Guaranteed, Burstable ou BestEffort — que sai dos números de
+requests e limits</td><td><a href="qos-classes.html">Classes de QoS</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<p><code>PersistentVolume</code> e <code>PersistentVolumeClaim</code> são o par que mais gente troca. O PV é a
+oferta (o disco que existe); o PVC é o pedido (o que o pod precisa). O pod nunca fala com o PV: ele aponta para
+o claim, e o cluster encontra um volume que sirva. Quando o PVC fica em <code>Pending</code>, o problema é o
+encontro dos dois — tamanho, modo de acesso ou classe.</p>
+
+<p><code>requests</code> e <code>limits</code> separam duas responsabilidades que parecem uma: a reserva é
+conversa com o agendador (cabe ou não cabe no nó), o teto é conversa com o kernel (pode ou não passar daquilo).
+Reserva sem teto deixa o pod consumir o nó; teto sem reserva faz o agendador tratar o pod como minúsculo.</p>
+
+<p>A segunda tabela desta seção é a das palavras que aparecem quando algo dá errado — mais as duas de
+permissão. Vale reconhecer cada uma de longe, porque o nome do estado costuma ser o primeiro
+diagnóstico.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Termo</th><th>Em uma frase</th><th>Aula</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Pending</code></td><td>o pod foi aceito, mas nenhum nó tem lugar para ele</td><td><a href="pod-pending.html">Pod em Pending</a></td></tr>
+<tr><td><code>CrashLoopBackOff</code></td><td>o container sobe, morre, e o kubelet espera cada vez mais antes
+de tentar de novo</td><td><a href="crashloop.html">CrashLoopBackOff</a></td></tr>
+<tr><td><code>ImagePullBackOff</code></td><td>o kubelet não consegue baixar a imagem: nome, tag ou
+credencial</td><td><a href="image-pull-error.html">ImagePullBackOff</a></td></tr>
+<tr><td><code>OOMKilled</code></td><td>o kernel matou o processo por passar do limite de memória, com código
+137</td><td><a href="eviction-e-oom.html">Eviction e OOMKilled</a></td></tr>
+<tr><td><code>probe</code></td><td>a verificação periódica que pergunta se o container está vivo, pronto ou
+iniciado</td><td><a href="liveness-probe.html">Liveness probe</a></td></tr>
+<tr><td><code>eviction</code></td><td>a remoção de um pod para aliviar pressão de memória ou disco no nó</td><td><a href="eviction-e-oom.html">Eviction e OOMKilled</a></td></tr>
+<tr><td><code>PodDisruptionBudget</code></td><td>o mínimo de pods que precisa continuar no ar durante um despejo
+voluntário</td><td><a href="poddisruptionbudget.html">PodDisruptionBudget</a></td></tr>
+<tr><td><code>RBAC</code></td><td>o sistema de permissões por papel, sujeito e verbo</td><td><a href="ref-rbac.html">RBAC</a></td></tr>
+<tr><td><code>RoleBinding</code></td><td>a ligação entre um papel e os sujeitos que passam a tê-lo</td><td><a href="ref-rbac.html">RBAC</a></td></tr>
+<tr><td><code>taint</code></td><td>a marca no nó que afasta pods, a não ser que eles tenham a toleration
+correspondente</td><td><a href="taints-e-tolerations.html">Taints e tolerations</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Vale distinguir <code>eviction</code> de <code>OOMKilled</code>, que são mortes diferentes: o segundo é o
+kernel matando o container que passou do próprio limite; o primeiro é o nó escolhendo qual pod sacrificar
+porque a máquina inteira ficou sem memória. O sintoma é parecido — pod morrendo —, e a causa é outra: no
+primeiro caso, ajuste o <code>limits</code>; no segundo, ajuste o que ocupa o nó.</p>
+
+<p><code>taint</code> e <code>PodDisruptionBudget</code> também vivem em mundos opostos: a taint afasta pods de
+um nó específico; o PDB protege um conjunto de pods de ser reduzido demais numa manutenção. Um é regra de
+lugar, o outro é contrato de disponibilidade.</p>
+
+<h2>7. Pratique o vocabulário</h2>
+
+<p>Duas caixas para o glossário sair do papel. A primeira exercita o par label e selector — o que liga o
+Deployment aos pods e o Service a eles. A segunda exercita a diferença entre recurso e campo: o
+<code>kind</code> com maiúscula, o <code>apiVersion</code> com o grupo certo.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Service/cardapio|spec.selector.app=cardapio;;campo:Deployment/cardapio|spec.selector.matchLabels.app=cardapio;;pronto:Deployment/cardapio=2;;texto:Running">
+  <p class="try-task">O Service procura pods com a label <code>app: web</code>, mas o Deployment cria pods com
+  <code>app: cardapio</code>. Alinhe o seletor do Service e as labels do Deployment em <code>cardapio</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-qw2c2pbbns-gncb9   1/1     Running   0          9m
+cardapio-qw2c2pbbns-tk6pc   1/1     Running   0          7m
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>O painel mostra os dois pods em <code>Running</code> e guarda o seletor certo nos dois objetos. Num cluster
+real, o teste seguinte é <code>kubectl get endpoints cardapio</code>: com as labels alinhadas, os IPs dos pods
+aparecem; sem elas, a lista fica vazia e o Service não tem para onde mandar tráfego.</p>
+
+<div class="tryk8s" data-get="services" data-goal="objeto:Service/cardapio;;campo:Service/cardapio|spec.ports.0.port=80;;texto:service/cardapio created">
+  <p class="try-task">O manifesto usa <code>kind: service</code> em minúscula, e o cluster não conhece esse tipo.
+  Corrija o <code>kind</code> — e repare que <code>apiVersion</code> continua <code>v1</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+The service "cardapio" is invalid: kind: Invalid value: "service": no kind is registered for this resource
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>A mensagem do cluster é literal: <code>kind: Invalid value: "service": no kind is registered for this
+resource</code>. É a prova da regra da seção 3 — nome de recurso começa com maiúscula. O
+<code>apiVersion</code>, esse, não muda: Service mora no grupo principal, que é sempre <code>v1</code>.</p>
+
+<h2>8. Para ir além</h2>
+
+<p>O glossário é o mapa; estas são as páginas onde cada termo vira prática. Comece pelo nível em que você está
+— e, se estiver começando agora, siga a ordem das três primeiras.</p>
+
+<ul>
+  <li><a href="o-que-e-kubernetes.html">O que é Kubernetes</a> — a ideia geral antes de qualquer
+  comando.</li>
+  <li><a href="cluster-node-pod.html">Cluster, node e pod</a> — os três termos que sustentam o resto.</li>
+  <li><a href="primeiro-pod.html">O primeiro pod</a> — o manifesto mínimo e a resposta do cluster.</li>
+  <li><a href="deployment.html">Deployment</a> — o controlador que você vai usar todo dia.</li>
+  <li><a href="service-clusterip.html">Service ClusterIP</a> — o endereço estável dentro do cluster.</li>
+  <li><a href="configmap.html">ConfigMap</a> e <a href="secret.html">Secret</a> — configuração fora da
+  imagem.</li>
+  <li><a href="ref-volumes.html">Volumes</a> — emptyDir, hostPath, configMap, secret e PVC na mesma
+  tabela.</li>
+  <li><a href="ref-probes-recursos.html">Probes e recursos</a> — as três sondas e os números do
+  container.</li>
+  <li><a href="ref-erros.html">Mensagens de erro</a> — Pending, CrashLoopBackOff, OOMKilled e o
+  Forbidden.</li>
+  <li><a href="ref-rbac.html">RBAC</a> — quem pode o quê, com os verbos completos.</li>
+  <li><a href="ref-configmap-secret.html">ConfigMap e Secret (referência)</a> — os campos dos dois
+  objetos.</li>
+  <li><a href="checklist-debug.html">Checklist de depuração</a> — o roteiro quando nada funciona.</li>
+</ul>
+
+<p>Se o termo que você procurou não está aqui, duas pistas: ele pode ser específico de um nível mais avançado
+(Helm, operador, service mesh), e nesse caso a página do nível correspondente é o lugar; ou pode ser um campo de
+manifesto, e aí a referência de manifestos resolve melhor do que o glossário.</p>
+
+<h2>Resumo</h2>
+
+<p>Quarenta termos, cinco famílias: onde as coisas rodam (cluster, node, pod, container), o que roda
+(Deployment, StatefulSet, Job), o que atende (Service, Ingress, Endpoint), como se configura (ConfigMap, Secret,
+volume, requests, limits) e o que dá errado (Pending, CrashLoopBackOff, OOMKilled, eviction).</p>
+
+<p>Três diferenças resolvem a maior parte da confusão: nó é a máquina, pod é o pacote, container é o processo;
+label etiqueta, selector escolhe; requests reserva, limits limita. E nome de recurso começa com maiúscula
+(<code>Service</code>), nome de campo começa com minúscula (<code>spec</code>).</p>
+
+<p>O glossário serve para reconhecer; a aula serve para entender. Quando a palavra aparecer no terminal às três
+da manhã, a linha da tabela já diz o suficiente para escolher o próximo comando — e a terceira coluna diz onde
+estudar com calma.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Nó é a máquina; pod é o pacote; container é o processo.</li>
+  <li>Label etiqueta; selector escolhe; sem os dois iguais, nada se encontra.</li>
+  <li>ReplicaSet é criado pelo Deployment e quase nunca aparece no seu YAML.</li>
+  <li>Requests reserva, limits limita; QoS é a classe que sai dos dois.</li>
+  <li>OOMKilled é o limite do container; eviction é a pressão do nó.</li>
+  <li>RBAC é aditivo: o que não foi concedido é negado.</li>
+  <li>Nome de tipo com maiúscula, nome de campo com minúscula.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RBAC | Guia Kubernetes</title>
+<meta name="description" content="RBAC no Kubernetes sem susto: quem pode fazer o quê em qual recurso, o que o kubectl manda ao API server, Role, binding e a recusa 403 explicada.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">RBAC</span></h1>
+<p class="intro">A Ana contratou a Bia para cuidar dos relatórios da padaria. A Bia precisava de uma coisa
+minúscula: <em>ler</em> o que estava rodando. A Ana, com pressa, mandou o arquivo de acesso dela mesma — o
+que dá poder total ao cluster. Duas semanas depois, um comando digitado na janela errada apagou o cardápio
+do ar. RBAC é o nome do sistema que existe justamente para evitar esse tipo de presente envenenado: ele
+responde, a cada pedido, “esta pessoa pode fazer <em>isto</em> naquele recurso?”. Nesta aula a Ana aprende
+o modelo — quem, o quê, onde — e vê o kubectl por dentro: ele não é mágico, ele pede e escuta.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que significam as três perguntas do RBAC: quem, qual ação, qual recurso.</li>
+  <li>Como o <code>kubectl</code> conversa com o API server e por que isso importa.</li>
+  <li>As quatro peças do sistema: <code>Role</code>, <code>RoleBinding</code>, <code>ClusterRole</code>,
+  <code>ClusterRoleBinding</code>.</li>
+  <li>O que é um <em>verb</em> — e por que <code>get</code> não é <code>list</code>.</li>
+  <li>Como ler uma recusa <code>Forbidden</code> sem entrar em pânico.</li>
+  <li>Onde ficam as permissões que o próprio Kubernetes usa para funcionar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o acesso emprestado</h2>
+
+<p>O arquivo que a Ana mandou para a Bia é o <code>kubeconfig</code>: o mesmo que ela usa todo dia. Ele
+carrega o endereço do cluster, o certificado e o nome do usuário — e, no caso da Ana, esse usuário é
+administrador. Quem tem esse arquivo pode criar, apagar e mudar qualquer coisa em qualquer namespace. É
+como dar a chave mestra do prédio para quem só precisava abrir a porta do arquivo.</p>
+
+<p>O estrago não veio de má intenção. Veio de um comando copiado de um tutorial, digitado no terminal
+errado, num dia de pressa. O Kubernetes aceitou porque o pedido era legítimo: aquele usuário podia mesmo
+apagar um Deployment. É aí que o RBAC entra. Ele não impede erros de digitação; ele impede que alguém
+tenha poder que não precisa ter.</p>
+
+<p>A ideia é simples e burocrática de propósito. Todo pedido ao cluster passa por duas perguntas:
+<strong>quem é você</strong> (autenticação) e <strong>você pode fazer isso</strong> (autorização). O RBAC
+cuida da segunda. E a resposta dele não é “sim” ou “não” no vácuo: é sempre uma frase completa — “esta
+identidade pode executar esta ação neste recurso, neste escopo”.</p>
+
+<h2>2. As três perguntas do RBAC</h2>
+
+<p>Toda regra de RBAC tem três partes, e a ordem ajuda a memorizar. A primeira é o <strong>subject</strong>
+— quem. Pode ser um usuário (<code>User</code>), um grupo (<code>Group</code>) ou uma conta de serviço
+(<code>ServiceAccount</code>). A segunda é o <strong>verb</strong> — a ação: ler, listar, criar, apagar. A
+terceira é o <strong>resource</strong> — o tipo de objeto: pods, services, deployments. E há uma quarta
+dimensão, que não aparece no nome mas decide quase tudo: <strong>onde</strong> a regra vale, ou seja, em
+qual namespace.</p>
+
+<dl class="anatomy">
+<dt>subject</dt>
+<dd>Quem recebe a permissão: <code>User</code> (pessoa), <code>Group</code> (conjunto de pessoas) ou
+<code>ServiceAccount</code> (identidade de um pod).</dd>
+<dt>verb</dt>
+<dd>A ação permitida: <code>get</code>, <code>list</code>, <code>watch</code>, <code>create</code>,
+<code>update</code>, <code>patch</code>, <code>delete</code>. O curinga <code>*</code> vale por
+todos.</dd>
+<dt>resource</dt>
+<dd>O tipo de objeto: <code>pods</code>, <code>deployments</code>, <code>secrets</code>. Sempre no plural
+e minúsculo, como o <code>kubectl</code> aceita.</dd>
+<dt>role</dt>
+<dd>A lista de regras (verbs × resources). Vive num namespace e só vale nele.</dd>
+<dt>binding</dt>
+<dd>A cola: liga um subject a um role. Sem binding, um role não faz nada — é só uma lista de
+intenções.</dd>
+</dl>
+
+<p>Repare na separação: o <em>role</em> descreve o que pode ser feito, o <em>binding</em> diz quem faz. É
+por isso que existem dois arquivos em vez de um. Se você quiser dar a mesma lista de permissões para três
+pessoas, escreve um role e três bindings — e quando a lista mudar, muda num lugar só.</p>
+
+<h2>3. O kubectl não é mágico</h2>
+
+<p>Aqui está a virada de chave desta aula. O <code>kubectl</code> não tem superpoder nenhum. Ele é um
+programa que monta uma requisição HTTP e manda para o API server. Quando a Ana digita
+<code>kubectl get pods -n padaria</code>, o que sai da máquina dela é mais ou menos isto:</p>
+
+<pre class="term">GET https://127.0.0.1:6443/api/v1/namespaces/padaria/pods
+Authorization: Bearer &lt;o token do kubeconfig&gt;</pre>
+
+<p>O API server olha o token, descobre <em>quem</em> é (o usuário <code>ana</code>, por exemplo), olha o
+verbo (<code>list</code>, porque um <code>get</code> de lista vira <code>list</code>) e o recurso
+(<code>pods</code>, no namespace <code>padaria</code>), e então pergunta ao RBAC. Se a resposta for sim, ele
+devolve o JSON com os pods; o kubectl formata aquilo na tabela bonita. Se for não, ele devolve
+<code>403 Forbidden</code> com uma frase que nomeia o usuário, a ação, o recurso e o namespace.</p>
+
+<p>Essa é a razão de a mensagem de erro ser tão comprida e tão específica: ela é a resposta do servidor, não
+um enfeite do kubectl. E é também a razão de o kubectl não conseguir “driblar” permissão nenhuma: não há o
+que driblar. Quem decide é o servidor, sempre. Um <code>kubectl</code> antigo ou novo, com plugin ou sem,
+faz o mesmo pedido e recebe a mesma resposta.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Verbo</th><th>O que autoriza na prática</th><th>Comando típico</th></tr>
+</thead>
+<tbody>
+<tr><td><code>get</code></td><td>ler um objeto pelo nome</td><td><code>kubectl get pod cardapio</code></td></tr>
+<tr><td><code>list</code></td><td>listar todos os objetos de um tipo</td><td><code>kubectl get pods</code></td></tr>
+<tr><td><code>watch</code></td><td>acompanhar mudanças em tempo real</td><td><code>kubectl get pods -w</code></td></tr>
+<tr><td><code>create</code></td><td>criar objeto novo</td><td><code>kubectl apply -f</code> de coisa inédita</td></tr>
+<tr><td><code>update</code> / <code>patch</code></td><td>alterar objeto existente</td><td><code>kubectl apply</code>, <code>scale</code></td></tr>
+<tr><td><code>delete</code></td><td>apagar</td><td><code>kubectl delete pod</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas linhas dessa tabela explicam a maioria dos erros de permissão do mundo real. A primeira:
+<code>get</code> e <code>list</code> são verbos diferentes. Quem só tem <code>get</code> consegue
+<code>kubectl get pod cardapio</code>, mas <code>kubectl get pods</code> falha com
+<code>Forbidden</code> — porque a listagem é outro verbo. A segunda: <code>kubectl apply</code> precisa de
+<code>get</code> <em>e</em> de <code>create</code>/<code>patch</code>, porque ele primeiro pergunta se o
+objeto existe. Um role “só de escrita” quase nunca funciona como a pessoa espera.</p>
+
+<h2>4. O primeiro Role</h2>
+
+<p>Um <code>Role</code> é um objeto de namespace com uma lista de regras. Cada regra diz: nos grupos de API
+tais, nos recursos tais, permita os verbos tais. O grupo de API é aquela primeira parte do
+<code>apiVersion</code> que você já viu nos manifestos: <code>""</code> (vazio) para os recursos antigos
+como pods e services, <code>apps</code> para deployments, <code>batch</code> para jobs. Errar o
+<code>apiGroups</code> é o tropeço número um: a regra fica escrita e não vale para nada, porque não existe
+recurso daquele grupo com aquele nome.</p>
+
+<div class="tryk8s" data-goal="objeto:Role/leitor-cardapio;;campo:Role/leitor-cardapio|rules.0.verbs.0=get" data-get="role leitor-cardapio">
+  <p class="try-task">O role permite listar pods, mas não ler um pod pelo nome. Acrescente o verbo
+  <code>get</code> à lista de <code>verbs</code> e rode: o painel tem de mostrar o role criado.</p>
+<pre class="yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leitor-cardapio
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]</pre>
+<pre class="out">
+role.rbac.authorization.k8s.io/leitor-cardapio created
+
+NAME              AGE
+leitor-cardapio   8m
+</pre>
+<pre class="solucao">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leitor-cardapio
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]</pre>
+</div>
+
+<p>O painel responde <code>role.rbac.authorization.k8s.io/leitor-cardapio created</code> e mostra a tabela do
+<code>get</code> com <code>NAME</code> e <code>AGE</code>. Só isso: o <code>kubectl get</code> de um role não
+imprime as regras. Para ver o conteúdo, o caminho é <code>-o yaml</code> (ou o <code>describe</code>, que no
+cluster de verdade imprime uma tabela chamada <code>PolicyRule</code>).</p>
+
+<p>Uma nota de honestidade sobre o formato: no cluster real, um Role <em>não</em> tem campo
+<code>spec</code> — as regras ficam em <code>rules</code>, no nível de cima. O motor do painel completa
+alguns campos por conta própria ao aplicar, então um <code>-o yaml</code> ali pode mostrar um
+<code>spec: {}</code> sobrando. Não é você que errou: é o simulador sendo mais chato que o servidor. O que
+importa é o conteúdo de <code>rules</code>.</p>
+
+<p>E o ponto central: esse Role sozinho não dá permissão a ninguém. Ele é uma lista de intenções guardada no
+namespace. Enquanto ninguém estiver ligado a ela por um binding, o cluster continua respondendo
+<code>Forbidden</code> para todo mundo que não seja admin.</p>
+
+<h2>5. O binding: ligando gente a regras</h2>
+
+<p>O <code>RoleBinding</code> tem duas partes. O <code>subjects</code> é a lista de quem recebe — e note que
+é uma lista: um binding pode servir três pessoas e um grupo de uma vez. O <code>roleRef</code> aponta para o
+role. O <code>roleRef</code> é imutável depois de criado: para trocar de role, apaga-se o binding e cria
+outro. Isso é de propósito, para ninguém “reapontar” uma permissão sem deixar rastro.</p>
+
+<div class="tryk8s" data-goal="objeto:RoleBinding/ana-leitor;;campo:RoleBinding/ana-leitor|roleRef.name=leitor-cardapio" data-get="rolebindings">
+  <p class="try-task">O binding aponta para um role chamado <code>leitor</code>, que não existe — o cluster
+  aceita e não dá permissão nenhuma. Corrija o <code>roleRef.name</code> para
+  <code>leitor-cardapio</code> e rode.</p>
+<pre class="yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ana-leitor
+subjects:
+  - kind: User
+    name: ana
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor</pre>
+<pre class="out">
+rolebinding.rbac.authorization.k8s.io/ana-leitor created
+
+NAME         AGE
+ana-leitor   5m
+</pre>
+<pre class="solucao">apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ana-leitor
+subjects:
+  - kind: User
+    name: ana
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor-cardapio</pre>
+</div>
+
+<p>Repare que as duas versões — a errada e a certa — recebem o mesmo
+<code>rolebinding.rbac.authorization.k8s.io/ana-leitor created</code>. O Kubernetes <strong>não
+verifica</strong> se o role referenciado existe na hora de criar o binding. É uma das armadilhas mais
+silenciosas do assunto: você aplica, vê “created”, respira aliviado, e a pessoa continua sem acesso. A
+pergunta certa depois de aplicar um binding não é “deu erro?”, é “o role apontado existe?”.</p>
+
+<p>A segunda armadilha está no <code>name</code> do subject. O RBAC não conhece apelidos: ele compara o nome
+que você escreveu com o nome que o autenticador colocou no token. Se o cluster autentica por e-mail, o
+subject é o e-mail; se autentica por um provedor que devolve <code>ana</code>, é <code>ana</code>. Um
+binding para <code>Ana</code> com maiúscula não casa com <code>ana</code> — e maiúscula em nome de recurso
+também não existe. O jeito de descobrir o nome certo é perguntar ao cluster, não adivinhar.</p>
+
+<h2>6. O que existe, e onde: api-resources</h2>
+
+<p>Antes de escrever regra, vale ver o catálogo. O comando <code>kubectl api-resources</code> lista todos os
+tipos que o servidor conhece, com o grupo de API, os apelidos e uma coluna chamada
+<code>NAMESPACED</code> — <code>true</code> para o que vive dentro de namespace, <code>false</code> para o
+que é do cluster inteiro. Essa coluna é a diferença entre <code>Role</code> e <code>ClusterRole</code>, e
+você vai usá-la muitas vezes.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Objeto</th><th>Escopo</th><th>Para que serve</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Role</code></td><td>namespace</td><td>lista de verbos × recursos que vale só naquele
+namespace</td></tr>
+<tr><td><code>RoleBinding</code></td><td>namespace</td><td>liga um subject a um Role — ou a um ClusterRole,
+mas só ali</td></tr>
+<tr><td><code>ClusterRole</code></td><td>cluster</td><td>regras para recursos de cluster (nós, volumes) e
+regras reaproveitáveis por vários namespaces</td></tr>
+<tr><td><code>ClusterRoleBinding</code></td><td>cluster</td><td>liga um subject a um ClusterRole em todos os
+namespaces de uma vez</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Guarde a assimetria dessa tabela, porque ela é a origem de metade dos acidentes: um
+<code>RoleBinding</code> pode apontar para um <code>ClusterRole</code> — e aí a permissão vale
+<em>somente</em> no namespace do binding. Já um <code>ClusterRoleBinding</code> espalha o mesmo
+<code>ClusterRole</code> por todos os namespaces, inclusive os que ainda vão existir. Os dois objetos se
+chamam quase igual e produzem efeitos muito diferentes.</p>
+
+<p>Sobre o curinga <code>*</code>: ele existe nos três lugares (verbos, recursos e grupos) e é quase sempre
+uma má ideia. Um role com <code>verbs: ["*"]</code> e <code>resources: ["*"]</code> é um admin com outro nome
+— inclusive no que ainda não foi inventado, porque o curinga também cobre recursos futuros. Quando bater a
+vontade de usar, o caminho é listar os verbos que o trabalho realmente precisa; se a lista ficar longa
+demais, provavelmente a permissão é grande demais.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:rolebindings;;texto:clusterrolebindings">
+  <p class="try-task">Não existe um tipo chamado <code>rbac</code>. Rode o comando como está para ver o erro
+  e depois peça a lista de recursos da API, procurando as linhas de roles e bindings.</p>
+<pre class="yaml">kubectl get rbac</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get rbac
+error: the server doesn't have a resource type "rbac"
+</pre>
+<pre class="solucao">kubectl api-resources</pre>
+</div>
+
+<p>Na tabela aparecem as quatro peças, com escopo bem marcado: <code>roles</code> e
+<code>rolebindings</code> com <code>NAMESPACED</code> em <code>true</code>; <code>clusterroles</code> e
+<code>clusterrolebindings</code> com <code>false</code>. O grupo é <code>rbac.authorization.k8s.io/v1</code>,
+e é ele que vai no <code>apiVersion</code> dos seus manifestos. Repare também que <code>pods</code> é do grupo
+<code>v1</code> — o grupo vazio, que nos manifestos se escreve <code>""</code>.</p>
+
+<p>Para saber o que você mesmo pode fazer, existe um comando feito sob medida:</p>
+
+<pre class="term">ana@notebook:~$ kubectl auth can-i get pods --as=ana
+no
+ana@notebook:~$ kubectl auth can-i list pods -n padaria --as=ana
+yes
+ana@notebook:~$ kubectl auth can-i delete pods -n padaria --as=ana
+no</pre>
+
+<p>Essa é uma transcrição de um cluster real, com o <code>RoleBinding/ana-leitor</code> aplicado no namespace
+<code>padaria</code>: leitura sim, listagem sim, apagar não. O <code>--as=</code> faz o servidor responder
+“no lugar de” outra identidade — e exige que você já tenha permissão para perguntar. Atenção a um detalhe do
+painel: ele consulta os <code>RoleBinding</code> e <code>ClusterRoleBinding</code> que existem no cluster de
+exemplo, e nenhum cenário traz um binding pronto. Então, ali, <code>can-i</code> sem <code>--as=</code>
+responde <code>yes</code> (você é o admin) e <code>can-i --as=…</code> responde <code>no</code> enquanto não
+houver um binding. Por isso as respostas desta seção são transcrição, não caixa.</p>
+
+<h2>7. A recusa, traduzida</h2>
+
+<p>Quando falta permissão, o cluster responde com <code>403</code> e uma frase. Ela parece agressiva, mas é
+uma das mensagens mais bem escritas do Kubernetes: nomeia o usuário, a ação, o recurso, o grupo e o
+namespace, tudo na mesma linha.</p>
+
+<pre class="term">ana@notebook:~$ kubectl delete deployment cardapio -n padaria
+Error from server (Forbidden): deployments.apps "cardapio" is forbidden: User "bia" cannot delete resource "deployments" in API group "apps" in the namespace "padaria"</pre>
+
+<p>Leia em pedaços: <code>Forbidden</code> é o código; <code>deployments.apps</code> é o recurso com o grupo;
+<code>User "bia"</code> é quem pediu; <code>cannot delete resource "deployments"</code> é a ação que faltou;
+<code>in the namespace "padaria"</code> é onde. Não há nada de misterioso — e não há o que “consertar” no
+kubectl. A pergunta seguinte é sempre a mesma: qual binding deveria existir e não existe?</p>
+
+<p>Um detalhe que confunde: <code>Forbidden</code> (403) não é <code>Unauthorized</code> (401). O primeiro
+diz “sei quem você é, e você não pode”; o segundo diz “não sei quem você é”. Se a mensagem reclamar de
+token, certificado ou credencial, o problema é de autenticação — outro departamento. O RBAC só entra depois
+que a identidade está estabelecida.</p>
+
+<h2>8. As permissões que o cluster usa para funcionar</h2>
+
+<p>Existe uma pergunta que todo mundo faz na primeira semana: se tudo passa pelo RBAC, como o
+<em>próprio</em> Kubernetes consegue trabalhar? A resposta é que ele é cliente de si mesmo. Os componentes
+do plano de controle usam contas de serviço que vivem no namespace <code>kube-system</code>, e essas contas
+têm ClusterRoles com nomes que você vai reconhecer: <code>system:kube-controller-manager</code>,
+<code>system:kube-scheduler</code>, <code>system:node</code>. Não são exceções à regra; são regras como as
+suas.</p>
+
+<p>Junto delas vêm três ClusterRoles prontos que servem de atalho para gente comum: <code>view</code> (ler,
+sem ver segredo), <code>edit</code> (ler e alterar, sem mexer em permissão) e <code>cluster-admin</code>
+(pode tudo, inclusive apagar o chão). O <code>view</code> costuma ser exatamente o que a Bia precisava: ler
+o que está rodando, sem poder mudar nada. Na próxima aula a Ana cria roles do zero; aqui basta saber que os
+três existem e que <code>cluster-admin</code> é a chave mestra que ela não deveria ter emprestado.</p>
+
+<p>Um aviso de expectativa sobre o painel: ele não semeia esses ClusterRoles embutidos, então
+<code>kubectl get clusterroles</code> ali responde <code>No resources found.</code>. Num cluster de verdade a
+mesma lista traz dezenas de linhas começando por <code>cluster-admin</code>. Os três atalhos acima, porém,
+funcionam no motor quando usados como <code>roleRef</code> de um binding — é assim que a aula de ClusterRole
+vai provar o efeito deles.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o estágio que só precisava olhar</h3>
+<p>A Bia ganhou um <code>RoleBinding</code> para o ClusterRole <code>view</code>, no namespace
+<code>padaria</code>. Ela passou a rodar <code>kubectl get pods</code>, <code>describe</code> e
+<code>logs</code> sem pedir ajuda a ninguém — e sem conseguir apagar nada. O suporte da Ana caiu pela metade
+no primeiro dia, e o susto do acesso emprestado não voltou.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o pipeline que quebrava no apply</h3>
+<p>O script de publicação do site tinha um usuário só com <code>create</code> e <code>patch</code>. O
+primeiro deploy funcionou; do segundo em diante, <code>Forbidden</code>. O motivo: <code>kubectl apply</code>
+primeiro <em>lê</em> o objeto para saber se existe. Faltava <code>get</code>. O conserto foi acrescentar o
+verbo, não trocar o usuário por admin.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o binding que “não fazia efeito”</h3>
+<p>Uma pessoa aplicou o binding com o nome do role certo, mas no namespace errado: o Role estava em
+<code>padaria</code> e o binding em <code>default</code>. Como o binding só enxerga roles do próprio
+namespace, ele apontava para o vazio. O sintoma era o mesmo do role inexistente: tudo criado, ninguém com
+acesso.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Quem decide se um pedido ao cluster é permitido?</p>
+<label><input type="radio" name="q1"> o kubectl, antes de enviar a requisição</label>
+<label><input type="radio" name="q1"> o API server, consultando o RBAC</label>
+<label><input type="radio" name="q1"> o kubelet, no nó onde o pod vai rodar</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Um <code>Role</code> sozinho, sem binding, o que
+faz?</p>
+<label><input type="radio" name="q2"> dá permissão a todos os usuários do namespace</label>
+<label><input type="radio" name="q2"> dá permissão só ao criador dele</label>
+<label><input type="radio" name="q2"> nada: ele é uma lista de intenções sem ninguém ligado a ela</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. A mensagem <code>Forbidden</code> aparece quando…</p>
+<label><input type="radio" name="q3"> a identidade foi reconhecida, mas falta uma regra que permita a
+ação</label>
+<label><input type="radio" name="q3"> o token está vencido e o cluster não sabe quem é você</label>
+<label><input type="radio" name="q3"> o pod de destino está fora do ar</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o subject do binding</h2>
+
+<p>Você quer ligar a conta de serviço <code>relatorio</code> (que vive no namespace <code>padaria</code>) ao
+role <code>leitor-cardapio</code>. No <code>subjects</code> de um RoleBinding, o <code>kind</code> correto
+para esse caso é:</p>
+
+<div class="ex-code">kind: <input aria-label="resposta 1" data-answer="ServiceAccount" placeholder="..."></div>
+
+<p class="ex-dica">Dica: <code>User</code> é gente, <code>Group</code> é conjunto de gente,
+<code>ServiceAccount</code> é identidade de pod. E, para ServiceAccount, o subject precisa também do campo
+<code>namespace</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>RBAC responde a uma pergunta por pedido: esta identidade pode executar esta ação neste recurso, neste
+escopo? O kubectl só monta a requisição HTTP; quem autentica e autoriza é o API server. As quatro peças são
+<code>Role</code> e <code>RoleBinding</code> (dentro de um namespace) e <code>ClusterRole</code> e
+<code>ClusterRoleBinding</code> (para o cluster inteiro). Role descreve o quê; binding diz quem.</p>
+
+<p>Os verbos importam: <code>get</code> lê um objeto, <code>list</code> lista todos, e <code>apply</code>
+precisa dos dois mais escrita. O <code>apiGroups</code> tem de bater com o grupo do recurso — <code>""</code>
+para pods, <code>apps</code> para deployments. E o binding não confere se o role existe: errar o nome produz
+um objeto “created” que não dá acesso a ninguém.</p>
+
+<p>Recusou? Leia a frase do <code>Forbidden</code> até o fim: ela diz o usuário, o verbo, o recurso e o
+namespace. Foi falta de regra, não de sorte. Na próxima aula a Ana escreve o Role e o binding do zero, testa
+com <code>kubectl auth can-i</code> e vê a recusa acontecer antes de emprestar qualquer chave.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>RBAC = quem (subject) + o quê (verb) + em qual recurso + em qual namespace.</li>
+  <li>O kubectl pede ao API server; a decisão é sempre do servidor.</li>
+  <li><code>Role</code>/<code>RoleBinding</code> valem num namespace;
+  <code>ClusterRole</code>/<code>ClusterRoleBinding</code> valem no cluster.</li>
+  <li>Role sem binding não dá acesso a ninguém; binding para role inexistente também não.</li>
+  <li><code>403 Forbidden</code> é falta de regra; <code>401</code> é identidade não reconhecida.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mensagens de erro | Guia Kubernetes</title>
+<meta name="description" content="Catálogo de mensagens de erro do Kubernetes: Pending, ImagePullBackOff, CrashLoopBackOff, CreateContainerConfigError, OOMKilled, Forbidden e falha de validação.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Mensagens de <span class="hl">erro</span></h1>
+<p class="intro">São três da manhã, o site da padaria está fora do ar e a Ana tem uma tela com uma palavra em
+inglês. Esta página é o catálogo que ela abre nessa hora: o estado que aparece no <code>get</code>, a mensagem
+que aparece no <code>describe</code>, a causa em uma linha e o que fazer. Está tudo em tabela, na ordem em que
+os problemas costumam aparecer.</p>
+
+<h2>1. Para que serve esta página (e o que ela não cobre)</h2>
+
+<p>Mensagem de erro no Kubernetes tem três origens diferentes, e confundi-las é o que faz a madrugada durar
+mais: o <strong>API server</strong> recusa o manifesto, o <strong>agendador</strong> não encontra lugar, e o
+<strong>kubelet</strong> não consegue rodar o container. Cada uma deixa a mensagem num lugar diferente.</p>
+
+<p>Esta página é a consulta por sintoma: você sabe o que está vendo e quer a causa provável. Ela não ensina a
+depurar do zero — o roteiro completo está na aula de checklist — e não entra em problema de rede entre pods, que
+tem página própria.</p>
+
+<p>O que fica de fora: <code>CrashLoopBackOff</code> com causa de aplicação (vai para a aula de crashloop),
+<code>ImagePullBackOff</code> com registro privado (vai para a aula de imagem) e erro de Service sem endpoint.
+No fim há o link de cada uma.</p>
+
+<p>Para usar a página com pressa, procure pelo texto exato que está na tela: <code>Pending</code>,
+<code>137</code>, <code>Forbidden</code>, <code>not found</code>. O navegador acha em um segundo, e a linha da
+tabela já traz a causa e o próximo passo. Se a mensagem não estiver aqui, o caminho é o
+<code>describe</code> — ele quase sempre tem uma frase mais específica do que a do <code>get</code>.</p>
+
+<p>Um aviso honesto sobre este guia: o painel <strong>não executa container</strong>. Ele calcula agendamento,
+validação e contagem de pods, mas <code>CrashLoopBackOff</code>, <code>ImagePullBackOff</code> e
+<code>OOMKilled</code> não acontecem ali — aparecem nesta página como transcrição de cluster real, sempre
+identificada. O que o painel mostra de verdade são os erros de <code>apply</code> e o <code>Pending</code> por
+falta de lugar.</p>
+
+<h2>2. O essencial em 10 linhas</h2>
+
+<ol>
+  <li>Comece pelo <code>kubectl get pods</code>: a coluna <code>STATUS</code> diz qual dos três mundos é o
+  problema.</li>
+  <li><code>Pending</code> é o agendador: nenhum nó coube, ou falta um PVC.</li>
+  <li><code>ContainerCreating</code> é o kubelet: imagem baixando ou volume montando.</li>
+  <li><code>ImagePullBackOff</code> é imagem: nome, tag ou credencial de registro.</li>
+  <li><code>CreateContainerConfigError</code> é referência: ConfigMap ou Secret que não existe.</li>
+  <li><code>CrashLoopBackOff</code> é o programa: ele sobe e morre, e o intervalo entre tentativas
+  cresce.</li>
+  <li><code>OOMKilled</code> com código 137 é memória: o limite era menor do que o consumo.</li>
+  <li><code>Forbidden</code> é RBAC: verbo, recurso, grupo e namespace na própria mensagem.</li>
+  <li><code>Invalid</code> é validação: o campo errado vem antes dos dois-pontos.</li>
+  <li>O <code>describe</code> guarda os eventos; o <code>logs</code> guarda a saída do programa. Um não
+  substitui o outro.</li>
+</ol>
+
+<p>Há um hábito que economiza mais tempo do que qualquer comando: antes de olhar o cluster, responda duas
+perguntas. O que mudou nas últimas horas — imagem, manifesto, configuração, nó? E o problema é de um pod só ou
+de todos? Um pod só aponta para manifesto; todos apontam para nó, cota, imagem ou configuração compartilhada.
+Sem essas duas respostas, o plantão vira tentativa e erro, e cada tentativa apaga um pouco da evidência.</p>
+
+<p>O roteiro de trinta segundos, na ordem: <code>get pods</code>, <code>describe pod</code>, ler os eventos,
+<code>logs</code>, e só então mexer em alguma coisa. Pular direto para “vou reiniciar” costuma apagar a única
+evidência que existia.</p>
+
+<h2>3. Anatomia: onde cada erro aparece</h2>
+
+<p>Toda mensagem do Kubernetes tem um formato parecido, e reconhecer as partes acelera a leitura. A anatomia
+abaixo é a dos campos que você vai encontrar no <code>get</code>, no <code>describe</code> e na resposta do
+<code>apply</code>.</p>
+
+<dl class="anatomy">
+<dt><code>STATUS</code></dt>
+<dd>a coluna do <code>get pods</code>: <code>Pending</code>, <code>ContainerCreating</code>,
+<code>Running</code>, <code>CrashLoopBackOff</code>, <code>Completed</code>, <code>Error</code>,
+<code>Terminating</code>. É o primeiro indício, não o diagnóstico.</dd>
+<dt><code>READY</code></dt>
+<dd>containers prontos sobre o total. <code>1/1</code> com <code>Running</code> é saudável; <code>0/1</code>
+com <code>Running</code> é sonda de prontidão falhando.</dd>
+<dt><code>Events</code></dt>
+<dd>o bloco no fim do <code>describe</code>, com <code>Type</code>, <code>Reason</code>, <code>Message</code> e
+contagem. É onde o kubelet e o agendador escrevem o motivo real.</dd>
+<dt><code>Reason</code></dt>
+<dd>o motivo em uma palavra: <code>FailedScheduling</code>, <code>FailedMount</code>,
+<code>FailedPull</code>, <code>BackOff</code>, <code>OOMKilled</code>, <code>Evicted</code>.</dd>
+<dt><code>Last State</code> / <code>Exit Code</code></dt>
+<dd>no <code>describe</code>, o estado anterior do container e o código com que ele saiu. <code>137</code> é
+memória; <code>143</code> é encerramento educado; <code>1</code> é erro do programa.</dd>
+<dt><code>Error from server (…) </code></dt>
+<dd>o prefixo das respostas do API server, com o motivo entre parênteses: <code>Forbidden</code>,
+<code>NotFound</code>, <code>Invalid</code>, <code>AlreadyExists</code>, <code>Conflict</code>.</dd>
+</dl>
+
+<p>Há ainda uma quarta origem, que não é erro de pod: o <strong>controlador</strong>. Quando um Deployment
+não cria pods, o problema pode estar no ReplicaSet; quando um Job não termina, o motivo pode estar no
+<code>backoffLimit</code>. Nesses casos o <code>get pods</code> não mostra nada de errado, porque o pod nem
+existe — e o <code>describe</code> do objeto pai é que conta a história, no mesmo bloco de eventos.</p>
+
+<p>A leitura útil é sempre de fora para dentro: status → evento → estado do container → saída do programa. Cada
+camada responde uma pergunta e elimina metade das hipóteses. Quem começa pela última camada — abrindo o código
+da aplicação — costuma investigar o problema errado.</p>
+
+<h2>4. Os estados do dia a dia</h2>
+
+<p>A primeira tabela é a dos estados que aparecem no <code>get pods</code>. A segunda é a dos códigos de saída,
+que aparecem no <code>describe</code> e nos logs e dizem como o processo terminou.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Status</th><th>Quem escreveu</th><th>Causa em uma linha</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Pending</code></td><td>agendador</td><td>nenhum nó tem a reserva pedida, ou o PVC não vinculou</td><td><code>describe</code> e ler <code>FailedScheduling</code></td></tr>
+<tr><td><code>ContainerCreating</code></td><td>kubelet</td><td>imagem baixando ou volume montando</td><td>esperar; se passar de minutos, ver <code>FailedMount</code></td></tr>
+<tr><td><code>ImagePullBackOff</code></td><td>kubelet</td><td>nome ou tag da imagem errados, ou falta credencial</td><td>conferir <code>image</code> e <code>imagePullSecrets</code></td></tr>
+<tr><td><code>CreateContainerConfigError</code></td><td>kubelet</td><td>ConfigMap ou Secret referenciado não existe</td><td>criar o objeto no namespace certo</td></tr>
+<tr><td><code>CrashLoopBackOff</code></td><td>kubelet</td><td>o programa sobe e morre; a espera cresce até 5 min</td><td><code>logs --previous</code> e corrigir a causa</td></tr>
+<tr><td><code>OOMKilled</code></td><td>kernel</td><td>consumo acima de <code>limits.memory</code></td><td>subir o limite ou corrigir vazamento</td></tr>
+<tr><td><code>Evicted</code></td><td>kubelet</td><td>o nó ficou sem memória ou disco e escolheu este pod</td><td>ajustar <code>requests</code> e rever o que ocupa o nó</td></tr>
+<tr><td><code>Completed</code></td><td>kubelet</td><td>o processo terminou com código zero; normal em Job</td><td>nada, se for Job; se não for, investigar</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Exit code</th><th>Significa</th><th>Onde procurar</th></tr>
+</thead>
+<tbody>
+<tr><td><code>0</code></td><td>terminou bem</td><td>nada a fazer; em pod de serviço, é sinal de que o processo não devia sair</td></tr>
+<tr><td><code>1</code></td><td>erro genérico do programa</td><td>log da aplicação, primeira linha de stack trace</td></tr>
+<tr><td><code>137</code></td><td><code>SIGKILL</code>: memória ou kill externo</td><td><code>Last State</code> com <code>OOMKilled</code>; limite de memória</td></tr>
+<tr><td><code>143</code></td><td><code>SIGTERM</code>: encerramento pedido</td><td>deploy, escala para baixo ou <code>delete</code></td></tr>
+<tr><td><code>127</code></td><td>comando não encontrado</td><td>o <code>command</code> do manifesto aponta para binário inexistente</td></tr>
+<tr><td><code>139</code></td><td>falha de segmentação</td><td>binário incompatível com a arquitetura da imagem</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Dois estados merecem destaque porque o nome engana. <code>Completed</code> em um Deployment é problema: o
+container deveria continuar rodando, e sair com zero significa que o processo terminou. E
+<code>Evicted</code> não é falha do pod: é o nó se defendendo, e o pod foi a vítima escolhida pela ordem de
+consumo.</p>
+
+<h2>5. Os campos que mais confundem</h2>
+
+<p>A confusão mais comum é entre o que o <code>describe</code> mostra e o que o <code>logs</code> mostra. O
+primeiro conta o que o <em>cluster</em> fez com o pod; o segundo conta o que o <em>programa</em> disse. Quando o
+container nunca chegou a rodar, não existe log — e a ausência de log é uma informação, não um beco sem saída.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que você vê</th><th>O que isso quer dizer</th><th>Onde olhar em seguida</th></tr>
+</thead>
+<tbody>
+<tr><td><code>describe</code> com eventos e <code>logs</code> vazio</td><td>o container não chegou a iniciar</td><td>eventos, não log: imagem, ConfigMap, volume</td></tr>
+<tr><td><code>logs</code> com saída e pod reiniciando</td><td>o programa iniciou e morreu</td><td><code>logs --previous</code>, o log da tentativa que falhou</td></tr>
+<tr><td>pod <code>Running</code> e Service sem endpoint</td><td>readiness falhando ou seletor errado</td><td><code>get endpoints</code> e as labels do Service</td></tr>
+<tr><td><code>apply</code> aceito e nada criado</td><td>o objeto foi criado em outro namespace</td><td><code>-n</code> no comando e <code>metadata.namespace</code> no manifesto</td></tr>
+<tr><td><code>Error from server (NotFound)</code></td><td>nome ou tipo errado, ou namespace diferente</td><td><code>kubectl get</code> do tipo certo no namespace certo</td></tr>
+<tr><td><code>Error from server (Forbidden)</code></td><td>RBAC: falta permissão ao seu usuário ou à ServiceAccount</td><td><code>auth can-i</code> com o sujeito certo</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A linha do log vazio explica metade dos plantões: se o container não iniciou, o <code>kubectl logs</code>
+responde <code>Error from server (BadRequest): container "web" in pod "cardapio" is waiting to start:
+CreateContainerConfigError</code>. A mensagem está dizendo que não há log para mostrar e, de brinde, qual é o
+estado. O caminho é o evento, não o log.</p>
+
+<p>Vale distinguir as duas recusas que mais se confundem na leitura rápida. <code>NotFound</code> é o cluster
+dizendo “não existe objeto com esse nome e esse tipo aqui” — quase sempre namespace errado ou nome digitado
+errado. <code>Forbidden</code> é o cluster dizendo “existe, mas você não pode ver” — e, por segurança, ele não
+confirma se o objeto existe. Quem trata as duas como iguais perde tempo conferindo o nome de um pod que está
+lá, no namespace ao lado.</p>
+
+<p>A outra metade é o <code>logs --previous</code>. Quando o pod está em <code>CrashLoopBackOff</code>, o
+container atual pode estar dormindo entre tentativas; o <code>--previous</code> mostra a saída da última
+tentativa que morreu, que é onde está o erro de verdade.</p>
+
+<h2>6. O catálogo das três da manhã</h2>
+
+<p>A tabela abaixo é a consulta por mensagem. A primeira coluna traz o texto como ele aparece; a segunda, a
+causa em uma linha; a terceira, o que fazer. As duas transcrições depois dela são de cluster real.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>Causa em uma linha</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>0/1 nodes are available: 3 Insufficient memory</code></td><td>nenhum nó tem a reserva de memória
+livre</td><td>reduzir <code>requests</code>, somar nó ou tirar pod do nó</td></tr>
+<tr><td><code>pod has unbound immediate PersistentVolumeClaims</code></td><td>o PVC não encontrou PV
+compatível</td><td><code>describe pvc</code>; conferir classe, tamanho e modo de acesso</td></tr>
+<tr><td><code>Failed to pull image "cardapio:2.0": not found</code></td><td>tag inexistente no registro</td><td>corrigir
+a tag ou publicar a imagem</td></tr>
+<tr><td><code>configmap "cardapio" not found</code></td><td>referência a objeto que não existe no
+namespace</td><td>criar o objeto ou corrigir o <code>name</code></td></tr>
+<tr><td><code>Back-off restarting failed container</code></td><td>o container morre e o kubelet espera cada vez
+mais</td><td><code>logs --previous</code>; a causa está na aplicação</td></tr>
+<tr><td><code>exceeded quota: padaria-quota, requested: pods=1, used: pods=10, limited: pods=10</code></td><td>a
+cota do namespace acabou</td><td>apagar o que não usa ou pedir aumento de cota</td></tr>
+<tr><td><code>Error from server (Forbidden): … cannot list resource "pods"</code></td><td>RBAC sem a regra
+necessária</td><td>RoleBinding com o verbo e o recurso certos</td></tr>
+<tr><td><code>no matches for kind "Deployment" in version "v1"</code></td><td><code>apiVersion</code> do grupo
+errado</td><td>usar <code>apps/v1</code></td></tr>
+<tr><td><code>spec.selector: Invalid value: …: `selector` does not match template `labels`</code></td><td>o
+seletor não casa com as labels do template</td><td>igualar os dois blocos</td></tr>
+<tr><td><code>field is immutable</code></td><td>tentativa de editar objeto travado</td><td>criar objeto novo com
+outro nome e trocar a referência</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A primeira transcrição é de um pod que não agenda por falta de memória. Repare que o evento diz quantos nós
+foram considerados e por quê — a informação está toda ali:</p>
+
+<pre class="term">$ kubectl describe pod forno
+...
+Events:
+  Type     Reason            Age   From               Message
+  ----     ------            ----  ----               -------
+  Warning  FailedScheduling  18s   default-scheduler  0/3 nodes are available: 3 Insufficient memory. preemption: 0/3 nodes are available: 3 No preemption victims found for incoming pod.</pre>
+
+<p>A segunda é o caso clássico de memória: o container morreu, o kubelet reiniciou, e o estado anterior ficou
+registrado. O <code>137</code> com <code>OOMKilled</code> é a assinatura:</p>
+
+<pre class="term">$ kubectl describe pod relatorio
+...
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+    Ready:          False
+    Restart Count:  6</pre>
+
+<p>A mensagem de cota é a que mais confunde porque o pod nem aparece no <code>get pods</code>: a recusa acontece
+na criação, e o texto vem com quatro números — o que foi pedido, o que já está em uso, o limite e o nome da
+cota. <code>exceeded quota: padaria-quota, requested: pods=1, used: pods=10, limited: pods=10</code> quer dizer
+que o namespace já tem dez pods e a cota permite dez. O conserto é apagar o que não usa ou pedir aumento; mudar
+o manifesto não resolve, porque a regra está no namespace, não no pod.</p>
+
+<p>Traduzindo o conjunto: o container foi morto pelo kernel por passar do limite de memória
+(<code>OOMKilled</code>), saiu com <code>137</code>, e o kubelet está esperando antes de tentar de novo
+(<code>CrashLoopBackOff</code>). O conserto é no <code>limits.memory</code> ou no consumo do programa — não é
+reiniciar o pod, que já reiniciou seis vezes.</p>
+
+<h2>7. Duas coisas para praticar agora</h2>
+
+<p>As duas caixas são erros que o painel reproduz de verdade: validação do API server. A primeira é o seletor
+que não casa com as labels; a segunda é o <code>apiVersion</code> do grupo errado — dois campeões de
+frequência.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Deployment/cardapio|spec.selector.matchLabels.app=cardapio;;conta:pods=2;;texto:Running">
+  <p class="try-task">O <code>apply</code> recusa o Deployment porque o seletor não casa com as labels do
+  template. Corrija as labels para <code>app: cardapio</code> e rode de novo.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value: {"app":"web"}: `selector` does not match template `labels`
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>O painel mostra a recusa antes de criar qualquer coisa e, depois da correção, os dois pods em
+<code>Running</code>. A mensagem é literal, e sempre aponta o bloco das labels do template:
+<code>spec.template.metadata.labels: Invalid value: {"app":"web"}: `selector` does not match template
+`labels`</code>. O conserto é igualar os dois blocos — nunca “forçar” o apply.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="objeto:Deployment/cardapio;;pronto:Deployment/cardapio=2;;texto:Running">
+  <p class="try-task">O manifesto usa <code>apiVersion: v1</code> para um Deployment e o cluster recusa. Troque
+  para o grupo certo e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+<pre class="out">
+error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no matches for kind "Deployment" in version "v1"
+ensure CRDs are installed first
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0</pre>
+</div>
+
+<p>A mensagem que o painel devolve é a mesma do cluster: <code>error: resource mapping not found … no matches
+for kind "Deployment" in version "v1"</code>, seguida do aviso <code>ensure CRDs are installed first</code>.
+É o erro de quem copiou um manifesto antigo da internet ou trocou a versão “para ver se funciona”. Cada tipo
+tem o seu grupo, e o grupo faz parte do endereço do recurso.</p>
+
+<h2>8. Para ir além</h2>
+
+<p>As aulas abaixo pegam um erro cada e contam a história completa: o que a Ana viu, o que ela testou e o que
+resolveu. A ordem é a de leitura.</p>
+
+<ul>
+  <li><a href="pod-pending.html">Pod em Pending</a> — o agendador, a reserva e os taints.</li>
+  <li><a href="image-pull-error.html">ImagePullBackOff</a> — nome, tag, registro privado e segredo de pull.</li>
+  <li><a href="crashloop.html">CrashLoopBackOff</a> — o laço de reinício e o que o log conta.</li>
+  <li><a href="logs-e-eventos.html">Logs e eventos</a> — as duas fontes, lado a lado.</li>
+  <li><a href="describe-diagnostico.html">Diagnóstico com describe</a> — como ler o bloco de eventos.</li>
+  <li><a href="checklist-debug.html">Checklist de depuração</a> — o roteiro completo, em ordem.</li>
+  <li><a href="eviction-e-oom.html">Eviction e OOMKilled</a> — as duas mortes, por dentro.</li>
+  <li><a href="ref-rbac.html">RBAC</a> — o <code>Forbidden</code> e os verbos que faltam.</li>
+  <li><a href="ref-probes-recursos.html">Probes e recursos</a> — a sonda que reinicia e o limite que mata.</li>
+</ul>
+
+<p>Um detalhe de tempo que engana: os eventos do cluster são apagados sozinhos depois de cerca de uma hora. Se
+o pod está reiniciando desde a madrugada, o evento original já não existe — o que sobra é a contagem
+(<code>x14 over 2h</code>), que ainda diz muito, e o <code>Last State</code> do <code>describe</code>. Em
+cluster de produção, quem guarda histórico é o agregador de logs, não o Kubernetes.</p>
+
+<p>Para conferir a mensagem antes de sair procurando, dois comandos ajudam: <code>kubectl get events
+--sort-by=.lastTimestamp</code> mostra a linha do tempo do namespace, e <code>kubectl describe</code> no objeto
+certo — pod, pvc, deployment — mostra o bloco de eventos daquele objeto. A mensagem é quase sempre literal: se
+diz <code>not found</code>, é nome ou namespace; se diz <code>Insufficient</code>, é reserva.</p>
+
+<h2>Resumo</h2>
+
+<p>Erro no Kubernetes vem de três lugares: API server (validação e permissão), agendador
+(<code>Pending</code> e <code>FailedScheduling</code>) e kubelet (<code>ImagePullBackOff</code>,
+<code>CreateContainerConfigError</code>, <code>CrashLoopBackOff</code>). O <code>get</code> dá o status, o
+<code>describe</code> dá o evento, o <code>logs</code> dá a voz do programa — e o <code>--previous</code> dá a
+voz da tentativa que morreu.</p>
+
+<p><code>OOMKilled</code> com 137 é memória; 143 é encerramento pedido; 1 é erro do programa; 127 é comando
+inexistente. <code>Forbidden</code> é RBAC e traz verbo, recurso, grupo e namespace na mensagem; <code>no
+matches for kind</code> é <code>apiVersion</code> do grupo errado; <code>does not match template labels</code>
+é seletor diferente das labels.</p>
+
+<p>No painel deste guia, os erros de validação e o <code>Pending</code> por falta de lugar acontecem de verdade;
+os de runtime são transcrição. Saber qual é qual evita procurar no lugar errado — e, às três da manhã, isso é
+metade do conserto.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>get</code> → <code>describe</code> → eventos → <code>logs</code>: nesta ordem, sempre.</li>
+  <li><code>Pending</code> é lugar; <code>ContainerCreating</code> é imagem ou volume; <code>BackOff</code> é
+  o programa.</li>
+  <li>Sem log não é beco: o container não iniciou, e o evento diz por quê.</li>
+  <li>137 = memória; 143 = encerramento pedido; 127 = comando não encontrado.</li>
+  <li><code>Forbidden</code> = RBAC; <code>NotFound</code> = nome ou namespace.</li>
+  <li><code>apiVersion</code> errado é recusa na hora, com o grupo certo na mensagem.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

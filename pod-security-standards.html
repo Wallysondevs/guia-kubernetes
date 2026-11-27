@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pod Security | Guia Kubernetes</title>
+<meta name="description" content="Pod Security Standards na prática: os níveis privileged, baseline e restricted como labels do namespace, o que cada um recusa e como migrar sem derrubar tudo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Pod <span class="hl">Security</span></h1>
+<p class="intro">Depois de endurecer um pod à mão, a Ana quis garantir que <em>ninguém</em> pudesse publicar um
+pod privilegiado no namespace de produção. A resposta do Kubernetes não é um arquivo de configuração global
+nem um script de revisão: são três etiquetas no namespace. Escritas ali, elas fazem o servidor recusar — na
+hora da criação — qualquer pod que não cumpra o nível escolhido. Nesta aula a Ana conhece os três níveis, vê o
+que cada um proíbe, aprende a ler a recusa item por item e faz a migração do jeito que não derruba o site:
+avisando antes de proibir.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Como o Pod Security funciona: labels no namespace, avaliação na criação do pod.</li>
+  <li>O que significam <code>privileged</code>, <code>baseline</code> e <code>restricted</code>.</li>
+  <li>As três etiquetas de modo: <code>enforce</code>, <code>audit</code> e <code>warn</code>.</li>
+  <li>O que o <code>restricted</code> exige além do <code>baseline</code>.</li>
+  <li>Ler a mensagem <code>violates PodSecurity</code> e consertar campo por campo.</li>
+  <li>Migrar em etapas, começando pelo aviso e terminando na recusa.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a regra que precisa valer para todos</h2>
+
+<p>O pod do cardápio ficou endurecido na aula anterior: não-root, disco somente leitura, capabilities
+derrubadas. O problema é que isso vale para <em>um</em> manifesto. Amanhã entra um serviço novo, copiado de um
+tutorial, com <code>privileged: true</code> e <code>hostPath</code> — e nada no cluster impede. Revisar
+manifesto por manifesto não escala; alguém sempre esquece.</p>
+
+<p>O Kubernetes resolve isso no lugar certo: o namespace. Em vez de o servidor confiar que todo mundo vai
+escrever bem, ele aceita três etiquetas que dizem “neste namespace, só entra pod que respeite tal nível”. A
+partir daí, quem aplica um manifesto fora da regra recebe um erro — antes de o pod existir. Não é um alerta
+depois do fato; é uma recusa na porta.</p>
+
+<p>É importante entender quem faz o trabalho: um plugin de admissão embutido no API server, chamado
+<em>PodSecurity</em>. Ele roda em toda criação de pod — inclusive nos pods que um Deployment cria, porque o
+controlador também passa pelo mesmo caminho. Namespace com a etiqueta ligada não é uma sugestão; é uma
+fronteira.</p>
+
+<h2>2. Os três níveis</h2>
+
+<p>Os níveis são cumulativos: cada um inclui as proibições do anterior e acrescenta as suas. O
+<code>privileged</code> não proíbe nada — é o “sem política”, o padrão de quando nenhuma etiqueta existe. O
+<code>baseline</code> proíbe o que quase nenhum programa legítimo precisa, como rodar privilegiado ou usar a
+rede do nó. O <code>restricted</code> vai além e <em>exige</em> um conjunto de campos de segurança, no estilo
+do que a aula anterior montou à mão.</p>
+
+<dl class="anatomy">
+<dt>privileged</dt>
+<dd>Sem restrição nenhuma. É o nível padrão de um namespace sem etiqueta.</dd>
+<dt>baseline</dt>
+<dd>Proíbe os recursos mais perigosos (privilegiado, rede do nó, <code>hostPath</code>, portas do host), sem
+exigir configuração de segurança.</dd>
+<dt>restricted</dt>
+<dd>O mais rígido: além de proibir o que o baseline proíbe, exige <code>runAsNonRoot</code>,
+<code>allowPrivilegeEscalation: false</code>, <code>drop: ["ALL"]</code> e perfil seccomp.</dd>
+<dt>enforce</dt>
+<dd>A etiqueta que recusa: o pod que viola o nível não é criado.</dd>
+<dt>audit / warn</dt>
+<dd>As etiquetas que só registram (no log de auditoria) e só avisam (no terminal de quem aplicou), sem
+bloquear.</dd>
+</dl>
+
+<p>Repare que <code>enforce</code>, <code>audit</code> e <code>warn</code> não são níveis: são <em>modos</em>.
+Cada um recebe um nível como valor, e é possível combinar — por exemplo, exigir <code>baseline</code> e ao
+mesmo tempo avisar sobre o <code>restricted</code>. Essa combinação é justamente o que permite migrar sem
+susto, e é o assunto da seção 7.</p>
+
+<h2>3. Ligando a etiqueta no namespace</h2>
+
+<p>A etiqueta vai em <code>metadata.labels</code> do <code>Namespace</code>, e o valor é o nível. Um nome longo
+e pontuado de propósito: <code>pod-security.kubernetes.io/enforce</code>. No cluster real, o comando imperativo
+equivalente é <code>kubectl label namespace padaria pod-security.kubernetes.io/enforce=restricted</code>, que
+responde <code>namespace/padaria labeled</code>. Aqui o caminho é o manifesto, que é o que fica versionado.</p>
+
+<div class="tryk8s" data-goal="texto:pod-security.kubernetes.io/enforce: restricted" data-get="namespace padaria -o yaml">
+  <p class="try-task">O namespace nasceu com <code>enforce: privileged</code>, ou seja, sem proteção. Troque o
+  valor para <code>restricted</code> e rode: o <code>-o yaml</code> do painel tem de mostrar a etiqueta
+  nova.</p>
+<pre class="yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+  labels:
+    pod-security.kubernetes.io/enforce: privileged</pre>
+<pre class="out">
+namespace/padaria created
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+  name: padaria
+spec:
+  finalizers:
+    - kubernetes
+status:
+  phase: Active
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+  labels:
+    pod-security.kubernetes.io/enforce: restricted</pre>
+</div>
+
+<p>A resposta é <code>namespace/padaria created</code> e o YAML com a etiqueta nova. A partir desse instante,
+todo pod criado em <code>padaria</code> passa pelo filtro do <code>restricted</code>. Vale saber de um detalhe
+temporal: a avaliação acontece na <em>criação</em>. Pods que já estavam rodando não são reavaliados nem
+mortos — o que é uma bênção na migração e uma armadilha na auditoria: “está tudo rodando” não quer dizer “está
+tudo em conformidade”.</p>
+
+<p>Outro detalhe: as etiquetas valem por namespace, sem herança. Um namespace novo nasce sem nenhuma delas, ou
+seja, em <code>privileged</code>. Se a sua organização quer <code>baseline</code> em todo namespace, isso é
+trabalho de automação — o cluster não aplica política global por conta própria, e o namespace
+<code>kube-system</code>, onde o encanamento do Kubernetes mora, costuma precisar de exceções.</p>
+
+<h2>4. O que o baseline proíbe</h2>
+
+<p>O <code>baseline</code> é a linha de base recomendada para qualquer carga: proíbe o que permite escapar do
+container ou dominar o nó, sem exigir que o programa seja reescrito. Nenhum campo precisa ser adicionado ao
+manifesto — basta não usar os recursos proibidos. É o nível que dá mais proteção por menos atrito.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Controle</th><th><code>baseline</code></th><th><code>restricted</code></th></tr>
+</thead>
+<tbody>
+<tr><td><code>privileged: true</code></td><td>proibido</td><td>proibido</td></tr>
+<tr><td><code>hostNetwork</code>, <code>hostPID</code>, <code>hostIPC</code></td><td>proibidos</td><td>proibidos</td></tr>
+<tr><td>volumes <code>hostPath</code></td><td>proibidos</td><td>proibidos</td></tr>
+<tr><td><code>hostPort</code></td><td>proibido</td><td>proibido</td></tr>
+<tr><td>capabilities além da lista padrão</td><td>proibidas</td><td>proibidas</td></tr>
+<tr><td><code>seccompProfile: Unconfined</code></td><td>proibido</td><td>proibido</td></tr>
+<tr><td><code>runAsNonRoot</code></td><td>não exige</td><td><strong>exige</strong> <code>true</code></td></tr>
+<tr><td><code>allowPrivilegeEscalation</code></td><td>não exige</td><td><strong>exige</strong> <code>false</code></td></tr>
+<tr><td><code>capabilities.drop</code></td><td>não exige</td><td><strong>exige</strong> <code>["ALL"]</code></td></tr>
+<tr><td><code>seccompProfile</code></td><td>não exige</td><td><strong>exige</strong> <code>RuntimeDefault</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A lista de capabilities permitidas no baseline é curta e antiga: coisas como <code>CHOWN</code>,
+<code>SETUID</code>, <code>NET_BIND_SERVICE</code>, <code>KILL</code>, <code>SYS_CHROOT</code>. Acrescentar
+qualquer outra — <code>SYS_ADMIN</code>, <code>NET_ADMIN</code>, <code>SYS_PTRACE</code> — viola o baseline.
+Na prática, isso pega muitos agentes de monitoramento e VPNs que pedem <code>NET_ADMIN</code>; eles precisam
+de um namespace com nível próprio, não de uma exceção no namespace de produção.</p>
+
+<p>O <code>baseline</code> também restringe os <em>sysctls</em> a uma lista segura (coisas de rede, como
+<code>net.ipv4.ip_unprivileged_port_start</code>) e limita o <code>procMount</code> ao padrão. São controles
+que raramente aparecem no manifesto de uma aplicação comum, mas aparecem em manifesto copiado de stack de
+observabilidade.</p>
+
+<h2>5. O que o restricted exige</h2>
+
+<p>O <code>restricted</code> é o nível do “pod endurecido” da aula anterior, com uma diferença de postura: em
+vez de você escolher o que endurecer, o cluster exige o conjunto. Quem não declarar os campos é recusado. As
+quatro exigências que mais aparecem na prática são <code>runAsNonRoot: true</code>,
+<code>allowPrivilegeEscalation: false</code>, <code>capabilities.drop: ["ALL"]</code> e um
+<code>seccompProfile</code> com <code>RuntimeDefault</code> ou <code>Localhost</code>.</p>
+
+<div class="tryk8s" data-goal="texto:runAsNonRoot: true;;texto:type: RuntimeDefault;;texto:drop: - ALL" data-get="pod cardapio -n padaria -o yaml">
+  <p class="try-task">O namespace já está em <code>enforce: restricted</code>, mas o pod não cumpre nada
+  disso. Acrescente <code>runAsNonRoot</code>, <code>allowPrivilegeEscalation: false</code>,
+  <code>drop: ["ALL"]</code> e <code>seccompProfile: RuntimeDefault</code>, e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  namespace: padaria
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+namespace/padaria created
+pod/cardapio created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  namespace: padaria
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      name: web
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 24
+  ip: 10.244.47.29
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  namespace: padaria
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  containers:
+    - name: web
+      image: cardapio:1.0
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault</pre>
+</div>
+
+<p>O <code>-o yaml</code> do painel mostra os campos que o pod ganhou. Num cluster de verdade, esse manifesto
+passa no <code>restricted</code> — e o anterior não passaria. Note que <code>runAsUser</code> não é exigido
+pela política: o que ela exige é <code>runAsNonRoot: true</code>, e proíbe <code>runAsUser: 0</code> se você
+declarar o campo. Declarar um UID comum é boa prática porque transforma a exigência em comportamento
+previsível, mas o servidor não conhece o UID que a imagem usa; ele confia na flag.</p>
+
+<p>Uma consequência que assusta no primeiro dia: com <code>restricted</code>, o pod precisa de
+<code>seccompProfile</code>. Isso significa que aquele manifesto de dois meses atrás, sem nenhuma linha de
+segurança, passa a ser recusado. Não é regressão do Kubernetes — é o nível fazendo o trabalho dele. E é por
+isso que a migração tem ferramentas de aviso.</p>
+
+<h2>6. Lendo a recusa, item por item</h2>
+
+<p>Quando o pod é barrado, a mensagem lista <em>todos</em> os problemas de uma vez, no formato “controle
+(tipo e nome do objeto: o que fazer)”. É longa e, na primeira vez, assustadora. Esta é uma transcrição de
+cluster real, para o manifesto sem nenhuma configuração:</p>
+
+<pre class="term">ana@notebook:~$ kubectl apply -f cardapio.yaml
+Error from server (Forbidden): error when creating "cardapio.yaml": pods "cardapio" is forbidden: violates PodSecurity "restricted:latest": allowPrivilegeEscalation != false (container "web" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "web" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "web" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "web" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")</pre>
+
+<p>Leia em pedaços. O começo diz o que aconteceu: <code>Forbidden</code>, <code>violates PodSecurity
+"restricted:latest"</code> — o nível e a versão da política. Depois vêm os quatro itens, separados por
+vírgula: <code>allowPrivilegeEscalation != false</code>, <code>unrestricted capabilities</code>,
+<code>runAsNonRoot != true</code> e <code>seccompProfile</code>. Cada item traz, entre parênteses, o conserto
+exato e onde ele vai. É praticamente um tutorial dentro do erro.</p>
+
+<p>No modo aviso, a mesma lista aparece como <code>Warning:</code> em vez de <code>Error from server</code>: o
+pod é criado e a frase fica no terminal de quem aplicou. O conteúdo é idêntico, e essa é a beleza da
+migração: você consegue ver todos os problemas do seu parque sem derrubar nada.</p>
+
+<pre class="term">ana@notebook:~$ kubectl apply -f relatorio.yaml
+Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false (container "gerador" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "gerador" must set securityContext.capabilities.drop=["ALL"])
+deployment.apps/relatorio created</pre>
+
+<p>Repare no <code>would violate</code> e no final feliz: <code>deployment.apps/relatorio created</code>. O
+pod entrou, e o aviso cumpriu o papel de lista de tarefas. Se essa frase aparecer num pipeline, trate como
+dívida técnica visível — alguém vai precisar dela quando o <code>enforce</code> for ligado.</p>
+
+<p>Na hora de consertar, leia o parêntese com atenção: ele diz em qual objeto colocar o campo e qual valor usar.
+“container <code>gerador</code> must set securityContext.capabilities.drop=["ALL"]” é instrução literal —
+aquela linha, naquele container. Quando a mensagem diz “pod or container”, você escolhe: declarar no pod vale
+para todos os containers e encurta o manifesto; declarar em cada um dá controle fino e é o que serviços com
+requisitos diferentes costumam preferir.</p>
+
+<p>Se o <code>apply</code> não mostrar aviso nenhum e mesmo assim o pod não aparecer, o problema não é Pod
+Security: pode ser imagem, agendamento, cota. O sintoma específico da política é sempre o mesmo — pod recusado
+na criação, com a palavra <code>violates</code> na mensagem, ou Deployment com zero réplicas e evento
+<code>FailedCreate</code> repetido.</p>
+
+<h2>7. Migrando sem quebrar tudo</h2>
+
+<p>A ordem recomendada tem três passos, e o primeiro nunca bloqueia. Passo 1: <code>warn</code> e
+<code>audit</code> no nível desejado, sem <code>enforce</code>. O cluster passa a avisar quem aplica e a
+registrar no log de auditoria, mas aceita tudo. Passo 2: consertar os workloads que aparecem. Passo 3: trocar
+para <code>enforce</code> — e, se quiser garantia extra, testar antes com <code>kubectl apply --dry-run=server
+-f</code>, que roda a validação no servidor sem criar nada.</p>
+
+<div class="tryk8s" data-goal="texto:pod-security.kubernetes.io/warn: restricted;;texto:pod-security.kubernetes.io/enforce: baseline" data-get="namespace padaria -o yaml">
+  <p class="try-task">Este namespace está só no aviso, sem nível de exigência. Deixe o
+  <code>warn</code> em <code>restricted</code> e o <code>enforce</code> em <code>baseline</code>: avisa sobre o
+  nível mais rígido e ainda aceita o mais simples.</p>
+<pre class="yaml">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+  labels:
+    pod-security.kubernetes.io/warn: restricted</pre>
+<pre class="out">
+namespace/padaria created
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    pod-security.kubernetes.io/warn: restricted
+  name: padaria
+spec:
+  finalizers:
+    - kubernetes
+status:
+  phase: Active
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+  labels:
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/enforce: baseline</pre>
+</div>
+
+<p>O YAML mostra as duas etiquetas lado a lado. O efeito é exatamente o desejado: pod que passa no
+<code>baseline</code> mas não no <code>restricted</code> é aceito (com aviso), e pod que viola o
+<code>baseline</code> é recusado. Quando o parque estiver limpo, você troca <code>enforce</code> para
+<code>restricted</code> e o aviso continua existindo como rede de segurança para o que vier depois.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Etiqueta</th><th>O que o servidor faz</th><th>O que a pessoa vê</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enforce</code></td><td>recusa a criação do pod</td><td><code>Error from server
+(Forbidden)</code> com a lista de violações</td></tr>
+<tr><td><code>warn</code></td><td>aceita e devolve um aviso</td><td><code>Warning: would violate
+PodSecurity …</code>, e o objeto é criado</td></tr>
+<tr><td><code>audit</code></td><td>aceita e registra no log de auditoria</td><td>nada no terminal; a marca vai
+para o log do API server</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>As três são independentes, e é por isso que a combinação funciona: <code>enforce</code> num nível e
+<code>warn</code> no nível seguinte dá o degrau de que a migração precisa. O único arranjo sem sentido é
+<code>warn</code> igual a <code>enforce</code> — avisar sobre o que já é proibido não acrescenta nada além de
+ruído na saída do <code>apply</code>. E <code>audit</code> não substitui <code>warn</code>: quem não vai ler o
+log de auditoria do cluster precisa do aviso na tela.</p>
+
+<p>Um detalhe prático de migração: o nível de <code>warn</code> pode ser mais alto que o de
+<code>enforce</code>, mas nunca o contrário faz sentido — avisar sobre algo mais brando do que o já exigido é
+redundante. Por isso o arranjo clássico é <code>enforce: baseline</code> com <code>warn: restricted</code>:
+nada de perigoso entra hoje, e o time vê o que falta para apertar amanhã.</p>
+
+<p>Há um quarto passo opcional e muito útil: fixar a versão da política com
+<code>pod-security.kubernetes.io/enforce-version</code> (por exemplo <code>v1.34</code> em vez de
+<code>latest</code>). Sem o sufixo, vale a política mais nova da sua versão do Kubernetes — e uma atualização
+de cluster pode passar a exigir um campo que ninguém exigia antes. Fixar a versão transforma essa surpresa num
+item de plano.</p>
+
+<p>E as exceções, onde ficam? Não existe “menos uma regra” dentro do nível: a política é fechada. O que existe
+é namespace separado para a carga que precisa de mais poder — observabilidade, rede, o próprio
+<code>kube-system</code>. Se o seu agente pede <code>hostPath</code> e <code>NET_ADMIN</code>, ele mora num
+namespace com <code>baseline</code> ou <code>privileged</code> e com uma anotação dizendo por quê. Misturar
+exceção no namespace de produção é o caminho mais curto para a política virar decoração.</p>
+
+<h2>8. Onde as pessoas tropeçam</h2>
+
+<p>O primeiro tropeço é esquecer que a etiqueta vale para os pods criados por Deployment, StatefulSet e Job.
+Ao aplicar o Deployment com <code>enforce: restricted</code>, o Deployment em si é aceito — ele não é um pod —
+e o ReplicaSet dele tenta criar o pod e falha. O sintoma aparece longe: um Deployment “created” com zero
+réplicas e eventos dizendo <code>FailedCreate</code>. A mensagem do evento traz a violação completa, então o
+caminho é <code>kubectl describe deployment</code>.</p>
+
+<p>O segundo é ligar <code>restricted</code> de uma vez em todo lugar, inclusive em <code>kube-system</code>.
+Os componentes do Kubernetes usam <code>hostPath</code> e <code>hostNetwork</code> legitimamente; eles não vão
+passar. Namespace de sistema fica fora da política, ou recebe <code>privileged</code> de forma explícita e
+documentada.</p>
+
+<p>O terceiro é achar que <code>restricted</code> cobre tudo. Ele não exige sistema de arquivos somente
+leitura, não limita CPU nem memória, não impede imagem <code>latest</code> e não resolve rede. Política de
+pod é uma camada: junta-se ao <code>securityContext</code> que você escreve, ao RBAC que limita a conta de
+serviço e às NetworkPolicies que fecham o tráfego.</p>
+
+<p>O quarto é de leitura: a mensagem fala de “pod or container”. Cada exigência pode ser declarada no
+<code>securityContext</code> do pod ou no do container, e o servidor aceita a que estiver presente. Um time
+que declara tudo no pod tem manifestos mais curtos; um que declara por container tem controle fino. Os dois
+passam.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o deploy que parou de escalar</h3>
+<p>Depois de ligar <code>enforce: restricted</code>, um Deployment novo ficou com zero pods e ninguém entendeu:
+o <code>apply</code> tinha respondido “created”. O ReplicaSet não conseguia criar o pod por violação, e o
+evento dizia exatamente isso. O conserto foi no <code>template</code> do Deployment — onde ficam as linhas de
+segurança —, não no Deployment em si.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o agente de monitoramento</h3>
+<p>Um agente precisava de <code>hostPath</code> para ler logs do nó e de <code>NET_ADMIN</code> para medir
+tráfego. Passou a rodar num DaemonSet em um namespace com <code>privileged</code> e anotação explicando o
+motivo. No namespace da aplicação, a política continuou <code>restricted</code> — a exceção não vazou para
+onde não devia.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a migração em duas semanas</h3>
+<p>A Ana ligou <code>warn: restricted</code> na segunda e deixou rodar uma semana. Na sexta, tinha a lista
+completa de workloads fora do padrão, com o nome de cada container e o campo faltando. Na semana seguinte,
+consertou os quinze e trocou para <code>enforce</code>. O site não caiu uma vez — porque quem avisou foi a
+etiqueta, não o cliente.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. Onde se configura o Pod Security de um namespace?</p>
+<label><input type="radio" name="q1"> num ConfigMap chamado <code>pod-security</code></label>
+<label><input type="radio" name="q1"> no <code>spec.securityContext</code> de cada pod</label>
+<label><input type="radio" name="q1"> nas etiquetas <code>pod-security.kubernetes.io/*</code> do
+Namespace</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Qual etiqueta <strong>recusa</strong> o pod?</p>
+<label><input type="radio" name="q2"> <code>pod-security.kubernetes.io/enforce</code></label>
+<label><input type="radio" name="q2"> <code>pod-security.kubernetes.io/warn</code></label>
+<label><input type="radio" name="q2"> <code>pod-security.kubernetes.io/audit</code></label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Um namespace sem nenhuma etiqueta de Pod Security
+equivale a qual nível?</p>
+<label><input type="radio" name="q3"> <code>restricted</code></label>
+<label><input type="radio" name="q3"> <code>privileged</code></label>
+<label><input type="radio" name="q3"> <code>baseline</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a etiqueta que não bloqueia</h2>
+
+<p>Você quer ver o que quebraria com o nível <code>restricted</code> sem impedir nenhum pod de subir. Complete
+o nome da etiqueta que só avisa:</p>
+
+<div class="ex-code">pod-security.kubernetes.io/<input aria-label="resposta 1" data-answer="warn" placeholder="...">: restricted</div>
+
+<p class="ex-dica">Dica: são três modos — <code>enforce</code> recusa, <code>audit</code> registra no log de
+auditoria, e este aparece como <code>Warning:</code> no terminal de quem aplica.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Pod Security é uma política de admissão ligada por etiquetas no namespace, com três níveis cumulativos:
+<code>privileged</code> (nada), <code>baseline</code> (proíbe o perigoso) e <code>restricted</code> (proíbe e
+exige). Três modos escolhem o que fazer com a violação: <code>enforce</code> recusa, <code>audit</code>
+registra, <code>warn</code> avisa.</p>
+
+<p>O <code>restricted</code> exige <code>runAsNonRoot: true</code>,
+<code>allowPrivilegeEscalation: false</code>, <code>capabilities.drop: ["ALL"]</code> e perfil seccomp
+<code>RuntimeDefault</code>; o <code>baseline</code> apenas proíbe privilegiado, namespace do host,
+<code>hostPath</code>, <code>hostPort</code> e capabilities fora da lista padrão. A avaliação acontece na
+criação do pod — pods já rodando não são reavaliados.</p>
+
+<p>Migre na ordem: avisar, consertar, exigir. Leia a mensagem de violação como lista de tarefas, lembre que o
+pod do Deployment é criado pelo ReplicaSet (e é lá que o erro aparece) e mantenha exceções em namespaces
+separados, com o motivo escrito. Na próxima aula o assunto sai do pod e vai para o segredo: como trazer
+credenciais de fora do cluster sem deixá-las em manifesto.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>As etiquetas vão no <code>Namespace</code>: <code>pod-security.kubernetes.io/enforce|audit|warn</code>.</li>
+  <li><code>privileged</code> &lt; <code>baseline</code> &lt; <code>restricted</code>, cada um incluindo o
+  anterior.</li>
+  <li><code>enforce</code> recusa na criação; <code>warn</code> e <code>audit</code> só avisam e registram.</li>
+  <li>Pods já rodando não são reavaliados; o Deployment é aceito e o pod dele é que falha.</li>
+  <li>Fixe a versão da política (<code>enforce-version</code>) para uma atualização de cluster não mudar a
+  regra sozinha.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

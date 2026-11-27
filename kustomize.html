@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kustomize | Guia Kubernetes</title>
+<meta name="description" content="Kustomize sem template: base e overlays, kustomization.yaml, patches, namePrefix, kubectl apply -k e quando preferir Kustomize em vez de Helm.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Kustomize</span></h1>
+<p class="intro">O time da Ana decidiu não usar template. O manifesto do site é YAML comum, legível, e
+ninguém quer aprender a linguagem de molde para trocar duas linhas por ambiente. Só que copiar a pasta três
+vezes foi exatamente o problema que trouxe o Helm para a conversa. O <strong>Kustomize</strong> resolve o
+mesmo problema por outro caminho: um manifesto de base, que é YAML puro, e pequenos arquivos de sobreposição
+que dizem só o que muda em cada ambiente. Sem <code>{{ }}</code>, sem linguagem nova — e embutido no
+<code>kubectl</code>.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é base e o que é overlay, e por que a separação funciona.</li>
+  <li>O que vai num <code>kustomization.yaml</code>, campo por campo.</li>
+  <li>Como <code>namePrefix</code> e <code>namespace</code> mudam os nomes sem editar manifesto.</li>
+  <li>Patches: sobrepor um campo sem copiar o arquivo inteiro.</li>
+  <li><code>labels</code> comuns e a coesão entre seletor e etiqueta.</li>
+  <li><code>kubectl apply -k</code> e <code>kubectl kustomize</code>, e quando preferir isso ao Helm.</li>
+</ul>
+</div>
+
+<h2>1. A cena: três diferenças, nenhum template</h2>
+
+<p>O site da padaria tem um Deployment, um Service e um ConfigMap. Entre teste e produção mudam três coisas:
+o número de réplicas, a tag da imagem e uma variável de ambiente. No Helm, isso vira chart, values e um
+molde com buracos. No Kustomize, isso vira uma pasta com o manifesto de verdade mais três linhas de
+instrução por ambiente.</p>
+
+<p>A diferença de filosofia é real e vale entender antes de escolher. Template é poderoso e tem custo: você
+precisa aprender a linguagem, e o arquivo que você lê não é o arquivo que vai para o cluster. Sobreposição é
+mais limitada e mais previsível: o arquivo que você lê é quase o que vai para o cluster, e o que muda está
+listado num lugar pequeno.</p>
+
+<p>Existe uma frase que resume: com Helm você escreve <em>como gerar</em> o manifesto; com Kustomize você
+escreve <em>o que mudar</em> no manifesto. Nenhum dos dois é melhor em tudo — e a última seção compara os
+dois sem torcida.</p>
+
+<h2>2. Base e overlay: a ideia inteira</h2>
+
+<p>Pense numa receita de bolo com uma anotação colada no vidro do forno: “para o bolo de festa, dobre o
+açúcar e asse dez minutos a mais”. A receita é a mesma; a anotação só diz o que muda naquele caso. No
+Kustomize, a receita é a <strong>base</strong> e a anotação é o <strong>overlay</strong>.</p>
+
+<p>A base é uma pasta com manifestos comuns e um <code>kustomization.yaml</code> que lista esses manifestos.
+O overlay é outra pasta, com outro <code>kustomization.yaml</code>, que aponta para a base e diz o que
+acrescentar, trocar ou renomear. Você aplica o overlay; o Kustomize junta tudo e entrega o resultado ao
+cluster.</p>
+
+<dl class="anatomy">
+<dt>base</dt>
+<dd>A pasta com os manifestos comuns e um <code>kustomization.yaml</code> que os lista. Não é aplicada
+sozinha em produção.</dd>
+<dt>overlay</dt>
+<dd>A pasta que aponta para uma base e acrescenta as diferenças de um ambiente.</dd>
+<dt>kustomization.yaml</dt>
+<dd>O arquivo de instruções: recursos, prefixo, namespace, etiquetas, patches, geradores. É o único arquivo
+obrigatório.</dd>
+<dt>patch</dt>
+<dd>Um trecho de manifesto que altera um objeto da base. Pode ser estratégico (por campo) ou JSON patch (por
+posição).</dd>
+<dt>namePrefix</dt>
+<dd>Um prefixo acrescentado ao nome de todos os objetos — e às referências entre eles.</dd>
+<dt>gerador</dt>
+<dd>Um campo que cria ConfigMap ou Secret a partir de arquivos e valores, sem você escrever o objeto.</dd>
+</dl>
+
+<p>Uma coisa que surpreende e é a melhor parte: o Kustomize entende as <em>referências</em> entre objetos. Se
+você aplica <code>namePrefix: prod-</code>, o Deployment passa a se chamar <code>prod-cardapio</code> e o
+Service — mesmo sem você tocar nele — passa a apontar para os pods do Deployment renomeado. O Kustomize
+reescreve as referências junto, o que templates costumam fazer com trabalho manual.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo do kustomization</th><th>O que faz</th><th>Exemplo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>resources</code></td><td>lista os manifestos ou pastas que entram na montagem</td><td><code>../../base</code></td></tr>
+<tr><td><code>namePrefix</code></td><td>põe um prefixo no nome de todos os objetos e nas referências</td><td><code>prod-</code></td></tr>
+<tr><td><code>namespace</code></td><td>define o namespace de tudo o que for montado</td><td><code>padaria-prod</code></td></tr>
+<tr><td><code>labels</code></td><td>acrescenta etiquetas, com opção de incluir nos seletores</td><td><code>equipe: padaria</code></td></tr>
+<tr><td><code>replicas</code></td><td>muda o número de réplicas de um Deployment por nome</td><td><code>count: 3</code></td></tr>
+<tr><td><code>patches</code></td><td>aplica trechos de manifesto sobre objetos da base</td><td><code>patch-imagem.yaml</code></td></tr>
+<tr><td><code>configMapGenerator</code></td><td>cria ConfigMap a partir de arquivos ou valores</td><td>um <code>.properties</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Não é preciso decorar: na prática, três ou quatro desses campos resolvem quase todo overlay. O que vale
+entender é a lógica — o <code>kustomization.yaml</code> nunca contém manifesto, só instruções sobre
+manifestos. Quem tem o conteúdo são os arquivos que ele referencia.</p>
+
+<h2>3. A base</h2>
+
+<p>A base da padaria tem três arquivos e um índice. Os manifestos são os mesmos de sempre, sem nenhum
+buraco:</p>
+
+<pre class="file" data-file="base/deployment.yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+
+<p>E o índice da base lista o que entra na montagem:</p>
+
+<pre class="file" data-file="base/kustomization.yaml">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+  - configmap.yaml</pre>
+
+<p>Repare no <code>apiVersion</code> e no <code>kind</code> desse arquivo: ele também é um objeto Kubernetes,
+só que de um tipo que o <code>kubectl</code> conhece do lado do cliente. O <code>resources</code> pode listar
+arquivos ou pastas — inclusive uma pasta de base, quando o índice está num overlay.</p>
+
+<p>A base deve ser <em>aplicável</em>: se você rodar <code>kubectl apply -k base/</code>, o resultado tem de
+ser um site funcionando em algum ambiente, provavelmente o de teste. Quando a base não funciona sozinha,
+é sinal de que ela está misturando coisas de ambientes diferentes.</p>
+
+<h2>4. O overlay</h2>
+
+<p>O overlay de produção é menor que a base. Ele não copia manifesto nenhum: aponta para a pasta de cima e
+declara as diferenças.</p>
+
+<pre class="file" data-file="overlays/producao/kustomization.yaml">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+namePrefix: prod-
+replicas:
+  - name: cardapio
+    count: 3</pre>
+
+<p>Leia como uma frase: “use a base, coloque <code>prod-</code> no nome de tudo, e mude as réplicas do
+Deployment <code>cardapio</code> para 3”. O campo <code>replicas</code> é um atalho do Kustomize para uma
+mudança que aparece em todo projeto — existe porque mudar réplicas é a sobreposição mais comum de todas.</p>
+
+<p>O <code>namePrefix</code> tem um efeito colateral ótimo: se você aplicar os três ambientes no mesmo
+cluster, nada colide, porque o nome de cada objeto carrega o ambiente. Teste vira <code>teste-cardapio</code>,
+produção vira <code>prod-cardapio</code>, e o Service de cada um aponta para os seus próprios pods.</p>
+
+<p>A caixa abaixo é o resultado do overlay — o que o <code>kubectl apply -k</code> entregaria ao cluster.
+Ela está sem o prefixo e com uma réplica. Ajuste as duas coisas.</p>
+
+<div class="tryk8s" data-goal="pronto:Deployment/prod-cardapio=3;;campo:Deployment/prod-cardapio|spec.replicas=3">
+  <p class="try-task">O overlay de produção define <code>namePrefix: prod-</code> e três réplicas. Renomeie
+  o Deployment para <code>prod-cardapio</code> e ponha três réplicas.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   1/1     1            1           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prod-cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Depois de aplicar, o painel mostra o Deployment <code>prod-cardapio</code> com <code>3/3</code> prontos.
+Note que o <code>selector</code> não mudou: o prefixo vai no <em>nome do objeto</em>, não nas etiquetas. Se o
+prefixo fosse aplicado nas etiquetas também, o Service de cada ambiente precisaria ser ajustado — e é por
+isso que o Kustomize deixa as etiquetas em paz e mexe só nos nomes e nas referências.</p>
+
+<h2>5. Patches: sobrepor um campo</h2>
+
+<p>Quando a diferença não é um número de réplicas, entra o patch. Ele é um pedaço de manifesto com a mesma
+estrutura do original, contendo só o que você quer mudar. O Kustomize encontra o objeto pela
+<code>kind</code>, pelo <code>name</code> e pelo <code>apiVersion</code>, e aplica a sobreposição campo a
+campo.</p>
+
+<pre class="file" data-file="overlays/producao/patch-imagem.yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          env:
+            - name: AMBIENTE
+              value: producao</pre>
+
+<p>O patch diz “no Deployment chamado <code>cardapio</code>, no container <code>web</code>, troque a imagem e
+acrescente a variável”. Tudo o que não está no patch continua como está na base. É por isso que ele é curto:
+a única parte trabalhosa é acertar a <em>posição</em> do campo — a mesma árvore do manifesto.</p>
+
+<p>Existe um segundo estilo, o <strong>JSON patch</strong>, que trabalha por operação e por caminho:
+<code>[{"op": "replace", "path": "/spec/replicas", "value": 3}]</code>. Ele é mais preciso e mais frágil: se
+a estrutura mudar de posição, o patch quebra. Para o dia a dia, o patch estratégico (o do exemplo) é o que se
+lê melhor.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/prod-cardapio|spec.template.spec.containers.0.image=cardapio:2.0;;campo:Deployment/prod-cardapio|spec.template.spec.containers.0.env.0.name=AMBIENTE">
+  <p class="try-task">Aplique o patch: a imagem de produção é <code>cardapio:2.0</code> e o container
+  precisa da variável <code>AMBIENTE</code> com valor <code>producao</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prod-cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/prod-cardapio created
+
+NAME            READY   UP-TO-DATE   AVAILABLE   AGE
+prod-cardapio   3/3     3            3           4m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prod-cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080
+          env:
+            - name: AMBIENTE
+              value: producao</pre>
+</div>
+
+<p>Uma armadilha do patch estratégico: listas são mescladas por chave, não substituídas. Se o patch traz um
+container com <code>name: web</code>, ele é mesclado com o container de mesmo nome da base — e é por isso que
+o <code>name</code> aparece no patch mesmo quando você não quer mudá-lo. Sem esse nome, o Kustomize
+acrescentaria um container novo em vez de alterar o existente.</p>
+
+<h2>6. labels: a etiqueta em todos os objetos</h2>
+
+<p>O Kustomize tem um campo para acrescentar etiquetas a todos os objetos de uma vez — e, diferente do
+prefixo, ele mexe também nos seletores. O nome do campo mudou entre versões (<code>commonLabels</code> e,
+mais recente, <code>labels</code> com opções), e o efeito é o que interessa: a etiqueta entra no objeto e no
+seletor que aponta para ele.</p>
+
+<pre class="file" data-file="overlays/producao/kustomization.yaml">labels:
+  - pairs:
+      equipe: padaria
+    includeSelectors: true</pre>
+
+<p>Com <code>includeSelectors: true</code>, o Deployment ganha a etiqueta no pod e no seletor, e o Service
+ganha no seletor também. Resultado: os três continuam se encontrando. Se você editasse o seletor do Service
+na mão e esquecesse o pod, o Service ficaria sem endpoints — aquele sintoma de “o site está no ar mas não
+responde”.</p>
+
+<p>A caixa abaixo é esse caso: o Service tem a etiqueta <code>equipe: padaria</code> no seletor, e o pod não
+tem. Conserte o Deployment e veja a conta fechar.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:pods[equipe=padaria]=2;;campo:Deployment/cardapio|spec.template.metadata.labels.equipe=padaria;;campo:Service/cardapio|spec.selector.equipe=padaria">
+  <p class="try-task">Acrescente a etiqueta <code>equipe: padaria</code> no template do pod (é o que o
+  <code>includeSelectors</code> faz). O Service já a tem no seletor.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    equipe: padaria
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+    equipe: padaria
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    equipe: padaria
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        equipe: padaria
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+    equipe: padaria
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>A verificação conta os dois pods com a etiqueta e confere o seletor do Service. Com as duas pontas
+etiquetadas, o Service encontra os pods; sem isso, ele fica com zero endpoints e o tráfego não chega. É a
+mesma regra das aulas de Service e de labels, agora escrita em três linhas de kustomization em vez de
+espalhada por dois manifestos.</p>
+
+<h2>7. apply -k e kustomize</h2>
+
+<p>Para aplicar um overlay, o comando é <code>kubectl apply -k overlays/producao</code>. O <code>-k</code>
+substitui o <code>-f</code>: em vez de um arquivo, você aponta uma pasta com
+<code>kustomization.yaml</code>, e o kubectl faz a montagem antes de enviar. Não existe “servidor do
+Kustomize”; quem monta é o seu cliente.</p>
+
+<p>Para ver o resultado sem aplicar, existe <code>kubectl kustomize overlays/producao</code>. Ele imprime o
+YAML final — a base já com prefixo, réplicas, patch e etiquetas aplicados. Esta é a transcrição de uma saída
+assim, encurtada:</p>
+
+<pre class="term">$ kubectl kustomize overlays/producao
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prod-cardapio
+  labels:
+    app: cardapio
+    equipe: padaria
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+      equipe: padaria
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        equipe: padaria
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          env:
+            - name: AMBIENTE
+              value: producao</pre>
+
+<p>Esse comando é o equivalente ao <code>helm template</code>, e serve para a mesma coisa: ver antes de
+aplicar. Se o prefixo não apareceu, se o patch não pegou, se a etiqueta ficou só de um lado — você descobre
+aqui, sem tocar no cluster.</p>
+
+<p>Sobre o painel do guia, vale a honestidade de sempre: ele aplica manifestos e mostra a resposta do
+cluster; não executa o Kustomize. Nas caixas desta aula, o que você vê é o <em>resultado</em> da montagem,
+aplicado como qualquer outro manifesto. O comando <code>apply -k</code> em si não é simulado — num cluster de
+verdade ele funciona exatamente como descrito aqui.</p>
+
+<h2>8. Quando o patch não encontra o alvo</h2>
+
+<p>O erro mais comum de quem começa é o patch apontando para um objeto que não existe na montagem. Acontece
+quando o <code>name</code> no patch não é igual ao nome na base, ou quando o <code>kind</code> está errado.
+A mensagem do Kustomize é direta (transcrição):</p>
+
+<pre class="term">$ kubectl apply -k overlays/producao
+error: no matches for Id Deployment.v1.apps/cardapio.[noNs];
+failed to find unique target for patch Deployment.v1.apps/cardapio.[noNs]</pre>
+
+<p>Traduzindo: “procurei um Deployment chamado <code>cardapio</code> e não achei — ou achei mais de um”. O
+<code>[noNs]</code> significa que o patch não declarou namespace. Duas causas frequentes: você mudou o
+<code>namePrefix</code> e o patch continuou com o nome antigo (o patch deve usar o nome <em>da base</em>,
+porque ele é aplicado antes do prefixo), ou copiou um patch de outro projeto e o <code>name</code> não
+confere.</p>
+
+<p>Vale saber que existe também o contrário — o patch aplica sem erro e o resultado sai errado, porque a
+lista foi mesclada em vez de substituída. Para esses casos, <code>kubectl kustomize</code> é o juiz: o
+resultado impresso mostra imediatamente se apareceram dois containers onde devia haver um.</p>
+
+<h2>9. Kustomize ou Helm?</h2>
+
+<p>A pergunta volta em toda equipe, e a resposta honesta é que os dois resolvem o mesmo problema por
+caminhos diferentes. A tabela resume o que pesa na decisão.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Critério</th><th>Kustomize</th><th>Helm</th></tr>
+</thead>
+<tbody>
+<tr><td>o que você escreve</td><td>manifesto comum + o que muda</td><td>template com buracos + values</td></tr>
+<tr><td>linguagem nova</td><td>nenhuma (só YAML)</td><td>Go template, <code>include</code>, funções</td></tr>
+<tr><td>quem instala de fora</td><td>precisa da pasta inteira</td><td>um chart publicado, com versão</td></tr>
+<tr><td>estado da instalação</td><td>nenhum: o cluster é a verdade</td><td>releases e histórico de revisões</td></tr>
+<tr><td>rollback</td><td>reverter no git e reaplicar</td><td><code>helm rollback</code></td></tr>
+<tr><td>distribuir software</td><td>ruim: não há pacote</td><td>feito para isso</td></tr>
+<tr><td>depurar</td><td>o YAML que você lê é o que vai</td><td>é preciso renderizar para ver</td></tr>
+<tr><td>já vem instalado</td><td>sim, no <code>kubectl</code></td><td>não: precisa instalar o binário</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Na prática, times grandes usam os dois: Helm para o software de terceiro (banco, proxy, monitoramento) e
+Kustomize para os manifestos próprios, com o overlay por ambiente. E existe a combinação mais comum de todas:
+um chart de terceiro instalado por Helm, e o seu site aplicado por <code>kubectl apply -k</code>.</p>
+
+<p>O critério que eu usaria se tivesse que escolher um só: se o manifesto é seu e ninguém de fora vai
+instalá-lo, Kustomize dá menos dor de cabeça; se você precisa entregar algo versionado para outras pessoas
+consumirem com valores próprios, Helm é o formato certo.</p>
+
+<h2>10. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o prefixo que quebrou o ConfigMap</h3>
+<p>O overlay de produção aplicava <code>namePrefix: prod-</code> e o Deployment referenciava um ConfigMap
+pelo nome literal. O Kustomize renomeou os dois, mas a referência no volume continuou apontando para o nome
+antigo, e o pod ficou em <code>ContainerCreating</code>. A correção foi usar <code>configMapGenerator</code>
+— que o Kustomize sabe renomear e referenciar — em vez de um ConfigMap escrito à mão.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a etiqueta que só existia no Service</h3>
+<p>Alguém acrescentou <code>equipe: padaria</code> no seletor do Service e esqueceu o pod. O Service ficou
+com zero endpoints, o site parou de responder e nada nos logs apareceu — porque a requisição nunca chegava
+ao pod. O conserto foi usar <code>labels</code> com <code>includeSelectors</code> no kustomization, para que
+as duas pontas venham da mesma linha.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o patch que duplicou o container</h3>
+<p>Um patch trazia um container com imagem nova e sem <code>name</code>. O Kustomize acrescentou um segundo
+container em vez de alterar o primeiro, e o pod passou a ter dois processos disputando a porta 8080. O erro
+só apareceu depois do deploy, porque o patch aplicou sem nenhum aviso. <code>kubectl kustomize</code> teria
+mostrado na hora.</p>
+</div>
+
+<h2>11. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o overlay contém?</p>
+<label><input type="radio" name="q1"> uma cópia completa dos manifestos do ambiente</label>
+<label><input type="radio" name="q1"> um <code>kustomization.yaml</code> que aponta para a base e só as
+diferenças</label>
+<label><input type="radio" name="q1"> os templates que geram os manifestos</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que <code>namePrefix: prod-</code> faz com as
+referências entre objetos?</p>
+<label><input type="radio" name="q2"> nada: só muda o nome exibido</label>
+<label><input type="radio" name="q2"> quebra: você precisa atualizar cada referência na mão</label>
+<label><input type="radio" name="q2"> reescreve junto, para o Service continuar achando o Deployment</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual comando mostra o resultado da montagem sem aplicar?</p>
+<label><input type="radio" name="q3"> <code>kubectl kustomize overlays/producao</code></label>
+<label><input type="radio" name="q3"> <code>kubectl get kustomization</code></label>
+<label><input type="radio" name="q3"> <code>kubectl apply -k overlays/producao --dry-run=server</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o overlay de produção</h2>
+<p>Complete o <code>kustomization.yaml</code> do overlay para usar a base, prefixar os nomes e ajustar as
+réplicas.</p>
+<div class="ex-code">apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+namePrefix: <input aria-label="resposta 1" data-answer="prod-" placeholder="...">
+replicas:
+  - name: cardapio
+    count: <input aria-label="resposta 2" data-answer="3" placeholder="..."></div>
+<p class="ex-dica">Dica: o prefixo é o pedaço que vai na frente do nome de todos os objetos; o
+<code>count</code> é o número de réplicas desejado naquele ambiente.</p>
+</div>
+
+<h2>12. Resumo</h2>
+
+<p>Kustomize monta manifestos por sobreposição: uma <strong>base</strong> com YAML comum e um
+<strong>overlay</strong> por ambiente, que aponta para a base e declara o que muda. O único arquivo
+obrigatório é o <code>kustomization.yaml</code>, com <code>resources</code>, <code>namePrefix</code>,
+<code>namespace</code>, <code>labels</code>, <code>replicas</code>, <code>patches</code> e geradores.</p>
+
+<p>O prefixo muda o nome dos objetos e reescreve as referências entre eles; as etiquetas comuns, com
+<code>includeSelectors</code>, mantêm seletor e pod coerentes. Patches sobrepõem campo a campo, e listas são
+mescladas pela chave <code>name</code> — esquecer esse nome duplica container em vez de alterá-lo.</p>
+
+<p>Para aplicar, <code>kubectl apply -k pasta/</code>; para conferir antes, <code>kubectl kustomize
+pasta/</code>. Comparado ao <a href="helm-intro.html">Helm</a>, o Kustomize não tem template, não tem estado de release e não distribui
+pacote — e é justamente por isso que ele é simples. Com esta aula, o grupo de pacotes e entrega começa a
+fechar: daqui para a frente, o guia entra em GitOps e em como tudo isso chega ao cluster sem ninguém digitar
+nada.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Base = manifestos comuns; overlay = o que muda por ambiente.</li>
+  <li><code>kustomization.yaml</code> é o índice: <code>resources</code> primeiro, o resto depois.</li>
+  <li><code>namePrefix</code> muda nomes e referências; <code>labels</code> mexe em seletor e pod.</li>
+  <li>Patch estratégico mescla por <code>name</code>; JSON patch usa caminho e operação.</li>
+  <li><code>kubectl apply -k pasta/</code> aplica; <code>kubectl kustomize pasta/</code> mostra.</li>
+  <li>Sem template e sem histórico: a verdade é o que está no git.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

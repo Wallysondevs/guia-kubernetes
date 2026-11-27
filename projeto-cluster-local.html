@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cluster local completo | Guia Kubernetes</title>
+<meta name="description" content="Projeto guiado: o cluster inteiro na sua máquina com kind — três nós, o que roda em cada um, um DaemonSet em todos os nós e como derrubar tudo sem deixar sujeira.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Cluster local <span class="hl">completo</span></h1>
+<p class="intro">Até agora a Ana viu o cluster responder em caixas de aula. Chegou a hora de ter um de
+verdade: três nós, dentro da máquina dela, criados por um comando e apagados por outro. Nos próximos
+minutos você vai montar esse cluster, entender o que roda em cada nó, ver um DaemonSet ocupar os três — e
+derrubar tudo sem deixar container órfão, imagem gigante nem contexto perdido no kubeconfig.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é o kind e por que os nós dele são containers.</li>
+  <li>Como criar um cluster nomeado de três nós e conferir o contexto.</li>
+  <li>O que roda no control-plane e o que roda nos workers.</li>
+  <li>Por que um DaemonSet não entra no control-plane sem toleration.</li>
+  <li>Como apagar o cluster inteiro e o que sobra depois disso.</li>
+  <li>Onde o painel do guia para e o cluster da sua máquina começa.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>No fim desta página a Ana tem um cluster chamado <code>guia</code> rodando na máquina dela, com um nó de
+controle e dois workers. Dentro dele, uma loja com três réplicas espalhadas e um agente que roda em
+<em>todos</em> os nós. E, no fim, o mesmo cluster apagado por um comando, com a máquina limpa.</p>
+
+<p>A imagem mental é a de uma <em>maquete de cidade</em> montada na mesa da cozinha. Ela tem prefeitura
+(o control-plane), dois bairros (os workers) e ruas (a rede interna). Não é a cidade real, mas funciona
+igual o suficiente para testar o plano diretor: endereços, trânsito, distribuição de moradores. Quando você
+termina, desmonta a maquete inteira numa caixa — e a mesa volta a ficar livre.</p>
+
+<p>O programa que monta essa maquete é o <strong>kind</strong> — o mesmo do
+<a href="primeiro-cluster.html">primeiro cluster</a>, agora com três nós: “Kubernetes in Docker”. Ele cria containers
+Docker e faz de cada um um nó do cluster. Um cluster de três nós custa três containers e alguma memória —
+bem menos do que três máquinas virtuais, e infinitamente menos do que três servidores alugados.</p>
+
+<h2>2. O cenário da padaria</h2>
+
+<p>A Ana quer testar três coisas antes de mexer no cluster da loja: um Deployment com três réplicas, um
+DaemonSet novo de coleta de logs e uma política de rede. No cluster da loja, cada teste é uma aposta: um
+DaemonSet mal configurado pode encher os nós de pods, e uma NetworkPolicy errada pode cortar o tráfego do
+site.</p>
+
+<p>O cluster local resolve isso do jeito mais confortável possível: errar ali não custa nada. Se o
+DaemonSet ocupar todos os nós e travar a máquina, você apaga o cluster e cria outro em dois minutos. Se a
+política de rede cortar tudo, idem. Ninguém recebe alerta, nenhum cliente reclama, e o único limite é a
+memória do notebook.</p>
+
+<p>Tem um preço, e é bom conhecê-lo desde já: o cluster local não tem a escala do cluster de produção. Ele
+tem três nós e vive de containers na mesma máquina — sem alta disponibilidade de verdade, sem o tráfego
+real, sem a conta do cloud. Serve para aprender e para testar manifesto; não serve para medir desempenho
+nem para hospedar o site.</p>
+
+<h2>3. Antes de começar</h2>
+
+<p>Três coisas precisam existir na máquina: o Docker (ou outro runtime de containers), o <code>kubectl</code>
+e o <code>kind</code>. O Docker é o pré-requisito que ninguém avisa — sem ele, o kind não tem onde criar os
+nós. O <code>kubectl</code> é o cliente que fala com o cluster. O kind é o programa que monta o cluster.</p>
+
+<p>Existe uma alternativa ao kind que vale conhecer: o <strong>kwokctl</strong>, do projeto KWOK. Ele simula
+nós sem rodar container nenhum — cada “nó” é um objeto no etcd, e os pods aparecem como <code>Running</code>
+sem nenhum processo de verdade. Isso é ótimo para testar agendamento, taints, réplicas e DaemonSets com
+memória quase zero, e péssimo para testar imagem, volume ou log de aplicação, porque nada roda de fato.
+Escolha pela pergunta que você quer responder.</p>
+
+<dl class="anatomy">
+<dt>cluster kind</dt>
+<dd>Um conjunto de containers Docker. Um deles é o control-plane; os outros são workers. Tem nome — aqui,
+<code>guia</code> — e vive até você apagar.</dd>
+<dt>nó (node)</dt>
+<dd>Um container que roda kubelet, container runtime e o agente de rede. Para o Kubernetes, é uma máquina
+igual a qualquer outra.</dd>
+<dt>kubeconfig</dt>
+<dd>O arquivo com endereços e credenciais dos clusters que você conhece. O kind acrescenta um contexto por
+cluster, chamado <code>kind-</code> mais o nome.</dd>
+<dt>contexto</dt>
+<dd>O “cliente atual” do kubectl. É ele que decide em qual cluster o seu comando vai cair.</dd>
+<dt>taint do control-plane</dt>
+<dd>Uma marcação que impede pods comuns de cair no nó de controle. Só quem declara toleration entra.</dd>
+</dl>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>kind</code></th><th><code>kwokctl</code></th><th>cluster gerenciado</th></tr>
+</thead>
+<tbody>
+<tr><td>os nós são</td><td>containers Docker</td><td>objetos simulados, sem processo</td><td>máquinas de
+verdade, alugadas</td></tr>
+<tr><td>roda container de verdade?</td><td>sim</td><td>não</td><td>sim</td></tr>
+<tr><td>memória de um cluster de 3 nós</td><td>cerca de 1 a 2 GB</td><td>quase nada</td><td>a conta do
+cloud</td></tr>
+<tr><td>serve para</td><td>testar manifesto, imagem, rede, volume</td><td>testar agendamento e
+controladores</td><td>produção</td></tr>
+<tr><td>derruba com</td><td><code>kind delete cluster</code></td><td><code>kwokctl delete cluster</code></td><td>o
+provedor, com cuidado</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>4. Passo 1 — criar o cluster</h2>
+
+<p>Primeiro comando do projeto, e ele faz bastante coisa: baixa a imagem do nó, cria os containers, sobe o
+control-plane, instala a rede (CNI) e uma StorageClass padrão, e escreve o contexto no kubeconfig. O painel
+abaixo é um terminal: cada linha é um comando, e ele responde como responderia na máquina da Ana.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Creating cluster;;texto:Installing CNI;;texto:Set kubectl context to">
+  <p class="try-task">Troque a listagem pela criação: rode <code>kind create cluster --name guia</code> e
+  depois <code>kubectl config current-context</code>. O painel tem de mostrar a criação e o contexto
+  <code>kind-guia</code>.</p>
+<pre class="yaml">kind get nodes
+kubectl config current-context</pre>
+<pre class="out">
+ana@notebook:~$ kind get nodes
+guia-control-plane
+guia-worker
+guia-worker2
+
+ana@notebook:~$ kubectl config current-context
+kind-guia
+</pre>
+  <pre class="solucao">kind create cluster --name guia
+kubectl config current-context</pre>
+</div>
+
+<p>A saída da criação é uma sequência de etapas, cada uma com um emoji. Esta é a do motor, e é fiel ao que
+o kind imprime:</p>
+
+<pre class="term">ana@notebook:~$ kind create cluster --name guia
+Creating cluster "guia" ...
+ • Ensuring node image (kindest/node:v1.37.3) 🐳
+ • Preparing nodes 📦
+ • Writing configuration 📜
+ • Starting control-plane 👷
+ • Installing CNI 💉
+ • Installing StorageClass 📦
+Set kubectl context to "kind-guia"
+You can now use your cluster with:
+
+kubectl cluster-info --context kind-guia</pre>
+
+<p>Duas etapas merecem atenção. <em>Installing CNI</em> é a rede entre pods: sem ela, os pods sobem mas não
+conversam entre si, e o cluster parece meio quebrado. <em>Installing StorageClass</em> é o provisionador
+local que faz PVCs funcionarem — é o mesmo tipo de objeto da aula de armazenamento, apontando para o disco
+do nó.</p>
+
+<p>Se você rodar o comando de novo, com o mesmo nome, o kind reclama que o cluster já existe. Nomes são
+identidade: para ter dois clusters, use dois nomes (<code>guia</code> e <code>teste</code>), e o kubeconfig
+passa a ter dois contextos. É assim que se testa “o apply no cluster errado” sem apostar a loja.</p>
+
+<h2>5. Passo 2 — os três nós e o que roda em cada um</h2>
+
+<p>Cluster criado, hora de olhar para dentro. O comando <code>kubectl get nodes</code> mostra os três nós,
+com papel e versão. Um é <code>control-plane</code> (a prefeitura) e dois são workers (os bairros). Não
+existe “nó principal” além do control-plane: quem decide onde cada pod cai é o agendador.</p>
+
+<p>A caixa abaixo tem a loja com três réplicas e um DaemonSet <code>agente</code>. Rode do jeito que está e
+conte os pods do agente: são dois, porque o control-plane tem uma <em>taint</em> que expulsa pods comuns. A
+missão é dar ao agente a toleration que o autoriza a entrar lá também.</p>
+
+<div class="tryk8s" data-get="pods -o wide" data-goal="campo:DaemonSet/agente|spec.template.spec.tolerations.0.key=node-role.kubernetes.io/control-plane;;conta:pods[app=agente]=3;;campo:DaemonSet/agente|spec.template.spec.tolerations.0.effect=NoSchedule">
+  <p class="try-task">Acrescente em <code>spec.template.spec</code> do DaemonSet uma toleration com
+  <code>key: node-role.kubernetes.io/control-plane</code>, <code>operator: Exists</code> e
+  <code>effect: NoSchedule</code>. Rode e confira os três pods do agente em nós diferentes.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+  template:
+    metadata:
+      labels:
+        app: loja
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: agente
+spec:
+  selector:
+    matchLabels:
+      app: agente
+  template:
+    metadata:
+      labels:
+        app: agente
+    spec:
+      containers:
+        - name: agente
+          image: agente:1.0</pre>
+<pre class="out">
+deployment.apps/loja created
+daemonset.apps/agente created
+
+NAME                    READY   STATUS    RESTARTS   AGE   IP               NODE                 NOMINATED NODE   READINESS GATES
+agente-bm7ww            1/1     Running   0          3m    10.244.183.128   guia-worker          &lt;none&gt;           &lt;none&gt;
+agente-gcmgk            1/1     Running   0          6m    10.244.72.48     guia-worker2         &lt;none&gt;           &lt;none&gt;
+loja-pd42z5p4ml-7mvkp   1/1     Running   0          1m    10.244.121.8     guia-worker          &lt;none&gt;           &lt;none&gt;
+loja-pd42z5p4ml-gxdvn   1/1     Running   0          1m    10.244.114.228   guia-worker2         &lt;none&gt;           &lt;none&gt;
+loja-pd42z5p4ml-z46b5   1/1     Running   0          9m    10.244.140.52    guia-control-plane   &lt;none&gt;           &lt;none&gt;
+</pre>
+  <pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loja
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: loja
+  template:
+    metadata:
+      labels:
+        app: loja
+    spec:
+      containers:
+        - name: loja
+          image: loja:1.0
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: agente
+spec:
+  selector:
+    matchLabels:
+      app: agente
+  template:
+    metadata:
+      labels:
+        app: agente
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: agente
+          image: agente:1.0</pre>
+</div>
+
+<p>O painel mostra a tabela com a coluna <code>NODE</code> — a visão que faz o cluster de três nós valer a
+pena. É a saída real do motor:</p>
+
+<pre class="term">$ kubectl get nodes -o wide
+NAME                 STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE
+guia-control-plane   Ready    control-plane   8m    v1.37.3   192.0.2.28    none          Debian GNU/Linux 12 (bookworm)
+guia-worker          Ready    none            4m    v1.37.3   192.0.2.21    none          Debian GNU/Linux 12 (bookworm)
+guia-worker2         Ready    none            4m    v1.37.3   192.0.2.22    none          Debian GNU/Linux 12 (bookworm)
+
+$ kubectl get pods -o wide
+NAME           READY   STATUS    RESTARTS   AGE   IP               NODE                 NOMINATED NODE
+agente-bm7ww   1/1     Running   0          3m    10.244.179.128   guia-worker          none
+agente-gcmgk   1/1     Running   0          6m    10.244.223.28    guia-worker2         none
+agente-krqlv   1/1     Running   0          7m    10.244.44.117    guia-control-plane   none</pre>
+
+<p>Repare no campo <code>INTERNAL-IP</code>: os três nós usam endereços da faixa de documentação
+(<code>192.0.2.x</code>), que é o que aparece numa transcrição honesta — nada de IP da máquina de ninguém.
+Num cluster kind de verdade, esses IPs são os dos containers Docker, na rede interna do Docker.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Componente</th><th>Onde roda</th><th>O que faz</th></tr>
+</thead>
+<tbody>
+<tr><td>kube-apiserver</td><td>control-plane</td><td>recebe todo comando do kubectl; é a porta de
+entrada</td></tr>
+<tr><td>etcd</td><td>control-plane</td><td>guarda o estado do cluster: é o banco de dados dos
+objetos</td></tr>
+<tr><td>kube-scheduler</td><td>control-plane</td><td>decide em qual nó cada pod cabe</td></tr>
+<tr><td>kube-controller-manager</td><td>control-plane</td><td>roda os controladores: Deployment, Job, DaemonSet</td></tr>
+<tr><td>kubelet</td><td>todos os nós</td><td>sobe e vigia os containers daquele nó</td></tr>
+<tr><td>kube-proxy</td><td>todos os nós</td><td>faz o Service funcionar no nó</td></tr>
+<tr><td>CNI</td><td>todos os nós</td><td>dá IP e conectividade a cada pod</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma diferença entre o painel e o seu cluster que vale dizer: no painel, os três pods da loja são
+distribuídos entre os três nós. Num cluster kind de verdade, o control-plane tem a taint
+<code>node-role.kubernetes.io/control-plane:NoSchedule</code>, e pods comuns ficam nos workers — por isso o
+DaemonSet acima precisou de toleration. O painel simplifica o agendamento para você ver o espalhamento; a
+taint, ele mostra no manifesto e no efeito do DaemonSet.</p>
+
+<h2>6. Passo 3 — derrubar sem sujeira</h2>
+
+<p>Derrubar é mais importante do que parece. Um cluster kind esquecido consome memória, ocupa portas e
+guarda imagens que somam gigabytes. E o pior resíduo não é o disco: é o contexto no kubeconfig, que fica
+apontando para um cluster que não existe mais e faz todo <code>kubectl</code> falhar com erro de conexão
+recusada.</p>
+
+<p>O comando certo apaga o cluster inteiro — containers, volumes, rede e a entrada no kubeconfig. A caixa
+parte de um cluster com a loja rodando; a missão é apagar o Deployment e o cluster, na ordem em que isso
+faz sentido.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:deleted;;texto:Deleting cluster;;texto:Deleted nodes">
+  <p class="try-task">Apague primeiro o Deployment <code>cardapio</code> e depois o cluster:
+  <code>kubectl delete deployment cardapio</code> e <code>kind delete cluster</code>. Rode e confira as duas
+  respostas.</p>
+<pre class="yaml">kubectl get pods
+kind get nodes</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+
+ana@notebook:~$ kind get nodes
+guia-control-plane
+guia-worker
+guia-worker2
+</pre>
+  <pre class="solucao">kubectl delete deployment cardapio
+kind delete cluster</pre>
+</div>
+
+<p>A resposta do delete é curta e definitiva:</p>
+
+<pre class="term">ana@notebook:~$ kind delete cluster
+Deleting cluster "guia" ...
+Deleted nodes: ["guia-control-plane" "guia-worker" "guia-worker2"]</pre>
+
+<p>Depois disso, <code>kind get clusters</code> responde com uma lista vazia, <code>kubectl get nodes</code>
+falha porque não há para onde conectar, e o contexto sai do kubeconfig. Se você criou dois clusters, apagar
+um não mexe no outro — o comando age sobre o nome que você passar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que sobra na máquina</th><th>Sai com <code>kind delete cluster</code>?</th><th>Como limpar</th></tr>
+</thead>
+<tbody>
+<tr><td>containers dos nós</td><td>sim</td><td>—</td></tr>
+<tr><td>volume com o etcd</td><td>sim</td><td>—</td></tr>
+<tr><td>entrada no kubeconfig</td><td>sim</td><td>—</td></tr>
+<tr><td>imagens baixadas</td><td>não</td><td><code>docker image prune -a</code> com critério</td></tr>
+<tr><td>objetos que você criou dentro</td><td>sim, com o cluster</td><td>não há o que limpar</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Essa última linha é a que tranquiliza: apagar o cluster leva junto tudo o que estava dentro — Deployments,
+Services, PVCs, ConfigMaps. Não existe “sujeira de objeto” depois do delete; existe sujeira de imagem e de
+contexto, e as duas têm conserto simples.</p>
+
+<h2>7. Conferindo com o painel</h2>
+
+<p>Três comandos bastam para saber onde você está. <code>kubectl config current-context</code> diz qual
+cluster está no comando. <code>kubectl cluster-info</code> diz se ele responde. E
+<code>kubectl get nodes</code> diz quantos nós existem e se estão prontos.</p>
+
+<p>Um quarto comando é útil justamente por falhar: <code>kubectl top nodes</code> pede métricas de CPU e
+memória ao servidor de métricas, que não vem instalado por padrão. No painel, a resposta é a do cluster
+sem metrics-server:</p>
+
+<pre class="term">$ kubectl top nodes
+error: Metrics API not available</pre>
+
+<p>Isso não é defeito do seu cluster local: é a configuração de fábrica. Para ter números, é preciso
+instalar o metrics-server — e, num kind, ele precisa de uma opção extra para confiar no certificado do
+kubelet. Enquanto isso, a leitura de consumo é por outro caminho: <code>kubectl describe node</code> mostra
+os pedidos e limites somados por nó, e é o que responde “cabe mais um pod aqui?”.</p>
+
+<p>Com dois clusters criados, a conferência vira rotina de segurança: o comando
+<code>kubectl config get-contexts</code> lista todos, com um asterisco no atual. Antes de qualquer apply em
+ambiente que importa, olhe essa lista — é o mesmo hábito que salvou a Ana no projeto de multiambiente.</p>
+
+<dl class="anatomy">
+<dt>kubeconfig</dt>
+<dd>Um arquivo só, em <code>~/.kube/config</code>, com tudo o que o kubectl sabe sobre clusters, usuários e
+contextos. O kind escreve nele ao criar o cluster e apaga a entrada ao deletar.</dd>
+<dt>clusters</dt>
+<dd>Os endereços dos servidores de API e as autoridades certificadoras. Um por cluster, com nome
+próprio.</dd>
+<dt>contexts</dt>
+<dd>A ligação entre um cluster, um usuário e um namespace padrão. É o que aparece em
+<code>get-contexts</code> e o que o <code>use-context</code> troca.</dd>
+<dt>current-context</dt>
+<dd>O contexto em uso. Todo comando sem <code>--context</code> vai para ele — e é aqui que nascem os
+acidentes de aplicar no cluster errado.</dd>
+<dt><code>--context nome</code></dt>
+<dd>A flag que ignora o contexto atual e usa o que você mandar. Em produção, use sempre.</dd>
+</dl>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Cinco problemas cobrem quase toda primeira tentativa de cluster local. Nenhum é do Kubernetes; todos são
+de ambiente.</p>
+
+<p><strong>1. Docker parado.</strong> O kind responde que não conseguiu falar com o daemon. Conserto: abrir
+o Docker e esperar ele terminar de subir antes de rodar o comando de novo.</p>
+
+<p><strong>2. Cluster com o mesmo nome.</strong> O kind recusa a criação. Conserto: usar outro nome ou
+apagar o antigo com <code>kind delete cluster --name guia</code>.</p>
+
+<p><strong>3. Porta ocupada.</strong> Se você mapeia portas do cluster para a máquina (para abrir o site no
+navegador), duas tentativas na mesma porta brigam. Conserto: mapear outra porta, ou usar
+<code>kubectl port-forward</code>.</p>
+
+<p><strong>4. Contexto apontando para cluster morto.</strong> Todo comando falha com conexão recusada.
+Conserto: <code>kubectl config get-contexts</code> para ver, e <code>kubectl config use-context</code> para
+trocar.</p>
+
+<p><strong>5. Disco cheio de imagens.</strong> Cada cluster kind baixa a imagem de nó, e cada imagem de
+aplicação que você testa fica guardada. Conserto: <code>docker system df</code> para ver o tamanho e
+<code>docker image prune</code> para limpar o que não está em uso.</p>
+
+<div class="cenario">
+<h3>Cenário 1: o cluster que ficou ligado no fim de semana</h3>
+<p>A Ana criou o cluster na sexta para testar um DaemonSet e esqueceu. Na segunda, o notebook estava lento e
+o ventilador não parava. Eram três containers de nó e uma dúzia de pods consumindo memória havia dois dias.
+O conserto foi o hábito: <code>kind delete cluster</code> no fim de cada sessão, e <code>kind get
+clusters</code> para conferir se sobrou algum.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o teste que não provava nada</h3>
+<p>O time montou um cluster com kwokctl para testar um Deployment com limites de memória. Os pods apareciam
+como <code>Running</code>, o HPA escalava, tudo verde. Ao levar para o kind, os pods morriam por falta de
+memória: com nós simulados, nenhum processo consome nada, então limite de memória não tem como ser testado.
+A lição: escolher a ferramenta pela pergunta — agendamento no kwok, execução no kind.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o apply no cluster da loja</h3>
+<p>Com dois contextos no kubeconfig (o local e o da loja), o comando foi para o cluster errado: um
+<code>kubectl delete namespace padaria</code> digitado no terminal errado. O namespace era de teste, então o
+estrago foi pequeno. Desde então, todo comando em cluster de verdade leva <code>--context</code> explícito,
+e o prompt do terminal mostra o contexto atual.</p>
+</div>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>Você tem um cluster de três nós na máquina, sabe o que roda em cada um e sabe derrubar tudo. O kind
+transforma containers em nós; o control-plane guarda o estado e decide, os workers executam. O DaemonSet é o
+objeto que traduz “em todos os nós” em pods — e o control-plane só entra na conta se você declarar a
+toleration.</p>
+
+<p>A parte de limpeza não é detalhe: cluster esquecido consome memória, imagem esquecida consome disco,
+contexto esquecido quebra comando. Três comandos resolvem — <code>kind get clusters</code>,
+<code>docker system df</code> e <code>kubectl config get-contexts</code> — e valem a visita de vez em
+quando.</p>
+
+<p>E a fronteira do painel, como sempre: ele entende <code>kind</code> e <code>kubectl</code> no terminal,
+prova nós, pods e distribuição, mas não baixa imagem, não roda container e não tem metrics-server. O que
+depende de processo de verdade — consumo, log de aplicação, falha de imagem — aparece aqui como transcrição,
+sempre identificada. O resto, você faz no cluster da sua máquina, com os mesmos comandos.</p>
+
+<div class="cenario">
+<h3>Para praticar sozinho</h3>
+<p>Crie um segundo cluster com <code>kind create cluster --name teste</code>, rode
+<code>kubectl config get-contexts</code> e alterne entre eles com <code>use-context</code>. Depois apague só
+o <code>teste</code> e confirme que o <code>guia</code> continua de pé. É o exercício mais próximo do dia a
+dia de quem opera dois ambientes com nomes parecidos.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que é um nó num cluster kind?</p>
+<label><input type="radio" name="q1"> uma máquina virtual criada pelo Docker</label>
+<label><input type="radio" name="q1"> um container Docker que roda kubelet e o runtime</label>
+<label><input type="radio" name="q1"> um objeto simulado, sem processo nenhum</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. Por que o DaemonSet não criou pod no control-plane antes da
+toleration?</p>
+<label><input type="radio" name="q2"> porque o control-plane tem uma taint que expulsa pods comuns</label>
+<label><input type="radio" name="q2"> porque o DaemonSet só aceita dois nós</label>
+<label><input type="radio" name="q2"> porque o nó de controle não tem kubelet</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">3. O que <code>kind delete cluster</code> NÃO apaga?</p>
+<label><input type="radio" name="q3"> os containers dos nós</label>
+<label><input type="radio" name="q3"> a entrada do cluster no kubeconfig</label>
+<label><input type="radio" name="q3"> as imagens baixadas no Docker</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o nome do contexto</h2>
+<p>O cluster criado com <code>kind create cluster --name guia</code> ganha um contexto no kubeconfig. Complete
+o prefixo do nome dele, conforme o kind imprime na criação:</p>
+<div class="ex-code"><input aria-label="resposta 1" data-answer="kind-" placeholder="...">guia</div>
+<p class="ex-dica">Dica: é o mesmo prefixo que aparece em “Set kubectl context to …” na saída da criação —
+quatro letras e um hífen.</p>
+</div>
+
+<h2>Resumo</h2>
+
+<p>Cluster local completo é o kind: containers viram nós, um comando cria, outro apaga. Um cluster de três
+nós tem um control-plane (apiserver, etcd, scheduler, controller-manager) e dois workers (kubelet,
+kube-proxy, CNI). O <code>kubectl get nodes -o wide</code> mostra nome, papel, IP e versão; o
+<code>get pods -o wide</code> mostra em qual nó cada pod caiu.</p>
+
+<p>O DaemonSet é o objeto de “um por nó”, e o control-plane só participa se você declarar a toleration da
+taint <code>node-role.kubernetes.io/control-plane</code>. Já o kwokctl simula nós sem rodar nada: ótimo para
+agendamento, inútil para memória, imagem e log.</p>
+
+<p>E a limpeza: <code>kind delete cluster</code> leva containers, volume, objetos e contexto. Sobram imagens
+no Docker, que se limpam com <code>docker image prune</code>. Com isso você fecha o ciclo — criar, testar,
+derrubar — sem deixar rastro e sem tocar em nada de ninguém. A partir daqui, o próximo passo é repetir o
+mesmo ciclo com as suas próprias aplicações: o cluster é seu.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kind create cluster --name guia</code> cria três nós e o contexto <code>kind-guia</code>.</li>
+  <li>Nó de kind é container; kwokctl simula nós sem processo nenhum.</li>
+  <li>Control-plane tem taint: DaemonSet só entra com <code>tolerations</code>.</li>
+  <li><code>kubectl top nodes</code> falha sem metrics-server — isso é o padrão.</li>
+  <li><code>kind delete cluster</code> apaga tudo do cluster, inclusive o contexto.</li>
+  <li>Imagens ficam no Docker: <code>docker system df</code> e <code>image prune</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

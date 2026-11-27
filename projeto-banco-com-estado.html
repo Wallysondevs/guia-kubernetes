@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Banco com estado | Guia Kubernetes</title>
+<meta name="description" content="Projeto guiado: o banco da padaria com StatefulSet, Service headless e um volume por réplica — a ordem de subida, o disco que sobrevive e o pod que volta com o mesmo nome.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Banco com <span class="hl">estado</span></h1>
+<p class="intro">O site da Ana já está no ar, mas os pedidos moram num banco de dados — e banco de dados é
+outro bicho. Ele não pode ter duas cópias anônimas trocando de lugar, porque cada cópia guarda uma parte
+diferente dos dados; não pode subir tudo de uma vez, porque a segunda precisa conversar com a primeira; e não
+pode perder o disco quando o pod morre. Nesta página a Ana monta o banco da padaria com as três peças que
+resolvem isso: um <strong>Service headless</strong>, um <strong>StatefulSet</strong> e um
+<strong>volume por réplica</strong>.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Montar, na ordem, um banco de dados dentro do cluster.</li>
+  <li>Por que o Service do banco não tem IP e mesmo assim funciona.</li>
+  <li>O que o campo <code>serviceName</code> promete e o que acontece quando ele falta.</li>
+  <li>Como o <code>volumeClaimTemplates</code> dá um disco próprio a cada réplica.</li>
+  <li>A ordem de subida e o que fazer quando um pod do meio morre.</li>
+  <li>O que conferir no painel em cada etapa e o que só um cluster de verdade mostra.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>O banco da padaria é um Postgres com três cópias: uma que atende as leituras, uma que recebe as escritas e
+uma de reserva. Cada cópia tem um nome fixo (<code>banco-0</code>, <code>banco-1</code>,
+<code>banco-2</code>) e um disco próprio, que guarda a parte dos dados daquela cópia. O nome fixo é o que
+permite configurar replicação: o <code>banco-1</code> sabe que precisa copiar do <code>banco-0</code>
+justamente porque esse nome nunca muda.</p>
+
+<p>Repare no que isso exige e que um Deployment não entrega. O Deployment cria pods com nomes sorteados
+(<code>banco-7d9c8b6f5-2xk4p</code>) e pode ter qualquer quantidade — o nome de hoje não é o de amanhã. Ele
+também não cria disco nenhum: se você montar um volume compartilhado, as três cópias escrevem no mesmo lugar,
+o que para um banco é destruição de dados. E ele sobe todas as réplicas ao mesmo tempo, sem esperar a
+primeira ficar pronta.</p>
+
+<p>O StatefulSet é o controlador que entrega as três coisas juntas: identidade estável, disco por réplica e
+subida em ordem. Ele é o único controlador do Kubernetes que promete “o pod <code>banco-1</code> será sempre
+chamado <code>banco-1</code> e terá sempre o mesmo volume”. O Service headless é o parceiro: é ele que publica
+um nome de DNS para cada pod, já que não há IP de Service para agregar.</p>
+
+<h2>2. O cenário da padaria</h2>
+
+<p>O banco começou como um pod solto, criado com manifesto, com um <code>emptyDir</code> para os dados. Rodou
+uma semana. Na terça o nó precisou de manutenção, o pod foi recriado em outra máquina e o
+<code>emptyDir</code> nasceu vazio: os pedidos do dia sumiram e o site voltou com o cardápio padrão. A Ana
+restaurou um backup de segunda e passou a noite reenviando os pedidos que os clientes tinham em cópia por
+e-mail.</p>
+
+<p>A segunda tentativa foi um Deployment com duas réplicas e um PVC só, compartilhado. As duas cópias do
+Postgres tentaram abrir os mesmos arquivos, o banco recusou e entrou em laço de reinício. Quando o time
+reduziu para uma réplica, funcionou — mas sem alta disponibilidade, e com o mesmo disco amarrado a um pod de
+nome sorteado.</p>
+
+<p>A terceira tentativa, a que ficou, é a desta página: StatefulSet de três réplicas, cada uma com o seu PVC,
+um Service headless para os nomes e a replicação configurada por nome. É mais peças do que as tentativas
+anteriores, e é a primeira que sobrevive a um nó caindo.</p>
+
+<div class="cenario">
+<h3>Cenário 1: a réplica que “sabia” o nome da outra</h3>
+<p>Um script de replicação apontava para <code>banco-0.banco</code>. Funcionava. Um dia alguém recriou o
+Deployment, os pods ganharam nomes novos e o DNS respondeu vazio — o <code>banco-0</code> tinha deixado de
+existir. A réplica ficou em laço tentando conectar num nome que não resolvia. Com StatefulSet, o nome
+sobrevive à recriação: é sempre <code>banco-0</code>.</p>
+</div>
+<div class="cenario">
+<h3>Cenário 2: o volume compartilhado que corrompeu</h3>
+<p>Duas réplicas com o mesmo PVC <code>ReadWriteOnce</code> em nós diferentes: uma delas não conseguiu montar
+o volume e ficou em <code>ContainerCreating</code> para sempre. Quando o time forçou as duas no mesmo nó, as
+duas escreveram nos mesmos arquivos de controle do Postgres e o banco precisou ser restaurado do zero. Um
+disco por réplica não é luxo: é requisito do programa.</p>
+</div>
+<div class="cenario">
+<h3>Cenário 3: a escala que apagou o banco-2</h3>
+<p>Para economizar durante a madrugada, o time reduziu o StatefulSet de três para duas réplicas e voltou de
+manhã. Os pods voltaram, mas um deles não tinha mais os dados: alguém havia apagado o PVC
+<code>dados-banco-2</code> “porque não estava em uso”. O StatefulSet recriou o pod com um volume novo, vazio,
+e a réplica pediu uma cópia completa ao primário no meio do horário de pico.</p>
+</div>
+
+<h2>3. Antes de começar</h2>
+
+<p>Você precisa de um cluster com uma StorageClass padrão, porque o PVC precisa de onde se apoiar. Num cluster
+local de estudo, o provisionador já vem instalado; num cluster de nuvem, também. Se não houver classe padrão,
+os PVCs ficam em <code>Pending</code> e o banco nunca sobe — é o primeiro lugar para olhar quando os pods
+ficam presos.</p>
+
+<p>Precisa também decidir três números antes de escrever o manifesto: quantas réplicas (aqui, três), quanto
+disco por réplica (2Gi é suficiente para o exemplo) e em que caminho o programa grava (no Postgres,
+<code>/var/lib/postgresql/data</code>). Errar o caminho é o tropeço mais comum: o volume é montado, o banco
+sobe, e grava no disco do container em vez do volume.</p>
+
+<p>E precisa aceitar uma verdade do projeto: o painel não roda container. Ele aceita o manifesto, cria os
+objetos, gera os PVCs e mostra as tabelas do <code>kubectl</code> — mas o Postgres não inicia de verdade, e
+“pronto” aqui é decisão do agendador. Onde a diferença importar, a página mostra uma transcrição de cluster
+real, com o rótulo dizendo que é transcrição.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>o banco precisa de</th><th>quem entrega</th><th>com que campo</th></tr>
+</thead>
+<tbody>
+<tr><td>nome que não muda</td><td><code>StatefulSet</code></td><td><code>metadata.name</code> +
+ordinal (<code>-0</code>, <code>-1</code>, <code>-2</code>)</td></tr>
+<tr><td>um disco por réplica</td><td><code>volumeClaimTemplates</code></td><td><code>metadata.name</code> do
+template + <code>requests.storage</code></td></tr>
+<tr><td>subida em ordem</td><td><code>StatefulSet</code></td><td><code>podManagementPolicy:
+OrderedReady</code> (o padrão)</td></tr>
+<tr><td>nome de DNS por pod</td><td>Service headless</td><td><code>clusterIP: None</code> +
+<code>selector</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>4. Passo 1 — o Service headless</h2>
+
+<p>O primeiro objeto é o Service, e ele é esquisito de propósito: sem IP. Um Service normal recebe um IP
+virtual e distribui o tráfego entre os pods; o headless não recebe IP nenhum e, no lugar disso, publica no DNS
+um registro para <em>cada</em> pod que casa com o seletor. É o que o banco precisa: o cliente quer falar com
+a réplica específica, não com “qualquer uma”.</p>
+
+<div class="tryk8s" data-get="services" data-goal="campo:Service/banco|spec.clusterIP=None;;campo:Service/banco|spec.selector.app=banco">
+  <p class="try-task">Transforme o Service do banco em headless: <code>clusterIP: None</code> e seletor
+  <code>app: banco</code>. Rode e veja a coluna <code>CLUSTER-IP</code> virar <code>None</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: banco
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432</pre>
+<pre class="out">
+service/banco created
+
+NAME    TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE
+banco   ClusterIP   10.96.111.168   &lt;none&gt;        5432/TCP   5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: banco
+spec:
+  clusterIP: None
+  selector:
+    app: banco
+  ports:
+    - port: 5432
+      targetPort: 5432</pre>
+</div>
+
+<p>Antes, a tabela mostra um IP de verdade (<code>10.96.111.168</code> no painel) na coluna
+<code>CLUSTER-IP</code> e <code>&lt;none&gt;</code> em <code>EXTERNAL-IP</code>. Depois, o
+<code>CLUSTER-IP</code> passa a dizer <code>None</code>: o Service existe, tem seletor, tem porta, e não tem
+endereço para agregar. Num cluster real, o DNS passa a responder
+<code>banco-0.banco.default.svc.cluster.local</code>, <code>banco-1.banco…</code> e assim por diante — um nome
+por pod.</p>
+
+<dl class="anatomy">
+<dt><code>clusterIP: None</code></dt>
+<dd>A linha que transforma um Service comum em headless. O valor é o texto <code>None</code>, não vazio. Sem
+ela, o Service ganha IP e o DNS devolve um nome só, com balanceamento por trás.</dd>
+<dt>selector</dt>
+<dd>As etiquetas que escolhem quais pods entram no DNS. Precisa casar com
+<code>spec.template.metadata.labels</code> do StatefulSet — é o mesmo cuidado do Service comum.</dd>
+<dt>nome por pod</dt>
+<dd><code>&lt;pod&gt;.&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>. É o endereço que a
+replicação usa para achar o primário e que o cliente usa para falar com uma réplica específica.</dd>
+<dt>porta</dt>
+<dd>Aqui, <code>5432</code>, a porta do Postgres. O Service headless não muda a porta do programa: só publica
+o nome.</dd>
+</dl>
+
+<p>Uma coisa que confunde: o Service headless continua aparecendo no <code>kubectl get services</code> como
+tipo <code>ClusterIP</code>. O tipo não muda — o que muda é o <code>CLUSTER-IP</code> valer
+<code>None</code>. Não existe um <code>type: Headless</code>; quem marca é o campo.</p>
+
+<h2>5. Passo 2 — o StatefulSet e o <code>serviceName</code></h2>
+
+<p>Com o Service no lugar, entra o StatefulSet. Ele é parecido com um Deployment — seletor, template, imagem,
+porta — com duas diferenças que importam: o campo <code>serviceName</code>, que aponta para o Service headless,
+e a promessa de nomes ordinais. A caixa começa sem o <code>serviceName</code>, que é o erro número um de quem
+copia um Deployment e troca o <code>kind</code>.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:pods=3;;campo:StatefulSet/banco|spec.serviceName=banco;;texto:banco-2">
+  <p class="try-task">Acrescente <code>serviceName: banco</code> ao StatefulSet e rode. O painel tem de
+  mostrar <code>banco-0</code>, <code>banco-1</code> e <code>banco-2</code> em <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: banco
+spec:
+  clusterIP: None
+  selector:
+    app: banco
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: banco
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: banco
+  template:
+    metadata:
+      labels:
+        app: banco
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432</pre>
+<pre class="out">
+service/banco created
+The StatefulSet "banco" is invalid: spec.serviceName: Required value
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: banco
+spec:
+  clusterIP: None
+  selector:
+    app: banco
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: banco
+spec:
+  serviceName: banco
+  replicas: 3
+  selector:
+    matchLabels:
+      app: banco
+  template:
+    metadata:
+      labels:
+        app: banco
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432</pre>
+</div>
+
+<p>No código inicial o painel não mostra tabela nenhuma: ele mostra a linha do Service criado e a recusa do
+StatefulSet — <code>The StatefulSet "banco" is invalid: spec.serviceName: Required value</code>. Repare que o
+Service foi criado mesmo assim: cada objeto é validado por si, e um erro num documento não desfaz o anterior.
+Com o campo no lugar, os três pods aparecem, com os nomes na ordem dos números.</p>
+
+<p>O <code>serviceName</code> é <strong>obrigatório</strong> e não tem valor padrão. Ele não “cria” o Service:
+só declara qual Service é o dono dos nomes DNS dos pods. Se o Service não existir, o StatefulSet sobe do
+mesmo jeito — e o DNS fica sem resposta, o que é bem pior, porque o erro aparece longe da causa.</p>
+
+<h2>6. Passo 3 — o volume por réplica</h2>
+
+<p>Falta o disco. No StatefulSet ele não se declara em <code>spec.volumes</code> com um PVC pronto: declara-se
+um <em>molde</em> de PVC, o <code>volumeClaimTemplates</code>. O controlador cria um PVC por réplica, com o
+nome do molde mais o nome do pod — <code>dados-banco-0</code>, <code>dados-banco-1</code>,
+<code>dados-banco-2</code> — e monta cada um no seu pod. A caixa começa sem molde nenhum.</p>
+
+<div class="tryk8s" data-get="pvc" data-goal="conta:pvc=3;;campo:StatefulSet/banco|spec.volumeClaimTemplates.0.spec.resources.requests.storage=2Gi">
+  <p class="try-task">Dê um disco de 2Gi a cada réplica: acrescente <code>volumeClaimTemplates</code> com o
+  molde <code>dados</code> (<code>ReadWriteOnce</code>, <code>2Gi</code>) e monte em
+  <code>/var/lib/postgresql/data</code>. Rode e veja os três PVCs em <code>Bound</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: banco
+spec:
+  serviceName: banco
+  replicas: 3
+  selector:
+    matchLabels:
+      app: banco
+  template:
+    metadata:
+      labels:
+        app: banco
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16</pre>
+<pre class="out">
+statefulset.apps/banco created
+
+No resources found in default namespace.
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: banco
+spec:
+  serviceName: banco
+  replicas: 3
+  selector:
+    matchLabels:
+      app: banco
+  template:
+    metadata:
+      labels:
+        app: banco
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          volumeMounts:
+            - name: dados
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi</pre>
+</div>
+
+<p>Antes, a tabela dos PVCs diz <code>No resources found in default namespace.</code> — o StatefulSet cria
+pods, não volumes. Depois, aparecem três linhas: <code>dados-banco-0</code>, <code>dados-banco-1</code> e
+<code>dados-banco-2</code>, todas em <code>Bound</code>, com <code>2Gi</code> de capacidade e
+<code>RWO</code> em <code>ACCESS MODES</code>. Cada uma recebeu um volume diferente — os nomes
+<code>pvc-xfjmrlgr</code> e companhia, na coluna <code>VOLUME</code>, são a prova de que não é o mesmo
+disco.</p>
+
+<dl class="anatomy">
+<dt><code>volumeClaimTemplates</code></dt>
+<dd>Lista de moldes de PVC dentro do <code>spec</code> do StatefulSet. O controlador copia o molde uma vez por
+réplica e junta o nome do pod ao nome do molde. É por isso que o número de PVCs acompanha o número de
+réplicas.</dd>
+<dt><code>volumeMounts</code></dt>
+<dd>Onde o volume aparece dentro do container, em <code>mountPath</code>. O <code>name</code> do
+<code>volumeMounts</code> tem de ser igual ao <code>metadata.name</code> do molde; é essa igualdade que liga
+uma coisa à outra.</dd>
+<dt><code>accessModes</code></dt>
+<dd><code>ReadWriteOnce</code> (RWO) significa um nó por vez escrevendo. É o modo do disco de banco:
+<code>ReadWriteMany</code> exige um sistema de arquivos de rede e não resolve a briga entre dois Postgres pelo
+mesmo arquivo.</dd>
+<dt><code>Bound</code></dt>
+<dd>O status do PVC que encontrou um volume e está pronto para uso. O contrário é <code>Pending</code>: falta
+classe, falta capacidade, ou o provisionador não respondeu ao pedido.</dd>
+</dl>
+
+<p>O nome do molde (<code>dados</code>) não é decorativo: é ele que liga o <code>volumeMounts</code> ao PVC
+certo. Trocar um dos dois deixa o pod sem o volume, e o banco grava no disco do container, que morre com ele.
+É um erro silencioso: o pod sobe, o site responde, e o dado some no próximo reinício.</p>
+
+<h2>7. Conferindo: a ordem de subida e o pod que volta</h2>
+
+<p>Num cluster de verdade, o StatefulSet sobe uma réplica por vez, na ordem crescente, e espera cada uma
+ficar <code>Ready</code> antes de criar a próxima. A transcrição abaixo é de um cluster local de três nós,
+durante a subida de um StatefulSet de três réplicas — e o detalhe importante está no que <em>não</em>
+aparece:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods
+NAME      READY   STATUS              RESTARTS   AGE
+banco-0   1/1     Running             0          41s
+banco-1   0/1     ContainerCreating   0          3s
+
+ana@notebook:~$ kubectl get pods
+NAME      READY   STATUS    RESTARTS   AGE
+banco-0   1/1     Running   0          58s
+banco-1   1/1     Running   0          20s
+banco-2   1/1     Running   0          4s</pre>
+
+<p>Não existe <code>banco-2</code> na primeira listagem. Ele não está <code>Pending</code>, não está
+escondido: ele ainda não foi criado, porque o <code>banco-1</code> não estava pronto. Essa é a garantia do
+<code>OrderedReady</code>, o padrão do StatefulSet. Ela existe porque banco de dados de verdade precisa dela:
+a réplica 2 pede a cópia inicial à réplica 0, e não faz sentido pedir antes de a 0 estar atendendo.</p>
+
+<p>O painel desta página não reproduz essa espera: ele cria as três de uma vez e mostra a tabela final. Se
+você quer ver a ordem acontecendo, é no seu cluster — e a transcrição acima é o que você vai ver.</p>
+
+<p>O segundo comportamento que separa o StatefulSet do Deployment aparece quando um pod morre. Apague o do
+meio e observe: o pod volta com <strong>o mesmo nome</strong> e <strong>o mesmo volume</strong>. A
+transcrição mostra a idade dos PVCs ao lado da idade do pod novo — a diferença é a prova de que o disco não
+foi recriado:</p>
+
+<pre class="term">ana@notebook:~$ kubectl delete pod banco-1
+pod "banco-1" deleted
+
+ana@notebook:~$ kubectl get pods
+NAME      READY   STATUS    RESTARTS   AGE
+banco-0   1/1     Running   0          9m
+banco-1   1/1     Running   0          6s
+banco-2   1/1     Running   0          7m
+
+ana@notebook:~$ kubectl get pvc
+NAME            STATUS   VOLUME         CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+dados-banco-0   Bound    pvc-2lp75ps2   2Gi        RWO                           9m
+dados-banco-1   Bound    pvc-92ppdcnm   2Gi        RWO                           9m
+dados-banco-2   Bound    pvc-qpz76z5l   2Gi        RWO                           7m</pre>
+
+<p>O pod <code>banco-1</code> tem 6 segundos; o PVC <code>dados-banco-1</code> tem 9 minutos. Ou seja: o
+controlador recriou o pod e <em>religou</em> o volume que já existia. É exatamente o que um banco precisa —
+o processo morre, o dado fica. Num Deployment isso não aconteceria: o pod voltaria com outro nome, e um PVC
+declarado no template seria compartilhado por todas as réplicas.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>o que conferir</th><th>comando</th><th>sinal de problema</th></tr>
+</thead>
+<tbody>
+<tr><td>os pods com nome ordinal</td><td><code>kubectl get pods</code></td><td>nomes com hash no meio:
+ainda é Deployment</td></tr>
+<tr><td>um PVC por réplica</td><td><code>kubectl get pvc</code></td><td>menos PVCs que pods, ou todos com o
+mesmo <code>VOLUME</code></td></tr>
+<tr><td>o PVC ligado ao pod certo</td><td><code>kubectl describe pod banco-1</code></td><td>
+<code>ClaimName</code> diferente de <code>dados-banco-1</code></td></tr>
+<tr><td>o Service é headless</td><td><code>kubectl get services</code></td><td><code>CLUSTER-IP</code> com IP
+em vez de <code>None</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Os erros do banco com estado são mais caros que os do site, porque alguns não têm volta sem backup. Vale
+conhecer os cinco antes de precisar deles.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>sintoma</th><th>causa</th><th>conserto</th></tr>
+</thead>
+<tbody>
+<tr><td><code>The StatefulSet "banco" is invalid: spec.serviceName: Required value</code></td><td>faltou o
+campo <code>serviceName</code></td><td>apontar para o Service headless existente</td></tr>
+<tr><td>pods em <code>Pending</code> sem parar</td><td>PVC em <code>Pending</code>: nenhuma StorageClass
+padrão ou sem capacidade</td><td><code>kubectl get pvc</code> e <code>describe pvc</code> para ver o
+evento</td></tr>
+<tr><td>o banco sobe vazio toda vez</td><td><code>volumeMounts</code> com nome diferente do molde, ou
+caminho de montagem errado</td><td>conferir <code>claimName</code> e <code>mountPath</code></td></tr>
+<tr><td>duas réplicas brigam pelo mesmo arquivo</td><td>PVC compartilhado em vez de molde por réplica</td><td>
+voltar ao <code>volumeClaimTemplates</code></td></tr>
+<tr><td>recusa com <code>spec: Forbidden: updates to statefulset spec for fields other than 'replicas',
+'template' … are forbidden</code></td><td>tentou mudar <code>volumeClaimTemplates</code> ou o seletor num
+objeto existente</td><td>criar um StatefulSet novo ou expandir o PVC à parte</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O último é o que mais dói. O <code>volumeClaimTemplates</code> é imutável: aumentar o disco de um banco em
+produção não é editar o molde, é expandir cada PVC (quando a StorageClass permite) ou criar um novo
+StatefulSet e migrar. O Kubernetes recusa a alteração em vez de aceitar e fazer algo pela metade — o que é
+melhor, mas chega na hora errada se você não sabia.</p>
+
+<p>O terceiro erro tem uma demonstração barata e definitiva. Reduza o StatefulSet para duas réplicas e olhe
+os PVCs: o pod <code>banco-2</code> é apagado, mas o volume dele <strong>fica</strong>. A transcrição é de um
+cluster real, depois de <code>kubectl scale statefulset banco --replicas=2</code>:</p>
+
+<pre class="term">ana@notebook:~$ kubectl scale statefulset banco --replicas=2
+statefulset.apps/banco scaled
+
+ana@notebook:~$ kubectl get pods
+NAME      READY   STATUS    RESTARTS   AGE
+banco-0   1/1     Running   0          22m
+banco-1   1/1     Running   0          21m
+
+ana@notebook:~$ kubectl get pvc
+NAME            STATUS   VOLUME         CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+dados-banco-0   Bound    pvc-2lp75ps2   2Gi        RWO                           22m
+dados-banco-1   Bound    pvc-92ppdcnm   2Gi        RWO                           21m
+dados-banco-2   Bound    pvc-qpz76z5l   2Gi        RWO                           20m</pre>
+
+<p>Dois pods, três PVCs. Se você voltar para três réplicas, o <code>banco-2</code> reaparece com o disco
+antigo, com os dados que tinha. E se você apagar o PVC à mão, o dado vai junto — é o único caso em que reduzir
+réplicas “perde” informação, e é sempre por intervenção humana. A regra prática: reduza pods à vontade; não
+apague PVC de banco sem backup.</p>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>O banco com estado é a soma de três decisões. A primeira: identidade estável, porque replicação se
+configura por nome e nome sorteado não serve. A segunda: um disco por réplica, porque banco não compartilha
+arquivo. A terceira: subida em ordem, porque a réplica 2 depende da 0. O StatefulSet entrega as três; o
+Service headless entrega o endereço de cada uma.</p>
+
+<p>Para praticar sozinho: (1) aumente as réplicas para quatro e veja o PVC <code>dados-banco-3</code> nascer
+junto com o pod; (2) troque o <code>mountPath</code> para um caminho errado e observe que nada quebra no
+painel — é justamente o erro silencioso que só aparece com dado real; (3) apague o pod <code>banco-0</code>
+no seu cluster e confirme, com <code>kubectl get pvc</code>, que o volume continuou com a idade antiga.</p>
+
+<p>O que o painel prova e o que ele não prova: ele prova o manifesto aceito, o <code>serviceName</code>
+obrigatório, os três pods com nome ordinal e os três PVCs ligados a cada réplica. Ele não roda container, não
+inicia Postgres e não tem rede — então a replicação, o DNS respondendo e a ordem de subida são do seu cluster.
+As três transcrições desta página existem para você comparar com o que vê lá.</p>
+
+<p>Com o banco de pé, falta abrir a loja para o mundo com nome e cadeado. O próximo projeto é o Ingress com
+TLS: o Secret feito à mão, o host apontando para o Service e o que o painel consegue mostrar de um roteamento
+que, na vida real, depende de rede.</p>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Para que serve o <code>serviceName</code> no
+StatefulSet?</p>
+<label><input type="radio" name="q1"> para criar o Service automaticamente</label>
+<label><input type="radio" name="q1"> para declarar qual Service headless publica o DNS de cada pod</label>
+<label><input type="radio" name="q1"> para definir a porta que o banco escuta</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Quantos PVCs um StatefulSet de três réplicas cria com um
+molde chamado <code>dados</code>?</p>
+<label><input type="radio" name="q2"> um só, compartilhado pelas três réplicas</label>
+<label><input type="radio" name="q2"> nenhum: o PVC precisa ser criado à mão</label>
+<label><input type="radio" name="q2"> três: <code>dados-banco-0</code>, <code>dados-banco-1</code> e
+<code>dados-banco-2</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Você reduziu o StatefulSet de três para duas réplicas. O
+que acontece com o PVC da terceira?</p>
+<label><input type="radio" name="q3"> fica, com os dados, esperando a réplica voltar</label>
+<label><input type="radio" name="q3"> é apagado junto com o pod</label>
+<label><input type="radio" name="q3"> vira um PVC órfão e o cluster o apaga em 24 horas</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o Service sem IP</h2>
+<p>O banco precisa de um nome por pod. Complete o campo do Service que remove o IP e faz o DNS publicar um
+registro para cada réplica.</p>
+<div class="ex-code">apiVersion: v1
+kind: Service
+metadata:
+  name: banco
+spec:
+  <input aria-label="resposta 1" data-answer="clusterIP" placeholder="...">: None
+  selector:
+    app: banco</div>
+<p class="ex-dica">Dica: não é um <code>type</code> novo — é o campo que normalmente guarda o IP virtual,
+recebendo o texto <code>None</code>.</p>
+</div>
+
+<h2>Resumo</h2>
+
+<p>Banco de dados no Kubernetes pede StatefulSet, não Deployment. O StatefulSet dá nome fixo por ordinal
+(<code>banco-0</code>, <code>-1</code>, <code>-2</code>), um PVC por réplica a partir do
+<code>volumeClaimTemplates</code> e subida em ordem com <code>OrderedReady</code>. O Service headless
+(<code>clusterIP: None</code>) publica um nome de DNS por pod, que é como a replicação encontra o primário.</p>
+
+<p>A ordem de montagem é Service headless, StatefulSet (com <code>serviceName</code>), e então o molde de
+volume. Faltar o <code>serviceName</code> é recusa na hora, com a mensagem
+<code>spec.serviceName: Required value</code>; faltar o molde é silêncio: pods sobem, e o banco grava no disco
+errado.</p>
+
+<p>Quando um pod morre, ele volta com o mesmo nome e o mesmo volume — o PVC sobrevive ao pod, e é isso que
+faz o dado durar. Quando você reduz réplicas, os PVCs continuam; apagar um PVC de banco é decisão humana e
+sem volta. O <code>volumeClaimTemplates</code> é imutável: crescer disco é expandir PVC, não editar o
+molde.</p>
+
+<p>O painel mostra o manifesto aceito, os pods ordinais e os PVCs ligados a cada réplica; a ordem de subida, o
+DNS respondendo e o Postgres rodando são do seu cluster. Com o banco pronto, o próximo passo é abrir a loja
+para o mundo: Ingress com TLS.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>StatefulSet: nome fixo, disco por réplica, subida em ordem.</li>
+  <li><code>serviceName</code> é obrigatório e aponta para o Service headless.</li>
+  <li><code>volumeClaimTemplates</code> + <code>volumeMounts</code> com o mesmo nome = disco montado
+  certo.</li>
+  <li>Pod morre, PVC fica. Reduzir réplicas não apaga disco; apagar PVC apaga dado.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eventos e alertas | Guia Kubernetes</title>
+<meta name="description" content="O evento vive uma hora, conta o que já passou e não é alerta. Veja o TTL, os Warnings, o caminho até o Prometheus e a regra que faz o telefone tocar.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Eventos e <span class="hl">alertas</span></h1>
+<p class="intro">A Ana já viu que o <code>kubectl get events</code> mostra os recados do cluster sobre os objetos
+dela. Na sexta em que o cardápio ficou fora do ar, porém, o painel não tinha um único <em>Warning</em> — e nenhum
+alerta tocou. Nesta aula ela descobre o que é um evento de verdade, por que ele tem prazo de validade, por que
+<em>Normal</em> não quer dizer saudável, e qual é o caminho honesto do evento até um alerta que alguém vê antes do
+cliente reclamar.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um evento, quem escreve e por que ele não é o log da aplicação.</li>
+  <li>Quanto tempo um evento dura e o que acontece quando o prazo vence.</li>
+  <li>Por que <em>Warning</em> não significa urgente e <em>Normal</em> pode ser o desastre.</li>
+  <li>Como reduzir ruído com filtro, <code>--for</code> e <code>--watch</code>.</li>
+  <li>Os três caminhos de evento até o alerta: exportador, métrica de estado e regra de log.</li>
+  <li>Por que os alertas de plantão nascem de métrica, não de evento.</li>
+  <li>Como escrever a regra que avisa quando o cardápio fica sem réplica.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o alarme que nunca tocou</h2>
+
+<p>Sexta-feira, dezenove horas, o site da padaria parou de aceitar encomenda. A Ana abriu o terminal e rodou
+<code>kubectl get deployments</code>: a coluna <code>READY</code> dizia <code>0/0</code>. Nenhum pod, nenhuma
+réplica, nada acontecendo. O cluster estava saudável — ele apenas não estava fazendo nada, porque alguém tinha
+aplicado <code>replicas: 0</code> no Deployment do cardápio durante um teste de manhã e esquecido de voltar.</p>
+
+<p>O alarme do time disparava quando um pod entrava em erro: <code>CrashLoopBackOff</code>, imagem que não
+desce, container que reinicia. Naquela noite não havia pod nenhum para entrar em erro. O alerta não falhou — ele
+simplesmente não tinha sobre o que avisar. E o evento que descrevia o desastre existia, escrito de manhã, com o
+tipo <em>Normal</em>: <code>Scaled up replica set cardapio-8nhmvd9p6r to 0</code>. Ninguém estava olhando para
+ele, e às sete da noite ele já não existia mais.</p>
+
+<p>Este é o buraco que a aula de hoje tapa. Primeiro vamos entender o que é um evento, de onde ele vem e por que
+ele tem prazo de validade. Depois, por que um evento nunca é um alerta e o que precisa acontecer no meio do
+caminho. No fim, a regra que a Ana escreveu para o telefone dela tocar antes do telefone do cliente.</p>
+
+<h2>2. O recado, não o registro</h2>
+
+<p>Um evento é uma frase curta que um componente do cluster escreve sobre um objeto. Não é o log do programa da
+padaria — esse fala do que o processo fez por dentro. O evento fala do que o <em>cluster</em> fez com o objeto: o
+agendador achou um nó, o kubelet baixou a imagem, o controlador criou réplicas, o nó ficou sem memória e expulsou
+um pod. São duas testemunhas diferentes, e a aula anterior mostrou a primeira.</p>
+
+<p>O evento também é um objeto da API, guardado no etcd como o resto: no formato antigo, <code>v1/Event</code>;
+no formato novo, <code>events.k8s.io/v1</code>, com campos de nome mais claro — <code>regarding</code> (o objeto
+de que se fala), <code>note</code> (a frase), <code>reportingController</code> (quem escreveu) e
+<code>action</code> (o que foi tentado). Ele é gravado como qualquer objeto, mas com uma diferença que muda todo
+o desenho: <strong>prazo de validade</strong>. O kube-apiserver tem um coletor que apaga eventos mais velhos que
+<code>--event-ttl</code>, cujo padrão é <code>1h0m0s</code> — uma hora.</p>
+
+<p>Quem escreve? O agendador escreve <code>Scheduled</code> e <code>FailedScheduling</code>. O kubelet escreve
+<code>Pulling</code>, <code>Pulled</code>, <code>Created</code>, <code>Started</code>, <code>Unhealthy</code>,
+<code>BackOff</code>, <code>FailedMount</code> e <code>Killing</code>. Os controladores escrevem
+<code>ScalingReplicaSet</code> e <code>SuccessfulCreate</code>. O seu <code>kubectl apply</code> não escreve
+evento nenhum: ele muda o objeto, e os componentes comentam a mudança. (No painel deste guia, o
+<code>apply</code> simulado registra um <code>Created</code> para você ver o mecanismo já na primeira caixa; num
+cluster real, quem assina é o componente, e o seu apply deixa apenas a anotação de
+<code>last-applied-configuration</code>.)</p>
+
+<p>E o cluster não escreve uma linha por tentativa. Se o mesmo fato se repete — o kubelet tentando puxar a
+imagem de novo, dez vezes —, ele incrementa a contagem do mesmo evento e move o <code>lastTimestamp</code>. É por
+isso que uma tabela de cinco linhas pode resumir trezentas ocorrências, e é por isso que a contagem é a
+informação que você mais sente falta quando ela não está na tela.</p>
+
+<dl class="anatomy">
+<dt>evento</dt>
+<dd>Objeto da API que registra um acontecimento sobre outro objeto. Vive no namespace do objeto (exceto os de
+nó, que são do cluster) e é apagado depois de uma hora.</dd>
+<dt>Type</dt>
+<dd>Duas gavetas: <code>Normal</code> e <code>Warning</code>. Quem escolhe é quem escreve, e a escolha mede
+“deu certo ou não”, não “é grave ou não”.</dd>
+<dt>Reason</dt>
+<dd>A palavra curta e estável que serve para filtrar e para escrever regra: <code>FailedScheduling</code>,
+<code>BackOff</code>, <code>Unhealthy</code>, <code>ScalingReplicaSet</code>.</dd>
+<dt>OBJECT</dt>
+<dd>O objeto de que o evento fala, no formato <code>Kind/nome</code>. É o endereço que diz onde olhar — e o
+campo que quase todo filtro usa.</dd>
+<dt>TTL</dt>
+<dd>Tempo de vida do evento no etcd. Padrão de uma hora no kube-apiserver
+(<code>--event-ttl</code>). Depois disso, o coletor apaga.</dd>
+</dl>
+
+<h2>3. A caixa: fazer o evento nascer</h2>
+
+<p>O painel começa só com a consulta. Rode como está e repare na resposta: <code>No resources found in default
+namespace.</code> Esse é o primeiro ensinamento da aula. Evento não é estado — é acontecimento. Enquanto nada
+acontece, não há o que contar.</p>
+
+<div class="tryk8s" data-goal="texto:Pod/forno;;texto:Normal" data-modo="terminal">
+  <p class="try-task">O terminal começa apenas com a consulta. Crie o pod <code>forno</code> com a imagem
+  <code>nginx:1.27</code> e rode de novo: a tabela tem de mostrar o evento que o cluster escreveu sobre ele.</p>
+<pre class="yaml">kubectl get events</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get events
+No resources found in default namespace.
+</pre>
+<pre class="solucao">kubectl run forno --image=nginx:1.27
+kubectl get events</pre>
+</div>
+
+<p>A solução tem duas linhas porque são duas coisas: o comando que provoca o acontecimento e a consulta que o
+mostra. O <code>kubectl run</code> cria o pod; o cluster reage e escreve. A tabela tem as cinco colunas de
+sempre: <code>LAST SEEN</code> (a idade do último registro), <code>TYPE</code>, <code>REASON</code>,
+<code>OBJECT</code> e <code>MESSAGE</code> — a frase em inglês que conta o fato.</p>
+
+<p>No painel aparece um evento só, porque o motor do guia não roda container de verdade. Num cluster real, o
+mesmo comando gera uma sequência de cinco linhas, uma para cada etapa, e é essa sequência que você aprende a
+ler. A transcrição abaixo é de um cluster de verdade:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get events --sort-by=.lastTimestamp
+NAMESPACE   LAST SEEN   TYPE      REASON             OBJECT        MESSAGE
+default     12s         Normal    Scheduled          pod/forno     Successfully assigned default/forno to guia-worker
+default     11s         Normal    Pulling            pod/forno     Pulling image "nginx:1.27"
+default     9s          Normal    Pulled             pod/forno     Successfully pulled image "nginx:1.27" in 3.412s (3.412s including waiting)
+default     8s          Normal    Created            pod/forno     Created container: forno
+default     8s          Normal    Started            pod/forno     Started container forno
+default     4m          Warning   FailedScheduling   pod/bolo      0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.</pre>
+
+<p>Repare em duas coisas. Primeiro, a ordem: <code>LAST SEEN</code> é idade, não ordem de acontecimento, então
+a tabela mistura o pod de agora com o de quatro minutos atrás; <code>--sort-by=.lastTimestamp</code> arruma isso
+no cluster real. Segundo, o <code>Warning</code> da última linha, que é de outro pod: <code>0/3 nodes are
+available</code> quer dizer que nenhum dos três nós serve, e o motivo está na sequência — os três têm rótulos
+que não casam com o <code>nodeSelector</code> pedido. Traduzindo do inglês: “três nós não casaram com o seletor
+do pod; a preempção não ajudaria”.</p>
+
+<h2>4. Normal e Warning: duas gavetas, não duas urgências</h2>
+
+<p>O campo <code>TYPE</code> só tem dois valores na prática. <code>Warning</code> quer dizer “eu tentei fazer e
+não deu”: o agendador não achou nó, o kubelet não conseguiu montar o volume, a sonda falhou, o container
+reiniciou, o nó expulsou o pod por falta de memória. <code>Normal</code> quer dizer “aconteceu o que era
+previsto”: agendei, baixei a imagem, criei o container, comecei, escalei o ReplicaSet.</p>
+
+<p>Só que “previsto” não é sinônimo de “bom”. O evento da cena desta aula é <code>Normal</code>: o controlador
+fez exatamente o que o manifesto pedia, baixando o Deployment para zero réplicas. O cluster não tem opinião
+sobre quantas réplicas o cardápio precisa — isso é política da padaria, não do Kubernetes. Quem lê a tabela
+procurando a palavra <code>Warning</code> encontra o silêncio e conclui que está tudo bem.</p>
+
+<p>O contrário também acontece. Uma sonda de <code>readiness</code> com <code>initialDelaySeconds</code> curto
+demais gera <code>Warning</code> <code>Unhealthy</code> durante os primeiros segundos de todo pod, e o pod fica
+pronto logo depois. É ruído. A regra prática é simples e vale a aula inteira: <strong>leia a coluna
+<code>MESSAGE</code>, não a coluna <code>TYPE</code></strong>. O tipo é uma dica grosseira de quem escreveu; a
+frase é o fato.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Reason</th><th>Type usual</th><th>Quem escreve</th><th>O que significa</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Scheduled</code></td><td>Normal</td><td>agendador</td><td>o pod ganhou um nó</td></tr>
+<tr><td><code>FailedScheduling</code></td><td>Warning</td><td>agendador</td><td>nenhum nó serviu: falta
+recurso, seletor ou tolerância</td></tr>
+<tr><td><code>Pulling</code> / <code>Pulled</code></td><td>Normal</td><td>kubelet</td><td>a imagem está sendo
+baixada / foi baixada</td></tr>
+<tr><td><code>BackOff</code></td><td>Warning</td><td>kubelet</td><td>o container falhou e o kubelet espera
+antes de tentar de novo</td></tr>
+<tr><td><code>Unhealthy</code></td><td>Warning</td><td>kubelet</td><td>uma sonda falhou</td></tr>
+<tr><td><code>FailedMount</code></td><td>Warning</td><td>kubelet</td><td>o volume não montou (ConfigMap,
+Secret ou PVC ausente)</td></tr>
+<tr><td><code>Evicted</code></td><td>Warning</td><td>kubelet</td><td>o nó estava sob pressão e expulsou o
+pod</td></tr>
+<tr><td><code>ScalingReplicaSet</code></td><td>Normal</td><td>controlador do Deployment</td><td>o número de
+réplicas mudou — para mais ou para menos</td></tr>
+<tr><td><code>SuccessfulCreate</code></td><td>Normal</td><td>ReplicaSet</td><td>um pod foi criado pelo
+controlador</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>5. A caixa: o Normal que esconde o desastre</h2>
+
+<p>Agora o caso da sexta-feira, em miniatura. O manifesto abaixo é um Deployment perfeito do ponto de vista da
+API: campos certos, seletor casando com o rótulo do template, imagem existente. O único detalhe é
+<code>replicas: 0</code>. Rode e leia a tabela de eventos: nenhum erro, nenhum aviso, uma linha
+<code>Normal</code> dizendo que o ReplicaSet foi escalado para zero.</p>
+
+<div class="tryk8s" data-goal="texto:to 3;;conta:pods=3" data-get="events">
+  <p class="try-task">O cardápio foi aplicado com <code>replicas: 0</code> e o único evento é Normal. Suba para
+  três réplicas e rode: leia a coluna <code>MESSAGE</code> do evento novo. O cluster continua sem reclamar.</p>
+<pre class="yaml" data-file="cardapio.yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+          ports:
+            - containerPort: 80</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+LAST SEEN   TYPE     REASON              OBJECT                MESSAGE
+20s         Normal   Created             Deployment/cardapio   created by ana
+23s         Normal   ScalingReplicaSet   Deployment/cardapio   Scaled up replica set cardapio-jl8rwmvhnh to 0
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+          ports:
+            - containerPort: 80</pre>
+</div>
+
+<p>Com três réplicas, a mensagem muda para <code>Scaled up replica set cardapio-8nhmvd9p6r to 3</code> e os três
+pods passam a existir. O que não muda é o tipo: <code>Normal</code> nas duas versões. O evento conta o que o
+controlador fez, não o que a padaria precisava. Um Deployment com zero réplicas é um estado perfeitamente válido
+para o Kubernetes — e um desastre para quem vende pão.</p>
+
+<p>Guarde a consequência, porque ela é o coração da aula: <strong>se o alarme só olha para evento de falha, ele
+não vê o serviço que ficou com zero réplicas</strong>. Não há falha. Há ausência. E ausência não gera
+<code>Warning</code>.</p>
+
+<h2>6. O que um evento não é</h2>
+
+<p>Um evento não é histórico. O coletor do kube-apiserver apaga o que passou de uma hora (ou do valor que o
+administrador puser em <code>--event-ttl</code>). Na terça seguinte, quando alguém perguntar “o que aconteceu na
+sexta às sete?”, a resposta não está ali. Os eventos também guardam referência ao objeto: quando o pod é
+apagado, os eventos dele perdem o dono e somem junto. Evento é para agora.</p>
+
+<p>Um evento não é fila nem garantia de entrega. Ele é gravado e esquecido. Quem quiser levá-lo para outro lugar
+precisa de um processo rodando o tempo todo — e se esse processo cair, o que passou naquela janela está perdido
+para sempre. Não existe “reenviar os eventos de ontem”.</p>
+
+<p>Um evento não é métrica. Ele não tem número no tempo; tem uma frase. Você não plota
+<code>FailedScheduling</code> sem antes transformar o evento em contador. E um evento não é auditoria: quem
+mudou o quê, com qual usuário e por qual API fica no <em>audit log</em> do kube-apiserver, outro assunto.</p>
+
+<p>Também não é uma lista curta. Num cluster com dezenas de nós, são milhares de eventos por dia, e a tabela sem
+filtro é ruído puro. Daí os filtros que valem decorar: <code>-A</code> para ver todos os namespaces,
+<code>--field-selector type=Warning</code> para só os avisos e <code>--field-selector
+involvedObject.name=cardapio-8nhmvd9p6r</code> para um objeto específico. E daí o comando mais novo,
+<code>kubectl events</code>, que filtra por objeto com <code>--for</code> e acompanha ao vivo com
+<code>--watch</code>:</p>
+
+<pre class="term">ana@notebook:~$ kubectl events --for deployment/cardapio --watch
+LAST SEEN   TYPE     REASON              OBJECT                MESSAGE
+3m          Normal   ScalingReplicaSet   Deployment/cardapio   Scaled up replica set cardapio-8nhmvd9p6r to 0
+12s         Normal   ScalingReplicaSet   Deployment/cardapio   Scaled up replica set cardapio-5c7f9b2xk4 to 3</pre>
+
+<p>Vale a honestidade sobre o painel deste guia: ele não roda container, então os avisos que vêm do kubelet
+(<code>BackOff</code>, <code>Unhealthy</code>, <code>FailedMount</code>) não são calculados — quando aparecem na
+aula, é transcrição de cluster real, como as duas acima. O que o motor calcula é o que vem do agendador e dos
+controladores: <code>FailedScheduling</code>, <code>ScalingReplicaSet</code> e o registro da aplicação.</p>
+
+<h2>7. A caixa: cada evento aponta um objeto</h2>
+
+<p>A coluna <code>OBJECT</code> é o endereço do evento, e ela prega peças. Quando um Deployment muda de tamanho,
+quem escreve é o controlador do Deployment — então o evento aponta <code>Deployment/cardapio</code>, e não os
+pods que nasceram daquilo. Quem procura evento de pod e não acha nada muitas vezes devia estar olhando o
+Deployment. Na caixa, crie o Deployment <code>encomendas</code> com duas réplicas e veja quem assina a
+linha.</p>
+
+<div class="tryk8s" data-goal="texto:Deployment/encomendas;;texto:ScalingReplicaSet;;conta:pods=2" data-modo="terminal">
+  <p class="try-task">Crie o Deployment <code>encomendas</code> com a imagem <code>nginx:1.27</code> e duas
+  réplicas, e rode a consulta. Repare que o evento fala do Deployment, não dos pods que ele criou.</p>
+<pre class="yaml">kubectl get events</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get events
+No resources found in default namespace.
+</pre>
+<pre class="solucao">kubectl create deployment encomendas --image=nginx:1.27 --replicas=2
+kubectl get events</pre>
+</div>
+
+<p>O evento diz <code>Scaled up replica set encomendas-...</code> com <code>OBJECT</code> igual a
+<code>Deployment/encomendas</code>. Faz sentido: quem decidiu criar pods foi o controlador do Deployment, e o
+ReplicaSet é o intermediário. Já o <code>FailedScheduling</code> é sempre do pod, porque é o pod que não achou
+lugar. Saber de quem é o evento é o que decide o filtro certo — e é o motivo de tanta investigação começar no
+lugar errado.</p>
+
+<h2>8. Do evento ao alerta: três caminhos</h2>
+
+<p>Um alerta é outra coisa: é uma pergunta feita sem parar, com uma regra que decide quando a resposta vira
+telefone. O evento é uma afirmação no passado (“escalei para zero”). O alerta precisa de uma pergunta no presente
+(“quantas réplicas disponíveis existem agora?”). Entre um e outro há três caminhos conhecidos, e cada um resolve
+um pedaço.</p>
+
+<p><strong>1. Exportar o evento.</strong> Um agente lê os eventos da API e os manda para um backend de log ou
+transforma em métrica — é o que fazem o <code>kubernetes-event-exporter</code> e parentes. Serve para auditoria
+curta, para “quem apagou o quê” e para contar quantos <code>FailedScheduling</code> aconteceram na última hora.
+O custo é que ele precisa estar de pé: se o exportador reiniciar, a janela dele está perdida, porque a fonte não
+guarda nada. E ele continua falando do passado.</p>
+
+<p><strong>2. Olhar o estado.</strong> O <code>kube-state-metrics</code> lê os objetos da API e publica o estado
+deles como número: quantas réplicas o Deployment tem disponíveis, em que fase está cada pod, quantas vezes cada
+container reiniciou e por qual motivo está esperando. O Prometheus coleta esses números a cada intervalo e uma
+regra decide quando aquilo é grave. Esse é o caminho dos alertas de plantão — é dele que vivem as regras
+<code>KubePodNotReady</code>, <code>KubeDeploymentReplicasMismatch</code> e <code>KubePodCrashLooping</code> do
+pacote <code>kube-prometheus-stack</code>. Responde “está errado agora?” e continua respondendo enquanto estiver
+errado.</p>
+
+<p><strong>3. Regra no log.</strong> O backend de log avalia as linhas que recebe e dispara quando aparece o
+padrão combinado (o <em>ruler</em> do Loki, um <em>watcher</em> do Elasticsearch). É o caminho para o erro de
+negócio: “pagamento recusado por falta de estoque” não é evento de Kubernetes nem métrica de pod; é uma linha que
+o programa escreveu.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>Evento</th><th>Métrica de estado</th><th>Log</th></tr>
+</thead>
+<tbody>
+<tr><td>responde</td><td>o que aconteceu com este objeto</td><td>como está o cluster agora</td><td>o que o
+programa disse</td></tr>
+<tr><td>duração</td><td>uma hora, e some com o objeto</td><td>o tempo da retenção do Prometheus</td><td>o tempo
+da retenção do backend</td></tr>
+<tr><td>atraso</td><td>segundos</td><td>um intervalo de coleta (15s a 1m)</td><td>segundos a minutos</td></tr>
+<tr><td>nome do objeto</td><td>Kind/nome, com Reason</td><td>série com etiquetas</td><td>texto livre</td></tr>
+<tr><td>serve para alertar</td><td>só via exportador, e sempre sobre o passado</td><td>sim, é o caminho
+principal</td><td>sim, para erro de negócio</td></tr>
+<tr><td>custo</td><td>baixo, mas frágil</td><td>médio, e cresce com a quantidade de séries</td><td>alto, cresce
+com o volume de linhas</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Nenhum dos três substitui o outro, e a ordem de importância é essa: estado para o plantão, log para o
+negócio, evento para a investigação e a auditoria curta. O Alertmanager entra só no fim — ele recebe os alertas
+que já dispararam e decide como entregar: agrupa, roteia, inibe e silencia. Ele não mede nada e não conhece
+evento; a aula dele é a <code>alertmanager.html</code>.</p>
+
+<h3>A regra, escrita</h3>
+
+<p>Foi assim que a Ana fechou o buraco da sexta. O arquivo abaixo é um <code>PrometheusRule</code> — um objeto
+que o Prometheus Operator lê e transforma em regra viva. A primeira regra pergunta pelo estado; a segunda pega o
+caso clássico de container que não sobe:</p>
+
+<pre class="file" data-file="alerta-cardapio.yaml">apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: padaria
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: padaria.cardapio
+      rules:
+        - alert: CardapioSemReplicas
+          expr: kube_deployment_status_replicas_available{namespace="default",deployment="cardapio"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: O cardápio está sem nenhuma réplica disponível
+        - alert: PodEmCrashLoop
+          expr: kube_pod_container_status_waiting_reason{namespace="default",reason="CrashLoopBackOff"} &gt; 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Um container do namespace default está em CrashLoopBackOff</pre>
+
+<p>Leia linha por linha. <code>kube_deployment_status_replicas_available</code> é a série que o
+kube-state-metrics publica com o número de réplicas disponíveis do Deployment; as etiquetas
+<code>namespace</code> e <code>deployment</code> dizem de qual se trata; <code>== 0</code> é a condição do
+desastre. O <code>for: 5m</code> é o que separa alerta de susto: a expressão precisa ser verdadeira por cinco
+minutos seguidos, então um rollout normal, que passa por zero por alguns segundos, não acorda ninguém. A
+anotação <code>summary</code> é o texto que vai aparecer na mensagem, e <code>severity</code> é a etiqueta que o
+Alertmanager usa para escolher a rota.</p>
+
+<p>Se o Prometheus ainda não está de pé na padaria, o mesmo raciocínio vale para qualquer ferramenta: a pergunta
+tem de ser sobre estado, com uma janela de tolerância. “Nenhuma réplica disponível por cinco minutos” é um
+alerta. “Escalou para zero” é um evento — e, como você viu, um evento <em>Normal</em>. A próxima aula abre o
+Prometheus por dentro: de onde vêm esses números, como ele os coleta e o que é uma série temporal.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o plantão que soube pelo cliente</h3>
+<p>O alerta do time cobria reinício de container e imagem que não desce — os dois viram <code>Warning</code> na
+tabela de eventos. O serviço caiu porque o Deployment ficou com zero réplicas, o que não gera aviso nenhum. A
+correção foi trocar a pergunta do alerta: em vez de “houve evento de falha?”, passou a ser “existe réplica
+disponível?”. Nenhuma linha de código da aplicação mudou.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o evento que inundou o Slack</h3>
+<p>Depois de ligar o exportador de eventos, o canal do plantão recebeu quatrocentas mensagens numa madrugada,
+todas do mesmo pod em <code>BackOff</code>. O evento é deduplicado no cluster, mas o exportador mandava cada
+atualização como mensagem nova. O conserto foi em duas camadas: <code>for</code> maior na regra, para o ruído de
+segundos não contar, e agrupamento no Alertmanager, para o mesmo problema virar um aviso só. Alerta que chega
+demais é alerta que ninguém lê.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a investigação da terça anterior</h3>
+<p>Na terça, alguém perguntou o que tinha acontecido no sábado à noite. A resposta não estava nos eventos: uma
+hora depois, o coletor do kube-apiserver já tinha apagado tudo. O que sobrou foi a métrica — o gráfico de
+réplicas disponíveis, que mostrou a queda até zero e a volta na manhã de segunda — e o log da aplicação. Evento
+serve para o agora; para o passado, o que conta é o que foi exportado e guardado.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que acontece com um evento depois de uma hora?</p>
+<label><input type="radio" name="q1"> ele vira parte do histórico do objeto e aparece no describe para
+sempre</label>
+<label><input type="radio" name="q1"> o coletor do kube-apiserver apaga, porque o TTL padrão é de uma
+hora</label>
+<label><input type="radio" name="q1"> ele é movido para o namespace kube-system</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Um evento do tipo Normal pode indicar problema?</p>
+<label><input type="radio" name="q2"> não: Normal é emitido só quando tudo está saudável</label>
+<label><input type="radio" name="q2"> só se o Reason for FailedScheduling</label>
+<label><input type="radio" name="q2"> sim: escalar o Deployment para zero réplicas é Normal e pode ser o
+desastre</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual fonte responde “está errado agora?”</p>
+<label><input type="radio" name="q3"> a métrica de estado, como as do kube-state-metrics</label>
+<label><input type="radio" name="q3"> a tabela de eventos, que é atualizada a cada fato</label>
+<label><input type="radio" name="q3"> o log da aplicação, que guarda tudo por uma hora</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a regra do cardápio</h2>
+<p>Complete a regra que avisa quando o cardápio fica sem nenhuma réplica disponível por cinco minutos:</p>
+<div class="ex-code">- alert: CardapioSemReplicas
+  expr: kube_deployment_status_replicas_available{deployment="cardapio"} == <input aria-label="resposta 1" data-answer="0" placeholder="...">
+  for: <input aria-label="resposta 2" data-answer="5m" placeholder="..."></div>
+<p class="ex-dica">Dica: o número que caracteriza “sem nenhuma réplica” é o menor de todos, e a janela de
+tolerância é escrita com número e unidade, como no exemplo da aula.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Um evento é uma frase curta que um componente do cluster escreve sobre um objeto: quem falou, sobre o quê,
+com qual motivo e quando. Ele vive no etcd com prazo de validade — uma hora por padrão, ajustável em
+<code>--event-ttl</code> — e some junto com o objeto. Duplicatas não viram linhas novas: o mesmo evento ganha
+contagem e <code>lastTimestamp</code> atualizado.</p>
+
+<p>O campo <code>TYPE</code> tem duas gavetas e nenhuma escala. <code>Warning</code> quer dizer “tentei e não
+deu”; <code>Normal</code> quer dizer “aconteceu o previsto” — e escalar para zero réplicas é previsto. Por isso
+a leitura certa é da coluna <code>MESSAGE</code>, e a coluna <code>OBJECT</code> diz de quem é o evento: do
+Deployment quando o controlador escalou, do pod quando o agendador não achou lugar.</p>
+
+<p>Evento não é histórico, não é fila, não é métrica e não é auditoria. Para transformá-lo em alerta é preciso
+exportá-lo — e aceitar que a janela em que o exportador esteve fora está perdida. O alerta de plantão nasce de
+métrica de estado: o kube-state-metrics publica réplicas disponíveis, fases e motivos de espera, o Prometheus
+coleta e uma regra com <code>for</code> decide quando aquilo vira telefone. O log fica com o erro de negócio, e o
+Alertmanager só entrega.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Evento é acontecimento, não estado: sem ação, a tabela fica vazia.</li>
+  <li>TTL padrão de uma hora; depois disso, nada de “semana passada”.</li>
+  <li><code>Warning</code> é “não deu”; <code>Normal</code> é “deu” — e pode ser o desastre.</li>
+  <li>Leia o <code>MESSAGE</code>; o <code>TYPE</code> é dica grosseira.</li>
+  <li>Filtre: <code>--field-selector type=Warning</code>, <code>-A</code>, <code>kubectl events --for</code>.</li>
+  <li>Alerta bom pergunta pelo estado, com janela: “sem réplica por 5m”.</li>
+  <li>Exportar evento é complemento; o plantão vive de métrica de estado.</li>
+  <li>Alerta que toca demais não é lido: <code>for</code> e agrupamento são parte da regra.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

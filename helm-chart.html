@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Um chart | Guia Kubernetes</title>
+<meta name="description" content="A anatomia de um chart Helm: Chart.yaml, values.yaml, templates/ e _helpers.tpl, como o template vira manifesto e o que significam os erros de renderização.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Um <span class="hl">chart</span></h1>
+<p class="intro">A Ana já sabe instalar: <code>helm install cardapio ./cardapio</code>. Agora ela precisa
+montar o pacote — abrir a pasta e entender por que ela tem quatro arquivos com nomes estranhos, um deles
+chamado <code>_helpers.tpl</code>, e nenhum manifesto completo. É aqui que o Helm deixa de ser um comando e
+vira uma forma de escrever: o manifesto que você conhece vira <em>molde</em>, e o que muda por ambiente sai
+do molde e vai para um arquivo de valores. Nesta aula a Ana monta o chart do site, vê o molde virar manifesto
+e aprende a ler o erro de renderização que trava todo mundo na primeira vez.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>A anatomia da pasta de um chart, arquivo por arquivo.</li>
+  <li>O que vai em <code>Chart.yaml</code> e o que vai em <code>values.yaml</code>.</li>
+  <li>Como um template com <code>{{ }}</code> vira manifesto de verdade.</li>
+  <li>Para que serve o <code>_helpers.tpl</code> e o que é <code>include</code>.</li>
+  <li>Os três erros de renderização mais comuns, traduzidos.</li>
+  <li>Como ver o resultado antes de instalar: <code>helm template</code>, <code>lint</code> e
+  <code>--dry-run</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o site virou pacote</h2>
+
+<p>O site da Ana vai ser instalado em duas lojas novas. Cada loja tem o seu cluster, o seu endereço e o seu
+número de réplicas, mas o formato é o mesmo: um Deployment, um Service e um ConfigMap. Mandar a pasta de
+manifestos por e-mail funciona mal — a segunda loja recebe a versão que a primeira já corrigiu, e ninguém
+sabe qual foi.</p>
+
+<p>A solução é empacotar: um chart chamado <code>cardapio</code>, com os manifestos em forma de molde e os
+valores de cada loja separados. Quem instala não precisa entender o molde; precisa informar três ou quatro
+coisas. E quem mantém o molde corrige uma vez, publica uma versão nova e as duas lojas atualizam.</p>
+
+<p>Antes de criar a pasta, um aviso de expectativa: escrever chart é escrever <em>template</em>, e template
+tem uma linguagem própria. Ela é pequena — comparação, laço, função — mas é uma linguagem. O caminho mais
+seguro é começar com um manifesto que já funciona, transformar só o que muda em buraco e deixar o resto
+exatamente como estava.</p>
+
+<h2>2. A anatomia da pasta</h2>
+
+<p>Um chart é um diretório com nome igual ao do chart. Dentro dele, quatro coisas importam no começo: o
+arquivo de identidade, o de valores padrão, a pasta de moldes e o arquivo de trechos reutilizáveis.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Arquivo</th><th>Para que serve</th><th>Quem lê</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Chart.yaml</code></td><td>identidade: nome, versão do chart, versão da aplicação, tipo</td><td>o Helm, ao instalar e ao publicar</td></tr>
+<tr><td><code>values.yaml</code></td><td>valores padrão que preenchem os moldes</td><td>o Helm, e serve de documentação para quem instala</td></tr>
+<tr><td><code>templates/</code></td><td>os manifestos com buracos <code>{{ }}</code></td><td>o Helm, que os renderiza antes de entregar</td></tr>
+<tr><td><code>templates/_helpers.tpl</code></td><td>trechos nomeados reutilizados pelos templates</td><td>os outros templates, via <code>include</code></td></tr>
+<tr><td><code>templates/NOTES.txt</code></td><td>o texto que aparece depois do <code>install</code></td><td>você, na tela</td></tr>
+<tr><td><code>charts/</code></td><td>charts dos quais este depende</td><td>o Helm, ao instalar as dependências</td></tr>
+</tbody>
+</table>
+</div>
+
+<dl class="anatomy">
+<dt>chart</dt>
+<dd>A pasta empacotada: identidade, valores padrão, moldes e trechos reutilizáveis.</dd>
+<dt>template</dt>
+<dd>Um arquivo de manifesto com buracos <code>{{ }}</code>. Só vira manifesto depois de renderizado.</dd>
+<dt>values</dt>
+<dd>O dicionário que preenche os buracos. Chega ao template em <code>.Values</code>.</dd>
+<dt>helper</dt>
+<dd>Trecho nomeado no <code>_helpers.tpl</code>, declarado com <code>define</code> e usado com
+<code>include</code>.</dd>
+<dt>render</dt>
+<dd>O ato de o Helm executar os moldes com os valores e produzir YAML comum.</dd>
+<dt>release</dt>
+<dd>A instalação: nome, namespace e revisão. Dentro do template, chega em <code>.Release</code>.</dd>
+</dl>
+
+<p>Vale guardar essa distinção desde agora: <code>templates/</code> é código, <code>values.yaml</code> é
+configuração. Quem instala o seu chart mexe no segundo e nunca no primeiro — e, se precisar mexer no
+primeiro, o chart está mal desenhado.</p>
+
+<p>O <code>Chart.yaml</code> do site da padaria é curto:</p>
+
+<pre class="file" data-file="cardapio/Chart.yaml">apiVersion: v2
+name: cardapio
+description: O site da padaria, com cardápio e pedidos
+type: application
+version: 0.3.1
+appVersion: "1.4.0"
+maintainers:
+  - name: Ana</pre>
+
+<p>Duas versões convivem e confundem: <code>version</code> é a versão do <em>pacote</em> (o chart, que muda
+quando você mexe nos moldes) e <code>appVersion</code> é a versão da <em>aplicação</em> que ele instala (a
+imagem, que muda quando o site ganha funcionalidade). Elas sobem por motivos diferentes e não precisam
+coincidir — a Ana está no chart 0.3.1 instalando a aplicação 1.4.0.</p>
+
+<p>O <code>apiVersion: v2</code> é o formato do chart, não do Kubernetes. Chart v1 é do Helm 2; todo chart
+novo nasce v2, e um chart v1 antigo continua instalando, mas sem recursos novos.</p>
+
+<h2>3. values.yaml: os buracos têm padrão</h2>
+
+<p>O arquivo de valores é a parte que quem instala lê primeiro, porque é ali que ele descobre o que pode
+mudar. O padrão é ser curto e comentado — não é lugar de esconder lógica.</p>
+
+<pre class="file" data-file="cardapio/values.yaml">replicaCount: 2
+image:
+  repository: cardapio
+  tag: "1.0"
+service:
+  port: 80
+  targetPort: 8080
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi</pre>
+
+<p>Repare na estrutura: grupos com nome (<code>image</code>, <code>service</code>,
+<code>resources</code>) e, dentro deles, os valores. Essa hierarquia não é enfeite — ela é o caminho que o
+template usa para achar o valor (<code>.Values.image.repository</code>) e é o que permite sobrescrever um
+campo sem reescrever o grupo inteiro. É a mesma ideia do manifesto aninhado, aplicada a configuração.</p>
+
+<p>O conteúdo de <code>values.yaml</code> aparece inteiro em <code>.Values</code> dentro dos templates. Se
+você acrescentar <code>corFavorita: azul</code> no arquivo, ela existe em <code>.Values.corFavorita</code> na
+hora — e desaparece se o usuário passar outro valor. Nada é mágico: é um dicionário preenchido antes da
+renderização.</p>
+
+<h2>4. templates/: o molde com buracos</h2>
+
+<p>Dentro de <code>templates/</code> ficam arquivos que <em>parecem</em> manifestos. A diferença são os
+trechos entre <code>{{</code> e <code>}}</code>, que o Helm executa como programa. O molde do Deployment do
+cardápio:</p>
+
+<pre class="file" data-file="cardapio/templates/deployment.yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-cardapio
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: web
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: 8080</pre>
+
+<p>Três coisas merecem atenção. A primeira: <code>{{ .Release.Name }}</code> é o nome da release que quem
+instalou escolheu — é assim que duas instalações do mesmo chart não brigam pelo mesmo nome de objeto. A
+segunda: <code>{{ .Values.replicaCount }}</code> vira um número na hora de renderizar, e é por isso que
+<code>replicas: 3</code> funciona como valor inteiro e não como texto.</p>
+
+<p>A terceira: as aspas em <code>image: "{{ ... }}:{{ ... }}"</code>. Sem elas, um valor que comece por
+número ou contenha dois-pontos pode virar um tipo diferente do esperado no YAML. Essa é a origem de um erro
+famoso, “cannot unmarshal number into Go struct field”, em que um <code>tag: 1.0</code> vira o número 1 na
+cabeça do interpretador e a imagem fica <code>cardapio:1</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Trecho</th><th>O que faz</th><th>Exemplo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>{{ .Values.x }}</code></td><td>insere um valor dos values</td><td><code>{{ .Values.replicaCount }}</code></td></tr>
+<tr><td><code>{{ .Release.Name }}</code></td><td>nome da release escolhido na instalação</td><td><code>cardapio</code></td></tr>
+<tr><td><code>{{ .Chart.Version }}</code></td><td>versão do chart, do <code>Chart.yaml</code></td><td><code>0.3.1</code></td></tr>
+<tr><td><code>{{ include "x" . }}</code></td><td>insere um trecho definido no <code>_helpers.tpl</code></td><td>um bloco de etiquetas</td></tr>
+<tr><td><code>{{ .Values.y | default "z" }}</code></td><td>usa <code>z</code> quando o valor não existe</td><td>evita campo vazio</td></tr>
+<tr><td><code>{{ toYaml .Values.resources | nindent 8 }}</code></td><td>converte um bloco inteiro e indenta</td><td>requests e limits</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>5. _helpers.tpl: os trechos com nome</h2>
+
+<p>Todo chart em que você puser os olhos tem um <code>_helpers.tpl</code>. O sublinhado no começo do nome é
+proposital: o Helm não renderiza esse arquivo como manifesto — ele é um arquivo de definições. Lá dentro,
+blocos nomeados são declarados com <code>define</code> e usados nos outros templates com
+<code>include</code>.</p>
+
+<pre class="file" data-file="cardapio/templates/_helpers.tpl">{{- define "cardapio.labels" -}}
+app: {{ .Release.Name }}
+tier: web
+{{- end -}}</pre>
+
+<p>Por que não repetir essas duas linhas em cada template? Porque repetição em molde é pior do que
+repetição em YAML: no dia em que a etiqueta mudar, você precisa achar todos os lugares. Com o
+<code>include</code>, muda-se uma linha e todos os templates acompanham — e, se alguma etiqueta ficar
+diferente entre o Deployment e o Service, o Service para de achar os pods.</p>
+
+<p>Nos charts maduros, o <code>_helpers.tpl</code> também resolve o nome dos objetos. O padrão é uma função
+que devolve o nome da release (ou <code>release-chart</code>, quando os dois diferem), truncado em 63
+caracteres — o limite de nome de alguns recursos. É a razão de você ver nomes como
+<code>cardapio-cardapio</code> em instalações por aí: o helper juntou release e chart.</p>
+
+<p>O exemplo abaixo é o resultado renderizado do chart da padaria, já com o <code>include</code> resolvido.
+O seletor do Deployment pede uma etiqueta que o template do pod não tem, e o cluster recusa. Conserte o
+molde e rode.</p>
+
+<div class="tryk8s" data-goal="pronto:Deployment/cardapio=2;;campo:Deployment/cardapio|spec.template.metadata.labels.tier=web">
+  <p class="try-task">O <code>selector</code> exige <code>tier: web</code> e o template do pod não tem essa
+  etiqueta — é o que o <code>include</code> deveria ter colocado nos dois lugares. Acrescente no pod.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    tier: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      tier: web
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+The Deployment "cardapio" is invalid: spec.template.metadata.labels: Invalid value: {"app":"cardapio"}: `selector` does not match template `labels`
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    tier: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+      tier: web
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        tier: web
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>A mensagem do cluster é literal e aponta o problema:
+<code>`selector` does not match template `labels`</code>. Esse erro é o mais comum de quem mexe em chart,
+porque a etiqueta aparece em três lugares (metadata do Deployment, selector e template do pod) e só dois
+deles são atualizados. O <code>include</code> do helper existe justamente para que os três venham do mesmo
+lugar.</p>
+
+<h2>6. O apiVersion também é molde</h2>
+
+<p>Charts antigos são uma fonte inesgotável de erro de <code>apiVersion</code>: o molde foi escrito quando
+Deployment era <code>extensions/v1beta1</code> e ninguém atualizou. O Helm não valida isso — ele entrega o
+manifesto ao cluster, e é o cluster que recusa. A caixa abaixo reproduz o caso.</p>
+
+<div class="tryk8s" data-goal="texto:2/2;;campo:Deployment/cardapio|spec.replicas=2">
+  <p class="try-task">O molde renderizou <code>apiVersion: v1</code> para um Deployment. Corrija para o grupo
+  certo e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no matches for kind "Deployment" in version "v1"
+ensure CRDs are installed first
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>A resposta é específica e didática:
+<code>apiVersion: Invalid value: "v1": no matches for kind "Deployment" in version "v1" (o certo é apps/v1)</code>.
+No cluster de verdade, a mesma frase aparece como
+<code>no matches for kind "Deployment" in version "v1"</code> seguida de
+<code>ensure CRDs are installed first</code> — a segunda linha confunde muita gente, porque fala de CRD num
+problema que não tem nada a ver com CRD.</p>
+
+<h2>7. Quando a renderização quebra</h2>
+
+<p>Os erros de template acontecem <em>antes</em> de qualquer coisa chegar ao cluster, e a mensagem vem do
+Helm, não do Kubernetes. Reconhecer o formato economiza tempo. Esta é a transcrição de dois casos reais.</p>
+
+<pre class="term">$ helm template cardapio ./cardapio
+Error: parse error at (cardapio/templates/deployment.yaml:18): unexpected "}" in operand
+
+$ helm install cardapio ./cardapio
+Error: INSTALLATION FAILED: template: cardapio/templates/deployment.yaml:21:24:
+executing "cardapio/templates/deployment.yaml" at &lt;include "cardapio.labels" .&gt;:
+no template "cardapio.labels" associated with template "gotpl"</pre>
+
+<p>O primeiro é sintaxe: falta uma chave, sobrou um parêntese, o <code>{{</code> não fechou. O número da
+linha indica onde o interpretador desistiu, que quase nunca é onde está o erro — se ele reclama da linha 18,
+olhe a 15. O segundo é nome: alguém chamou <code>include "cardapio.labels"</code> e o
+<code>_helpers.tpl</code> não define esse nome (ou define com um espaço a mais, ou o arquivo está fora da
+pasta <code>templates/</code>).</p>
+
+<p>Existe um terceiro, mais sutil: <code>nil pointer evaluating interface {}.imagem</code>. Ele quer dizer
+que o template tentou ler <code>.Values.imagem.algumaCoisa</code> e <code>imagem</code> não existe nos values
+daquela instalação. Acontece quando o chart espera um bloco que o arquivo de valores do ambiente não tem — e
+o conserto é <code>| default dict</code> no template ou acrescentar o bloco nos values, não “reinstalar”.</p>
+
+<p>Uma armadilha de leitura: no meio da mensagem, valores do seu YAML aparecem entre sinais de menor e
+maior. Isso <em>não</em> é HTML nem XML — é só a forma como o Helm mostra o pedaço do template que falhou.
+Vale ler devagar a primeira vez, porque o susto é maior que o problema.</p>
+
+<h2>8. Ver antes de instalar</h2>
+
+<p>Existe um comando que resolve três quartos dos problemas: <code>helm template</code>. Ele renderiza os
+moldes e imprime os manifestos no terminal, sem tocar no cluster. Se o resultado estiver errado, você vê
+antes de instalar. A caixa abaixo usa esse comando e o argunento do nome precisa estar certo — sem o nome da
+release, o <code># Source:</code> sai apontando para lugar nenhum.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:# Source: ./cardapio/templates/deployment.yaml;;texto:kind: Deployment">
+  <p class="try-task">Falta o nome da release no comando. Renderize o chart
+  <code>./cardapio</code> com o nome <code>cardapio</code> e confira o manifesto impresso.</p>
+<pre class="yaml">helm template ./cardapio</pre>
+<pre class="out">
+ana@notebook:~$ helm template ./cardapio
+# Source: app/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ./cardapio
+spec:
+  replicas: 2
+</pre>
+<pre class="solucao">helm template cardapio ./cardapio</pre>
+</div>
+
+<p>Num cluster de verdade, o mesmo comando imprime o manifesto inteiro, começando por uma linha
+<code># Source:</code> que diz de qual arquivo do chart aquele documento veio. É essa linha que permite achar
+o molde responsável quando o resultado está estranho — e ela sai em todos os documentos, inclusive nos que
+você não lembrou que existiam.</p>
+
+<p>Dois companheiros do <code>template</code> completam a caixa de ferramentas. O <code>helm lint ./cardapio</code>
+lê o chart sem renderizar e aponta problemas de estrutura: arquivo faltando, chave desconhecida no
+<code>Chart.yaml</code>, valor com tipo esquisito. Ele não substitui o teste, mas pega o básico em um
+segundo. E o <code>helm install --dry-run</code> faz a renderização com o contexto da release (nome,
+namespace, valores passados) e mostra o que seria aplicado, sem aplicar.</p>
+
+<p>O <code>lint</code> merece uma transcrição, porque o formato dele é reconhecível e tranquilizador. Num
+chart saudável, ele imprime um aviso cosmético e uma linha de conclusão:</p>
+
+<pre class="term">$ helm lint ./cardapio
+==&gt; Linting ./cardapio
+[INFO] Chart.yaml: icon is recommended
+
+1 chart(s) linted, 0 chart(s) failed</pre>
+
+<p>Agora o mesmo comando num chart quebrado — e repare que o erro é o mesmo que o <code>install</code>
+daria, só que aqui ninguém tocou no cluster:</p>
+
+<pre class="term">$ helm lint ./cardapio
+==&gt; Linting ./cardapio
+[ERROR] templates/: template: cardapio/templates/deployment.yaml:21:24:
+executing "cardapio/templates/deployment.yaml" at &lt;include "cardapio.labels" .&gt;:
+no template "cardapio.labels" associated with template "gotpl"
+
+Error: 1 chart(s) linted, 1 chart(s) failed</pre>
+
+<p>A linha <code>1 chart(s) linted, 1 chart(s) failed</code> é o que se coloca num script de integração
+contínua: o comando sai com código de erro, e o pipeline para antes de publicar um chart que não
+renderiza.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o helper que truncava o nome no meio de uma palavra</h3>
+<p>Um chart com nome comprido gerou um Service com 63 caracteres e o nome do pod ficou impossível de ler nos
+logs. O <code>_helpers.tpl</code> tinha um <code>trunc 63</code> que cortava sem cuidado. O conserto foi
+truncar o nome do chart e nunca o nome da release, que é o que o usuário digitou — e é o que ele espera ver.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a tag 1.0 que virou 1</h3>
+<p>A imagem subiu como <code>cardapio:1</code> e o cluster não encontrou a tag. Nos values estava
+<code>tag: 1.0</code>, sem aspas: o interpretador leu como número e imprimiu <code>1</code>. O conserto foi
+<code>tag: "1.0"</code> nos values e <code>| quote</code> no template. É o tipo de erro que só aparece no
+resultado renderizado — mais um motivo para usar <code>helm template</code> antes.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o template que só funcionava em teste</h3>
+<p>Um laço no template percorria uma lista de hosts que existia nos values de teste e não existia em
+produção. Em teste, tudo certo; em produção, o manifesto saía sem o bloco de Ingress e ninguém notou até o
+site ficar inacessível. O conserto foi <code>{{ .Values.hosts | default (list "cardapio.loja.test") }}</code>,
+que dá um padrão explícito em vez de gerar vazio.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="1"><p class="mc-q">1. O que o <code>_helpers.tpl</code> guarda?</p>
+<label><input type="radio" name="q1"> trechos nomeados, declarados com <code>define</code> e usados com
+<code>include</code></label>
+<label><input type="radio" name="q1"> os manifestos finais, prontos para aplicar</label>
+<label><input type="radio" name="q1"> o histórico das releases instaladas</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual é a diferença entre <code>version</code> e
+<code>appVersion</code> no <code>Chart.yaml</code>?</p>
+<label><input type="radio" name="q2"> nenhuma: as duas sobem juntas sempre</label>
+<label><input type="radio" name="q2"> <code>version</code> é do Kubernetes e <code>appVersion</code> é do
+Helm</label>
+<label><input type="radio" name="q2"> <code>version</code> é a versão do pacote; <code>appVersion</code> é a
+da aplicação que ele instala</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. O que o <code>helm template</code> faz?</p>
+<label><input type="radio" name="q3"> instala o chart e mostra os pods criados</label>
+<label><input type="radio" name="q3"> renderiza os moldes e imprime os manifestos, sem tocar no
+cluster</label>
+<label><input type="radio" name="q3"> baixa o chart do repositório para a pasta local</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o nome do objeto vem da release</h2>
+<p>Complete o template para que o nome do objeto use o nome da release e o número de réplicas venha dos
+values.</p>
+<div class="ex-code">metadata:
+  name: {{ .<input aria-label="resposta 1" data-answer="Release" placeholder="...">.Name }}
+spec:
+  replicas: {{ .<input aria-label="resposta 2" data-answer="Values" placeholder="...">.replicaCount }}</div>
+<p class="ex-dica">Dica: <code>.Release</code> traz dados da instalação (nome, namespace, revisão);
+<code>.Values</code> traz o conteúdo do <code>values.yaml</code> com as sobrescritas da instalação.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Um chart é uma pasta: <code>Chart.yaml</code> (identidade e versões), <code>values.yaml</code> (padrões),
+<code>templates/</code> (moldes com <code>{{ }}</code>) e <code>templates/_helpers.tpl</code> (trechos
+nomeados usados com <code>include</code>). O <code>Chart.yaml</code> tem duas versões: a do pacote e a da
+aplicação.</p>
+
+<p>O template usa <code>.Values</code> para os valores, <code>.Release</code> para o nome da release e
+<code>.Chart</code> para os metadados do chart. Renderizar é preencher os buracos; o resultado é um manifesto
+comum, que o cluster valida — e é por isso que erro de <code>apiVersion</code> e seletor que não casa
+aparecem com a mensagem do Kubernetes, não do Helm.</p>
+
+<p>Os erros de renderização são do Helm e têm três formatos: <code>parse error</code> (sintaxe),
+<code>no template ... associated with template</code> (include de nome que não existe) e
+<code>nil pointer</code> (valor que falta). <code>helm template</code> e <code>helm lint</code> mostram tudo
+isso antes de qualquer coisa chegar ao cluster. Na <a href="helm-values.html">aula de values</a> a Ana mexe na parte que quem instala
+realmente usa: os values e a ordem em que eles se sobrescrevem.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Chart = pasta com <code>Chart.yaml</code>, <code>values.yaml</code> e <code>templates/</code>.</li>
+  <li><code>version</code> é do pacote; <code>appVersion</code> é da aplicação.</li>
+  <li><code>{{ .Values.x }}</code> vem dos values; <code>{{ .Release.Name }}</code> vem da instalação.</li>
+  <li><code>_helpers.tpl</code> não é renderizado: só define trechos para o <code>include</code>.</li>
+  <li>Erro de seletor e de <code>apiVersion</code> é do cluster; <code>parse error</code> é do Helm.</li>
+  <li><code>helm template</code> e <code>helm lint</code> antes de instalar; sempre.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

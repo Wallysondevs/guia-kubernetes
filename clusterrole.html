@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClusterRole | Guia Kubernetes</title>
+<meta name="description" content="ClusterRole e ClusterRoleBinding: permissão para o que não vive em namespace, como nós e volumes, e a diferença perigosa entre os dois tipos de binding.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">ClusterRole</span></h1>
+<p class="intro">A Ana quis dar à Bia uma permissão boba: ver a lista de máquinas do cluster. Escreveu um Role,
+aplicou, criou o binding — e continuou recebendo <code>Forbidden</code>. O motivo não é o verbo nem o nome: é
+que <strong>nó não mora em namespace</strong>, e um Role só existe dentro de um. Para o que é do cluster
+inteiro existe o ClusterRole, e para ligá-lo a alguém existe o ClusterRoleBinding. Nesta aula a Ana aprende
+os dois, entende por que a diferença entre eles é a mais perigosa do RBAC e vê o jeito seguro de reaproveitar
+uma regra de cluster dentro de um namespace só.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Quais recursos são do cluster e por que eles não cabem num namespace.</li>
+  <li>Escrever um <code>ClusterRole</code> e um <code>ClusterRoleBinding</code>.</li>
+  <li>Por que <code>roleRef.kind</code> precisa ser <code>ClusterRole</code> nesse binding.</li>
+  <li>A diferença de alcance entre <code>RoleBinding</code> e <code>ClusterRoleBinding</code>.</li>
+  <li>Reaproveitar um ClusterRole num namespace só, sem espalhar permissão.</li>
+  <li>Como ler e testar permissões de escopo de cluster.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a permissão que não pegava</h2>
+
+<p>O pedido da Bia era simples: ela queria ver em quais máquinas os pods estavam caindo, para entender por que
+um relatório demorava. O comando é <code>kubectl get nodes</code> — uma listagem, nada de escrita. A Ana criou
+um <code>Role</code> com <code>resources: ["nodes"]</code>, aplicou no namespace <code>padaria</code>, criou
+o <code>RoleBinding</code> para o grupo da Bia e avisou que estava pronto.</p>
+
+<p>Não funcionou. A resposta continuava <code>Forbidden</code>, e a frase falava de um lugar estranho: “at the
+cluster scope”. A Ana conferiu o verbo, o plural, o nome do grupo, o namespace do binding — tudo certo. O
+problema estava numa camada acima: um Role é um objeto de namespace, e regra dentro de namespace não alcança
+recurso que não está em namespace nenhum. Nó é do cluster. Como o Role também é de namespace, ele não tem
+como falar de nó.</p>
+
+<p>A imagem ajuda: o namespace é uma sala com porta; o nó é o prédio. Uma regra escrita dentro da sala não
+descreve o prédio — não porque esteja errada, mas porque está no lugar errado. Para o prédio existe um tipo de
+objeto próprio, que não mora em sala nenhuma.</p>
+
+<h2>2. O que não vive em namespace</h2>
+
+<p>Você já viu essa divisão na aula de namespaces e na de RBAC, na coluna <code>NAMESPACED</code> do
+<code>kubectl api-resources</code>. Vale revisitar com o foco em permissão, porque é aqui que ela morde. Os
+recursos de cluster mais comuns no dia a dia são quatro: <code>nodes</code>, <code>persistentvolumes</code>,
+<code>storageclasses</code> e <code>namespaces</code>. Junto deles vêm os próprios objetos de RBAC de escopo
+amplo: <code>clusterroles</code> e <code>clusterrolebindings</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Recurso</th><th>Onde vive</th><th>Como se dá permissão</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pods</code>, <code>services</code>, <code>deployments</code></td><td>namespace</td><td><code>Role</code>
+> ou <code>ClusterRole</code> + binding</td></tr>
+<tr><td><code>nodes</code></td><td>cluster</td><td>só <code>ClusterRole</code> +
+<code>ClusterRoleBinding</code></td></tr>
+<tr><td><code>persistentvolumes</code></td><td>cluster</td><td>só <code>ClusterRole</code> +
+<code>ClusterRoleBinding</code></td></tr>
+<tr><td><code>storageclasses</code></td><td>cluster</td><td>só <code>ClusterRole</code> +
+<code>ClusterRoleBinding</code></td></tr>
+<tr><td><code>namespaces</code></td><td>cluster</td><td>só <code>ClusterRole</code> +
+<code>ClusterRoleBinding</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare na segunda coluna: não é “onde o objeto está guardado”, é “o objeto tem dono por namespace?”. Um
+<code>PersistentVolume</code> é o disco; um <code>PersistentVolumeClaim</code> é o pedido de disco, e o pedido
+mora no namespace de quem pediu. Por isso os dois tipos, que parecem irmãos, têm escopos diferentes — e por
+isso a regra de permissão de um não serve para o outro.</p>
+
+<p>A consequência prática é sempre a mesma: se o recurso não tem namespace, um Role não o alcança, por mais
+certa que esteja a regra. Não há erro de sintaxe nesse caso; há erro de escopo. E o servidor não avisa: o Role
+é aceito, o binding é aceito, e a permissão simplesmente não existe.</p>
+
+<dl class="anatomy">
+<dt>ClusterRole</dt>
+<dd>Objeto de escopo de cluster com <code>rules</code>, sem namespace. Serve para recursos globais e como
+regra reutilizável.</dd>
+<dt>ClusterRoleBinding</dt>
+<dd>Liga subjects a um ClusterRole com efeito em todos os namespaces. Não tem campo de namespace.</dd>
+<dt>escopo de cluster</dt>
+<dd>O “lugar” dos objetos que não pertencem a namespace nenhum: nós, volumes, StorageClasses,
+namespaces.</dd>
+<dt>at the cluster scope</dt>
+<dd>O fim da frase de erro quando falta permissão para um recurso global — em vez de
+<code>in the namespace "x"</code>.</dd>
+<dt>reuso</dt>
+<dd>Usar um ClusterRole como <code>roleRef</code> de um RoleBinding: a regra é global, o efeito é local.</dd>
+</dl>
+
+<h2>3. O ClusterRole: mesma forma, sem namespace</h2>
+
+<p>A boa notícia é que um ClusterRole é escrito exatamente como um Role. <code>apiVersion</code>,
+<code>kind</code>, <code>metadata.name</code> e <code>rules</code> com <code>apiGroups</code>,
+<code>resources</code> e <code>verbs</code>. A única diferença de forma é que não existe
+<code>metadata.namespace</code>: o objeto é do cluster. Se você puser um namespace ali, ele é ignorado — e
+essa é uma das razões de manifestos copiados darem resultado esquisito.</p>
+
+<div class="tryk8s" data-goal="objeto:ClusterRole/leitor-nos;;campo:ClusterRole/leitor-nos|rules.0.resources.0=nodes" data-get="clusterroles">
+  <p class="try-task">Este ClusterRole foi copiado de um role de pods e ficou com o recurso errado. Troque
+  <code>pods</code> por <code>nodes</code> e rode: o painel tem de listar o ClusterRole criado.</p>
+<pre class="yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: leitor-nos
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]</pre>
+<pre class="out">
+clusterrole.rbac.authorization.k8s.io/leitor-nos created
+
+NAME         AGE
+leitor-nos   10m
+</pre>
+<pre class="solucao">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: leitor-nos
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]</pre>
+</div>
+
+<p>A resposta é <code>clusterrole.rbac.authorization.k8s.io/leitor-nos created</code> e a tabela do
+<code>get clusterroles</code> com nome e idade. Note o nome do recurso na linha de criação: ele carrega o
+grupo (<code>rbac.authorization.k8s.io</code>), diferente de <code>role.rbac…</code> do Role — o prefixo é o
+mesmo, o tipo é que muda.</p>
+
+<p>Um ClusterRole sozinho, como o Role, não dá acesso a ninguém. E aqui aparece a primeira diferença
+interessante: ele pode ser usado por dois tipos de binding, com efeitos bem diferentes — e é o assunto das
+duas próximas seções.</p>
+
+<h2>4. O ClusterRoleBinding e o alcance total</h2>
+
+<p>O <code>ClusterRoleBinding</code> liga um subject a um ClusterRole <em>no cluster inteiro</em>: vale em
+todos os namespaces, inclusive nos que ainda não existem. É o objeto certo para permissões que realmente são
+globais — ver nós, listar StorageClasses, administrar o cluster — e é o objeto errado para quase todo o
+resto.</p>
+
+<p>Ele tem duas exigências que o RoleBinding não tem. A primeira: o <code>roleRef.kind</code> tem de ser
+<code>ClusterRole</code>. Um ClusterRoleBinding não pode apontar para um Role, porque Role é de namespace e o
+binding não é. A segunda: não existe campo de namespace no objeto — o alcance é o cluster por definição.</p>
+
+<div class="tryk8s" data-goal="objeto:ClusterRoleBinding/bia-nos;;campo:ClusterRoleBinding/bia-nos|roleRef.kind=ClusterRole" data-get="clusterrolebindings">
+  <p class="try-task">O <code>roleRef</code> está com <code>kind: Role</code>, o que é inválido num
+  ClusterRoleBinding. Corrija para <code>ClusterRole</code> e rode.</p>
+<pre class="yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bia-nos
+subjects:
+  - kind: User
+    name: bia
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor-nos</pre>
+<pre class="out">
+clusterrolebinding.rbac.authorization.k8s.io/bia-nos created
+
+NAME      AGE
+bia-nos   1m
+</pre>
+<pre class="solucao">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bia-nos
+subjects:
+  - kind: User
+    name: bia
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: leitor-nos</pre>
+</div>
+
+<p>No painel, a versão errada é aceita do mesmo jeito — e é bom saber que o cluster de verdade recusa, com uma
+frase curta e direta (transcrição):</p>
+
+<pre class="term">ana@notebook:~$ kubectl apply -f bia-nos.yaml
+The ClusterRoleBinding "bia-nos" is invalid: roleRef.kind: Unsupported value: "Role": supported values: "ClusterRole"</pre>
+
+<p>Guarde esse formato de mensagem: <code>Unsupported value</code> seguido de <code>supported values</code> é
+o jeito do Kubernetes dizer “você escolheu uma opção que não existe nesta lista”. Aparece em
+<code>roleRef.kind</code>, em <code>spec.type</code> de Service, em estratégia de Deployment — sempre com a
+lista do que era aceitável logo depois.</p>
+
+<h2>5. A diferença perigosa entre os dois bindings</h2>
+
+<p>Agora o ponto que faz mais estrago em cluster de verdade. Existem duas combinações possíveis envolvendo um
+ClusterRole, e elas se parecem no papel:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Combinação</th><th>Alcance do efeito</th><th>Quando é a certa</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ClusterRoleBinding</code> + <code>ClusterRole</code></td><td>todos os namespaces, para
+sempre</td><td>permissão realmente global: nós, StorageClasses, admin</td></tr>
+<tr><td><code>RoleBinding</code> + <code>ClusterRole</code></td><td>só o namespace do binding</td><td>reusar
+uma regra pronta (como <code>view</code>) num namespace</td></tr>
+<tr><td><code>RoleBinding</code> + <code>Role</code></td><td>só o namespace do binding</td><td>regra
+específica daquele namespace</td></tr>
+<tr><td><code>ClusterRoleBinding</code> + <code>Role</code></td><td>não existe</td><td>inválido: o servidor
+recusa</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>As duas primeiras linhas produzem o mesmo objeto de regra e resultados muito diferentes. Na primeira, a
+pessoa lê pods em <code>padaria</code>, em <code>default</code>, em <code>kube-system</code> e em qualquer
+namespace criado amanhã. Na segunda, lê pods apenas em <code>padaria</code>. Se a intenção era a segunda e
+alguém escreveu a primeira, o cluster ficou mais aberto do que devia — sem erro, sem aviso, sem sintoma.</p>
+
+<p>É por isso que muita gente adota uma regra de time: <code>ClusterRoleBinding</code> só para o que não pode
+ser feito de outro jeito. Tudo o mais — inclusive o acesso de leitura amplo — vai por
+<code>RoleBinding</code> apontando para um ClusterRole, repetido nos namespaces que interessam. Fica mais
+verboso, e cada repetição é uma chance de revisar se aquela permissão ainda faz sentido ali.</p>
+
+<p>Existe um jeito de descobrir se o seu cluster sofreu esse deslize: comparar o número de
+<code>ClusterRoleBinding</code> com o de <code>RoleBinding</code>. Num cluster bem cuidado, o primeiro é uma
+lista curta e estável — encanamento do Kubernetes, o controlador de ingress, um ou outro time com acesso
+global legítimo. Quando a lista de bindings globais cresce a cada sprint, é sinal de que alguém resolveu um
+problema de namespace trocando o escopo. A revisão é ler <code>subjects</code>, um por um, e perguntar “esta
+pessoa precisa disto fora do namespace dela?”. Na dúvida, a resposta é não.</p>
+
+<p>Há um efeito colateral pouco óbvio do binding global: ele vale para namespaces que ainda não existem.
+Conceder hoje é conceder para sempre, inclusive para o ambiente que a próxima pessoa criar daqui a seis meses
+com dados de cliente dentro. O RoleBinding, ao contrário, nasce com prazo natural — se o namespace sumir, o
+binding vai junto.</p>
+
+<h2>6. Reaproveitando um ClusterRole num namespace só</h2>
+
+<p>Este é o jeito seguro, e ele mistura os dois mundos de propósito: o <code>ClusterRole</code> guarda a regra
+(que é genérica e serve para vários lugares), e o <code>RoleBinding</code> diz onde ela vale. A caixa abaixo
+faz isso num namespace novo, com uma regra de leitura de pods e logs.</p>
+
+<div class="tryk8s" data-goal="texto:namespace/padaria created;;texto:leitura-cardapio" data-get="rolebindings -n padaria">
+  <p class="try-task">Falta o documento do Namespace, e o RoleBinding está apontando para
+  <code>kind: Role</code> — mas o objeto que ele referencia é um ClusterRole. Conserte as duas coisas e
+  rode.</p>
+<pre class="yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: leitura-cardapio
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bia-leitura
+  namespace: padaria
+subjects:
+  - kind: User
+    name: bia
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitura-cardapio</pre>
+<pre class="out">
+clusterrole.rbac.authorization.k8s.io/leitura-cardapio created
+Error from server (NotFound): error when creating "STDIN": namespaces "padaria" not found
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: leitura-cardapio
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bia-leitura
+  namespace: padaria
+subjects:
+  - kind: User
+    name: bia
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: leitura-cardapio</pre>
+</div>
+
+<p>O painel mostra as três criações e a tabela do <code>get rolebindings -n padaria</code> com
+<code>bia-leitura</code>. O efeito, no cluster de verdade, é: a Bia lê pods e logs em <code>padaria</code>, e
+em nenhum outro lugar. O ClusterRole existe uma vez, no cluster; o binding existe uma vez, no namespace. Se
+amanhã ela precisar do mesmo acesso em <code>homolog</code>, você cria outro RoleBinding lá — e a regra
+continua escrita num lugar só.</p>
+
+<p>Esse desenho é o que torna os ClusterRoles prontos (<code>view</code>, <code>edit</code>) tão úteis. Em vez
+de reescrever a lista de recursos para cada time, você aponta para <code>view</code> e decide o alcance pelo
+tipo de binding. A regra vem do cluster; o alcance vem do namespace.</p>
+
+<h2>7. Testando e lendo permissões de cluster</h2>
+
+<p>O teste é o mesmo <code>kubectl auth can-i</code>, com uma diferença: quando o recurso é do cluster, a
+pergunta não leva <code>-n</code> — e o servidor costuma responder reclamando do escopo, se o binding for do
+tipo errado. A transcrição abaixo é de um cluster real, com o <code>ClusterRoleBinding/bia-nos</code> e o
+<code>leitor-nos</code> aplicados:</p>
+
+<pre class="term">ana@notebook:~$ kubectl auth can-i list nodes --as=bia
+yes
+ana@notebook:~$ kubectl auth can-i get nodes --as=bia
+yes
+ana@notebook:~$ kubectl auth can-i list nodes --as=bia -n padaria
+Warning: the server doesn't have a resource type 'nodes' in the namespace 'padaria'
+no</pre>
+
+<p>A terceira linha é a mais instrutiva: pedir um recurso de cluster “dentro de um namespace” não faz sentido,
+e o kubectl avisa antes de perguntar. No fluxo normal, o erro que aparece é outro, e este é o texto dele:</p>
+
+<pre class="term">ana@notebook:~$ kubectl get nodes --as=bia
+Error from server (Forbidden): nodes is forbidden: User "bia" cannot list resource "nodes" in API group "" at the cluster scope</pre>
+
+<p>Compare com a mensagem de falta de permissão em pods: lá o fim da frase é
+<code>in the namespace "padaria"</code>; aqui é <code>at the cluster scope</code>. Essa troca de sufixo é a
+pista de que você está lidando com outro escopo — e de que um Role, por mais bem escrito, não vai resolver.</p>
+
+<p>Para inspecionar o que existe, <code>kubectl get clusterroles</code> lista os objetos e
+<code>kubectl get clusterrole NOME -o yaml</code> mostra as regras. Duas notas honestas sobre o painel: ele não
+semeia os ClusterRoles embutidos, então a listagem ali responde <code>No resources found.</code> (num cluster
+real são dezenas), e o <code>describe</code> de ClusterRole é mais pobre que o do servidor de verdade. Use
+<code>-o yaml</code> e leia <code>rules</code>.</p>
+
+<h2>8. Os atalhos prontos e o cluster-admin</h2>
+
+<p>Todo cluster de verdade nasce com três ClusterRoles de propósito geral: <code>view</code> (ler recursos
+comuns, sem segredos), <code>edit</code> (ler e alterar, sem mexer em permissão) e <code>cluster-admin</code>
+(tudo, inclusive RBAC). Somam-se a eles dezenas de <code>system:*</code>, que são o encanamento do próprio
+Kubernetes — <code>system:kube-scheduler</code>, <code>system:node</code>, o controlador de deployments. Não
+são exceções à regra: são regras como as suas, com bindings como os seus.</p>
+
+<p>O uso saudável é <code>view</code> e <code>edit</code> via RoleBinding, no namespace do time. O uso
+perigoso é <code>cluster-admin</code> via ClusterRoleBinding, que é a chave mestra do prédio inteiro — e, uma
+vez concedida, ninguém consegue limitar o que a pessoa faz, porque ela passa a poder editar o próprio RBAC. Se
+um pipeline ou uma pessoa “precisa de cluster-admin para funcionar”, o problema quase sempre é uma permissão
+específica que ninguém identificou ainda.</p>
+
+<p>E vale saber que o <code>view</code> tem limites: ele não inclui <code>secrets</code> justamente para não
+transformar leitura em vazamento de senha. Quem precisa ver um Secret precisa de uma regra explícita — e
+merece uma conversa antes.</p>
+
+<p>Os nomes com <code>system:</code> não são decorativos. Eles marcam os ClusterRoles que o próprio cluster
+usa, e por isso a recomendação é nunca editá-los: uma atualização do Kubernetes pode reescrever o conteúdo, e
+o seu ajuste vira pó. Se você precisa de uma variação, crie um ClusterRole novo com nome seu, copie as regras
+que interessam e aponte o binding para ele. O mesmo vale para os <code>system:*</code> que aparecem em
+<code>subjects</code> de bindings internos: são contas de componentes, não pessoas.</p>
+
+<p>Um último detalhe de forma: ClusterRoles podem se agregar. Existe um campo
+<code>aggregationRule</code> que manda o servidor juntar as regras de outros ClusterRoles marcados com
+etiquetas — é assim que o <code>edit</code> e o <code>view</code> embutidos ganham regras de tipos que não
+existiam quando foram escritos. Você raramente escreve um, mas pode topar com eles ao ler um
+<code>-o yaml</code> e estranhar a ausência de <code>rules</code>: as regras vêm por agregação, não estão
+listadas ali.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a lista de nós que nunca funcionou</h3>
+<p>O Role com <code>nodes</code> foi aplicado no namespace <code>padaria</code> e ficou lá, bonito, sem efeito
+nenhum. O conserto foi trocar o objeto: <code>ClusterRole</code> com a regra e
+<code>ClusterRoleBinding</code> para o grupo. O verbo estava certo desde o começo — o escopo é que não.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o estagiário com poder de apagar o cluster</h3>
+<p>Alguém ligou o grupo <code>devs</code> ao <code>cluster-admin</code> “só para destravar o acesso ao
+dashboard”. No mês seguinte, um <code>kubectl delete namespace</code> digitado no contexto errado apagou o
+ambiente de homologação inteiro. A permissão era global porque o binding era global — e o erro de digitação
+virou perda de dados.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o mesmo acesso em três namespaces</h3>
+<p>Um time precisava de <code>edit</code> em <code>padaria</code>, <code>homolog</code> e <code>teste</code>.
+Em vez de um ClusterRoleBinding, foram três RoleBindings apontando para o ClusterRole <code>edit</code> — um
+por namespace. Deu mais linhas e menos risco: quando o teste acabou, bastou apagar um binding, sem tocar nos
+outros dois.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Por que um <code>Role</code> não consegue dar permissão em
+<code>nodes</code>?</p>
+<label><input type="radio" name="q1"> porque nós não têm verbo <code>get</code></label>
+<label><input type="radio" name="q1"> porque <code>nodes</code> é do cluster e Role só vale dentro de um
+namespace</label>
+<label><input type="radio" name="q1"> porque falta o campo <code>apiGroups</code> na regra</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Um <code>RoleBinding</code> apontando para um
+<code>ClusterRole</code> dá acesso…</p>
+<label><input type="radio" name="q2"> em todos os namespaces</label>
+<label><input type="radio" name="q2"> em nenhum: a combinação é inválida</label>
+<label><input type="radio" name="q2"> só no namespace onde o binding está</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual <code>roleRef.kind</code> um
+<code>ClusterRoleBinding</code> aceita?</p>
+<label><input type="radio" name="q3"> <code>ClusterRole</code>, e só ele</label>
+<label><input type="radio" name="q3"> <code>Role</code> ou <code>ClusterRole</code>, tanto faz</label>
+<label><input type="radio" name="q3"> <code>Role</code>, desde que o namespace seja o <code>default</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o escopo do nó</h2>
+
+<p>Você precisa que um time liste nós (<code>nodes</code>), que é recurso de cluster. Complete o tipo do
+binding que faz isso no cluster inteiro:</p>
+
+<div class="ex-code">kind: <input aria-label="resposta 1" data-answer="ClusterRoleBinding" placeholder="..."></div>
+
+<p class="ex-dica">Dica: o <code>ClusterRole</code> guarda a regra; quem dá alcance global é o binding de
+cluster. O <code>roleRef</code> dele aponta para <code>kind: ClusterRole</code>.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Recursos como <code>nodes</code>, <code>persistentvolumes</code>, <code>storageclasses</code> e
+<code>namespaces</code> não vivem em namespace — e por isso não podem ser alcançados por um
+<code>Role</code>. Para eles existe o <code>ClusterRole</code>, que tem exatamente a mesma forma de um Role,
+sem <code>metadata.namespace</code>, e o <code>ClusterRoleBinding</code>, que liga um subject a ele no cluster
+inteiro.</p>
+
+<p>A combinação que mais confunde é <code>RoleBinding</code> + <code>ClusterRole</code>: a regra vem do
+cluster, mas o efeito fica só no namespace do binding. É o jeito recomendado de reaproveitar
+<code>view</code> e <code>edit</code>. Já o <code>ClusterRoleBinding</code> vale em todos os namespaces,
+inclusive nos futuros — e é por isso que ele deve ser exceção, não regra.</p>
+
+<p>Na dúvida, comece pelo namespace e só suba de escopo quando o recurso exigir. Recusou com “at the cluster
+scope” no fim da frase? É escopo, não é verbo. Na próxima aula o assunto muda de permissão para blindagem: o
+<code>securityContext</code>, campo a campo, para endurecer o pod.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Recurso sem namespace (nós, PV, StorageClass) só se alcança com <code>ClusterRole</code> +
+  <code>ClusterRoleBinding</code>.</li>
+  <li><code>RoleBinding</code> + <code>ClusterRole</code> = regra do cluster, alcance do namespace.</li>
+  <li><code>ClusterRoleBinding</code> vale em todos os namespaces, inclusive os que ainda vão existir.</li>
+  <li><code>roleRef.kind</code> de um ClusterRoleBinding é sempre <code>ClusterRole</code>.</li>
+  <li><code>cluster-admin</code> é a chave mestra: conceda com parcimônia e prefira <code>view</code> e
+  <code>edit</code>.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

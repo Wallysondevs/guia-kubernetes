@@ -1,0 +1,621 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>securityContext | Guia Kubernetes</title>
+<meta name="description" content="securityContext campo a campo: runAsNonRoot, runAsUser, fsGroup, readOnlyRootFilesystem e capabilities para endurecer o pod sem quebrar o programa.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">securityContext</span></h1>
+<p class="intro">A Ana descobriu uma coisa incômoda: o container do cardápio roda como <em>root</em>. Não
+porque ela pediu, mas porque ninguém disse o contrário — e a imagem, sem instrução, começa com uid 0. Se
+alguém conseguir executar um comando lá dentro, começa como root. O campo que muda isso chama-se
+<code>securityContext</code>, e ele não é um botão só: é uma família de campos que dizem com qual usuário o
+processo roda, o que ele pode fazer, onde pode escrever e quais poderes do kernel ele carrega. Nesta aula a
+Ana endurece o pod campo a campo, vendo o que cada um resolve e o que cada um quebra.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é <code>securityContext</code> e por que ele fica em dois níveis do manifesto.</li>
+  <li>Rodar como não-root com <code>runAsNonRoot</code>, <code>runAsUser</code> e
+  <code>runAsGroup</code>.</li>
+  <li>Deixar o sistema de arquivos somente leitura e continuar gravando onde precisa.</li>
+  <li>Dar dono ao volume com <code>fsGroup</code>.</li>
+  <li>Tirar as <em>capabilities</em> do kernel e desligar a escalada de privilégio.</li>
+  <li>Reconhecer os erros que aparecem quando o endurecimento passa do ponto.</li>
+</ul>
+</div>
+
+<h2>1. A cena: root sem querer</h2>
+
+<p>A conversa começou com uma pergunta simples de auditoria: “com qual usuário este container roda?”. A Ana
+abriu um terminal no pod e digitou <code>id</code>. A resposta foi <code>uid=0(root) gid=0(root)
+groups=0(root)</code>. Ninguém escreveu isso em lugar nenhum; é o padrão. Uma imagem que não declara
+<code>USER</code> no Dockerfile começa como uid 0, e o Kubernetes, sem instrução contrária, respeita a
+imagem.</p>
+
+<p>Dentro do container, root não é o mesmo root do nó — há namespaces, e o processo não enxerga os outros
+processos nem o disco do host do jeito que enxergaria fora. Mas “menos poderoso que root no host” não é a
+mesma coisa que “inofensivo”. Root dentro do container pode instalar pacote, escrever em qualquer diretório da
+imagem, abrir porta baixa, mudar dono de arquivo e explorar caminhos que só existem para quem tem privilégio.
+Se a aplicação for comprometida, o atacante herda tudo isso.</p>
+
+<p>A ideia do <code>securityContext</code> é reduzir esse poder ao mínimo que o programa precisa. Não é uma
+coisa só: é um conjunto de campos, alguns no nível do pod (valem para todos os containers), outros no nível do
+container (valem para um). Saber em qual nível cada campo mora evita metade dos erros de validação.</p>
+
+<h2>2. Os dois níveis do securityContext</h2>
+
+<p>O manifesto de um pod tem <code>spec.securityContext</code>, que é do pod inteiro, e
+<code>spec.containers[].securityContext</code>, que é de cada container. Alguns campos existem nos dois
+lugares e o do container vence; outros só existem em um dos dois. Pôr um campo no nível errado não é
+“ignorado com carinho”: o servidor recusa o objeto com um erro de campo desconhecido.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Nível</th><th>O que faz</th></tr>
+</thead>
+<tbody>
+<tr><td><code>runAsUser</code></td><td>pod e container</td><td>define o UID do processo</td></tr>
+<tr><td><code>runAsGroup</code></td><td>pod e container</td><td>define o GID primário</td></tr>
+<tr><td><code>runAsNonRoot</code></td><td>pod e container</td><td>recusa iniciar se o UID efetivo for 0</td></tr>
+<tr><td><code>fsGroup</code></td><td>só pod</td><td>grupo dono dos volumes montados</td></tr>
+<tr><td><code>readOnlyRootFilesystem</code></td><td>só container</td><td>monta o sistema de arquivos da imagem
+como somente leitura</td></tr>
+<tr><td><code>allowPrivilegeEscalation</code></td><td>só container</td><td>impede ganho de privilégio por
+<code>setuid</code>/<code>sudo</code></td></tr>
+<tr><td><code>capabilities</code></td><td>só container</td><td>lista de poderes do kernel para dar ou tirar</td></tr>
+<tr><td><code>privileged</code></td><td>só container</td><td>dá tudo: todos os poderes e acesso a
+dispositivos</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare em duas linhas que costumam surpreender. <code>fsGroup</code> é só de pod porque o volume é
+compartilhado por todos os containers — não faria sentido cada um reivindicar um dono. E
+<code>readOnlyRootFilesystem</code> é só de container porque cada container tem o seu próprio sistema de
+arquivos, vindo da imagem; o do vizinho pode continuar gravável.</p>
+
+<dl class="anatomy">
+<dt>securityContext</dt>
+<dd>O bloco que decide como o container roda: usuário, grupo, poderes e o que ele pode escrever.</dd>
+<dt>UID efetivo</dt>
+<dd>O número que o kernel usa para decidir permissão. Zero é root; 1000 é o primeiro usuário comum
+típico.</dd>
+<dt>capability</dt>
+<dd>Um poder granular do kernel (<code>CHOWN</code>, <code>NET_RAW</code>,
+<code>NET_BIND_SERVICE</code>), menor que root e maior que nada.</dd>
+<dt>fsGroup</dt>
+<dd>O GID dono dos volumes do pod. É o que permite um processo não-root gravar no disco montado.</dd>
+<dt>EACCES / EROFS</dt>
+<dd>Os dois erros de escrita mais comuns: permissão negada e sistema de arquivos somente leitura.</dd>
+</dl>
+
+<h2>3. Rodando como não-root</h2>
+
+<p>O primeiro passo do endurecimento é o mais óbvio e o mais esquecido: dizer com que usuário o processo roda.
+<code>runAsUser</code> fixa o UID; <code>runAsNonRoot</code> transforma isso em exigência — se por algum motivo
+o UID efetivo for 0, o container não inicia. Usar os dois juntos é melhor que usar um só, porque o segundo
+cobre o caso em que a imagem declara root e o primeiro não foi lido como você esperava.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/forno|spec.securityContext.runAsUser=1000;;campo:Pod/forno|spec.securityContext.runAsNonRoot=true" data-get="pod forno -o yaml">
+  <p class="try-task">O forno está rodando como root por decisão explícita. Troque o UID para
+  <code>1000</code> e ligue <code>runAsNonRoot</code>; o <code>-o yaml</code> do painel tem de mostrar os dois
+  campos.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  securityContext:
+    runAsUser: 0
+    runAsNonRoot: false
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+pod/forno created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+  namespace: default
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      name: forno
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext:
+    runAsNonRoot: false
+    runAsUser: 0
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.144.245
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsNonRoot: true
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+</div>
+
+<p>No cluster de verdade, a diferença entre a versão antiga e a nova aparece em <code>kubectl exec</code>. Era
+<code>uid=0(root)</code>; passa a ser um UID comum, sem nome no <code>/etc/passwd</code> da imagem:</p>
+
+<pre class="term">ana@notebook:~$ kubectl exec forno -- id
+uid=1000 gid=0(root) groups=0(root)</pre>
+
+<p>Esse <code>gid=0</code> incomoda, e é o próximo ajuste: sem <code>runAsGroup</code>, o grupo continua sendo
+o da imagem. Para fechar de vez, use <code>runAsGroup: 1000</code> também. Se o seu time é disciplinado, o
+caminho é declarar os dois no nível do pod, e nenhum container escapa por esquecimento.</p>
+
+<p>Um efeito colateral esperado: mudar de UID quebra tudo o que dependia de root. O programa que gravava em
+<code>/var/lib/meu-app</code> sem permissão de escrita agora falha com <code>Permission denied</code>. Isso não
+significa que o endurecimento está errado; significa que o app estava se aproveitando do privilégio. O
+conserto é dar a ele um diretório gravável — o assunto das próximas duas seções.</p>
+
+<h2>4. Sistema de arquivos somente leitura e capabilities</h2>
+
+<p>O segundo passo é impedir que o processo escreva na própria imagem. Com
+<code>readOnlyRootFilesystem: true</code>, o sistema de arquivos do container é montado como somente leitura:
+nada de criar arquivo em <code>/tmp</code>, nada de reescrever o próprio binário, nada de plantar um script
+para outro processo executar. É uma das medidas mais eficazes do conjunto, e a que mais quebra programas
+mal-comportados.</p>
+
+<p>O terceiro passo é tirar os poderes do kernel. Todo container nasce com um conjunto de
+<strong>capabilities</strong> — permissões granulares como <code>CHOWN</code> (mudar dono de arquivo),
+<code>NET_RAW</code> (abrir sockets crus) e <code>NET_BIND_SERVICE</code> (escutar portas abaixo de 1024).
+<code>drop: ["ALL"]</code> tira todas; depois você devolve só as que o programa precisa. Junto com isso,
+<code>allowPrivilegeEscalation: false</code> impede que o processo ganhe privilégio depois de iniciado.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/forno|spec.containers.0.securityContext.readOnlyRootFilesystem=true;;campo:Pod/forno|spec.containers.0.securityContext.allowPrivilegeEscalation=false;;campo:Pod/forno|spec.containers.0.securityContext.capabilities.drop.0=ALL" data-get="pod forno -o yaml">
+  <p class="try-task">Este container está privilegiado e com o disco gravável. Deixe
+  <code>readOnlyRootFilesystem</code> verdadeiro, <code>allowPrivilegeEscalation</code> falso e derrube todas
+  as capabilities com <code>drop: ["ALL"]</code>. Rode e confira no <code>-o yaml</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsNonRoot: true
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      securityContext:
+        privileged: true
+        allowPrivilegeEscalation: true
+        readOnlyRootFilesystem: false</pre>
+<pre class="out">
+pod/forno created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+  namespace: default
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      name: forno
+      resources:
+        limits: {}
+        requests: {}
+      securityContext:
+        allowPrivilegeEscalation: true
+        privileged: true
+        readOnlyRootFilesystem: false
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  terminationGracePeriodSeconds: 30
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.144.245
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsNonRoot: true
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]</pre>
+</div>
+
+<p>Note que a solução <em>remove</em> o <code>privileged: true</code> em vez de trocá-lo por
+<code>false</code>. As duas formas funcionam, mas a ausência é mais legível: o padrão já é não privilegiado, e
+um <code>privileged: false</code> explícito pode dar a impressão de que alguém cogitou ligar. Em manifesto,
+quanto menos campos, menos dúvida.</p>
+
+<p>Sobre <code>capabilities.drop: ["ALL"]</code>: essa é a única linha de segurança do guia que eu recomendo
+sem pensar duas vezes. Quase nenhum programa de aplicação precisa de capability alguma — servidor web que
+escuta na 8080, gerador de relatório, fila, banco em container. Quem precisa de porta 80 dentro do container
+tem dois caminhos: usar <code>8080</code> (o mais comum, com o Service traduzindo) ou devolver
+<code>NET_BIND_SERVICE</code> sozinha.</p>
+
+<h2>5. fsGroup: dando dono ao volume</h2>
+
+<p>Se o sistema de arquivos da imagem é somente leitura, o programa que precisa gravar tem de gravar em um
+volume. E aí aparece o segundo problema: o volume é montado com dono que o processo talvez não possa usar. O
+campo <code>fsGroup</code> resolve isso: o cluster passa a dona do grupo do volume para o GID informado, e
+todos os containers do pod herdam essa permissão.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/forno|spec.securityContext.fsGroup=2000;;objeto:Pod/forno" data-get="pod forno -o yaml">
+  <p class="try-task">O forno grava em <code>/app/dados</code>, que vem de um <code>emptyDir</code>. Falta o
+  grupo dono do volume: acrescente <code>fsGroup: 2000</code> no <code>securityContext</code> do pod e
+  rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsNonRoot: true
+  volumes:
+    - name: dados
+      emptyDir: {}
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /app/dados</pre>
+<pre class="out">
+pod/forno created
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+  namespace: default
+spec:
+  containers:
+    - image: cardapio:1.0
+      imagePullPolicy: IfNotPresent
+      name: forno
+      resources:
+        limits: {}
+        requests: {}
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File
+      volumeMounts:
+        - mountPath: /app/dados
+          name: dados
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  preemptionPolicy: PreemptLowerPriority
+  priority: 0
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  terminationGracePeriodSeconds: 30
+  volumes:
+    - emptyDir: {}
+      name: dados
+status:
+  conditions:
+    - status: "True"
+      tipo: PodScheduled
+    - status: "True"
+      tipo: Initialized
+    - status: "True"
+      tipo: Ready
+    - status: "True"
+      tipo: ContainersReady
+  iniciadoEm: 23
+  ip: 10.244.144.245
+  "no": guia-control-plane
+  phase: Running
+  ready: true
+  reinicios: 0
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsNonRoot: true
+    fsGroup: 2000
+  volumes:
+    - name: dados
+      emptyDir: {}
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      volumeMounts:
+        - name: dados
+          mountPath: /app/dados</pre>
+</div>
+
+<p>O <code>-o yaml</code> do painel mostra o campo no <code>spec.securityContext</code>, ao lado de
+<code>runAsUser</code>. Num cluster real, o efeito é visível no volume: em vez de o diretório nascer com
+<code>root:root</code> e modo 755 (que o UID 1000 não escreve), ele nasce com o grupo <code>2000</code> e
+permissão de escrita para o grupo. É essa combinação que faz o par “não-root + disco somente leitura + volume
+gravável” funcionar junto em vez de brigar.</p>
+
+<p>Existe ainda o <code>fsGroupChangePolicy</code>, que controla quando o cluster ajusta recursivamente o dono
+dos arquivos de um volume já populado. Em volume grande, a checagem recursiva atrasa a subida do pod; com
+<code>OnRootMismatch</code>, ela só acontece quando o dono da raiz está errado. É um detalhe de desempenho, não
+de segurança — mas é o tipo de ajuste que resolve “meu pod demora dois minutos para ficar pronto”.</p>
+
+<h2>6. Quando o endurecimento passa do ponto</h2>
+
+<p>Configurar segurança é fácil; configurar segurança que <em>funciona</em> é o trabalho. Os três tropeços
+abaixo são os que aparecem toda semana, e todos têm a mesma origem: o programa não sabe que foi endurecido.
+As mensagens são transcrições de cluster real, porque o painel não roda container e não calcula esses
+estados.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get pods
+NAME    READY   STATUS                       RESTARTS   AGE
+forno   0/1     CreateContainerConfigError   0          40s
+
+ana@notebook:~$ kubectl describe pod forno
+  Warning  Failed  12s   kubelet  Error: container has runAsNonRoot and image will run as root</pre>
+
+<p>O primeiro: <code>runAsNonRoot: true</code> com uma imagem cujo <code>USER</code> é root e sem
+<code>runAsUser</code> definido. O kubelet percebe antes de iniciar e recusa — o que é ótimo, porque é uma
+recusa clara em vez de um processo rodando com poder que ninguém queria. O conserto é definir
+<code>runAsUser</code> ou trocar a imagem por uma que já declare um usuário comum.</p>
+
+<p>O segundo é o <code>Permission denied</code> no volume: o programa tenta escrever em
+<code>/app/dados/cardapio.json</code> e recebe <code>EACCES</code>. Falta <code>fsGroup</code>, ou o volume
+está sendo montado em um caminho que o dono não cobre. O terceiro é o <code>EROFS</code> (read-only file
+system): o programa escreve em <code>/tmp</code> ou no diretório da aplicação, e o disco da imagem é somente
+leitura. O conserto é apontar a escrita para um volume — <code>emptyDir</code> serve para arquivo temporário.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Causa provável</th><th>Conserto</th></tr>
+</thead>
+<tbody>
+<tr><td><code>CreateContainerConfigError</code></td><td><code>runAsNonRoot</code> com imagem root</td><td>definir
+<code>runAsUser</code> ou trocar a imagem</td></tr>
+<tr><td><code>EACCES</code> no volume</td><td>volume sem dono para o UID/GID do processo</td><td>acrescentar
+<code>fsGroup</code></td></tr>
+<tr><td><code>EROFS</code> ao gravar</td><td><code>readOnlyRootFilesystem: true</code></td><td>mover a escrita
+para um volume gravável</td></tr>
+<tr><td><code>Permission denied</code> na porta 80</td><td>capability <code>NET_BIND_SERVICE</code> removida</td><td>escutar
+na 8080 ou devolver a capability</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um hábito que economiza horas: endureça um campo por vez, subindo o pod a cada mudança. Quem liga os cinco
+de uma vez descobre que algo quebrou, mas não qual. E leia o evento do <code>describe</code> antes de mexer no
+manifesto — ele costuma dizer exatamente qual dos cinco foi o culpado.</p>
+
+<h2>7. O que não é securityContext</h2>
+
+<p>Vale separar o que este campo faz do que ele não faz, porque a lista de expectativas erradas é longa.
+<code>securityContext</code> não isola a rede (isso é <code>NetworkPolicy</code>), não limita CPU nem memória
+(<code>resources</code>), não decide o que o pod pode pedir à API (isso é RBAC, com ServiceAccount) e não
+filtra syscalls por conta própria — para isso existe o <code>seccompProfile</code>, que também mora no
+<code>securityContext</code>, mas é um assunto com nome próprio.</p>
+
+<p>Também não é uma proteção contra imagem maliciosa deliberada. Um container com <code>drop: ["ALL"]</code>,
+não-root e disco somente leitura ainda compartilha o kernel com o resto do cluster; fugas de container existem
+e são raras. O objetivo do endurecimento é reduzir a superfície: transformar “root com todos os poderes e
+disco gravável” em “usuário comum, sem poderes, disco somente leitura”. Isso muda o custo de um ataque, e é o
+que está ao seu alcance no manifesto.</p>
+
+<p>Sobre o painel, para não haver ilusão: ele guarda os campos e os mostra no <code>-o yaml</code> (o
+<code>describe</code> de pod não imprime esse bloco, nem no painel nem no cluster), mas não executa o
+container — logo, não calcula <code>EROFS</code>, <code>EACCES</code> nem
+<code>CreateContainerConfigError</code>. O que você prova ali é que o manifesto ficou como devia; o que
+acontece na execução vem das transcrições acima.</p>
+
+<p>Uma confusão frequente, para fechar esta seção: <code>runAsUser</code> não muda o dono dos arquivos da
+imagem, nem “cria” um usuário. Ele só diz ao runtime com qual UID iniciar o processo. Se a imagem tem arquivos
+com dono 0 e modo 700, o UID 1000 não os lê — e o erro aparece como <code>Permission denied</code> na
+inicialização, mesmo com o manifesto correto. Nesse caso não há campo de <code>securityContext</code> que
+resolva: é a imagem que precisa declarar donos compatíveis, ou o processo que precisa de outro caminho.</p>
+
+<p>Outra: <code>runAsNonRoot</code> não verifica “se o programa é confiável”. Ele compara o UID efetivo com
+zero, e nada mais. Um processo rodando como 1000 continua podendo fazer tudo o que o 1000 pode — inclusive
+apagar o banco de dados se o banco estiver acessível a ele. Segurança em camadas é isto: cada campo fecha uma
+porta, e nenhum deles fecha todas.</p>
+
+<h2>8. Endurecendo o cardápio, na prática</h2>
+
+<p>Juntando tudo, o pod do cardápio fica com quatro decisões: rodar como UID 1000 com
+<code>runAsNonRoot</code>, sistema de arquivos da imagem somente leitura, todas as capabilities derrubadas,
+e um volume com <code>fsGroup</code> para o que precisa ser gravado. Três dessas decisões são exatamente o que
+o nível <code>restricted</code> do Pod Security vai exigir na próxima aula; a quarta — o disco somente leitura
+— não é exigência da política, é recomendação a mais que você escolhe manter.</p>
+
+<p>Se você quer saber o que o seu pod precisa antes de apertar, o caminho é observar: rode com o mínimo e veja o
+que quebra. Cada erro é uma dependência que estava escondida. Programa que escreve em <code>/tmp</code>:
+aponte <code>TMPDIR</code> para um <code>emptyDir</code>. Programa que precisa de porta baixa: devolva
+<code>NET_BIND_SERVICE</code>. Programa que abre socket cru (ping, traceroute): devolva
+<code>NET_RAW</code> com a consciência de que é um poder de verdade.</p>
+
+<p>E o que fazer quando a imagem insiste em root e não dá para trocar hoje? Existe uma saída de emergência,
+<code>privileged: true</code> ou <code>runAsUser: 0</code> explícito — e ela deve vir com data e responsável
+numa anotação, não escondida no meio do manifesto. Segurança sem rastro de exceção é segurança que ninguém
+audita.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o pod que parou de subir depois da “melhoria”</h3>
+<p>Alguém aplicou <code>readOnlyRootFilesystem: true</code> em todos os pods de uma vez. Metade subiu; a outra
+metade entrou em <code>CrashLoopBackOff</code> porque gravava cache em <code>/app/cache</code>. O conserto não
+foi reverter: foi montar um <code>emptyDir</code> em <code>/app/cache</code> e apontar a variável de cache
+para lá. O endurecimento revelou uma dependência que ninguém sabia que existia.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o volume que só o root escrevia</h3>
+<p>O relatório gerava um PDF em <code>/dados/saida</code> e funcionava antes do endurecimento. Depois do
+<code>runAsUser: 1000</code>, <code>Permission denied</code>. O volume vinha de um PVC montado com dono
+<code>root</code>. Com <code>fsGroup: 1000</code>, o diretório passou a pertencer ao grupo do processo, e a
+gravação voltou — sem root e sem disco gravável na imagem.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a porta 80 que ninguém queria</h3>
+<p>Uma imagem de servidor escutava em 80 por tradição. Com <code>drop: ["ALL"]</code>, o processo não conseguiu
+abrir a porta: 80 é privilegiada. Em vez de devolver a capability, o time trocou para 8080 e ajustou o Service
+para traduzir <code>80 → 8080</code>. Uma linha no manifesto e uma no Service; o endurecimento continuou
+inteiro.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Um container sem nenhuma instrução de usuário roda
+como…</p>
+<label><input type="radio" name="q1"> o usuário que criou o pod</label>
+<label><input type="radio" name="q1"> o que a imagem declarar; sem <code>USER</code>, uid 0 (root)</label>
+<label><input type="radio" name="q1"> um usuário aleatório escolhido pelo cluster</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual campo dá dono ao volume montado?</p>
+<label><input type="radio" name="q2"> <code>runAsUser</code></label>
+<label><input type="radio" name="q2"> <code>readOnlyRootFilesystem</code></label>
+<label><input type="radio" name="q2"> <code>fsGroup</code>, no <code>securityContext</code> do pod</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O que faz <code>capabilities.drop: ["ALL"]</code>?</p>
+<label><input type="radio" name="q3"> tira todos os poderes granulares do kernel do container</label>
+<label><input type="radio" name="q3"> apaga todas as variáveis de ambiente</label>
+<label><input type="radio" name="q3"> impede o pod de agendar em qualquer nó</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o campo que falta no forno</h2>
+
+<p>O forno grava em <code>/app/dados</code> e precisa que o volume pertença ao grupo 2000. Complete o campo,
+que fica no <code>securityContext</code> do <strong>pod</strong>:</p>
+
+<div class="ex-code">securityContext:
+  <input aria-label="resposta 1" data-answer="fsGroup" placeholder="...">: 2000</div>
+
+<p class="ex-dica">Dica: é o único dos campos desta aula que não existe no nível do container. Sem ele, o
+processo não-root recebe <code>EACCES</code> ao tentar gravar no volume.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p><code>securityContext</code> é o conjunto de campos que decide como o container roda: com qual UID
+(<code>runAsUser</code>), com qual grupo (<code>runAsGroup</code>), recusando root
+(<code>runAsNonRoot</code>), com o disco da imagem travado (<code>readOnlyRootFilesystem</code>), sem ganho de
+privilégio (<code>allowPrivilegeEscalation: false</code>) e sem poderes do kernel
+(<code>capabilities.drop: ["ALL"]</code>). Alguns ficam no pod, outros no container, e o lugar importa.</p>
+
+<p>O volume é a válvula de escape do endurecimento: disco somente leitura na imagem, volume gravável para o
+que precisa persistir, e <code>fsGroup</code> para o dono bater com o UID do processo. Os erros clássicos são
+<code>CreateContainerConfigError</code> (non-root com imagem root), <code>EACCES</code> (volume sem dono) e
+<code>EROFS</code> (escrita na imagem).</p>
+
+<p>Endureça um campo por vez e leia o evento do <code>describe</code> quando algo quebrar. Na próxima aula
+esses mesmos campos aparecem como exigência: os Pod Security Standards, que recusam o pod antes de ele nascer
+quando o namespace está marcado como <code>restricted</code>.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Sem instrução, o container roda com o usuário da imagem — muitas vezes root.</li>
+  <li><code>runAsNonRoot: true</code> + <code>runAsUser</code> é o par que garante não-root.</li>
+  <li><code>readOnlyRootFilesystem</code> e <code>capabilities</code> são campos de container;
+  <code>fsGroup</code> é de pod.</li>
+  <li>Disco somente leitura exige volume para o que precisa ser gravado; <code>fsGroup</code> dá o dono.</li>
+  <li><code>drop: ["ALL"]</code> e <code>allowPrivilegeEscalation: false</code> são o mínimo recomendado.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

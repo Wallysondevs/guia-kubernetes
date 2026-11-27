@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tracing | Guia Kubernetes</title>
+<meta name="description" content="Tracing para quem nunca programou: o que é trace e span, como o contexto se propaga entre serviços, o que o OpenTelemetry faz e como rodar o coletor no Kubernetes.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Tracing</span></h1>
+<p class="intro">O cliente reclamou que o pedido demorou “uma eternidade”. A Ana abriu os logs do site e
+encontrou uma linha de sucesso, 812 milissegundos, sem erro nenhum. Abriu o log do banco e também estava
+limpo. Abriu o do serviço de pagamento: limpo. Três programas, todos bem comportados, e um pedido lento — o
+log responde “o que aconteceu aqui”, mas não responde “onde o tempo foi gasto”. Quem responde isso é o
+<strong>trace</strong>: a história de uma requisição contada por todos os programas que ela atravessou, com
+o relógio de cada trecho.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que log, métrica e trace respondem — e por que os três convivem.</li>
+  <li>O que são trace, span, <code>trace_id</code> e <code>span_id</code>.</li>
+  <li>Como o contexto viaja entre serviços, no cabeçalho <code>traceparent</code>.</li>
+  <li>O que é OpenTelemetry e por que existe um “coletor” no meio.</li>
+  <li>Rodar o coletor no cluster e apontar a aplicação para ele.</li>
+  <li>Ligar o trace ao log pela identificação e ver a história do pedido lento.</li>
+</ul>
+</div>
+
+<h2>1. A cena: três logs limpos e um pedido lento</h2>
+
+<p>O pedido 1042 levou 812 ms. O normal é 120. Nenhum erro apareceu em lugar nenhum: o site respondeu 200, o
+banco respondeu 200, o pagamento aprovou. Só que, em algum lugar do caminho, oito décimos de segundo
+passaram sem que ninguém registrasse.</p>
+
+<p>A Ana tem três ferramentas de observação, e cada uma responde a uma pergunta diferente. A
+<strong>métrica</strong> diz “a média subiu de 120 para 400 ms na última hora” — ótima para saber que existe
+um problema, péssima para saber onde. O <strong>log</strong> diz “o pedido 1042 foi gravado às 15h52” — ótimo
+para saber o que um programa fez, e cego para o que aconteceu entre programas. O <strong>trace</strong> diz
+“este pedido passou por quatro programas; 12 ms no site, 640 ms esperando o banco, 150 ms no pagamento, 10 ms
+de volta” — e é exatamente a pergunta em aberto.</p>
+
+<p>A diferença está na unidade de medida. Métrica conta eventos por minuto; log escreve frases de um
+processo; trace segue <em>uma requisição</em> do começo ao fim, cruzando processos. Sem trace, o seu
+diagnóstico de lentidão é tentativa e erro entre logs de sistemas diferentes — e você acaba culpando o banco
+por um tempo que foi gasto na fila do próprio site.</p>
+
+<h2>2. Log, métrica e trace: três perguntas</h2>
+
+<p>Vale fixar o papel de cada uma antes das definições, porque muita equipe tenta resolver tudo com uma só.
+As três se complementam, e todas custam dinheiro: guardar log é caro pelo volume, métrica é cara pela
+quantidade de séries, trace é caro pela amostragem e pelo armazenamento.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sinal</th><th>Pergunta que responde</th><th>Exemplo da padaria</th></tr>
+</thead>
+<tbody>
+<tr><td>métrica</td><td>quantos, com que frequência, com que tendência</td><td>“pedidos por minuto caíram 30% às 15h”</td></tr>
+<tr><td>log</td><td>o que este programa fez neste momento</td><td>“pedido 1042 gravado, total 42,00”</td></tr>
+<tr><td>trace</td><td>por onde esta requisição passou e onde gastou tempo</td><td>“640 ms esperando o banco”</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare que a métrica avisa, o trace localiza e o log explica. O ciclo de investigação que funciona é esse:
+a métrica (ou o alerta) diz que há problema; o trace mostra qual trecho está lento ou falhando; o log daquele
+trecho conta o detalhe. Começar pelo log é o caminho mais lento, porque você não sabe em qual dos cinco
+programas olhar.</p>
+
+<h2>3. A anatomia de um trace</h2>
+
+<p>Um <strong>trace</strong> é o registro de uma requisição. Ele é feito de <strong>spans</strong>: cada span
+é um pedaço de trabalho com começo, fim e um nome. “Receber o pedido HTTP”, “consultar o banco”, “chamar o
+pagamento”, “gravar o arquivo” — cada um é um span, e todos carregam o mesmo <code>trace_id</code>, a
+etiqueta que amarra a história.</p>
+
+<p>Os spans têm hierarquia: cada um aponta para o span que o originou (o <em>pai</em>). É isso que permite
+desenhar a árvore em vez de uma lista solta, e é isso que responde “o tempo foi gasto <em>dentro</em> de
+qual chamada”.</p>
+
+<dl class="anatomy">
+<dt>trace</dt>
+<dd>A história completa de uma requisição, identificada por um <code>trace_id</code> de 32 caracteres
+hexadecimais.</dd>
+<dt>span</dt>
+<dd>Um trecho dessa história: nome, início, duração, atributos e o resultado (sucesso ou erro).</dd>
+<dt>span_id</dt>
+<dd>O identificador do span, de 16 caracteres. O span pai é referenciado no <code>parent_span_id</code>.</dd>
+<dt>contexto</dt>
+<dd>O conjunto <code>trace_id</code> + <code>span_id</code> que viaja junto com a requisição entre
+serviços.</dd>
+<dt>atributos</dt>
+<dd>Pares chave-valor que dão sentido ao span: <code>http.status_code</code>, <code>db.system</code>,
+<code>usuario.id</code>.</dd>
+<dt>amostragem</dt>
+<dd>A decisão de guardar ou descartar um trace. Guardar 100% custa caro; guardar 5% costuma bastar.</dd>
+</dl>
+
+<p>Um aviso para quem está começando: trace não é log com mais campos. Ele é estruturado em árvore e
+pensado para ser consultado por tempo e por serviço, não lido de cima a baixo. Um trace com oitenta spans é
+normal e é para ser explorado na interface, não impresso.</p>
+
+<h2>4. A propagação de contexto</h2>
+
+<p>Se cada programa criasse o seu próprio <code>trace_id</code>, você teria três traces separados e nenhuma
+história. Para virar um trace só, a identificação viaja junto com a requisição, num cabeçalho HTTP. O padrão
+atual chama-se <strong>W3C Trace Context</strong> e o cabeçalho é o <code>traceparent</code>:</p>
+
+<pre class="file" data-file="traceparent.txt">traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01</pre>
+
+<p>Lendo da esquerda para a direita: a versão do formato (<code>00</code>), o <code>trace_id</code>, o
+<code>span_id</code> de quem está chamando e os <em>flags</em> (<code>01</code> quer dizer “amostrado, guarde
+este trace”). O serviço que recebe lê esse cabeçalho, cria o seu span como filho daquele
+<code>span_id</code> e repassa adiante na próxima chamada.</p>
+
+<p>O ponto de falha clássico é aqui. Basta uma biblioteca HTTP que não repassa o cabeçalho para a história
+quebrar: você vê o span do site, o span do pagamento, mas eles não se ligam, e o trace aparece partido em
+dois. É por isso que “instrumentar” não é só instalar uma biblioteca — é garantir que todo cliente HTTP e
+todo consumidor de fila saiba propagar o contexto.</p>
+
+<p>Do lado de dentro do processo, o contexto também precisa estar disponível para quem escreve o log. É o
+que permite carimbar o <code>trace_id</code> em cada linha e, depois, pular do log para o trace na interface
+com um clique.</p>
+
+<h2>5. OpenTelemetry: um padrão, não um produto</h2>
+
+<p><strong>OpenTelemetry</strong> (OTel, na conversa) é o projeto que padronizou as três coisas necessárias
+para instrumentar: a <em>API</em> (as chamadas que o seu código faz para criar spans), o <em>SDK</em> (a
+implementação que faz o trabalho dentro do processo) e o <em>protocolo</em> de envio (OTLP). Antes dele, cada
+fornecedor tinha a sua biblioteca, e trocar de fornecedor significava reescrever o código.</p>
+
+<p>O terceiro pedaço é o <strong>coletor</strong> (OpenTelemetry Collector): um programa que recebe os dados,
+processa e exporta para onde você quiser. Ele existe porque ninguém quer que cada aplicação saiba falar com
+três fornecedores, aplicar regras de amostragem e lidar com retentativa. A aplicação manda para um endereço
+só; o coletor decide o resto — e, quando o fornecedor muda, muda a configuração dele, não o código.</p>
+
+<pre class="file" data-file="otel-collector-config.yaml">receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  batch: {}
+exporters:
+  otlp:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp]</pre>
+
+<p>Essa configuração tem três blocos, e a leitura é sempre a mesma: <code>receivers</code> é por onde entra,
+<code>exporters</code> é para onde vai, <code>processors</code> é o que acontece no meio (o
+<code>batch</code> junta spans em lotes para não fazer uma chamada por span). O bloco
+<code>service.pipelines</code> liga as pontas.</p>
+
+<h2>6. O coletor no cluster</h2>
+
+<p>No Kubernetes, o coletor é um Deployment como outro qualquer, com a configuração num ConfigMap e as portas
+declaradas. A caixa abaixo tem as duas peças: o ConfigMap com a configuração e o Deployment que o monta.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="objeto:ConfigMap/otel-collector-config;;campo:Deployment/otel-collector|spec.template.spec.containers.0.ports.0.containerPort=4317;;campo:Deployment/otel-collector|spec.template.spec.containers.0.volumeMounts.0.mountPath=/etc/otelcol;;texto:Running">
+  <p class="try-task">Crie o ConfigMap <code>otel-collector-config</code>, aponte o volume para ele montado
+  em <code>/etc/otelcol</code> e declare a porta <code>4317</code> no container.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector:0.111.0
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: config
+              mountPath: /etc/config</pre>
+<pre class="out">
+deployment.apps/otel-collector created
+
+NAME                              READY   STATUS    RESTARTS   AGE
+otel-collector-pf6nh8ljfk-lx7z6   1/1     Running   0          7m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+    exporters:
+      debug: {}
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          exporters: [debug]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector:0.111.0
+          ports:
+            - containerPort: 4317
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol</pre>
+</div>
+
+<p>As portas do coletor são poucas e vale conhecê-las, porque é nelas que os erros de conexão aparecem: a
+<code>4317</code> é o OTLP em gRPC (a mais usada), a <code>4318</code> é o OTLP em HTTP, e algumas imagens
+expõem ainda uma porta de métricas internas e uma de saúde.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Porta</th><th>Para que serve</th><th>Quem usa</th></tr>
+</thead>
+<tbody>
+<tr><td><code>4317</code></td><td>OTLP em gRPC</td><td>aplicações e outros coletores</td></tr>
+<tr><td><code>4318</code></td><td>OTLP em HTTP</td><td>aplicações que falam HTTP, navegador</td></tr>
+<tr><td><code>8888</code></td><td>métricas internas do próprio coletor</td><td>Prometheus</td></tr>
+<tr><td><code>13133</code></td><td>health check</td><td>probe de vida e de prontidão</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma escolha de desenho aparece aqui: o coletor pode ser um Deployment (uma instância que serve todos os
+pods) ou um DaemonSet (uma instância por nó). O Deployment é mais simples e concentra a configuração num
+lugar; o DaemonSet evita que todos os pods de todos os nós mandem tráfego para uma única instância, o que
+ajuda quando o volume é grande. Para a padaria, um Deployment resolve.</p>
+
+<h2>7. Instrumentar a aplicação</h2>
+
+<p>Com o coletor no ar, a aplicação precisa saber três coisas: para onde mandar, como se chamar e quanto
+amostrar. Em muitas linguagens isso é feito só com variáveis de ambiente, sem mudar uma linha de código —
+o SDK lê as variáveis e se configura.</p>
+
+<p>A caixa abaixo tem o Deployment do site. As variáveis estão com o nome errado (o SDK ignora o que não
+conhece, e o resultado é silêncio: nenhum span aparece e nenhum erro é registrado). Conserte os dois nomes e
+os valores.</p>
+
+<div class="tryk8s" data-goal="pronto:Deployment/cardapio=1;;campo:Deployment/cardapio|spec.template.spec.containers.0.env.1.name=OTEL_EXPORTER_OTLP_ENDPOINT;;campo:Deployment/cardapio|spec.template.spec.containers.0.env.1.value=http://otel-collector:4317">
+  <p class="try-task">Troque <code>OTEL_ENDPOINT</code> por <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> e
+  aponte para <code>http://otel-collector:4317</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: cardapio
+            - name: OTEL_ENDPOINT
+              value: otel:4317</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   1/1     1            1           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: cardapio
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4317</pre>
+</div>
+
+<p>O valor <code>http://otel-collector:4317</code> usa o nome do Service do coletor — e aqui aparece uma
+ligação direta com a aula de DNS interno: dentro do cluster, o nome curto resolve porque existe um Service
+com esse nome no mesmo namespace. Se o coletor estiver em outro namespace, o endereço precisa do sufixo
+(<code>otel-collector.observabilidade.svc.cluster.local</code>) ou você configura
+<code>OTEL_EXPORTER_OTLP_ENDPOINT</code> com o nome completo.</p>
+
+<p>Outra variável que muda o jogo é <code>OTEL_TRACES_SAMPLER</code>. O padrão costuma ser amostrar tudo, e
+amostrar tudo em produção é uma conta alta no fim do mês. Valores comuns são <code>parentbased_traceidratio</code>
+com <code>OTEL_TRACES_SAMPLER_ARG=0.05</code>, que guarda 5% dos traces e mantém a decisão coerente na
+cadeia inteira — se o pai foi amostrado, os filhos também são.</p>
+
+<h2>8. Ver o trace e ligá-lo ao log</h2>
+
+<p>Com tudo instrumentado, o coletor passa a registrar o que recebe. Esta é a transcrição do log de um
+coletor OTel rodando em cluster local, com o exporter <code>debug</code> ligado:</p>
+
+<pre class="term">2026-11-27T15:52:03.118Z	info	TracesExporter	{"kind": "exporter", "data_type": "traces", "name": "debug", "resource spans": 1, "spans": 4}
+2026-11-27T15:52:03.121Z	info	ResourceSpans #0
+Resource SchemaURL:
+Resource attributes:
+     - service.name: Str(cardapio)
+ScopeSpans #0
+ScopeSpans SchemaURL:
+InstrumentationScope tracetest
+Span #0
+    Trace ID       : 4bf92f3577b34da6a3ce929d0e0e4736
+    Parent ID      : 00f067aa0ba902b7
+    ID             : b7ad6b7169203331
+    Name           : GET /pedido/1042
+    Kind           : Server
+    Start time     : 2026-11-27 15:52:02.311 +0000 UTC
+    End time       : 2026-11-27 15:52:03.123 +0000 UTC</pre>
+
+<p>Esse formato é o que o exporter <code>debug</code> imprime: um resumo por lote e, em seguida, os detalhes
+de cada span. Serve para provar que a instrumentação funciona antes de apontar para o armazenamento de
+verdade — é o equivalente a um <code>echo</code> no lugar de um envio real.</p>
+
+<p>Do lado da aplicação, o ganho é carimbar o <code>trace_id</code> em cada linha de log. Aí o log deixa de
+ser uma frase solta e vira um endereço para a história completa (transcrição):</p>
+
+<pre class="term">15:52:02 GET /pedido/1042 200 812ms trace_id=4bf92f3577b34da6a3ce929d0e0e4736 span_id=00f067aa0ba902b7
+15:52:02 consulta de precos: 640ms db=postgres tabela=precos
+15:52:03 cobranca aprovada: 150ms gateway=pix</pre>
+
+<p>Com o <code>trace_id</code> na mão, você abre a interface do armazenamento (Jaeger, Tempo, o que for),
+cola o identificador e vê a árvore. É nesse momento que o “812 ms sem explicação” vira “640 ms esperando o
+banco”: o span da consulta tem 640 ms e o span do site tem 812 — o resto é o site esperando.</p>
+
+<p>Para abrir a interface de um Jaeger que está rodando no cluster, o caminho é o mesmo da aula de portas: um
+túnel do seu notebook até o pod. A caixa abaixo erra a porta — aponta para a 16685, que é o gRPC do Jaeger, e
+não a interface.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Forwarding from 127.0.0.1:16686 -> 16686">
+  <p class="try-task">A interface do Jaeger escuta na 16686. Conserte a porta de destino e abra o túnel.</p>
+<pre class="yaml">kubectl run jaeger --image=jaegertracing/all-in-one:1.62
+kubectl port-forward pod/jaeger 16686 16685</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run jaeger --image=jaegertracing/all-in-one:1.62
+pod/jaeger created
+
+ana@notebook:~$ kubectl port-forward pod/jaeger 16686 16685
+Forwarding from 127.0.0.1:16686 -&gt; 16685
+Handling connection for 16686
+</pre>
+<pre class="solucao">kubectl run jaeger --image=jaegertracing/all-in-one:1.62
+kubectl port-forward pod/jaeger 16686 16686</pre>
+</div>
+
+<p>Depois disso, <code>http://localhost:16686</code> no navegador é a busca de traces. Escolha o serviço
+<code>cardapio</code>, o período e clique: a lista mostra os traces mais lentos primeiro. O túnel morre quando
+você fecha o terminal — e é bom que morra, porque a interface do Jaeger em produção aberta para a internet é
+um vazamento de dados internos.</p>
+
+<h2>9. O que o Kubernetes tem a ver com isso</h2>
+
+<p>Uma confusão comum: achar que o Kubernetes “faz tracing”. Ele não faz. O cluster cuida de rodar os pods,
+dar endereço e reiniciar o que cai. Tracing é decisão da aplicação (instrumentar) somada a um lugar para
+guardar (o armazenamento). O que o Kubernetes oferece é a infraestrutura onde as três peças vivem.</p>
+
+<p>O que ele <em>facilita</em> é bastante, porém. O coletor sobe como Deployment com a configuração num
+ConfigMap, escala com réplicas e tem probe apontando para a porta de saúde. O endereço dele é um Service, e
+por isso a aplicação não precisa saber em qual nó ele está. E o <code>trace_id</code> no log casa com o
+<code>kubectl logs</code> que você já usa: você acha a linha estranha no log do pod, copia o identificador e
+abre o trace.</p>
+
+<p>O que ele <em>atrapalha</em>, se você não pensar: pod que reinicia perde o que estava em memória antes de
+o coletor receber; coletor com uma réplica só vira ponto único de falha; e a decisão de amostragem precisa
+estar na aplicação, porque o coletor já recebeu o que sobrou. Nada disso é específico de Kubernetes, mas
+tudo aparece junto com ele.</p>
+
+<h2>10. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o trace partido em dois</h3>
+<p>A Ana instrumentou o site e o pagamento, mas os traces apareciam separados. O cliente HTTP usado pelo site
+não repassava o cabeçalho <code>traceparent</code> — a biblioteca de instrumentação automática dependia de uma
+configuração que ninguém tinha ligado. Depois de ligar, os dois spans viraram uma árvore e o tempo apareceu
+onde devia.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a conta do tracing</h3>
+<p>O time deixou a amostragem em 100% e, em três semanas, o armazenamento de traces ficou maior que o banco
+de produção. A correção foi amostrar 5% das requisições, mantendo 100% dos erros — a combinação que dá
+informação útil sem gastar o orçamento: erro é raro e precisa de trace completo; sucesso é comum e uma
+amostra basta.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o coletor que virou gargalo</h3>
+<p>Uma única réplica do coletor recebia os spans de trinta pods. Quando o tráfego subia, ele atrasava e os
+spans chegavam fora de ordem ou eram descartados. O conserto foi escalar o coletor para duas réplicas atrás
+de um Service e reduzir o envio com <code>batch</code> — o processador que junta spans em lotes antes de
+exportar.</p>
+</div>
+
+<h2>11. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. O que o trace responde que o log não responde?</p>
+<label><input type="radio" name="q1"> qual foi o texto exato do erro do programa</label>
+<label><input type="radio" name="q1"> quantas requisições por minuto o serviço recebeu</label>
+<label><input type="radio" name="q1"> por onde a requisição passou e onde gastou tempo</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O que amarra os spans de uma mesma requisição?</p>
+<label><input type="radio" name="q2"> o <code>trace_id</code>, repetido em todos os spans daquela
+requisição</label>
+<label><input type="radio" name="q2"> o nome do pod, que é igual em todos os serviços</label>
+<label><input type="radio" name="q2"> a porta 4317 do coletor</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Para que serve o coletor do OpenTelemetry?</p>
+<label><input type="radio" name="q3"> para gerar os spans no lugar da aplicação</label>
+<label><input type="radio" name="q3"> para receber, processar e exportar os dados para o destino
+escolhido</label>
+<label><input type="radio" name="q3"> para guardar os traces dentro do etcd do cluster</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: apontar o site para o coletor</h2>
+<p>Complete a variável de ambiente que diz ao SDK para onde enviar os spans, apontando para o Service do
+coletor na porta gRPC.</p>
+<div class="ex-code">          env:
+            - name: OTEL_SERVICE_NAME
+              value: cardapio
+            - name: <input aria-label="resposta 1" data-answer="OTEL_EXPORTER_OTLP_ENDPOINT" placeholder="...">
+              value: http://otel-collector:4317</div>
+<p class="ex-dica">Dica: o nome segue o padrão <code>OTEL_</code> + <code>EXPORTER</code> + protocolo. Um
+nome inventado não gera erro: o SDK simplesmente ignora e você não vê span nenhum.</p>
+</div>
+
+<h2>12. Resumo</h2>
+
+<p>Trace é a história de uma requisição; span é cada trecho dessa história. Todos os spans de um pedido
+carregam o mesmo <code>trace_id</code> e apontam para o span pai, formando uma árvore com tempos. O contexto
+viaja entre serviços no cabeçalho <code>traceparent</code>, e é aí que a instrumentação quebra quando uma
+biblioteca não repassa o cabeçalho.</p>
+
+<p>OpenTelemetry padroniza API, SDK e protocolo; o coletor recebe, processa e exporta, o que permite trocar o
+destino sem tocar no código. No cluster, o coletor é um Deployment com a config num ConfigMap, portas 4317
+(gRPC) e 4318 (HTTP), endereço atrás de um Service. A aplicação se configura por variáveis de ambiente, e a
+amostragem é o botão que decide a conta no fim do mês.</p>
+
+<p>Use métrica para saber que existe problema, trace para localizar e log para entender o detalhe — com o
+<code>trace_id</code> carimbado no log, os três se conversam. Na <a href="helm-intro.html">aula de Helm</a> a Ana sai da observação e entra
+na entrega: como parar de copiar manifesto para três ambientes, começando pelo Helm.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Trace = requisição inteira; span = um pedaço, com início, fim e resultado.</li>
+  <li><code>trace_id</code> amarra; <code>parent_span_id</code> dá a hierarquia.</li>
+  <li>O contexto viaja no <code>traceparent</code> (W3C): versão, trace, span, flags.</li>
+  <li>Coletor: recebe (4317/4318), processa (<code>batch</code>), exporta.</li>
+  <li>A aplicação aponta para o Service do coletor via <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>.</li>
+  <li>Amostragem é decisão de custo: guarde menos sucesso e mais erro.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

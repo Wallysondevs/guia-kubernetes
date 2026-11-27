@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>App completa | Guia Kubernetes</title>
+<meta name="description" content="Projeto guiado: a loja da padaria de ponta a ponta com ConfigMap, Secret, Deployment e Service, na ordem certa, com o painel provando cada passo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">App</span> completa</h1>
+<p class="intro">Até aqui a Ana aprendeu cada peça separada: o ConfigMap guarda o preço, o Secret guarda a
+senha do banco, o Deployment mantém o site no ar e o Service dá um endereço fixo para ele. Nesta página as
+quatro entram juntas, na ordem em que um cluster de verdade precisa delas, e o resultado é a loja da padaria
+funcionando de ponta a ponta: um site que lê a configuração de fora da imagem, conversa com o banco sem
+senha escrita no manifesto e responde num endereço que não muda quando o pod morre.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>A montar a aplicação inteira em três passos, cada um com uma caixa para provar.</li>
+  <li>Por que a configuração e o segredo vêm antes do Deployment, e o Service vem depois.</li>
+  <li>Como ligar ConfigMap e Secret ao container com <code>envFrom</code>.</li>
+  <li>Como o seletor do Service decide quem entra nos endpoints — e o que acontece quando ele erra.</li>
+  <li>O que conferir no painel em cada etapa, e o que só um cluster de verdade mostra.</li>
+  <li>Os cinco tropeços que derrubam uma aplicação “que estava funcionando ontem”.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>A imagem mental é uma loja pequena com quatro partes. A primeira é o <strong>cardápio</strong>: preços,
+horário e o nome da loja, que mudam toda semana e não deveriam exigir uma imagem nova. A segunda é o
+<strong>cofre</strong>: a senha do banco de pedidos, que ninguém pode ler de dentro do repositório. A
+terceira é o <strong>balcão</strong>: o programa que responde às requisições, com duas cópias para aguentar
+o movimento. A quarta é a <strong>tabuleta</strong>: o endereço fixo que o cliente digita, mesmo que o
+balcão mude de lugar.</p>
+
+<p>No Kubernetes, essas quatro partes têm nomes: ConfigMap, Secret, Deployment e Service. O trabalho do
+projeto é montar as quatro na ordem certa e provar, no painel, que cada uma faz o que promete. A ordem não
+é capricho: o Deployment <em>lê</em> a configuração, então ela precisa existir antes; o Service
+<em>procura</em> os pods, então eles precisam existir antes. Inverter a ordem não quebra o
+<code>apply</code>, mas deixa o sistema num estado intermediário esquisito — pod sem configuração,
+Service sem ninguém do outro lado.</p>
+
+<p>Uma coisa importante sobre o painel: cada caixa começa com um cluster vazio. Isso quer dizer que a
+caixa do passo 3 repete o Deployment do passo 2 — num cluster de verdade ele já estaria lá. A repetição é
+de propósito, para a caixa funcionar sozinha; no fim da página você vê o manifesto completo, que é o que
+se guarda no repositório.</p>
+
+<h2>2. O cenário da padaria</h2>
+
+<p>A loja da Ana hoje é um programa Node com o preço do pão escrito no código. Toda segunda-feira ela pede
+ao filho que “mude o preço”, ele edita um arquivo, gera uma imagem nova, publica, e o site fica fora do ar
+por quinze minutos. Na sexta passada o pão subiu para 6,50 e o site passou o dia vendendo a 5,00: prejuízo
+pequeno, mas do tipo que ninguém esquece.</p>
+
+<p>A senha do banco está no mesmo arquivo, em texto puro, dentro do repositório. Qualquer pessoa com acesso
+ao código leu a senha; trocá-la significa outra imagem, outro deploy. E o acesso dos clientes é pelo IP do
+pod, que muda cada vez que o Deployment recria as cópias — a Ana já mandou o endereço errado para três
+fornecedores.</p>
+
+<p>São três problemas com a mesma raiz: coisas que mudam (preço, senha, endereço) estão amarradas a coisas
+que não deveriam mudar (a imagem e o pod). O projeto separa essas duas famílias. O que muda toda semana vai
+para o ConfigMap; o que é segredo vai para o Secret; o que precisa de cópias e auto-cura vai para o
+Deployment; o que precisa de endereço fixo vai para o Service.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>peça</th><th>guarda</th><th>o que quebra sem ela</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ConfigMap</code></td><td>preço, horário, nome da loja</td><td>todo ajuste vira imagem nova e
+novo deploy</td></tr>
+<tr><td><code>Secret</code></td><td>senha do banco, chave de API</td><td>segredo em texto puro no
+repositório</td></tr>
+<tr><td><code>Deployment</code></td><td>a imagem e o número de cópias</td><td>pod morto não volta
+sozinho</td></tr>
+<tr><td><code>Service</code></td><td>o endereço fixo e a porta</td><td>cliente precisa descobrir o IP do
+pod, e ele muda</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>3. Antes de começar</h2>
+
+<p>Você precisa de um cluster respondendo (as aulas de instalação do Nível 1), do <code>kubectl</code>
+configurado e de um namespace para trabalhar. Aqui tudo vai no <code>default</code>, para o painel e o seu
+terminal mostrarem a mesma coisa. Se preferir isolar, crie um namespace <code>padaria</code> e passe
+<code>-n padaria</code> em todos os comandos — mas saiba que o painel desta página usa o namespace
+padrão.</p>
+
+<p>Precisa também de uma imagem para o site. A Ana usa <code>cardapio:1.0</code>, que neste guia é só um
+nome: o painel não baixa imagem nenhuma. Num cluster de verdade, essa imagem teria de estar num registro
+acessível — e é justamente por isso que a configuração sai do código: mudar o preço passa a ser editar um
+ConfigMap, sem tocar na imagem.</p>
+
+<p>Sobre a ordem, vale guardar o resumo: primeiro o que é <em>lido</em> (ConfigMap e Secret), depois quem
+<em>lê</em> (Deployment), depois quem <em>expõe</em> (Service). O Kubernetes não vai te impedir de aplicar
+na ordem errada — ele aceita quase tudo e deixa o sistema meio montado. Quem impede o desastre é você,
+seguindo a ordem e conferindo entre um passo e outro.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>ordem</th><th>peça</th><th>por que antes</th><th>se inverter</th></tr>
+</thead>
+<tbody>
+<tr><td>1º</td><td><code>ConfigMap</code> e <code>Secret</code></td><td>o container os lê ao
+iniciar</td><td>o pod fica em <code>CreateContainerConfigError</code> até os dois existirem</td></tr>
+<tr><td>2º</td><td><code>Deployment</code></td><td>cria os pods que vão receber
+tráfego</td><td>o Service fica sem endpoints e devolve erro</td></tr>
+<tr><td>3º</td><td><code>Service</code></td><td>precisa de pods com as etiquetas certas</td><td>endpoints
+vazios, mesmo com o site no ar</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>4. Passo 1 — a configuração e o segredo</h2>
+
+<p>O primeiro passo é tirar do código o que muda e o que é secreto. A caixa começa com um ConfigMap só, de
+três chaves — e uma delas é a senha do banco, em texto puro, num objeto que qualquer pessoa com permissão de
+leitura vê inteiro no <code>kubectl get configmap -o yaml</code>. O Secret ainda não existe: é você quem
+cria.</p>
+
+<div class="tryk8s" data-get="configmaps" data-goal="texto:secret/cardapio-segredo created;;campo:Secret/cardapio-segredo|type=Opaque;;conta:secrets=1">
+  <p class="try-task">Tire a senha do ConfigMap e crie o Secret: o ConfigMap fica com
+  <code>PRECO_PAO</code> e <code>HORARIO</code>, e o Secret <code>cardapio-segredo</code> recebe
+  <code>SENHA_BANCO</code> com o base64 de <code>farinha12</code> (que é <code>ZmFyaW5oYTEy</code>).
+  Rode e veja a coluna <code>DATA</code> do ConfigMap cair de 3 para 2 e a linha do Secret criado.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+data:
+  PRECO_PAO: "6.50"
+  SENHA_BANCO: farinha12
+  HORARIO: "6h as 19h"</pre>
+<pre class="out">
+configmap/cardapio-config created
+
+NAME              DATA   AGE
+cardapio-config   3      2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+data:
+  PRECO_PAO: "6.50"
+  HORARIO: "6h as 19h"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cardapio-segredo
+type: Opaque
+data:
+  SENHA_BANCO: ZmFyaW5oYTEy</pre>
+</div>
+
+<p>O painel responde com as linhas de criação e a tabela dos ConfigMaps, com a coluna <code>DATA</code>
+dizendo quantas chaves cada um guarda. No código inicial ela mostra <code>3</code>; na solução, <code>2</code>
+— a senha saiu do ConfigMap. O Secret não aparece nessa tabela, porque é outro tipo de objeto: quem confirma
+que ele nasceu com o tipo certo é a linha <code>secret/cardapio-segredo created</code>, logo acima, e o
+<code>kubectl get secrets</code> no seu cluster.</p>
+
+<dl class="anatomy">
+<dt>ConfigMap</dt>
+<dd>Objeto de configuração com pares chave-valor em <code>data</code>. Serve para preço, horário, URL de
+serviço, nome de fila. Não serve para senha: qualquer pessoa com permissão de leitura vê o conteúdo.</dd>
+<dt>Secret</dt>
+<dd>O mesmo formato, com <code>type: Opaque</code> para dados comuns. As chaves vão em <code>data</code>,
+em base64. Base64 não é criptografia: é só uma codificação — a proteção real é o RBAC e o cuidado com o
+repositório.</dd>
+<dt>base64</dt>
+<dd>A codificação que o Secret espera em <code>data</code>. No terminal:
+<code>echo -n farinha12 | base64</code> devolve <code>ZmFyaW5oYTEy</code>. Repare no <code>-n</code>:
+sem ele, o echo acrescenta uma quebra de linha e o resultado muda.</dd>
+<dt><code>kubectl create secret generic</code></dt>
+<dd>O atalho do terminal: <code>kubectl create secret generic cardapio-segredo
+--from-literal=SENHA_BANCO=farinha12</code> cria o Secret com o base64 feito na hora. Prático para um teste;
+no repositório, o manifesto em <code>data</code> é o que fica versionado.</dd>
+</dl>
+
+<p>Repare no <code>---</code> entre os dois documentos. Um arquivo YAML pode conter vários objetos, e o
+<code>apply</code> os aplica na ordem em que aparecem. É o que permite guardar a aplicação inteira num
+arquivo só — e é o que a caixa usa para aplicar ConfigMap e Secret de uma vez.</p>
+
+<h2>5. Passo 2 — o Deployment que usa as duas</h2>
+
+<p>Com a configuração e o segredo no lugar, o Deployment pode apontar para eles. A ligação é feita com
+<code>envFrom</code>: em vez de repetir chave por chave, o container pede “todas as chaves deste ConfigMap
+viram variáveis de ambiente” e “todas as chaves deste Secret também”. O programa lê
+<code>process.env.PRECO_PAO</code> como se a variável tivesse sido escrita no manifesto.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="conta:pods=2;;campo:Deployment/cardapio|spec.template.spec.containers.0.envFrom.1.secretRef.name=cardapio-segredo">
+  <p class="try-task">O Deployment está com uma réplica só e sem configuração. Suba para duas réplicas e
+  acrescente o <code>envFrom</code> com os dois — ConfigMap primeiro, Secret depois. Rode e confira os dois
+  pods em <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+data:
+  PRECO_PAO: "6.50"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cardapio-segredo
+type: Opaque
+data:
+  SENHA_BANCO: ZmFyaW5oYTEy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+configmap/cardapio-config created
+secret/cardapio-segredo created
+deployment.apps/cardapio created
+
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+data:
+  PRECO_PAO: "6.50"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cardapio-segredo
+type: Opaque
+data:
+  SENHA_BANCO: ZmFyaW5oYTEy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: cardapio-config
+            - secretRef:
+                name: cardapio-segredo</pre>
+</div>
+
+<p>A saída tem as três linhas de criação e a tabela dos pods. No código inicial aparece <em>um</em> pod — o
+manifesto pedia uma réplica só; na solução, dois, com nomes compridos que o Deployment inventa (o do
+ReplicaSet e o do pod), justamente porque vai recriá-los quando for preciso. O que importa está no
+<code>READY</code> (<code>1/1</code>) e no <code>STATUS</code> (<code>Running</code>), iguais em qualquer
+réplica: o cluster aceitou a referência ao ConfigMap e ao Secret e subiu o container.</p>
+
+<p>O <code>envFrom</code> é uma lista, e a ordem importa quando as duas fontes têm a mesma chave: a última
+vence. Aqui não há colisão — <code>PRECO_PAO</code> e <code>HORARIO</code> vêm do ConfigMap,
+<code>SENHA_BANCO</code> vem do Secret. Se um dia colidirem, o valor do Secret ganha, porque ele é o
+segundo da lista. Guarde isso: é o tipo de detalhe que explica um “por que a variável está com o valor
+antigo?”.</p>
+
+<p>Se você quisesse uma chave só, com nome diferente do original, o caminho seria <code>env</code> com
+<code>valueFrom</code> e <code>secretKeyRef</code>. O <code>envFrom</code> é o atalho: todas as chaves, com
+o mesmo nome, de uma vez.</p>
+
+<h2>6. Passo 3 — o Service que abre a porta</h2>
+
+<p>Os pods estão no ar, mas ninguém de fora chega neles. O Service resolve isso com um endereço estável e
+um seletor: ele olha as etiquetas dos pods, encontra os que casam e mantém a lista — os
+<strong>endpoints</strong> — atualizada sozinha. A caixa abaixo tem o seletor errado
+(<code>app: vitrine</code>, que não existe) e o <code>targetPort</code> errado (80, quando o site escuta
+8080).</p>
+
+<div class="tryk8s" data-get="endpoints" data-goal="campo:Service/cardapio|spec.selector.app=cardapio;;campo:Service/cardapio|spec.ports.0.targetPort=8080;;conta:pods=2">
+  <p class="try-task">Faça o Service encontrar os pods: o seletor precisa ser <code>app: cardapio</code> e
+  o <code>targetPort</code>, <code>8080</code>. Rode e veja a coluna <code>ENDPOINTS</code> sair de
+  <code>&lt;none&gt;</code> para dois IPs com porta.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: vitrine
+  ports:
+    - port: 80
+      targetPort: 80</pre>
+<pre class="out">
+deployment.apps/cardapio created
+service/cardapio created
+
+NAME       ENDPOINTS   AGE
+cardapio   &lt;none&gt;      2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+spec:
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>Duas colunas contam a história. Antes, <code>ENDPOINTS</code> mostra <code>&lt;none&gt;</code>: o Service
+existe, tem IP, mas não achou pod nenhum — o seletor procura uma etiqueta que ninguém tem. Depois, aparecem
+dois endereços no formato <code>IP:8080</code>, que é exatamente o que o cliente vai alcançar quando digitar
+o nome do Service.</p>
+
+<dl class="anatomy">
+<dt>selector</dt>
+<dd>As etiquetas que o Service procura nos pods. Só entra nos endpoints quem tem todas elas. Um erro de
+uma letra aqui é a causa número um de “o site está no ar mas não responde”.</dd>
+<dt>port</dt>
+<dd>A porta do Service, a que o cliente usa. <code>80</code> é o padrão do HTTP; o nome
+<code>http</code> é opcional, mas ajuda quando há mais de uma.</dd>
+<dt>targetPort</dt>
+<dd>A porta do container, para onde o tráfego é encaminhado. É o <code>8080</code> do site. Se estiver
+errada, o endpoint aparece — e a conexão é recusada, o que confunde muito mais.</dd>
+<dt>Endpoints</dt>
+<dd>O objeto que o Kubernetes mantém com os IPs e portas dos pods que casam com o seletor. O
+<code>kubectl get endpoints</code> mostra a lista; vazia, é sinal de seletor errado ou de pod não
+pronto.</dd>
+</dl>
+
+<h2>7. Conferindo com o painel e com o cluster</h2>
+
+<p>Com os três passos aplicados num cluster de verdade, a conferência é sempre a mesma sequência: ver os
+pods, ver os endpoints, ver o Service. Se os três concordam, a aplicação está montada. A transcrição abaixo
+é de um cluster local de três nós, com a aplicação aplicada de uma vez (é o manifesto completo, que você
+monta juntando as três caixas):</p>
+
+<pre class="term">ana@notebook:~$ kubectl get all
+NAME                            READY   STATUS    RESTARTS   AGE
+pod/cardapio-6d8f89b786-88dn9   1/1     Running   0          4m
+pod/cardapio-6d8f89b786-lq2xk   1/1     Running   0          4m
+
+NAME                 TYPE        CLUSTER-IP    EXTERNAL-IP   PORT(S)   AGE
+service/cardapio     ClusterIP   10.96.147.79  none          80/TCP    4m
+service/kubernetes   ClusterIP   10.96.0.1     none          443/TCP   12d
+
+NAME                       READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/cardapio   2/2     2            2           4m
+
+ana@notebook:~$ kubectl get endpoints cardapio
+NAME       ENDPOINTS                                AGE
+cardapio   10.244.111.241:8080,10.244.56.236:8080   4m</pre>
+
+<p>Repare no que o <code>get all</code> <em>não</em> mostra: o ConfigMap e o Secret. “All” é um apelido
+para alguns tipos, não para todos — e é por isso que quem confere configuração lista
+<code>configmaps</code> e <code>secrets</code> à parte. A aplicação tem quatro peças; o comando mostra
+duas.</p>
+
+<p>A segunda conferência é no Service, e ela responde “quem está do outro lado?”:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe service cardapio
+Name:              cardapio
+Namespace:         default
+Labels:            &lt;none&gt;
+Annotations:       &lt;none&gt;
+Selector:          app=cardapio
+Type:              ClusterIP
+IP:                10.96.147.79
+Port:              http  80/TCP
+TargetPort:        8080/TCP
+Endpoints:         10.244.111.241:8080,10.244.56.236:8080
+Session Affinity:  None
+Events:            &lt;none&gt;</pre>
+
+<p>As duas linhas que você aprende a ler primeiro são <code>Selector</code> e <code>Endpoints</code>. Se o
+seletor está certo e os endpoints estão preenchidos, o caminho interno funciona. Se o seletor está certo e
+os endpoints estão vazios, o problema é do pod (não está pronto, não tem a etiqueta). Se os endpoints estão
+preenchidos e o cliente recebe erro, o problema é de porta — quase sempre o
+<code>targetPort</code>.</p>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Os cinco tropeços abaixo são os que aparecem em quase toda aplicação nova. Todos têm a mesma forma: o
+manifesto é aceito, o objeto é criado, e o erro aparece mais tarde, em outro lugar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>sintoma</th><th>causa</th><th>conserto</th></tr>
+</thead>
+<tbody>
+<tr><td>pod em <code>CreateContainerConfigError</code></td><td>o ConfigMap ou o Secret referenciado não
+existe, ou o nome está errado</td><td>conferir o <code>name</code> do <code>envFrom</code> contra o nome do
+objeto</td></tr>
+<tr><td>endpoints vazios, site no ar</td><td>seletor do Service não casa com as etiquetas do pod</td><td>
+comparar <code>spec.selector</code> com <code>spec.template.metadata.labels</code></td></tr>
+<tr><td>endpoint preenchido e conexão recusada</td><td><code>targetPort</code> diferente da porta que o
+programa escuta</td><td>alinhar <code>targetPort</code> com <code>containerPort</code></td></tr>
+<tr><td>variável com valor antigo</td><td>o pod não foi recriado depois de mudar o ConfigMap</td><td>
+<code>kubectl rollout restart deployment/cardapio</code></td></tr>
+<tr><td>senha legível por qualquer um</td><td>o segredo foi para o ConfigMap</td><td>mover para um Secret e
+restringir leitura com RBAC</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O primeiro merece uma transcrição, porque é o erro que mais assusta quem está começando: o pod não sobe e
+o <code>kubectl get pods</code> mostra um status comprido e feio. A causa está nos eventos, no fim do
+<code>describe</code>:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe pod cardapio-6d8f89b786-88dn9
+Name:             cardapio-6d8f89b786-88dn9
+Namespace:        default
+Status:           Pending
+Containers:
+  web:
+    Image:          cardapio:1.0
+    State:          Waiting
+      Reason:       CreateContainerConfigError
+    Ready:          False
+    Restart Count:  0
+    Environment Variables from:
+      cardapio-conf   ConfigMap  Optional: false
+    Environment:      &lt;none&gt;
+Events:
+  Type     Reason     Age                From               Message
+  ----     ------     ----               ----               -------
+  Normal   Scheduled  46s                default-scheduler  Successfully assigned default/cardapio-6d8f89b786-88dn9 to guia-worker
+  Normal   Pulled     14s (x4 over 44s)  kubelet            Container image "cardapio:1.0" already present on machine
+  Warning  Failed     14s (x4 over 44s)  kubelet            Error: configmap "cardapio-conf" not found</pre>
+
+<p>A última linha diz tudo: <code>Error: configmap "cardapio-conf" not found</code>. O manifesto pedia
+<code>cardapio-conf</code>; o objeto se chama <code>cardapio-config</code>. Duas letras, quarenta minutos de
+procura. O hábito que resolve: quando um erro citar um nome, compare letra por letra com o
+<code>metadata.name</code> do objeto — não com o que você lembra de ter escrito.</p>
+
+<p>Sobre o <code>stringData</code>: ele existe e é um atalho real (você escreve o valor em texto e o
+servidor converte para base64 ao gravar). Neste painel, porém, o Secret criado com <code>stringData</code>
+aparece com <code>DATA 0</code> na tabela, o que confunde. Nas caixas, use <code>data</code> com base64; no
+cluster, os dois caminhos funcionam.</p>
+
+<div class="cenario">
+<h3>Cenário 1: o preço que voltou ao antigo</h3>
+<p>A Ana mudou o <code>PRECO_PAO</code> no ConfigMap às oito da manhã e o site continuou vendendo pelo preço
+velho. O objeto estava certo — mas o container lê <code>envFrom</code> uma vez, ao iniciar, e os pods eram de
+ontem. O conserto foi <code>kubectl rollout restart deployment/cardapio</code>: pods novos, variáveis novas,
+preço novo. A lição: ConfigMap atualizado não é variável atualizada.</p>
+</div>
+<div class="cenario">
+<h3>Cenário 2: o site novo que ninguém achava</h3>
+<p>O Deploy entrou na sexta, os pods subiram em <code>Running</code>, o monitoramento ficou verde — e os
+clientes recebiam erro. O seletor do Service procurava <code>app: cardapio-web</code>; o manifesto novo
+etiquetava os pods como <code>app: cardapio</code>. Os endpoints ficaram vazios por três dias porque ninguém
+olhou a coluna <code>ENDPOINTS</code>: todo mundo conferia pods, ninguém conferia o encontro entre Service e
+pod.</p>
+</div>
+<div class="cenario">
+<h3>Cenário 3: a senha que apareceu no chamado</h3>
+<p>Para “resolver rápido”, a senha do banco foi para o ConfigMap. Duas semanas depois, alguém colou a saída
+de <code>kubectl get configmap cardapio-config -o yaml</code> num chamado de suporte aberto para a empresa
+inteira. A senha foi trocada no mesmo dia e o ConfigMap virou Secret — mas o custo real foi o tempo de
+descobrir todos os lugares onde aquela senha tinha sido copiada.</p>
+</div>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>A aplicação completa é a soma de quatro decisões pequenas. A primeira: o que muda não mora na imagem. A
+segunda: segredo mora em Secret, e Secret sem RBAC é só um arquivo com nome bonito. A terceira: quem
+mantém cópias é o Deployment, e ele recria pods com nomes novos, então nenhum cliente pode depender do nome
+de um pod. A quarta: quem dá endereço fixo é o Service, e ele acha os pods por etiqueta, não por IP.</p>
+
+<p>Para praticar sozinho, três exercícios de verdade: (1) acrescente <code>HORARIO</code> ao ConfigMap,
+recrie os pods e leia a variável de dentro do container com <code>kubectl exec</code> — o painel responde de
+forma curta e explicativa para esse comando, porque ele não roda container; (2) troque o
+<code>targetPort</code> do Service para 80 e veja os endpoints mudarem de porta sem o site cair; (3) apague
+um pod com <code>kubectl delete pod</code> e observe o Deployment criar outro, com nome novo e o mesmo
+endereço no Service.</p>
+
+<p>O que o painel prova e o que ele não prova, para você não se enganar: ele prova o manifesto aceito, os
+objetos criados, os campos no lugar e os endpoints calculados a partir das etiquetas. Ele não roda
+container, não baixa imagem e não tem rede — então “o site responde” é uma conclusão do seu cluster, não
+dele. Essa separação é a mesma da vida real: o <code>kubectl</code> diz o que o cluster aceitou; quem diz se
+o cliente é atendido é o cliente.</p>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. Qual é a ordem certa de aplicar as peças?</p>
+<label><input type="radio" name="q1"> Service, Deployment, ConfigMap, Secret</label>
+<label><input type="radio" name="q1"> Deployment, Service, Secret, ConfigMap</label>
+<label><input type="radio" name="q1"> ConfigMap e Secret, Deployment, Service</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">2. O que o <code>envFrom</code> faz?</p>
+<label><input type="radio" name="q2"> copia o conteúdo do ConfigMap para dentro da imagem</label>
+<label><input type="radio" name="q2"> transforma todas as chaves do ConfigMap ou do Secret em variáveis de
+ambiente do container</label>
+<label><input type="radio" name="q2"> monta o ConfigMap como arquivo em <code>/etc/config</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O Service está criado e os endpoints estão
+<code>&lt;none&gt;</code>. Onde olhar primeiro?</p>
+<label><input type="radio" name="q3"> no <code>spec.selector</code> do Service comparado com as etiquetas
+dos pods</label>
+<label><input type="radio" name="q3"> no <code>targetPort</code>, que sempre é a causa</label>
+<label><input type="radio" name="q3"> na quantidade de réplicas do Deployment</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a porta que o Service encaminha</h2>
+<p>O site da Ana escuta na 8080, e o Service atende na 80. Complete o campo do Service que diz para qual
+porta do container o tráfego vai.</p>
+<div class="ex-code">ports:
+  - port: 80
+    <input aria-label="resposta 1" data-answer="targetPort" placeholder="...">: 8080</div>
+<p class="ex-dica">Dica: <code>port</code> é a porta do Service (a que o cliente usa);
+<code>_____</code> é a porta do container (a que o programa escuta).</p>
+</div>
+
+<h2>Resumo</h2>
+
+<p>A aplicação completa são quatro peças e uma ordem. O ConfigMap guarda o que muda (preço, horário); o
+Secret guarda o que é segredo, com as chaves em base64 dentro de <code>data</code>; o Deployment mantém as
+cópias do site no ar e lê os dois com <code>envFrom</code>; o Service dá o endereço fixo e acha os pods por
+etiqueta, mantendo a lista de endpoints.</p>
+
+<p>A ordem é ConfigMap e Secret, depois Deployment, depois Service. Inverter não gera erro no
+<code>apply</code> — gera um sistema meio montado, com pod em <code>CreateContainerConfigError</code> ou
+Service sem endpoints. Conferir é sempre a mesma sequência: pods em <code>Running</code>, endpoints
+preenchidos, <code>describe service</code> com seletor e endpoints coerentes.</p>
+
+<p>Os cinco tropeços valem como lista de bolso: nome do ConfigMap errado, seletor que não casa,
+<code>targetPort</code> diferente da porta do programa, variável que não atualiza porque o pod não foi
+recriado, e senha que foi parar no ConfigMap. Todos aparecem depois do “created”, todos se resolvem olhando
+o objeto certo.</p>
+
+<p>Com a aplicação de pé, o próximo passo é o banco: um lugar onde os dados não podem sumir quando o pod
+morre. É o assunto do próximo projeto — StatefulSet, Service headless e um volume por réplica.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>A ordem é: configuração e segredo, Deployment, Service.</li>
+  <li><code>envFrom</code> injeta todas as chaves; a última fonte da lista vence em caso de nome
+  repetido.</li>
+  <li>Endpoint vazio = seletor errado ou pod não pronto; conexão recusada com endpoint cheio =
+  <code>targetPort</code>.</li>
+  <li>O painel prova o manifesto e os objetos; quem prova o site no ar é o cluster.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

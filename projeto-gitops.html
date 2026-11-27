@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitOps: o Git como fonte da verdade | Guia Kubernetes</title>
+<meta name="description" content="Projeto de GitOps na padaria: versionar o chart e o values da loja, sincronizar com o Argo CD, causar e desfazer o drift e destravar o OutOfSync com o painel respondendo.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>GitOps: o <span class="hl">Git</span> como fonte da verdade</h1>
+<p class="intro">A Ana já entendeu o conceito de GitOps: o repositório manda e o cluster obedece. Entender
+não é o mesmo que ter. Neste projeto ela monta o fluxo inteiro da padaria — o chart e o values da loja
+versionados, a <code>Application</code> que amarra o repositório ao namespace, o primeiro sync — e depois
+faz o que separa GitOps de conversa: causa um drift de propósito, desfaz, e destrava um
+<code>OutOfSync</code> que não quer sair. No fim, o cluster vira descartável: se ele sumir hoje, o
+repositório reergue tudo amanhã.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Como separar o que é repositório do que é cluster, e por que isso muda a rotina do time.</li>
+  <li>A <code>Application</code> do Argo CD campo por campo: origem, destino e política.</li>
+  <li>O <code>values.yaml</code> como painel de botões do chart, e o manifesto como consequência dele.</li>
+  <li>O drift que um <code>kubectl</code> na mão provoca — e o tamanho do estrago.</li>
+  <li>O que o sync aplica, o que o <code>prune</code> apaga e o que o <code>selfHeal</code> devolve.</li>
+  <li>A rotina de conferência com <code>argocd app get</code>, <code>diff</code> e <code>history</code>.</li>
+  <li>Os cinco tropeços que mantêm um app em <code>OutOfSync</code> para sempre.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>No fim deste projeto, a padaria tem três peças que conversam sozinhas. A primeira é o
+<strong>repositório</strong> <code>git.loja.test/padaria/site.git</code>, com o chart do Helm em
+<code>chart/loja</code> e os valores de produção em <code>values-producao.yaml</code>. A segunda é a
+<strong>Application</strong> <code>loja</code>, o objeto que diz ao Argo CD “olhe esta pasta deste
+repositório e deixe o namespace <code>padaria</code> igual a ela”. A terceira é o <strong>cluster</strong>,
+que passa a ser consequência das duas primeiras — e não mais o lugar onde alguém digita comandos.</p>
+
+<p>Vale desenhar a imagem mental, porque ela resolve a maioria das dúvidas antes de aparecerem. Uma única
+seta: o commit entra no repositório, o Argo CD lê o repositório, o Argo CD escreve no cluster. A seta só
+aponta para um lado. Quando alguém muda o cluster na mão, o GitOps não importa a mudança para o
+repositório: ele apaga a mudança. Essa assimetria é o coração do assunto.</p>
+
+<p>O teste de fogo é cruel de propósito: <code>kind delete cluster</code>,
+<code>kind create cluster</code>, instalar o Argo CD, aplicar a <code>Application</code> e esperar. Se a
+loja volta igual — mesma imagem, mesmas réplicas, mesmo Service —, o repositório é fonte da verdade. Se
+volta “quase”, o que faltou é exatamente o que falta versionar.</p>
+
+<h2>2. O cenário da padaria</h2>
+
+<p>Na sexta-feira o time da Ana publicou a versão <code>1.4.0</code> do cardápio. O commit entrou, a
+imagem foi construída, e alguém desligou o sync automático do Argo CD “só até o fim do mutirão”. O mutirão
+acabou, o sync ficou desligado, e ninguém lembrou. O repositório dizia <code>cardapio:1.4.0</code> com três
+réplicas; o cluster continuou com <code>cardapio:1.0.0</code> e duas.</p>
+
+<p>No sábado, o filho da Ana quis testar a imagem nova e fez o que qualquer pessoa faria:
+<code>kubectl set image</code> com uma tag de teste e <code>kubectl scale</code> para cinco réplicas, para
+“ver se aguenta”. Funcionou. Ele foi almoçar. Na segunda-feira, a tela do Argo CD mostrava
+<code>OutOfSync</code> em vermelho, o cluster tinha cinco pods rodando uma imagem que não existe em lugar
+nenhum do repositório, e ninguém sabia dizer qual era a versão “oficial” do site.</p>
+
+<p>O problema não foi o teste do sábado — testar é legítimo. O problema foi o teste não ter passado pelo
+repositório. Com GitOps, o cluster é considerado errado até prova em contrário, e a prova é o
+repositório.</p>
+
+<h2>3. Antes de começar</h2>
+
+<p>Você precisa de três coisas prontas: o cluster do curso respondendo, o <code>kubectl</code>
+configurado e o Argo CD instalado no namespace <code>argocd</code> — a aula de
+<a href="gitops-argocd.html">GitOps</a> mostrou como; aqui a gente usa. O Helm entra só para renderizar o
+chart localmente e ver o que ele produz antes de publicar.</p>
+
+<p>O contrato do projeto é uma única <code>Application</code>. Ela não guarda manifesto nenhum: guarda
+<em>onde</em> está o manifesto e <em>para onde</em> ele vai. O arquivo abaixo é o do projeto — repare que
+o time migrou a pasta de YAML solto para um chart, e a origem agora aponta para <code>chart/loja</code>:</p>
+
+<pre class="file" data-file="application-loja.yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loja
+  namespace: argocd
+spec:
+  project: padaria
+  source:
+    repoURL: https://git.loja.test/padaria/site.git
+    targetRevision: main
+    path: chart/loja
+    helm:
+      valueFiles:
+        - values-producao.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: padaria
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true</pre>
+
+<dl class="anatomy">
+<dt>source</dt>
+<dd>De onde vem o manifesto: o repositório, o ramo e a pasta. Sem isso o Argo não tem o que aplicar.</dd>
+<dt>targetRevision</dt>
+<dd>Qual ponto do repositório acompanhar: <code>main</code>, uma tag ou um commit. É o campo que
+congela a versão quando você quer estabilidade.</dd>
+<dt>path</dt>
+<dd>A pasta dentro do repositório. Aqui é o chart; o Argo renderiza o chart com os values antes de
+aplicar.</dd>
+<dt>helm.valueFiles</dt>
+<dd>Os arquivos de valores que o Argo passa ao chart. É o “botão de produção” do <code>helm
+install</code>, só que versionado.</dd>
+<dt>destination</dt>
+<dd>Onde aplicar: o cluster (<code>kubernetes.default.svc</code> é o próprio cluster) e o namespace de
+destino.</dd>
+<dt>syncPolicy.automated</dt>
+<dd>Como aplicar: <code>prune</code> apaga do cluster o que saiu do repositório e
+<code>selfHeal</code> desfaz mudança feita na mão.</dd>
+</dl>
+
+<p>Com a <code>Application</code> aplicada e o sync ligado, o <code>argocd app get</code> é a foto do
+contrato funcionando. Esta é a transcrição de um cluster de prova do guia — o painel das caixas não tem
+Argo CD instalado, então essa saída não vem dele:</p>
+
+<pre class="term">ana@notebook:~$ argocd app get loja
+Name:               argocd/loja
+Project:            padaria
+Server:             https://kubernetes.default.svc
+Namespace:          padaria
+URL:                https://argocd.loja.test/applications/loja
+Repo:               https://git.loja.test/padaria/site.git
+Target:             main
+Path:               chart/loja
+Sync Policy:        Automated (Prune)
+Sync Status:        Synced to main (9f3c1a2)
+Health Status:      Healthy
+
+GROUP  KIND        NAMESPACE  NAME      STATUS  HEALTH   MESSAGE
+       Service     padaria    cardapio  Synced  Healthy  service/cardapio unchanged
+apps   Deployment  padaria    cardapio  Synced  Healthy  deployment.apps/cardapio unchanged</pre>
+
+<p>Leia as três linhas do topo. <code>Synced to main</code> com o commit <code>9f3c1a2</code> entre
+parênteses é o Argo dizendo “o cluster está igual a este ponto do repositório”. <code>Healthy</code> é
+outra pergunta: as réplicas estão de pé e respondendo. As duas podem discordar — dá para estar
+<code>Synced</code> e <code>Degraded</code> ao mesmo tempo.</p>
+
+<h2>4. Passo 1 — o values no repositório</h2>
+
+<p>O chart é o molde; o values é o painel de botões. Tudo o que muda entre um release e outro está nos
+valores, e o manifesto no cluster é o resultado da conta. O arquivo abaixo é o
+<code>values-producao.yaml</code> do projeto: três réplicas e a tag <code>1.4.0</code>.</p>
+
+<pre class="file" data-file="values-producao.yaml">replicaCount: 3
+
+image:
+  repository: cardapio
+  tag: "1.4.0"
+
+service:
+  port: 80
+  targetPort: 8080
+
+ingress:
+  host: loja.test</pre>
+
+<dl class="anatomy">
+<dt>replicaCount</dt>
+<dd>Quantas cópias do pod o Deployment deve ter. Vira o campo <code>spec.replicas</code> do manifesto
+renderizado.</dd>
+<dt>image.repository</dt>
+<dd>O nome da imagem, sem a tag: <code>cardapio</code>. O chart junta com o registro quando você usa um
+registro privado.</dd>
+<dt>image.tag</dt>
+<dd>A versão publicada. É o campo que mais muda e o que mais causa confusão: tag igual a
+<code>latest</code> esconde a versão em uso.</dd>
+<dt>service.port</dt>
+<dd>A porta que o Service expõe para os outros pods do cluster.</dd>
+<dt>ingress.host</dt>
+<dd>O endereço público do site. Fica no values porque muda entre produção e teste, e não no
+template.</dd>
+</dl>
+
+<p>O exercício do passo 1 é fazer a conta que o Argo faz: olhar o values e escrever o Deployment
+correspondente. A caixa começa com o manifesto do release anterior — a tag <code>1.0.0</code> e duas
+réplicas —, que é o que o chart gerou da última vez que o sync rodou. Os valores já mudaram no
+repositório; o manifesto ainda não.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/cardapio|spec.replicas=3;;campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:1.4.0;;campo:Deployment/cardapio|spec.template.metadata.labels.version=1.4.0;;pronto:Deployment/cardapio=3">
+  <p class="try-task">O <code>values-producao.yaml</code> diz <code>replicaCount: 3</code> e
+  <code>tag: "1.4.0"</code>. Ajuste o Deployment para ser o que o chart renderizaria agora: três réplicas,
+  a imagem <code>cardapio:1.4.0</code> e a label <code>version</code> em <code>"1.4.0"</code> nos dois
+  lugares.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    version: "1.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        version: "1.0.0"
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    version: "1.4.0"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+        version: "1.4.0"
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.4.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>O painel mostra <code>cardapio 3/3</code> e a linha <code>deployment.apps/cardapio created</code>.
+Você não “instalou” nada: descreveu o resultado e o cluster correu atrás. E a label <code>version</code>
+é o que responde, daqui a três semanas, qual versão está no ar sem abrir o repositório. Num chart de
+verdade ela se chama <code>app.kubernetes.io/version</code>; aqui está encurtada só para caber na meta do
+painel, que lê caminhos separados por ponto.</p>
+
+<p>E vale dizer o que essa caixa <em>não</em> faz, porque o assunto depende disso: ela não renderiza
+Helm nem lê repositório. O manifesto que você editou é o que o chart produziria. Quem renderiza de verdade
+é o Argo CD, na hora do sync, com o <code>helm template</code> por baixo.</p>
+
+<h2>5. Passo 2 — o drift causado na mão</h2>
+
+<p>Agora a parte que dói. A caixa abaixo começa no cluster que o último sync deixou: <code>1.0.0</code>
+com duas réplicas. Os primeiros comandos são o que o filho da Ana fez no sábado —
+<code>scale</code> para cinco e <code>set image</code> para uma tag de teste. Rode assim e olhe o resultado:
+o cluster fica com cinco pods de uma imagem que não está em lugar nenhum do repositório. É o drift, e ele
+não avisa.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="campo:Deployment/cardapio|spec.replicas=3;;campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:1.4.0;;texto:successfully rolled out">
+  <p class="try-task">Os quatro primeiros comandos causam o drift: cinco réplicas e a imagem
+  <code>cardapio:9.9.9</code>. Complete o roteiro com o que o Argo faria no próximo sync — voltar para
+  <code>3</code> réplicas e <code>cardapio:1.4.0</code>, conferindo com <code>rollout status</code> — e
+  rode.</p>
+<pre class="yaml">kubectl get deployment cardapio
+kubectl scale deployment/cardapio --replicas=5
+kubectl set image deployment/cardapio web=cardapio:9.9.9
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get deployment cardapio
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+
+ana@notebook:~$ kubectl scale deployment/cardapio --replicas=5
+deployment.apps/cardapio scaled
+
+ana@notebook:~$ kubectl set image deployment/cardapio web=cardapio:9.9.9
+deployment.apps/cardapio image updated
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-qpfv2txs4x-57qln   1/1     Running   0          4m
+cardapio-qpfv2txs4x-cgp2l   1/1     Running   0          3m
+cardapio-qpfv2txs4x-hwkc4   1/1     Running   0          2m
+cardapio-qpfv2txs4x-sx9rw   1/1     Running   0          4m
+cardapio-qpfv2txs4x-trt5g   1/1     Running   0          5m
+</pre>
+<pre class="solucao">kubectl get deployment cardapio
+kubectl scale deployment/cardapio --replicas=5
+kubectl set image deployment/cardapio web=cardapio:9.9.9
+kubectl get pods
+kubectl scale deployment/cardapio --replicas=3
+kubectl set image deployment/cardapio web=cardapio:1.4.0
+kubectl rollout status deployment/cardapio
+kubectl get deployment cardapio</pre>
+</div>
+
+<p>O que aconteceu, em ordem. O <code>get</code> mostrou <code>2/2</code>: o cluster estava como o
+repositório mandava, só desatualizado. O <code>scale</code> mudou o número no objeto vivo — não no
+repositório — e o <code>set image</code> fez o mesmo com a imagem. O <code>get pods</code> mostrou cinco
+pods em <code>Running</code>, todos sorrindo: nada no cluster acha que está errado. É por isso que drift é
+perigoso — ele não gera erro, gera um site que funciona com a versão errada.</p>
+
+<p>Os quatro comandos do fim são o papel do Argo CD. <code>scale</code> de volta para três,
+<code>set image</code> de volta para <code>1.4.0</code> — e o <code>rollout status</code> respondendo
+<code>successfully rolled out</code>, que é o cluster confirmando que chegou onde devia. Num cluster com
+<code>selfHeal: true</code> você <strong>não digitaria nada disso</strong>: o controlador compararia o vivo
+com o repositório e desfaria o drift em poucos minutos.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Está no Git</th><th>Está no cluster</th></tr>
+</thead>
+<tbody>
+<tr><td>quem manda</td><td>sim: é a fonte da verdade</td><td>não: é consequência</td></tr>
+<tr><td>como muda</td><td>commit, revisão, pull request</td><td>sync do Argo CD — ou um <code>kubectl</code> que será desfeito</td></tr>
+<tr><td>quem enxerga a mudança</td><td>todo mundo, com autor e data</td><td>só quem está olhando o cluster naquele minuto</td></tr>
+<tr><td>como volta atrás</td><td><code>git revert</code> do commit</td><td><code>argocd app rollback</code> ou <code>sync</code> de novo</td></tr>
+<tr><td>se sumir</td><td>continua lá, inteiro</td><td>é recriado a partir do Git</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A última linha da tabela justifica o projeto inteiro. Um cluster que pode ser apagado sem perda não é
+um risco: é um ativo descartável. Um cluster que guarda coisas que só existem nele é o contrário — cada
+dia mais difícil de reproduzir.</p>
+
+<h2>6. Passo 3 — o que o Argo sincroniza</h2>
+
+<p>O Deployment é só o primeiro objeto da pasta. Um app leva vários, e o sync aplica todos na mesma
+passada: Deployment, Service, ConfigMap, HPA, Ingress. Se um está no repositório e não no cluster, o Argo
+cria; se está nos dois e diferente, corrige; se está no cluster e não no repositório, o
+<code>prune</code> apaga. É esse terceiro caso que derruba gente.</p>
+
+<p>A caixa abaixo conta a história ao contrário: um Service aplicado na mão, fora do repositório, com o
+seletor errado. Os pods estão etiquetados <code>app: cardapio</code>, mas o Service procura
+<code>app: vitrine</code> — ninguém atende ao chamado e o site fica sem tráfego, com todos os pods em
+<code>Running</code>. É o hotfix que alguém faz às três da manhã e esquece de commitar.</p>
+
+<div class="tryk8s" data-cenario="padaria" data-get="endpoints" data-goal="campo:Service/cardapio|spec.selector.app=cardapio;;texto::8080">
+  <p class="try-task">Este é o <code>hotfix.yaml</code> que nunca entrou no repositório. O Service aponta
+  para <code>app: vitrine</code> e o painel mostra <code>&lt;none&gt;</code> em ENDPOINTS. Alinhe o seletor
+  com a etiqueta dos pods do Deployment e rode: os IPs têm de aparecer com a porta 8080.</p>
+<pre class="yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  type: ClusterIP
+  selector:
+    app: vitrine
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+<pre class="out">
+service/cardapio configured
+
+NAME       ENDPOINTS   AGE
+cardapio   &lt;none&gt;      2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  type: ClusterIP
+  selector:
+    app: cardapio
+  ports:
+    - port: 80
+      targetPort: 8080</pre>
+</div>
+
+<p>Repare em dois detalhes do painel. Com o seletor errado, a primeira linha é
+<code>service/cardapio configured</code> — o cluster aceitou o manifesto e mudou o objeto, sem discutir. É
+o que o <code>kubectl apply</code> faz: aplica e cala. A tabela de endpoints mostra
+<code>&lt;none&gt;</code>, e é ali que o problema aparece, não no apply. Com o seletor certo, os IPs com
+<code>:8080</code> aparecem.</p>
+
+<p>O segundo detalhe é a palavra <code>unchanged</code>, que aparece em vez de <code>configured</code>
+quando o manifesto já é igual ao que existe. Na caixa, a solução mostra <code>unchanged</code> porque o
+painel recomeça do cluster de exemplo a cada Rodar e esse Service já estava certo; num cluster com o
+hotfix aplicado, você veria <code>configured</code> e os endpoints voltando.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Objeto</th><th>O que o sync garante</th><th>O que ele não faz</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Deployment</code></td><td>réplicas, imagem e labels iguais ao repositório</td><td>não garante que a imagem existe no registro</td></tr>
+<tr><td><code>Service</code></td><td>portas e seletor iguais ao repositório</td><td>não garante que existe pod com a etiqueta</td></tr>
+<tr><td><code>ConfigMap</code></td><td>os dados estão no cluster, com o conteúdo do commit</td><td>não reinicia pod sozinho ao mudar</td></tr>
+<tr><td><code>Ingress</code></td><td>host e rotas como estão no manifesto</td><td>não garante DNS, certificado nem controlador</td></tr>
+<tr><td><code>HPA</code></td><td>metas e limites como estão no manifesto</td><td>não garante que o metrics-server exista</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A coluna da direita separa “sincronizado” de “funcionando”. O Argo é ótimo em deixar o cluster igual
+ao repositório e péssimo em saber se o programa responde — para isso existem probes, endpoints e métricas.
+Site fora do ar com tudo <code>Synced</code> é problema de aplicação; com algo <code>OutOfSync</code>, é
+de sincronização.</p>
+
+<h2>7. Conferindo com o painel</h2>
+
+<p>A conferência tem quatro perguntas, da mais ampla para a mais estreita: o app está sincronizado? o que
+difere? o cluster tem os objetos e os IPs? o que mudou de um sync para o outro? As três primeiras saem do
+<code>argocd</code> e do <code>kubectl</code>; a última, do histórico.</p>
+
+<p>A pergunta “o que difere?” é a mais útil e a menos usada. O <code>argocd app diff</code> mostra o
+vivo e o desejado lado a lado — e é isso que transforma “está vermelho” em “duas réplicas e uma tag”.
+Esta é a transcrição de um cluster de prova do guia:</p>
+
+<pre class="term">ana@notebook:~$ argocd app diff loja
+===== apps/Deployment padaria/cardapio ======
+--- live
++++ target
+ spec:
+-  replicas: 2
++  replicas: 3
+   template:
+     spec:
+       containers:
+-        - image: cardapio:1.0.0
++        - image: cardapio:1.4.0</pre>
+
+<p>O sinal de menos é “está no cluster”; o de mais, “está no repositório”. Duas linhas de diferença, dois
+campos, um conserto: sincronizar. Se o diff mostrasse um <code>Service</code> inteiro ou um
+<code>ConfigMap</code> que ninguém escreveu, a pergunta mudaria de “sincronizar” para “quem criou isso e
+por quê”.</p>
+
+<p>No painel das caixas, os comandos <code>argocd</code> não existem: não há Argo CD no simulador, e o
+objeto <code>Application</code> nem é um tipo conhecido lá. O painel mostra o <em>resultado</em> do sync no
+cluster — que é o que interessa. Por isso as caixas usam <code>kubectl</code>, e as saídas do
+<code>argocd</code> aparecem como transcrição, com o aviso em cima.</p>
+
+<p>A rotina completa, para colar no mural:</p>
+
+<pre class="file" data-file="rotina-gitops.sh">argocd app get loja
+argocd app diff loja
+kubectl get deployment,pods -n padaria
+kubectl get endpoints cardapio -n padaria</pre>
+
+<p>O primeiro diz o estado e o commit de origem; o segundo, o que difere; o terceiro, se os pods existem
+e quantos estão prontos; o quarto, se o Service entrega tráfego. Quando o primeiro diz <code>Synced</code>
+e o site não responde, o problema é da aplicação — vale voltar às aulas de
+<a href="readiness-probe.html">readiness</a> e de <a href="endpoints.html">endpoints</a>.</p>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Quase todo <code>OutOfSync</code> que não sai cai em um dos casos abaixo. O primeiro é o
+<code>targetRevision</code> num ramo que não recebe mais commit: o Argo mostra <code>Synced</code> com um
+ponto antigo, e o cluster é que está velho. O segundo é o <code>path</code> errado — a pasta mudou de nome
+e o Argo responde <code>app path does not exist</code>. O terceiro é o namespace ausente com
+<code>CreateNamespace=true</code> de fora: <code>namespaces "padaria" not found</code>.</p>
+
+<p>O quarto é o mais silencioso: <code>selfHeal</code> desligado — o drift dura para sempre e o Argo só
+avisa. O quinto assusta mais: <code>prune</code> ligado num app que aponta para uma pasta incompleta apaga
+do cluster o que não está no repositório sem perguntar, inclusive um Secret criado à mão. Antes de ligar
+<code>prune</code>, confira se tudo o que precisa existir está versionado.</p>
+
+<pre class="term">ana@notebook:~$ argocd app history loja
+ID  DATE                         REVISION
+0   2026-11-20 09:12:44 +0000    main (1b2c3d4)
+1   2026-11-24 18:40:02 +0000    main (8e7f6a5)
+2   2026-11-27 07:05:11 +0000    main (9f3c1a2)
+
+ana@notebook:~$ argocd app rollback loja 1
+Name:               argocd/loja
+Sync Status:        Synced to main (8e7f6a5)
+Health Status:      Healthy</pre>
+
+<p>O <code>history</code> resolve a pergunta que mais trava um incidente: “o que estava no ar quando
+funcionava?”. O <code>rollback</code> volta o cluster a um desses pontos sem tocar no repositório — é
+remédio, não cura. Enquanto o commit problemático continuar no <code>main</code>, o próximo sync traz o
+problema de volta; a cura é o <code>git revert</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pista no painel</th><th>Causa provável</th><th>Primeiro comando</th></tr>
+</thead>
+<tbody>
+<tr><td><code>OutOfSync</code> que volta sozinho</td><td>alguém mexendo na mão, ou outro controlador escrevendo no mesmo objeto</td><td><code>argocd app diff loja</code></td></tr>
+<tr><td><code>Synced</code> e o site velho</td><td><code>targetRevision</code> num ramo parado</td><td><code>argocd app get loja</code></td></tr>
+<tr><td><code>app path does not exist</code></td><td>pasta errada ou commit sem o arquivo</td><td><code>git show --stat HEAD</code></td></tr>
+<tr><td><code>namespaces "padaria" not found</code></td><td>namespace ausente e sem <code>CreateNamespace</code></td><td><code>kubectl get ns</code></td></tr>
+<tr><td><code>SyncError</code> em um <code>ConfigMap</code></td><td>manifesto inválido no repositório</td><td><code>kubectl apply --dry-run=server -f</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="cenario">
+<h3>Cenário 1: o hotfix que ninguém commitou</h3>
+<p>Às três da manhã o disco encheu e o time subiu o limite de memória na mão, direto no Deployment. O
+site voltou, todo mundo dormiu, e o commit nunca veio. Na semana seguinte o <code>selfHeal</code> devolveu
+o limite antigo e o disco encheu de novo — às três da manhã. A correção não é desligar o
+<code>selfHeal</code>: é fazer do hotfix um commit. Emergência sem commit é dívida com juros.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o prune que apagou o Secret</h3>
+<p>O Secret da senha do banco foi criado à mão e nunca entrou no repositório. No dia em que o time ligou
+<code>prune: true</code> para limpar objetos órfãos, o Argo fez o que prometia: apagou tudo o que não
+estava no Git — Secret incluído. A lição: versionar o Secret (ainda que cifrado) ou marcá-lo com a
+anotação que pede ao Argo para ignorá-lo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o app que estava sincronizado com o ramo errado</h3>
+<p>A <code>Application</code> foi criada com <code>targetRevision: develop</code> e copiada para produção
+sem trocar o campo. Meses depois o <code>argocd app get</code> dizia <code>Synced</code> em verde e o site
+mostrava features que ninguém tinha aprovado. Nada estava quebrado — estava sincronizado com o lugar
+errado.</p>
+</div>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>Você montou o laço inteiro: o chart e o values versionados, a <code>Application</code> amarrando
+repositório e namespace, o sync aplicando, o drift aparecendo e sendo desfeito. O que ficou não é a
+memória dos comandos — é a ordem de autoridade. O repositório decide; o cluster obedece; quem digita
+<code>kubectl</code> na mão está criando uma dívida que o próximo sync cobra. E o teste de fogo continua
+valendo: se o cluster sumir hoje, ele volta do Git?</p>
+
+<p>Para continuar sozinho, três caminhos naturais. O primeiro é trocar o botão do sync por um pipeline que
+abre um pull request no <code>values-producao.yaml</code> quando sai imagem nova — é GitOps com revisão
+humana. O segundo é o <a href="kustomize.html">Kustomize</a>, quando o chart fica grande demais para
+poucos valores. O terceiro é o <a href="secrets-externos.html">cofre externo</a>, para o Secret nunca
+morar no repositório.</p>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que o <code>selfHeal: true</code> faz?</p>
+<label><input type="radio" name="g1"> reinicia os pods que falham, como uma probe de vida</label>
+<label><input type="radio" name="g1"> desfaz no cluster a mudança feita fora do repositório</label>
+<label><input type="radio" name="g1"> apaga do cluster os objetos que saíram do repositório</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O repositório diz 3 réplicas e o cluster tem 5. Quem
+está errado e o que acontece?</p>
+<label><input type="radio" name="g2"> o repositório: o Argo importa as 5 réplicas para o Git</label>
+<label><input type="radio" name="g2"> ninguém: os dois estados são válidos até alguém decidir</label>
+<label><input type="radio" name="g2"> o cluster: o próximo sync volta para 3 réplicas</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O app está <code>Synced</code> e o site não responde.
+O que isso quer dizer?</p>
+<label><input type="radio" name="g3"> o manifesto chegou ao cluster; o problema é da aplicação</label>
+<label><input type="radio" name="g3"> o Argo CD está desligado</label>
+<label><input type="radio" name="g3"> o repositório está fora do ar</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o campo que devolve o estado</h2>
+<p>O time desligou o sync automático por um dia e, no dia seguinte, alguém escalou o Deployment na mão.
+Qual campo da <code>Application</code> faz o Argo desfazer essa mudança sozinho, sem esperar o próximo
+commit? Complete o manifesto:</p>
+<div class="ex-code">  syncPolicy:
+    automated:
+      prune: true
+      <input aria-label="resposta 1" data-answer="selfHeal" placeholder="...">: true</div>
+<p class="ex-dica">Dica: <code>prune</code> cuida do que <em>saiu</em> do repositório; o outro cuida do que
+<em>mudou</em> no cluster. É o campo que a seção 5 mostrou em ação, quando o painel voltou de cinco para
+três réplicas.</p>
+</div>
+
+<h2>Resumo</h2>
+
+<p>GitOps é uma ordem de autoridade, não uma ferramenta: o repositório declara o estado desejado, um
+controlador compara com o estado atual e age. Na prática, três objetos contam a história — o
+<code>values.yaml</code> com os botões (réplicas, tag, portas), o chart que transforma valores em
+manifesto, e a <code>Application</code> que liga repositório, pasta e namespace com uma política de sync.
+O cluster inteiro é consequência dos três.</p>
+
+<p>O drift é o que aparece quando alguém fura o fluxo: um <code>scale</code> na mão, um
+<code>set image</code> de teste, um hotfix de madrugada. Com <code>selfHeal</code> ele dura minutos; sem
+<code>selfHeal</code>, dura até alguém olhar. O <code>prune</code> é o irmão perigoso: apaga o que não está
+no repositório, então só ligue quando tudo o que precisa existir estiver versionado. E
+<code>Synced</code> não significa “funcionando” — significa “igual ao Git”; quem responde “está de pé?” são
+os pods, os endpoints e as probes.</p>
+
+<p>As caixas deste projeto aplicam o manifesto que o controlador aplicaria, porque o painel não tem Argo
+CD. Num cluster de verdade o dia a dia é menor: commitar, abrir pull request, ler o
+<code>argocd app get</code> e o <code>diff</code> quando o vermelho aparece. O teste final é sempre o
+mesmo: apague o cluster e veja se o repositório o traz de volta.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+<li>A <code>Application</code> amarra <code>source</code> (repo, ramo, pasta) a <code>destination</code>
+(cluster, namespace).</li>
+<li><code>prune</code> apaga o que saiu do Git; <code>selfHeal</code> desfaz o que mudou na mão.</li>
+<li>O values é o painel de botões: <code>replicaCount</code> e <code>image.tag</code> viram manifesto no
+sync.</li>
+<li>Cluster divergente não é cluster “meio certo”: é <code>OutOfSync</code>, e volta no próximo sync.</li>
+<li><code>Synced</code> + <code>Healthy</code> são duas perguntas diferentes; <code>Synced</code> não
+garante site no ar.</li>
+<li>A rotina é <code>argocd app get</code>, <code>argocd app diff</code>, <code>kubectl get pods</code> e
+<code>kubectl get endpoints</code>.</li>
+<li><code>OutOfSync</code> eterno: ramo parado, pasta errada, namespace ausente ou <code>selfHeal</code>
+desligado.</li>
+<li><code>rollback</code> é remédio; a cura é <code>git revert</code> do commit.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

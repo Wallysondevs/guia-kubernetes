@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manifestos | Guia Kubernetes</title>
+<meta name="description" content="Consulta dos manifestos Kubernetes: o esqueleto apiVersion, kind, metadata e spec, o mapa de qual versão cada kind usa e os erros de validação traduzidos.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Manifestos</span></h1>
+<p class="intro">Todo manifesto do Kubernetes tem o mesmo começo: quatro blocos, dois espaços de
+indentação e um <code>kind</code> que decide o resto. A Ana já sabe escrever o do pod; o que ela não lembra
+de cabeça é qual <code>apiVersion</code> vai com cada tipo — <code>apps/v1</code>? <code>batch/v1</code>?
+<code>networking.k8s.io/v1</code>? Esta página é a consulta: primeiro o esqueleto, depois o mapa, depois as
+mensagens de erro que aparecem quando um dos dois está errado.</p>
+
+<div class="note">
+<strong>Como usar esta página</strong>
+<ul>
+  <li>A tabela 2 é o mapa que você vai consultar mais: <code>kind</code> → <code>apiVersion</code>.</li>
+  <li>As mensagens de erro estão no fim, com a tradução e o conserto de cada uma.</li>
+  <li>Para a sintaxe do YAML (hífen, indentação, dois-pontos), a aula é
+  <a href="yaml-anatomia.html">A anatomia do YAML</a>.</li>
+</ul>
+</div>
+
+<h2>1. Para que serve esta página (e o que ela não cobre)</h2>
+
+<p>Esta é a folha de consulta do <em>formato</em>. Ela responde a três perguntas: quais blocos todo
+manifesto tem, o que vai dentro de cada um e qual <code>apiVersion</code> acompanha cada
+<code>kind</code>. Também traduz as mensagens de validação — as que começam com <code>The Deployment "x" is
+invalid:</code> —, que são as mais fáceis de resolver e as mais assustadoras de ler.</p>
+
+<p>Ela não cobre o significado de cada campo de cada recurso: para isso existem as páginas de consulta
+<a href="ref-pods.html">Pods</a>, <a href="ref-deployments.html">Deployments</a> e
+<a href="ref-servicos.html">Services e Ingress</a>. Também não cobre a sintaxe do YAML em si, nem
+<code>kubectl apply</code> a fundo — isso fica em <a href="yaml-anatomia.html">A anatomia do YAML</a> e em
+<a href="apply-e-dry-run.html">apply e dry-run</a>.</p>
+
+<p>Vale distinguir duas ideias que costumam andar juntas na cabeça de quem começa. <code>kubectl
+create</code> é uma ordem pontual: cria e reclama se já existe. <code>kubectl apply</code> é uma
+convergência: compara o arquivo com o que está no cluster e ajusta a diferença. É por isso que
+<code>apply</code> pode ser rodado dez vezes com o mesmo arquivo e o resultado é o mesmo objeto — e é por
+isso que ele é o comando dos manifestos versionados, enquanto o <code>create</code> fica para o
+improviso.</p>
+
+<p>Uma coisa que vale dizer de saída: o manifesto é a <em>entrada</em>. O cluster responde com um objeto
+maior, cheio de campos que você não escreveu. Quem entende essa separação nunca se pergunta “por que o meu
+arquivo não tem <code>uid</code>?” — porque <code>uid</code> é resposta, não pedido.</p>
+
+<h2>2. O essencial em 10 linhas</h2>
+
+<ul>
+  <li>Quatro blocos: <code>apiVersion</code>, <code>kind</code>, <code>metadata</code> e
+  <code>spec</code>.</li>
+  <li><code>apiVersion</code> é texto: <code>v1</code> para o núcleo, <code>apps/v1</code> para
+  Deployment.</li>
+  <li><code>kind</code> é o tipo do objeto, com maiúscula: <code>Pod</code>, <code>Service</code>,
+  <code>Deployment</code>.</li>
+  <li><code>metadata</code> guarda identidade: <code>name</code>, <code>namespace</code>,
+  <code>labels</code>, <code>annotations</code>.</li>
+  <li><code>spec</code> guarda o que você quer que exista. O conteúdo muda com o <code>kind</code>.</li>
+  <li><code>status</code> não se escreve: é o cluster respondendo ao que você pediu.</li>
+  <li>Indentação é estrutura: dois espaços, nunca <kbd>Tab</kbd>.</li>
+  <li>Lista é hífen; mapa é <code>chave: valor</code> com um espaço depois dos dois-pontos.</li>
+  <li><code>---</code> separa vários objetos no mesmo arquivo.</li>
+  <li>Antes de aplicar, <code>kubectl apply -f arquivo.yaml --dry-run=client</code> ensaia sem enviar.</li>
+</ul>
+
+<p>A última linha é a que economiza mais tempo e a que quase ninguém usa no começo. O
+<code>--dry-run=client</code> monta o objeto no seu computador, valida o formato e mostra o que seria
+enviado; erros de digitação aparecem ali, não no cluster. É o equivalente a provar a massa antes de levar
+ao forno.</p>
+
+<p>Não existe “o manifesto do Kubernetes” no singular: existe um formato comum e um conteúdo por tipo. O
+que você reaproveita de um Pod para um Deployment são os quatro blocos e a disciplina da indentação; o
+<code>spec</code> é sempre novo.</p>
+
+<p>E há uma regra de ouro que resolve a maioria dos “não funcionou”: o manifesto descreve um estado
+<em>desejado</em>, não uma sequência de comandos. Você não diz “crie um pod e depois mexa na imagem”; você
+diz “quero este pod, com esta imagem”. Quem compara o desejo com a realidade é o controlador — e é por
+isso que aplicar o mesmo arquivo duas vezes não cria duas coisas.</p>
+
+<h2>3. Anatomia de um manifesto</h2>
+
+<dl class="anatomy">
+<dt>apiVersion</dt>
+<dd>A versão da API que entende aquele <code>kind</code>: <code>v1</code> (núcleo), <code>apps/v1</code>
+(Deployment), <code>batch/v1</code> (Job). Vem sempre antes do <code>kind</code>.</dd>
+<dt>kind</dt>
+<dd>O tipo do objeto, com maiúscula inicial: <code>Pod</code>, <code>Service</code>,
+<code>ConfigMap</code>. É o campo que decide qual <code>spec</code> é válido.</dd>
+<dt>metadata</dt>
+<dd>Identidade e organização: <code>name</code> (obrigatório), <code>namespace</code>,
+<code>labels</code> (para selecionar) e <code>annotations</code> (para registrar).</dd>
+<dt>spec</dt>
+<dd>O que você quer que exista. Cada <code>kind</code> tem o seu: no Pod é a lista de containers; no
+Service são as portas; no Deployment são réplicas, seletor e template.</dd>
+<dt>status</dt>
+<dd>A resposta do cluster: fase, condições, IPs, contagens. Nunca se escreve no arquivo; aparece no
+<code>kubectl get -o yaml</code>.</dd>
+</dl>
+
+<p>Para treinar a leitura, vale soletrar um Deployment: <code>apiVersion: apps/v1</code> diz qual API
+entende aquele tipo; <code>kind: Deployment</code> diz o que é; <code>metadata.name</code> dá o nome;
+<code>spec.replicas</code>, <code>spec.selector</code> e <code>spec.template</code> respondem “quantas
+cópias, de qual modelo, e quem são os pods desse modelo”. Dentro do <code>template</code> há um segundo
+<code>metadata</code> — o do pod que será criado — e um segundo <code>spec</code>, o do pod. É o mesmo
+esqueleto, um nível mais fundo: um manifesto que fabrica outro manifesto.</p>
+
+<p>Repare que não existe <code>data</code> nem <code>stringData</code> nesta lista: são campos de
+<code>ConfigMap</code> e <code>Secret</code>, que ficam no nível do objeto, ao lado de
+<code>spec</code> — e não dentro dele. Isso não é exceção à regra: é o formato daquele tipo. A regra que
+vale sempre é “os quatro blocos de cima”; o resto é o conteúdo do tipo.</p>
+
+<h2>4. O esqueleto e o mapa de apiVersion</h2>
+
+<p>Primeiro o esqueleto, com a pergunta que cada bloco responde. A coluna “obrigatório” é a que você
+consulta quando o <code>apply</code> recusa o arquivo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Bloco</th><th>Obrigatório?</th><th>O que vai dentro</th><th>Exemplo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>apiVersion</code></td><td>sim</td><td>a versão da API do <code>kind</code></td><td><code>apps/v1</code></td></tr>
+<tr><td><code>kind</code></td><td>sim</td><td>o tipo do objeto, com maiúscula</td><td><code>Deployment</code></td></tr>
+<tr><td><code>metadata</code></td><td>sim</td><td><code>name</code>, <code>namespace</code>,
+<code>labels</code>, <code>annotations</code></td><td><code>name: cardapio</code></td></tr>
+<tr><td><code>spec</code></td><td>depende do tipo</td><td>o estado desejado daquele objeto</td><td><code>replicas:
+2</code></td></tr>
+<tr><td><code>data</code></td><td>só em ConfigMap/Secret</td><td>os pares chave-valor da
+configuração</td><td><code>PORTA: "8080"</code></td></tr>
+<tr><td><code>status</code></td><td>nunca</td><td>a resposta do cluster</td><td><code>phase: Running</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Agora o mapa, que é a pergunta que mais aparece no começo. O <code>kind</code> vem com maiúscula; o
+<code>apiVersion</code>, com minúscula, e quando tem grupo vem no formato <code>grupo/versão</code>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th><code>kind</code></th><th><code>apiVersion</code></th><th>Em namespace?</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Pod</code></td><td><code>v1</code></td><td>sim</td></tr>
+<tr><td><code>Service</code></td><td><code>v1</code></td><td>sim</td></tr>
+<tr><td><code>ConfigMap</code>, <code>Secret</code></td><td><code>v1</code></td><td>sim</td></tr>
+<tr><td><code>Deployment</code>, <code>ReplicaSet</code>, <code>StatefulSet</code>,
+<code>DaemonSet</code></td><td><code>apps/v1</code></td><td>sim</td></tr>
+<tr><td><code>Job</code>, <code>CronJob</code></td><td><code>batch/v1</code></td><td>sim</td></tr>
+<tr><td><code>Ingress</code>, <code>NetworkPolicy</code></td><td><code>networking.k8s.io/v1</code></td><td>sim</td></tr>
+<tr><td><code>HorizontalPodAutoscaler</code></td><td><code>autoscaling/v2</code></td><td>sim</td></tr>
+<tr><td><code>Role</code>, <code>RoleBinding</code></td><td><code>rbac.authorization.k8s.io/v1</code></td><td>sim</td></tr>
+<tr><td><code>StorageClass</code></td><td><code>storage.k8s.io/v1</code></td><td>não</td></tr>
+<tr><td><code>Namespace</code>, <code>Node</code>, <code>PersistentVolume</code></td><td><code>v1</code></td><td>não</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O sufixo <code>/v1</code> não é decoração: ele faz parte do endereço da API. O <code>kubectl</code> traduz
+<code>Deployment</code> para <code>apps/v1</code> por uma tabela interna, e essa tabela é exatamente a do
+<code>kubectl api-resources</code> — o comando que mostra a versão e o escopo de tudo o que o cluster
+conhece. Quando você esquecer um <code>apiVersion</code>, é lá que se consulta (a página
+<a href="ref-api-recursos.html">Recursos da API</a> detalha cada grupo).</p>
+
+<p>Um mesmo <code>kind</code> pode ter mais de uma versão viva ao mesmo tempo, e a escolha muda o que
+você consegue escrever. O <code>HorizontalPodAutoscaler</code> é o exemplo da casa:
+<code>autoscaling/v1</code> aceita só CPU e um alvo só; <code>autoscaling/v2</code> aceita lista de métricas
+e o bloco <code>behavior</code>. O <code>kind</code> e o nome do objeto são os mesmos — o que muda é o
+vocabulário do <code>spec</code>. Quando um campo “não existe” na sua versão, o problema pode ser a versão,
+não o campo.</p>
+
+<p>Se você estiver na dúvida sobre a versão de um tipo, há dois caminhos de consulta no próprio
+terminal. <code>kubectl api-resources</code> lista todos os tipos com a versão e o escopo (namespaced ou
+não), e <code>kubectl explain deployment</code> mostra a versão do tipo seguida dos campos aceitos. Os dois
+respondem com o que <em>aquele</em> cluster conhece — o que é mais confiável do que qualquer blog, porque
+inclui os recursos customizados que alguém instalou ali.</p>
+
+<p>Outro detalhe do formato: um arquivo pode ter vários objetos, separados por uma linha com três hífens.
+O <code>apply</code> lê o arquivo inteiro e aplica na ordem em que os documentos aparecem — o que importa
+quando um objeto depende de outro, como um ConfigMap antes do Deployment que o monta. A ordem entre
+namespaces e objetos também conta: o namespace precisa existir antes do primeiro pod que mora nele.</p>
+
+<p>Um cuidado especial com os tipos antigos. Tutoriais de 2019 usam <code>extensions/v1beta1</code> para
+Ingress e <code>batch/v1beta1</code> para CronJob; essas versões foram removidas do Kubernetes 1.22 e 1.25.
+Copiar o manifesto de um tutorial antigo dá um erro de “no matches for kind”, que assusta e tem conserto
+de uma linha.</p>
+
+<h2>5. Os campos que mais confundem</h2>
+
+<p>Quatro confusões respondem por quase todos os manifestos que dão errado na primeira tentativa. Elas não
+são de sintaxe: são de <em>lugar</em>.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Confusão</th><th>Como é de verdade</th><th>O que quebra</th></tr>
+</thead>
+<tbody>
+<tr><td><code>labels</code> × <code>annotations</code></td><td><code>labels</code> são para selecionar
+(<code>app: cardapio</code>); <code>annotations</code> são para registrar (<code>dono:
+ana</code>)</td><td>seletor que não acha nada</td></tr>
+<tr><td><code>metadata.name</code> × <code>metadata.namespace</code></td><td>o nome identifica o objeto
+<em>dentro</em> do namespace; o mesmo nome pode existir em dois namespaces</td><td>dois
+<code>apply</code> que “não se veem”</td></tr>
+<tr><td><code>spec</code> × <code>status</code></td><td><code>spec</code> é o pedido;
+<code>status</code> é a resposta — e o servidor ignora <code>status</code> no seu arquivo</td><td>esperar
+que o campo <code>replicas</code> do status obedeça ao arquivo</td></tr>
+<tr><td><code>spec.selector</code> × <code>spec.template.metadata.labels</code></td><td>o seletor do
+Deployment precisa casar com as etiquetas do template</td><td><code>selector does not match template
+labels</code></td></tr>
+<tr><td><code>apiVersion: v1</code> × <code>apps/v1</code></td><td>só os objetos do núcleo usam
+<code>v1</code>; Deployment, StatefulSet e DaemonSet usam <code>apps/v1</code></td><td><code>no matches
+for kind</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um exemplo de cada lado esclarece a primeira linha da tabela. Etiqueta é o que o Service usa para
+achar pods: <code>app: cardapio</code> vira <code>selector: app: cardapio</code>, e o Service manda tráfego
+para quem tiver aquilo. Anotação é o que ninguém seleciona: o dono do objeto, o link do chamado, a versão do
+build. O próprio <code>kubectl apply</code> grava uma anotação com o último arquivo aplicado — útil para
+diff, invisível para seletores.</p>
+
+<p>Vale decorar a segunda linha da tabela, porque ela explica um comportamento que parece mágica: o
+namespace faz parte da identidade. Um ConfigMap chamado <code>cardapio</code> em <code>default</code> e
+outro com o mesmo nome em <code>padaria</code> são objetos diferentes, com histórias diferentes, e um pod
+só enxerga os do próprio namespace. É por isso que <code>-n</code> muda o resultado de um
+<code>get</code> — e por isso que “funcionava ontem” costuma ser “ontem eu estava em outro
+namespace”.</p>
+
+<p>Já a última linha é a que mais aparece em manifesto copiado. A regra prática: se o
+<code>kind</code> é <code>Pod</code>, <code>Service</code>, <code>ConfigMap</code>,
+<code>Secret</code>, <code>Namespace</code>, <code>Node</code> ou <code>PersistentVolume</code>, a
+<code>apiVersion</code> é <code>v1</code>. Todo o resto tem grupo, e o grupo aparece no nome da versão.</p>
+
+<h2>6. Erros e mensagens</h2>
+
+<p>As mensagens de validação têm uma estrutura fixa: <code>The TIPO "nome" is invalid:</code> seguido do
+caminho do campo e do motivo. Aprender a ler o caminho é metade do conserto.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>O que significa</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>apiVersion: Required value</code></td><td>faltou a primeira linha do
+manifesto</td><td>acrescente <code>apiVersion: v1</code> (ou a do tipo)</td></tr>
+<tr><td><code>kind: Required value</code></td><td>faltou o tipo</td><td>acrescente <code>kind: Pod</code>, com
+maiúscula</td></tr>
+<tr><td><code>metadata: Required value</code></td><td>faltou o bloco de identidade</td><td>acrescente
+<code>metadata:</code> e <code>name:</code></td></tr>
+<tr><td><code>no matches for kind "Deployment" in version "v1"</code></td><td>a versão não combina com o
+tipo</td><td>troque para <code>apps/v1</code> (veja o mapa)</td></tr>
+<tr><td><code>metadata.name: Invalid value: "Cardapio"</code></td><td>nome com maiúscula ou
+símbolo</td><td>use minúsculas, números e hífen: <code>cardapio</code></td></tr>
+<tr><td><code>spec.containers: Required value</code></td><td>o pod não tem container</td><td>acrescente a
+lista <code>containers:</code> com <code>name</code> e <code>image</code></td></tr>
+<tr><td><code>error converting YAML to JSON: yaml: line 4</code></td><td>o YAML está malformado (quase
+sempre indentação)</td><td>comece pelo fim da mensagem, que diz o que esperava</td></tr>
+<tr><td><code>error: no objects passed to apply</code></td><td>o arquivo está vazio ou só tem
+comentário</td><td>confira o conteúdo do arquivo</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A transcrição abaixo é de um cluster de verdade e mostra quatro recusas diferentes. Repare que
+nenhuma delas diz “erro genérico”: todas apontam o campo.</p>
+
+<pre class="term">$ kubectl apply -f sem-api.yaml
+The Pod "cardapio" is invalid: apiVersion: Required value
+
+$ kubectl apply -f maiusculo.yaml
+The Pod "Cardapio" is invalid: metadata.name: Invalid value: "Cardapio": a lowercase RFC 1123
+subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end
+with an alphanumeric character (e.g. 'example.com', regex used for validation is
+'[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+
+$ kubectl apply -f vazio.yaml
+error: no objects passed to apply
+
+$ kubectl apply -f deployment-v1.yaml
+error: resource mapping not found for name: "vitrine" namespace: "" from "STDIN": no matches for
+kind "Deployment" in version "v1"
+ensure CRDs are installed first</pre>
+
+<p>Duas lições saem daí. <code>Required value</code> é “faltou o campo”;
+<code>Invalid value</code> é “o campo veio, mas com formato errado” — e o texto entre parênteses costuma
+trazer o exemplo do formato aceito, como o <code>example.com</code> da mensagem do nome. E o caminho do
+campo, quando tem colchetes (<code>spec.containers[0].image</code>), aponta para o item da lista: o primeiro
+container, na posição zero.</p>
+
+<p>Quando a mensagem não basta, o campo se descobre com <code>kubectl explain</code>. Ele aceita o
+caminho completo (<code>kubectl explain deployment.spec.strategy</code>) e imprime o tipo do campo, a
+descrição e os subcampos — sem internet e sem adivinhação. É o mesmo comando que responde “isto é lista ou
+mapa?” quando você está na dúvida entre hífen e dois-pontos.</p>
+
+<p>Num cluster de verdade, uma sessão de conserto tem esta cara:</p>
+
+<pre class="term">$ kubectl apply -f cardapio.yaml
+pod/cardapio created
+service/cardapio created
+
+$ kubectl get pod cardapio -o yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  creationTimestamp: "2026-11-27T15:50:21Z"
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+  resourceVersion: "48213"
+  uid: 6f1c2a3e-9d4b-4a7e-8c1f-2b3d4e5f6a7b
+spec:
+  containers:
+  - image: cardapio:1.0
+    name: web
+status:
+  phase: Running</pre>
+
+<p>Compare o que você escreveu com o que voltou: o <code>spec</code> é seu, e o <code>status</code> +
+<code>uid</code> + <code>resourceVersion</code> + <code>creationTimestamp</code> são do cluster. Os campos
+que você não escreveu e aparecem no <code>spec</code> são os padrões que o servidor preencheu — como
+<code>restartPolicy: Always</code> e a política de pull da imagem.</p>
+
+<h2>7. Duas coisas para praticar agora</h2>
+
+<p>A primeira caixa monta o mínimo que funciona: um pod com os quatro blocos. A segunda conserta o erro de
+<code>apiVersion</code> mais comum de todos, o do Deployment escrito com <code>v1</code>.</p>
+
+<div class="tryk8s" data-goal="objeto:Pod/cardapio;;texto:pod/cardapio created;;texto:Running">
+  <p class="try-task">O manifesto do pod <code>cardapio</code> está sem a primeira linha. Acrescente a
+  <code>apiVersion</code> certa do Pod e rode: o painel tem de criar o pod e mostrá-lo em
+  <code>Running</code>.</p>
+<pre class="yaml">kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: apiVersion: Required value
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<div class="tryk8s" data-goal="objeto:Deployment/vitrine;;pronto:Deployment/vitrine=2;;texto:deployment.apps/vitrine created" data-get="deployments">
+  <p class="try-task">O Deployment da vitrine foi copiado de um tutorial antigo e ficou com
+  <code>apiVersion: v1</code>. Rode, leia a mensagem e troque pela versão do mapa. A meta pede duas
+  réplicas prontas.</p>
+<pre class="yaml">apiVersion: v1
+kind: Deployment
+metadata:
+  name: vitrine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vitrine
+  template:
+    metadata:
+      labels:
+        app: vitrine
+    spec:
+      containers:
+        - name: web
+          image: vitrine:1.0</pre>
+<pre class="out">
+error: resource mapping not found for name: "vitrine" namespace: "" from "STDIN": no matches for kind "Deployment" in version "v1"
+ensure CRDs are installed first
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vitrine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vitrine
+  template:
+    metadata:
+      labels:
+        app: vitrine
+    spec:
+      containers:
+        - name: web
+          image: vitrine:1.0</pre>
+</div>
+
+<p>As duas caixas desta página rodam no painel do guia, que valida o manifesto com as mesmas regras do
+cluster: campos obrigatórios, formato de nome, combinação de <code>apiVersion</code> e <code>kind</code>. A
+mensagem que aparece é a mensagem de verdade, não um resumo — dá para comparar com a tabela de erros linha
+por linha.</p>
+
+<p>Na primeira caixa, o erro é de validação: o objeto chegou ao servidor e foi recusado porque falta um
+campo obrigatório. Na segunda, o erro é de <em>roteamento</em>: o servidor nem chegou a validar o
+<code>spec</code>, porque não existe um tipo <code>Deployment</code> na versão <code>v1</code>. São famílias
+diferentes de problema, e a mensagem de cada uma diz isso com precisão.</p>
+
+<p>No segundo caso, o erro que o painel mostra é o mesmo do cluster de verdade:
+<code>error: resource mapping not found for name: "vitrine" ... no matches for kind "Deployment" in version
+"v1"</code>, com a linha <code>ensure CRDs are installed first</code> no fim. Essa última linha é um
+consolo para quem usa recurso customizado e uma pista falsa para quem só errou a versão: não há CRD
+nenhuma faltando, há um <code>apiVersion</code> trocado.</p>
+
+<h2>8. Para ir além</h2>
+
+<p>A leitura recomendada, na ordem em que o guia apresenta:</p>
+
+<ul>
+  <li><a href="yaml-anatomia.html">A anatomia do YAML</a> — indentação, listas, <code>---</code> e os erros
+  de sintaxe.</li>
+  <li><a href="pod-manifesto.html">O manifesto do Pod</a> — os quatro blocos aplicados a um caso
+  concreto.</li>
+  <li><a href="apply-e-dry-run.html">apply e dry-run</a> — o ensaio, o <code>create</code> e a
+  diferença.</li>
+  <li><a href="ref-api-recursos.html">Recursos da API</a> — os grupos, o escopo e o
+  <code>api-resources</code>.</li>
+  <li><a href="ref-pods.html">Pods</a> — todos os campos do <code>spec</code> do pod.</li>
+  <li><a href="ref-deployments.html">Deployments</a> — réplicas, seletor, estratégia e o mapa até o
+  pod.</li>
+  <li><a href="ref-servicos.html">Services e Ingress</a> — os campos de quem expõe o serviço.</li>
+  <li><a href="ref-kubectl.html">kubectl</a> — os verbos e as saídas do comando que aplica o
+  manifesto.</li>
+</ul>
+
+<h2>Resumo</h2>
+
+<p>Todo manifesto tem <code>apiVersion</code>, <code>kind</code>, <code>metadata</code> e
+<code>spec</code> — e o <code>status</code>, que é resposta e não se escreve. O <code>kind</code> vem com
+maiúscula e decide qual <code>spec</code> é válido; o <code>apiVersion</code> vem com minúscula e segue o
+mapa: <code>v1</code> para o núcleo, <code>apps/v1</code> para Deployment, <code>batch/v1</code> para Job,
+<code>networking.k8s.io/v1</code> para Ingress, <code>autoscaling/v2</code> para HPA,
+<code>rbac.authorization.k8s.io/v1</code> para Role.</p>
+
+<p><code>metadata</code> guarda identidade (nome, namespace, etiquetas e anotações) e <code>spec</code>
+guarda o desejo. As mensagens de validação têm forma fixa — <code>The TIPO "nome" is invalid:</code> mais o
+caminho do campo — e as três mais comuns são <code>Required value</code> (faltou), <code>Invalid value</code>
+(formato errado) e <code>no matches for kind</code> (versão errada). Antes de aplicar,
+<code>--dry-run=client</code>; depois de aplicar, <code>-o yaml</code> para ver o que o cluster
+acrescentou.</p>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

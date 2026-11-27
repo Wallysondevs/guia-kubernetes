@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pods | Guia Kubernetes</title>
+<meta name="description" content="Consulta do Pod: todos os campos do spec em tabela — containers, initContainers, resources, securityContext, volumes e restartPolicy — com exemplos e erros comuns.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Pods</span></h1>
+<p class="intro">O pod é a menor coisa que o Kubernetes liga, e o <code>spec</code> dele é o manifesto que
+a Ana mais escreveu até aqui. Só que o pod tem mais campos do que os três que ela usa no dia a dia:
+<code>initContainers</code>, <code>volumes</code>, <code>securityContext</code>, <code>tolerations</code>,
+probes. Esta página é a consulta: o que existe, onde fica e o que muda quando você mexe. Ela não substitui
+as aulas — serve para o momento em que você já sabe o que quer e só esqueceu o nome do campo.</p>
+
+<div class="note">
+<strong>Como usar esta página</strong>
+<ul>
+  <li>A tabela 1 lista os campos do <em>pod</em>; a tabela 2, os do <em>container</em>. A confusão entre os
+  dois níveis é o erro mais comum.</li>
+  <li>A seção 5 é a das armadilhas: leia antes de culpar o cluster.</li>
+  <li>Os dois campos que você vai usar em 90% dos manifestos: <code>containers</code> e
+  <code>resources</code>.</li>
+</ul>
+</div>
+
+<h2>1. Para que serve esta página (e o que ela não cobre)</h2>
+
+<p>Esta é a folha de consulta do <code>spec</code> do Pod. Ela responde “qual é o nome do campo?”, “ele
+fica no pod ou no container?” e “o que acontece se eu omitir?”. Também traduz as mensagens de validação
+que citam caminhos como <code>spec.containers[0].env</code> — as mais fáceis de resolver quando você sabe
+ler o caminho.</p>
+
+<p>Ela não ensina o ciclo de vida do pod (isso é <a href="cluster-node-pod.html">Cluster, node e pod</a>),
+nem requests e limits a fundo (<a href="recursos-do-pod.html">Requests e limits</a>), nem probes
+(<a href="readiness-probe.html">Readiness probe</a>) nem volumes (<a href="volumes-emptyDir.html">emptyDir</a>).
+O que está aqui é o mapa dos campos, com o ponteiro para a aula de cada assunto.</p>
+
+<p>E há um motivo prático para conhecer bem este <code>spec</code>: ele é copiado inteiro para dentro do
+<code>template</code> de todo controlador. Quando você escreve um Deployment, o
+<code>spec.template.spec</code> é exatamente o <code>spec</code> do pod; no Job, é
+<code>spec.template.spec</code>; no DaemonSet, idem. Aprender um é aprender os quatro — e o erro de
+indentação também se copia.</p>
+
+<p>Uma coisa que vale dizer de saída: o pod é o <em>único</em> objeto que o Kubernetes realmente executa.
+Deployment, Job, DaemonSet e StatefulSet não rodam nada — eles criam pods. Por isso o <code>spec</code> do
+pod aparece dentro do <code>template</code> de todos eles, e por isso vale conhecer este manifesto melhor
+do que qualquer outro.</p>
+
+<h2>2. O essencial em 10 linhas</h2>
+
+<ul>
+  <li><code>spec.containers</code> é obrigatório e é uma lista — mesmo com um container só, tem hífen.</li>
+  <li>Cada container precisa de <code>name</code> e <code>image</code>; o resto é opcional.</li>
+  <li><code>spec.initContainers</code> roda antes, em ordem, e precisa terminar para o pod começar.</li>
+  <li><code>spec.restartPolicy</code> é do pod: <code>Always</code> (padrão), <code>OnFailure</code> ou
+  <code>Never</code>.</li>
+  <li><code>spec.volumes</code> declara o volume; <code>volumeMounts</code>, no container, diz onde ele
+  aparece.</li>
+  <li><code>resources</code> é por container, com <code>requests</code> (reserva) e <code>limits</code>
+  (teto).</li>
+  <li><code>securityContext</code> existe nos dois níveis: no pod vale para todos, no container
+  sobrescreve.</li>
+  <li><code>ports</code> é informativo: não abre porta nem roteia tráfego.</li>
+  <li><code>command</code> substitui o entrypoint da imagem; <code>args</code>, o comando padrão.</li>
+  <li>O pod nasce, vive e morre; quem o recria é um controlador, não ele mesmo.</li>
+</ul>
+
+<p>A última linha é a que separa o pod de tudo o mais. Um pod solto não tem dono: se ele morre, ninguém o
+recria; se o nó reinicia, ele não volta. Quem garante a reposição é o controlador — Deployment, Job,
+DaemonSet. É por isso que o guia insiste tanto em não usar pod solto em produção, e é por isso que o
+<code>restartPolicy</code> do pod é diferente do comportamento do Deployment: o pod reinicia
+<em>containers</em>, o Deployment cria <em>pods</em>.</p>
+
+<p>Se você chegou aqui procurando um campo que não está nas tabelas, tente o nome em inglês no
+<code>kubectl explain pod.spec</code>: a lista de campos do pod é longa e cresce a cada versão. O que está
+aqui é o que se usa de verdade num cluster de padaria.</p>
+
+<p>Vale saber também o que o pod <em>não</em> tem: campo <code>replicas</code>, seletor, estratégia de
+atualização. Isso tudo é do controlador. O pod é a unidade; a política de quantas unidades existem e como
+são trocadas fica um nível acima — e é por isso que editar um pod criado por Deployment não adianta: o
+controlador compara com o template e desfaz.</p>
+
+<p>Outra linha que vale decorar: <strong>lista é hífen</strong>. <code>containers</code>,
+<code>env</code>, <code>ports</code>, <code>volumeMounts</code>, <code>volumes</code> e
+<code>initContainers</code> são listas; <code>resources</code>, <code>securityContext</code>,
+<code>nodeSelector</code> e <code>lifecycle</code> são mapas. Trocar os dois é o erro de YAML que mais
+aparece — e a mensagem de validação sempre diz “must be a list” quando é esse o caso.</p>
+
+<h2>3. Anatomia do spec do Pod</h2>
+
+<dl class="anatomy">
+<dt>containers</dt>
+<dd>A lista de containers que rodam juntos, no mesmo IP e no mesmo ciclo de vida. Obrigatória; cada item
+precisa de <code>name</code> e <code>image</code>.</dd>
+<dt>initContainers</dt>
+<dd>Containers que rodam antes dos principais, um de cada vez, e precisam terminar com sucesso. Servem
+para esperar o banco, baixar um arquivo, ajustar permissão.</dd>
+<dt>restartPolicy</dt>
+<dd>O que fazer quando um container sai: <code>Always</code> (padrão), <code>OnFailure</code> ou
+<code>Never</code>. Fica no pod, não no container — e o Deployment só aceita <code>Always</code>.</dd>
+<dt>volumes</dt>
+<dd>Os volumes do pod, com nome e tipo (<code>emptyDir</code>, <code>configMap</code>,
+<code>secret</code>, <code>persistentVolumeClaim</code>). O container só os vê se montar com
+<code>volumeMounts</code>.</dd>
+<dt>nodeSelector e tolerations</dt>
+<dd>Onde o pod pode ser agendado: etiquetas obrigatórias do nó e permissões para taints. Vazio, o pod vai
+para onde houver espaço.</dd>
+<dt>securityContext</dt>
+<dd>Usuário, grupo e permissões. No nível do pod vale para todos os containers; no nível do container,
+sobrescreve o do pod.</dd>
+</dl>
+
+<p>Os <code>initContainers</code> merecem uma nota porque o nome engana: eles não são “containers menores”,
+são containers que rodam <em>antes</em> e precisam terminar com sucesso. O kubelet executa um de cada vez,
+na ordem da lista, e só depois de o último sair com zero é que os containers principais começam. Se um init
+falhar, o pod reinicia conforme o <code>restartPolicy</code> e os principais nunca sobem — o que costuma
+aparecer no <code>get pods</code> como <code>Init:CrashLoopBackOff</code>.</p>
+
+<p>Fora dessa lista, mas ainda dentro do <code>spec</code>: <code>serviceAccountName</code> (a identidade
+que o pod usa para falar com a API), <code>terminationGracePeriodSeconds</code> (quanto tempo o kubelet
+espera antes de matar), <code>hostNetwork</code> (usa a rede do nó),
+<code>dnsPolicy</code> e <code>priorityClassName</code>. São campos de quem opera o cluster; no começo você
+não precisa deles, mas precisa saber que existem para não estranhar quando aparecerem num manifesto
+alheio.</p>
+
+<h2>4. Os campos em tabela</h2>
+
+<p>Primeiro o nível do pod. A coluna “padrão” é o que o servidor preenche quando você omite — e é por isso
+que o objeto que volta do <code>-o yaml</code> tem mais campos do que o seu arquivo.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo do pod</th><th>Para que serve</th><th>Padrão</th><th>Exemplo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>containers</code></td><td>a lista de containers principais</td><td>obrigatório</td><td><code>- name:
+web</code></td></tr>
+<tr><td><code>initContainers</code></td><td>containers que rodam antes e precisam terminar</td><td>vazio</td><td><code>name:
+espera-banco</code></td></tr>
+<tr><td><code>restartPolicy</code></td><td>o que fazer quando o container sai</td><td><code>Always</code></td><td><code>OnFailure</code></td></tr>
+<tr><td><code>volumes</code></td><td>os volumes disponíveis para o pod</td><td>vazio</td><td><code>emptyDir:
+{}</code></td></tr>
+<tr><td><code>nodeSelector</code></td><td>etiquetas obrigatórias do nó</td><td>vazio</td><td><code>disco: ssd</code></td></tr>
+<tr><td><code>tolerations</code></td><td>permissão para taints do nó</td><td>vazio</td><td><code>key: forno</code></td></tr>
+<tr><td><code>securityContext</code></td><td>usuário e permissões de todos os containers</td><td>vazio</td><td><code>runAsNonRoot:
+true</code></td></tr>
+<tr><td><code>serviceAccountName</code></td><td>identidade do pod na API</td><td><code>default</code></td><td><code>coletor</code></td></tr>
+<tr><td><code>terminationGracePeriodSeconds</code></td><td>carência antes de matar o pod</td><td>30</td><td><code>60</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Agora o nível do container, que é onde vive a maior parte do que você escreve. Repare que
+<code>volumeMounts</code> aparece aqui e <code>volumes</code> aparece lá em cima: declarar e montar são
+coisas diferentes.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo do container</th><th>Para que serve</th><th>Exemplo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>identifica o container dentro do pod (obrigatório)</td><td><code>web</code></td></tr>
+<tr><td><code>image</code></td><td>a imagem que será baixada e executada (obrigatório)</td><td><code>cardapio:1.0</code></td></tr>
+<tr><td><code>imagePullPolicy</code></td><td>quando baixar de novo</td><td><code>IfNotPresent</code></td></tr>
+<tr><td><code>command</code> / <code>args</code></td><td>o que executar, no lugar do padrão da imagem</td><td><code>["node",
+"servidor.js"]</code></td></tr>
+<tr><td><code>env</code></td><td>variáveis uma a uma</td><td><code>name: PORTA</code>,
+<code>value: "8080"</code></td></tr>
+<tr><td><code>envFrom</code></td><td>todas as variáveis de um ConfigMap ou Secret</td><td><code>configMapRef:
+cardapio</code></td></tr>
+<tr><td><code>ports</code></td><td>documenta a porta (não abre nada)</td><td><code>containerPort: 8080</code></td></tr>
+<tr><td><code>resources</code></td><td>reserva e teto de CPU e memória</td><td><code>requests.cpu: 200m</code></td></tr>
+<tr><td><code>volumeMounts</code></td><td>onde um volume do pod aparece dentro do container</td><td><code>mountPath:
+/app/config</code></td></tr>
+<tr><td><code>readinessProbe</code></td><td>quando o container está pronto para receber tráfego</td><td><code>httpGet:
+/</code></td></tr>
+<tr><td><code>livenessProbe</code></td><td>quando o container deve ser reiniciado</td><td><code>exec: cat
+/saude</code></td></tr>
+<tr><td><code>securityContext</code></td><td>usuário e permissões só deste container</td><td><code>readOnlyRootFilesystem:
+true</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Dois campos dessa tabela de container têm padrão que surpreende. O <code>imagePullPolicy</code> é
+<code>IfNotPresent</code> na maioria dos casos, mas vira <code>Always</code> quando a imagem usa a etiqueta
+<code>:latest</code> — e é por isso que <code>:latest</code> em produção é uma má ideia: o pod tenta baixar
+de novo a cada início. E o <code>command</code>/<code>args</code> segue a lógica do Docker: o
+<code>command</code> substitui o entrypoint da imagem, e o <code>args</code> substitui o comando padrão;
+se você só quer mudar o argumento, mexa no <code>args</code> e deixe o <code>command</code> em
+branco.</p>
+
+<p>Uma leitura que ajuda a memorizar: o pod declara <em>o que existe</em> (volumes, containers, política de
+reinício); o container declara <em>o que usa</em> (mounts, env, recursos). Quando você se pegar escrevendo
+<code>volumes</code> dentro de um container, pare: é <code>volumeMounts</code>. E quando for
+<code>resources</code>, lembre que é sempre por container — o pod não tem <code>resources</code>.</p>
+
+<h2>5. Os campos que mais confundem</h2>
+
+<p>Cinco confusões respondem por quase todos os manifestos de pod que dão errado depois de aceitos. Elas não
+são de sintaxe: são de expectativa.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Confusão</th><th>Como é de verdade</th><th>O que acontece</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ports</code> abre a porta</td><td>é documentação; a porta já está aberta no container</td><td>nada
+muda se você tirar — e o Service usa <code>targetPort</code></td></tr>
+<tr><td><code>resources</code> no pod</td><td>é por container; o pod soma para o agendador</td><td>o campo no
+lugar errado é ignorado</td></tr>
+<tr><td><code>securityContext</code> só num nível</td><td>existe no pod (vale para todos) e no container
+(sobrescreve)</td><td>o do container ganha naquele container</td></tr>
+<tr><td><code>env</code> como mapa</td><td><code>env</code> é lista de <code>name</code>/<code>value</code></td><td><code>Invalid
+value: must be a list</code></td></tr>
+<tr><td><code>restartPolicy</code> no container</td><td>é campo do pod, ao lado de <code>containers</code></td><td>o
+container reinicia sozinho e o campo é ignorado</td></tr>
+<tr><td><code>volumeMounts</code> sem <code>volumes</code></td><td>o mount aponta para um volume que precisa
+existir no pod</td><td><code>not found</code> no kubelet — pod preso em
+<code>ContainerCreating</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas dessas merecem um parágrafo. A primeira é a do <code>ports</code>: quem nunca programou tende a achar
+que declarar <code>containerPort: 8080</code> é o que faz o site responder na 8080. Não é. O programa
+escuta na porta que ele quiser; o campo só documenta, e é o Service que decide para onde mandar tráfego
+(<code>targetPort</code>). Se o seu pod responde na 3000 e o <code>ports</code> diz 8080, ninguém reclama —
+e o Service, se apontar para 8080, não acha nada.</p>
+
+<p>A segunda é a do <code>env</code>. O formato de lista vem do desenho da API: uma variável pode ter valor
+fixo (<code>value</code>) ou vir de outro objeto (<code>valueFrom</code>, com
+<code>configMapKeyRef</code>, <code>secretKeyRef</code> ou <code>fieldRef</code>). Um mapa não conseguiria
+expressar as duas coisas, então o campo é lista. E como toda lista no YAML, cada item começa com hífen e
+tem as chaves indentadas abaixo.</p>
+
+<p>Sobre as duas probes, a diferença em uma frase: a <strong>readiness</strong> decide se o pod recebe
+tráfego agora (e pode oscilar), a <strong>liveness</strong> decide se o container deve ser reiniciado (e só
+piora). Trocar as duas é um clássico: um pod que ainda está carregando, com liveness agressiva, é morto
+antes de terminar de subir. Para o “ainda estou subindo”, o campo certo é <code>startupProbe</code>.</p>
+
+<p>Vale ainda um alerta sobre <code>volumeMounts</code>: o volume é declarado no pod com um nome, e montado
+no container por esse nome. Se o nome não casar, o pod fica em <code>ContainerCreating</code> e o evento
+diz que o volume não existe. É um dos poucos erros que o <code>apply</code> aceita e o kubelet recusa — ou
+seja, o manifesto passa, o pod não sobe, e o motivo está no <code>describe</code>, não no
+<code>apply</code>.</p>
+
+<h2>6. Erros e mensagens</h2>
+
+<p>As mensagens citam o caminho completo do campo, com índice de lista quando é o caso. Aprender a ler
+<code>spec.containers[0].env</code> como “a chave <code>env</code> do primeiro container” resolve o
+resto.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>O que significa</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>spec.containers: Required value</code></td><td>o pod não tem container</td><td>acrescente a lista
+com <code>name</code> e <code>image</code></td></tr>
+<tr><td><code>spec.containers[0].name: Required value</code></td><td>o primeiro container está sem
+nome</td><td>todo container precisa de <code>name</code></td></tr>
+<tr><td><code>spec.containers[0].image: Required value</code></td><td>falta a imagem</td><td>acrescente
+<code>image: cardapio:1.0</code></td></tr>
+<tr><td><code>spec.containers[0].env: Invalid value: must be a list</code></td><td><code>env</code> foi escrito como
+mapa</td><td>use <code>- name: …</code> e <code>value: …</code></td></tr>
+<tr><td><code>spec.restartPolicy: Unsupported value: "Sempre"</code></td><td>o valor não é um dos
+três</td><td>use <code>Always</code>, <code>OnFailure</code> ou <code>Never</code></td></tr>
+<tr><td><code>spec.containers[0].ports[0].containerPort: Required value</code></td><td>a porta veio sem
+número</td><td>escreva <code>containerPort: 8080</code></td></tr>
+<tr><td><code>spec.containers[0].ports[0].containerPort: Invalid value: 70000</code></td><td>fora da faixa
+1–65535</td><td>corrija o número</td></tr>
+<tr><td><code>spec.containers[0].resources.requests.cpu: Invalid value</code></td><td>o valor não é
+texto/número reconhecido</td><td>use <code>"200m"</code> ou <code>1</code>, com unidade válida</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A transcrição abaixo é de um cluster de verdade e mostra o <code>describe</code> de um pod saudável —
+o lugar onde os campos que você escreveu viram uma lista legível. Repare nas quatro seções que importam para
+esta página: <code>Containers</code>, <code>Conditions</code>, <code>Volumes</code> e
+<code>Events</code>.</p>
+
+<pre class="term">$ kubectl describe pod cardapio
+Name:             cardapio
+Namespace:        default
+Priority:         0
+Service Account:  default
+Node:             guia-worker/192.0.2.11
+Start Time:       Fri, 27 Nov 2026 15:50:21 +0000
+Labels:           app=cardapio
+Status:           Running
+IP:               10.244.1.9
+
+Containers:
+  web:
+    Image:          cardapio:1.0
+    Port:           8080/TCP
+    State:          Running
+    Ready:          True
+    Restart Count:  0
+    Environment:    PORTA: 8080
+    Mounts:         config from config (ro)
+    Requests:
+      cpu:      200m
+      memory:   256Mi
+    Limits:
+      memory:   512Mi
+
+Conditions:
+  Type              Status
+  PodScheduled      True
+  Initialized       True
+  Ready             True
+  ContainersReady   True
+
+Volumes:
+  config:
+    Type:      ConfigMap (a volume populated by a ConfigMap)
+    Name:      cardapio
+
+QoS Class:                   Burstable
+Node-Selectors:              &lt;none&gt;
+Events:                      &lt;none&gt;</pre>
+
+<p>É nesse texto que você confere o que escreveu: se <code>Environment</code> não mostra a variável, o
+<code>env</code> não entrou; se <code>Mounts</code> está vazio, o <code>volumeMounts</code> não casou; se
+<code>Requests</code> não aparece, o <code>resources</code> foi ignorado. E quando algo dá errado, os
+<code>Events</code> no fim contam o motivo em ordem cronológica.</p>
+
+<p>O outro comando que responde “o que é este campo?” é o <code>explain</code>. A transcrição abaixo, de um
+cluster de verdade, mostra duas folhas úteis: o nome do container e a política de reinício.</p>
+
+<pre class="term">$ kubectl explain pod.spec.containers.name
+KIND:       Pod
+VERSION:    v1
+
+FIELD: name &lt;string&gt;
+
+DESCRIPTION:
+     Name of the container specified as a DNS_LABEL. Each container in a pod must
+     have a unique name (DNS_LABEL). Cannot be updated.
+
+$ kubectl explain pod.spec.restartPolicy
+KIND:       Pod
+VERSION:    v1
+
+FIELD: restartPolicy &lt;string&gt;
+
+DESCRIPTION:
+     Restart policy for all containers within the pod. One of Always, OnFailure,
+     Never. Default to Always.</pre>
+
+<h2>7. Duas coisas para praticar agora</h2>
+
+<p>A primeira caixa monta o mínimo que funciona — e o inicial esquece o campo que todo container precisa
+além da imagem, que é o nome. A segunda é o conserto do <code>env</code> escrito como mapa, o erro de YAML
+que mais aparece em pod.</p>
+
+<div class="tryk8s" data-goal="objeto:Pod/vitrine;;texto:Running;;campo:Pod/vitrine|spec.containers.0.name=web">
+  <p class="try-task">O pod da vitrine tem imagem, mas o container está sem nome. Rode e leia a mensagem;
+  depois acrescente <code>name: web</code> ao container e rode de novo.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: vitrine
+spec:
+  containers:
+    - image: vitrine:1.0
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+The Pod "vitrine" is invalid: spec.containers[0].name: Required value
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: vitrine
+spec:
+  containers:
+    - name: web
+      image: vitrine:1.0
+      ports:
+        - containerPort: 8080</pre>
+</div>
+
+<div class="tryk8s" data-goal="objeto:Pod/cardapio;;texto:Running;;campo:Pod/cardapio|spec.containers.0.env.0.name=PORTA">
+  <p class="try-task">A variável <code>PORTA</code> foi escrita como mapa e o servidor recusou. Passe para
+  o formato de lista e rode: o pod tem de subir com <code>PORTA</code> no primeiro item de
+  <code>env</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        PORTA: "8080"</pre>
+<pre class="out">
+The Pod "cardapio" is invalid: spec.containers[0].env: Invalid value: must be a list
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      env:
+        - name: PORTA
+          value: "8080"</pre>
+</div>
+
+<p>As duas caixas também ensinam onde o erro aparece. Falta de <code>name</code> e <code>env</code> em mapa
+são erros de <em>validação</em>: o objeto é recusado antes de existir, e o <code>get pods</code> continua
+vazio. Já um <code>volumeMounts</code> que aponta para um volume inexistente é erro de <em>execução</em>: o
+objeto é aceito, o pod fica em <code>ContainerCreating</code>, e o motivo só aparece no
+<code>describe</code>. Saber em qual das duas famílias o seu problema cai economiza metade do
+diagnóstico.</p>
+
+<p>Repare que, nos dois casos, o painel mostra a mensagem de validação antes de criar qualquer coisa: o
+objeto é recusado inteiro, não “pela metade”. É assim que o Kubernetes trabalha — o manifesto é validado
+antes de virar objeto, e o erro aponta o caminho exato do campo.</p>
+
+<h2>8. Para ir além</h2>
+
+<ul>
+  <li><a href="pod-manifesto.html">O manifesto do Pod</a> — os quatro blocos aplicados a um caso
+  concreto.</li>
+  <li><a href="recursos-do-pod.html">Requests e limits</a> — os números de <code>resources</code>, com
+  QoS.</li>
+  <li><a href="init-containers.html">Init containers</a> — o que roda antes e por quê.</li>
+  <li><a href="sidecar.html">Sidecar e multi-container</a> — dois containers no mesmo pod.</li>
+  <li><a href="restart-policy.html">restartPolicy</a> — os três valores e o efeito de cada um.</li>
+  <li><a href="volumes-emptyDir.html">emptyDir</a> — o volume mais simples, e o que é
+  <code>volumeMounts</code>.</li>
+  <li><a href="readiness-probe.html">Readiness probe</a> — quando o pod está pronto para receber
+  tráfego.</li>
+  <li><a href="ref-manifestos.html">Manifestos</a> — o esqueleto e o mapa de <code>apiVersion</code>.</li>
+</ul>
+
+<h2>Resumo</h2>
+
+<p>O <code>spec</code> do pod tem dois níveis: o do pod (<code>containers</code>,
+<code>initContainers</code>, <code>restartPolicy</code>, <code>volumes</code>, <code>nodeSelector</code>,
+<code>securityContext</code>) e o do container (<code>name</code>, <code>image</code>,
+<code>command</code>, <code>args</code>, <code>env</code>, <code>ports</code>, <code>resources</code>,
+<code>volumeMounts</code>, probes). Declarar é no pod, usar é no container — e trocar os dois é a origem
+da maioria dos erros.</p>
+
+<p><code>containers</code> é obrigatório e é lista; cada item precisa de <code>name</code> e
+<code>image</code>. <code>restartPolicy</code> vale para o pod inteiro e o padrão é <code>Always</code>;
+<code>ports</code> documenta e não roteia; <code>resources</code> é por container; <code>env</code> é lista,
+não mapa. As mensagens de validação citam o caminho completo, com índice — <code>spec.containers[0].env</code>
+—, e o <code>describe</code> mostra o que realmente entrou: <code>Environment</code>,
+<code>Mounts</code>, <code>Requests</code>, <code>Limits</code> e <code>Events</code>.</p>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

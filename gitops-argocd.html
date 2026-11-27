@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitOps | Guia Kubernetes</title>
+<meta name="description" content="GitOps na prática: o Git como fonte da verdade, o Argo CD sincronizando o cluster, sync e drift, prune e o que muda quando ninguém aplica mais com kubectl na mão.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>O <span class="hl">GitOps</span></h1>
+<p class="intro">O site da padaria da Ana já não é aplicado à mão: os manifestos moram num repositório Git, e
+uma ferramenta chamada Argo CD lê esse repositório e mantém o cluster igualzinho a ele. Parece só uma
+formalidade — até a madrugada em que alguém conserta um problema com <code>kubectl set image</code> e esquece
+de desfazer. Nesta aula a Ana entende o que é GitOps de verdade, o que é <em>drift</em>, como o Argo CD
+decide que o cluster está fora de sincronia e por que o botão de <em>prune</em> é o mais perigoso da tela.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que significa dizer que o Git é a fonte da verdade — e o que isso muda no dia a dia.</li>
+  <li>O que o Argo CD faz: comparar, sincronizar e corrigir, num laço que não para.</li>
+  <li>O que é <em>drift</em> e por que ele aparece mesmo em time organizado.</li>
+  <li>O que <code>selfHeal</code> e <code>prune</code> fazem, e quando eles assustam.</li>
+  <li>Por que o hotfix feito com <code>kubectl</code> às duas da manhã sempre volta como dívida.</li>
+  <li>O que não deve ir para o Git: segredo, dado e o que não é manifesto.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o cluster que não bate com o repositório</h2>
+
+<p>Sexta passada a Ana fez o deploy do cardápio novo. O repositório dizia <code>cardapio:2.1.0</code>, o
+pipeline rodou, o Argo CD mostrou “Synced” em verde e ela foi dormir. Na segunda-feira, o site ainda
+mostrava o preço antigo. Ela abriu o repositório: a imagem lá era <code>2.1.0</code>. Abriu o cluster:
+<code>cardapio:2.0.0</code>. As duas coisas estavam “certas” e não batiam. Levou uma hora para descobrir o
+motivo: no sábado, de madrugada, alguém tinha feito um teste com <code>kubectl set image</code> e
+esquecido de voltar.</p>
+
+<p>Esse desencontro tem nome: <strong>drift</strong>, ou desvio. É a diferença entre o que você
+<em>quis</em> que existisse e o que <em>existe</em> de fato no cluster. Em um cluster administrado por
+comandos soltos, o drift é o estado normal — cada pessoa que digitou <code>kubectl</code> deixou uma
+marca que ninguém viu. Em um cluster com GitOps, o drift é uma condição temporária: alguém compara os
+dois lados o tempo todo e corrige a diferença.</p>
+
+<p>A pergunta que resume a diferença é simples: <em>se este cluster sumisse agora, você conseguiria
+recriá-lo exatamente igual só com o que está no repositório?</em> Se a resposta é “quase”, você tem
+drift. Se é “de jeito nenhum, metade foi feita na mão”, você tem um cluster que ninguém sabe reproduzir —
+e o dia em que ele cair vai ser longo.</p>
+
+<h2>2. Git como fonte da verdade</h2>
+
+<p>Pense no caderno de receitas da padaria. Durante anos, cada padeiro anotou a sua versão do pão de
+queijo num papel diferente, e a receita “oficial” era a que estava na cabeça da Ana. Um dia ela juntou
+tudo num caderno único, numerado, com data e assinatura em cada mudança. A partir daí, a receita é o
+caderno. Se o pão sair diferente, o problema é de quem não seguiu o caderno — não existe “a receita do
+Zé”.</p>
+
+<p>GitOps é isso aplicado ao cluster. O repositório Git guarda os manifestos — os arquivos YAML que
+descrevem Deployments, Services, ConfigMaps. Uma ferramenta dentro do cluster lê esses arquivos e
+<strong>faz o cluster ficar igual a eles</strong>, continuamente. Não é uma pessoa aplicando; é um
+controlador, do mesmo jeito que o controlador do Deployment cria pods para chegar ao número de
+réplicas pedido.</p>
+
+<p>Quatro propriedades fazem a diferença na prática. Primeiro, o manifesto é <strong>declarativo</strong>:
+você descreve o resultado, não os comandos. Segundo, tudo é <strong>versionado</strong>: cada mudança tem
+autor, data e diff, e voltar atrás é um <code>git revert</code>. Terceiro, o estado é
+<strong>reconciliado</strong>: alguém compara o desejado com o atual sem parar. Quarto, é
+<strong>auditável</strong>: a pergunta “quem mudou as réplicas para cinco?” tem resposta no histórico, e
+não num log de auditoria do cluster que ninguém ligou.</p>
+
+<dl class="anatomy">
+<dt>estado desejado</dt>
+<dd>O que está escrito no repositório: os manifestos, com imagens, réplicas e configuração. É a
+intenção.</dd>
+<dt>estado atual</dt>
+<dd>O que existe no cluster naquele instante: objetos criados, imagens em execução, réplicas
+prontas.</dd>
+<dt>drift</dt>
+<dd>A diferença entre os dois. Pode nascer de um <code>kubectl</code> manual, de um objeto criado
+por outra ferramenta ou de um manifesto que não foi aplicado.</dd>
+<dt>reconciliação</dt>
+<dd>O laço que compara desejado e atual e age para fechar a diferença. É o coração do GitOps e o
+mesmo padrão que o Kubernetes usa desde sempre.</dd>
+<dt>sync</dt>
+<dd>O ato de aplicar o que está no Git no cluster. Pode ser manual (um botão, um comando) ou
+automático.</dd>
+<dt>Application</dt>
+<dd>O objeto do Argo CD que amarra um repositório, uma pasta e um namespace de destino. É o
+“contrato” de sincronização.</dd>
+</dl>
+
+<p>Repare no que muda de lugar. Sem GitOps, o cluster é o bem mais valioso e o repositório é
+documentação. Com GitOps, o repositório é o bem mais valioso e o cluster é descartável: se ele morrer,
+você aplica o repositório em outro e a padaria volta. Isso só é verdade se <em>tudo</em> estiver no
+repositório — e é aí que a maioria dos times descobre que metade do cluster foi feita na mão.</p>
+
+<h2>3. O Argo CD, em uma frase</h2>
+
+<p>O Argo CD é um controlador que roda dentro do cluster e faz uma coisa só: manter o cluster igual ao
+repositório. Ele baixa os manifestos, renderiza (Helm, Kustomize ou YAML puro), compara com o que está
+vivo e aplica a diferença. A configuração dele é um objeto chamado <code>Application</code>, que diz
+onde está o quê e para onde vai:</p>
+
+<pre class="file" data-file="application-cardapio.yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cardapio
+  namespace: argocd
+spec:
+  project: padaria
+  source:
+    repoURL: https://git.loja.test/padaria/site.git
+    targetRevision: main
+    path: deploy/padaria
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: padaria
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true</pre>
+
+<p>Leia de baixo para cima, como quem lê uma receita. <code>destination</code> diz onde aplicar: o
+próprio cluster onde o Argo roda (<code>kubernetes.default.svc</code> é o endereço interno do API server)
+e o namespace <code>padaria</code>. <code>source</code> diz de onde vem: o repositório, o ramo
+<code>main</code> e a pasta <code>deploy/padaria</code>. <code>syncPolicy</code> diz como: automático,
+apagando o que saiu do Git (<code>prune</code>) e corrigindo à força o que alguém mudar na mão
+(<code>selfHeal</code>).</p>
+
+<p>O Argo CD não é o único. O Flux faz o mesmo trabalho com outra filosofia: é um conjunto de
+controladores menores, sem interface gráfica própria, operado por linha de comando e pelos próprios
+objetos do Kubernetes. A escolha entre os dois é menos importante do que o hábito que ambos exigem: parar
+de aplicar na mão. Uma ferramenta de GitOps num time que continua usando <code>kubectl apply</code> é só
+mais um componente para dar problema.</p>
+
+<h2>4. Sync, drift e o laço que não para</h2>
+
+<p>O Argo CD compara três coisas, não duas: o que está no Git, o que está vivo no cluster e o que ele
+mesmo aplicou na última sincronização. Essa terceira parte é o que permite a ele distinguir “alguém mudou
+o cluster” de “o Git mudou”. O resultado da comparação vira um estado, e é esse estado que você vê na
+tela ou no <code>kubectl get applications</code>:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Estado</th><th>O que significa</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Synced</code></td><td>o cluster bate com o Git</td><td>nada; é o estado saudável</td></tr>
+<tr><td><code>OutOfSync</code></td><td>existe diferença entre Git e cluster</td><td>olhar o diff: quem mudou
+foi o Git (falta sincronizar) ou o cluster (alguém mexeu)?</td></tr>
+<tr><td><code>Progressing</code></td><td>a sincronização está em andamento</td><td>esperar; se demorar,
+<code>kubectl get pods</code> no namespace de destino</td></tr>
+<tr><td><code>Degraded</code></td><td>aplicou, mas a aplicação não ficou saudável</td><td>é problema de
+pod, não de Git: logs e <code>describe</code></td></tr>
+<tr><td><code>Missing</code></td><td>o objeto está no Git e não existe no cluster</td><td>sincronizar; se
+voltar sozinho, algo está apagando</td></tr>
+<tr><td><code>Unknown</code></td><td>o Argo não conseguiu comparar</td><td>credencial do repositório,
+rede ou permissão do namespace</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Duas confusões custam tempo. A primeira é achar que <code>OutOfSync</code> é sinônimo de erro: não é.
+Significa apenas que os dois lados divergem — e às vezes o lado certo é o cluster, quando alguém corrigiu
+uma emergência e ainda não commitou. A segunda é achar que sincronizar é aplicar por cima: o Argo calcula
+a diferença e mexe só no que precisa, o que é bem diferente de reaplicar o arquivo inteiro.</p>
+
+<p>Com <code>automated</code> ligado, o laço roda a cada poucos minutos e também quando o repositório
+muda. Com <code>selfHeal: true</code>, qualquer alteração manual no cluster é revertida — inclusive a sua,
+inclusive durante um incidente. É esse detalhe que separa GitOps de “aplicar automaticamente”: no
+primeiro, o cluster <em>defende</em> o estado do Git.</p>
+
+<h2>5. A caixa: devolver o cluster ao que o Git diz</h2>
+
+<p>A caixa abaixo começa no estado do problema da Ana: o Deployment <code>cardapio</code> existe no
+cluster com cinco réplicas e a imagem de teste <code>cardapio:2.0.0</code>, enquanto o repositório diz
+duas réplicas e <code>cardapio:1.0</code>. Você é o Argo CD: ajuste o manifesto até que ele descreva o
+que o Git manda e rode.</p>
+
+<div class="tryk8s" data-cenario="padaria" data-get="deployments" data-goal="campo:Deployment/cardapio|spec.replicas=2;;campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:1.0;;pronto:Deployment/cardapio=2">
+  <p class="try-task">Corrija as réplicas para <code>2</code> e a imagem para <code>cardapio:1.0</code>,
+  que é o que está no Git. O painel tem de mostrar o Deployment com <code>2/2</code> prontos.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio configured
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   5/5     5            5           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>A resposta é <code>deployment.apps/cardapio configured</code> — “configured”, não “created”, porque o
+objeto já existia. É exatamente o que o Argo CD faz quando encontra drift: aplica a diferença e o estado
+volta a <code>Synced</code>. Note que a tabela mostra <code>2/2</code>: duas réplicas pedidas, duas
+prontas.</p>
+
+<p>Agora a parte que quase ninguém pensa. Este é o Deployment como o cluster o guarda depois de receber o
+manifesto (saída do painel, que responde como o kubectl):</p>
+
+<pre class="term">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: cardapio
+  name: cardapio
+  namespace: default
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 2
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: cardapio
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - image: cardapio:1.0
+          imagePullPolicy: IfNotPresent
+          name: web
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          resources:
+            limits: {}
+            requests: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+status:
+  availableReplicas: 2
+  conditions:
+    - reason: MinimumReplicasAvailable
+      status: "True"
+      type: Available
+  readyReplicas: 2
+  replicas: 2
+  unavailableReplicas: 0
+  updatedReplicas: 2</pre>
+
+<p>Compare com o seu arquivo: o cluster tem muito mais campos. Todos os que você não escreveu
+(<code>progressDeadlineSeconds</code>, <code>strategy</code>, <code>revisionHistoryLimit</code>,
+<code>dnsPolicy</code>...) foram preenchidos pelo API server com os padrões, e o <code>status</code> no
+fim é o que o controlador calculou. É por isso que “o cluster é igual ao Git” nunca quer dizer
+byte a byte: quer dizer que os campos que o Git gerencia estão iguais. Todo o resto é conversa entre o
+cluster e ele mesmo — e é também por isso que o GitOps precisa saber quais campos ele é dono, senão
+briga com o cluster para sempre.</p>
+
+<h2>6. O que muda na cabeça de quem aplicava na mão</h2>
+
+<p>A mudança técnica é pequena: em vez de <code>kubectl apply -f</code>, você faz <code>git push</code>.
+A mudança de cabeça é grande, porque inverte quem tem pressa. Antes, o caminho mais rápido era o terminal:
+descobriu o problema, colou um <code>kubectl set image</code>, resolveu. Agora o caminho mais rápido é
+commit, revisão e sincronização — e o terminal passou a ser o caminho que <em>cria</em> drift.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Cluster aplicado na mão</th><th>Cluster com GitOps</th></tr>
+</thead>
+<tbody>
+<tr><td>quem aplica?</td><td>cada pessoa com acesso, no seu terminal</td><td>um controlador, sempre do
+mesmo jeito</td></tr>
+<tr><td>como sei o que mudou?</td><td>pelo histórico do seu shell, se você lembrar</td><td>pelo
+<code>git log</code> e pelo diff da <code>Application</code></td></tr>
+<tr><td>como volto atrás?</td><td><code>kubectl rollout undo</code>, se o objeto tiver histórico</td><td><code>git revert</code>
+e sincronizar</td></tr>
+<tr><td>quem precisa de credencial?</td><td>todo mundo que aplica</td><td>só o Argo CD; o time não precisa
+de acesso de escrita</td></tr>
+<tr><td>revisão antes de aplicar</td><td>não existe</td><td>é o pull request</td></tr>
+<tr><td>cluster de teste igual ao de produção</td><td>quase nunca</td><td>mesma pasta, valores
+diferentes</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O item da credencial é o mais subestimado. Num time que aplica na mão, todo mundo tem
+<code>cluster-admin</code> — porque é mais fácil dar tudo do que pensar em permissão. Com GitOps, o
+cluster aceita mudanças vindas de um único lugar, e as pessoas passam a precisar só de leitura. Isso
+reduz o estrago possível de um erro humano: ninguém apaga um namespace por engano às onze da noite.</p>
+
+<p>E tem o efeito colateral bom: o <code>git blame</code> responde “quem mudou e por quê”. O commit traz
+a mensagem, o pull request traz a discussão, o diff traz a linha. Nada disso existe num cluster onde a
+única pista é um evento com <code>created by ana</code> — que é o que o painel deste guia mostra quando
+você aplica um manifesto.</p>
+
+<h2>7. Prune: o que está no Git é o que existe</h2>
+
+<p>Existe uma diferença sutil entre “aplicar o que está no Git” e “o cluster ser o que está no Git”. A
+primeira parte cria e atualiza; ela nunca apaga. A segunda exige <em>prune</em>: apagar o que foi criado
+por aquela aplicação e não está mais no repositório. Sem prune, o cluster acumula objetos órfãos — o
+ConfigMap de um teste de março, o Service de uma versão que ninguém usa — e o drift cresce pelo lado do
+que sobra.</p>
+
+<p>A caixa abaixo mostra a versão sem prune e a versão com prune, de forma condensada: o repositório tem
+<em>um</em> ConfigMap, o <code>cardapio</code>. Aplique só o que o Git manda.</p>
+
+<div class="tryk8s" data-get="configmaps" data-goal="conta:configmaps=1;;campo:ConfigMap/cardapio|data.modo=producao">
+  <p class="try-task">O repositório define apenas o ConfigMap <code>cardapio</code>, com
+  <code>modo: producao</code>. Apague do arquivo o que não deveria existir e rode: o painel tem de mostrar
+  um único ConfigMap.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  modo: teste
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-teste
+data:
+  modo: teste</pre>
+<pre class="out">
+configmap/cardapio created
+configmap/cardapio-teste created
+
+NAME             DATA   AGE
+cardapio         1      2m
+cardapio-teste   1      1m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio
+data:
+  modo: producao</pre>
+</div>
+
+<p>O painel mostra dois ConfigMaps na primeira tentativa e um só na segunda. No Argo CD, esse “apagar o
+que sobra” é o <code>prune: true</code> — e ele é o botão que exige respeito. Com prune ligado, um
+manifesto que renderiza vazio (um <code>helm template</code> que falhou, uma pasta errada no
+<code>path</code>, um overlay sem recursos) pode apagar tudo o que aquela <code>Application</code>
+gerencia. Já viram isso acontecer com namespace inteiro.</p>
+
+<p>Duas proteções ajudam. A primeira é olhar o diff antes de sincronizar quando o prune está ligado: a
+tela do Argo mostra exatamente o que será apagado. A segunda é separar aplicações por dono — uma
+<code>Application</code> para o site, outra para o banco, outra para o ingress — para que um erro de
+render em uma não leve junto o que não é dela. E, claro, o que nunca entra no Git: segredos. Um Secret
+commitado é um segredo vazado para sempre, porque o histórico do Git não esquece. As soluções para isso
+(Sealed Secrets, External Secrets, Vault) estão na aula de segredos externos.</p>
+
+<h2>8. O hotfix de madrugada e o preço do desvio</h2>
+
+<p>Voltemos ao sábado. O site estava fora do ar, a Ana não ia abrir pull request às duas da manhã, e ela
+fez o que qualquer pessoa faria: apontou o Deployment para a imagem anterior com <code>kubectl set
+image</code>. Em trinta segundos o site voltou. O problema não foi o comando — foi o que aconteceu
+depois: nada. A caixa abaixo reproduz a sequência inteira, inclusive o arrependimento.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:image updated;;texto:successfully rolled out;;texto:rolled back">
+  <p class="try-task">A primeira linha já está escrita: ela aponta o Deployment para uma imagem de teste e
+  espera o rollout. Depois <strong>desfaça</strong> a mudança e mostre o histórico de revisões — o painel
+  tem de trazer as três respostas: imagem atualizada, rollout concluído e mudança desfeita.</p>
+<pre class="yaml">kubectl set image deployment/cardapio web=cardapio:9.9.9
+kubectl rollout status deployment/cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl set image deployment/cardapio web=cardapio:9.9.9
+deployment.apps/cardapio image updated
+
+ana@notebook:~$ kubectl rollout status deployment/cardapio
+deployment "cardapio" successfully rolled out
+</pre>
+<pre class="solucao">kubectl set image deployment/cardapio web=cardapio:9.9.9
+kubectl rollout status deployment/cardapio
+kubectl rollout undo deployment/cardapio
+kubectl rollout history deployment/cardapio</pre>
+</div>
+
+<p>O <code>rollout undo</code> volta para a revisão anterior — e é a rede de segurança que existe mesmo
+em cluster com GitOps, para o caso de o Git estar errado. O que ele <em>não</em> faz é avisar o
+repositório: o Git continua dizendo <code>2.1.0</code>, o cluster agora diz <code>1.0</code>, e a
+diferença vai aparecer como <code>OutOfSync</code>. Se o <code>selfHeal</code> estiver ligado, o Argo
+desfaz o seu <code>undo</code> em minutos — e isso é o sistema funcionando, não uma falha.</p>
+
+<p>O histórico que o comando imprime é a história do cluster, não a do Git:</p>
+
+<pre class="term">REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+3          &lt;none&gt;</pre>
+
+<p>Repare no <code>CHANGE-CAUSE</code> vazio. Revisão 1 foi a criação, revisão 3 foi o
+<code>undo</code> (a 2 foi a imagem de teste, que saiu do histórico ao ser desfeita). Nada ali diz
+“corrigido por causa do incidente de sábado”. Num cluster real, a boa prática é anotar a causa no
+manifesto — e é justamente o que um pipeline com GitOps faz de graça, porque a mensagem do commit vira o
+registro da mudança.</p>
+
+<p>A regra que a Ana adotou depois disso: hotfix no cluster é dívida com prazo de duas horas. Se em duas
+horas o mesmo ajuste não estiver commitado (ou o problema não tiver sido resolvido de outra forma), o
+próximo deploy vai brigar com ele. Com <code>selfHeal</code> ligado, nem é preciso esperar: o cluster
+volta sozinho ao que o Git diz, e o incidente continua aberto — o que é honesto, porque o problema nunca
+foi resolvido de verdade, só escondido.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o selfHeal desfez o conserto</h3>
+<p>A Ana aplicou um hotfix no cluster e, cinco minutos depois, o Argo o desfez. O site voltou a cair e ela
+achou que a ferramenta estava quebrada. Não estava: <code>selfHeal</code> faz exatamente isso. O caminho
+correto é commitar o ajuste (mesmo que simples, mesmo que provisório) e deixar o Argo aplicar — ou
+desligar o selfHeal daquela Application durante a janela de incidente, com data para religar.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o Pull Request que já está no ar</h3>
+<p>Num time, a <code>Application</code> aponta para o ramo <code>main</code> e sincroniza sozinha: o
+merge é o deploy. Em outro, aponta para um ramo de produção que só recebe merge depois do aval — e o
+deploy é um segundo merge. As duas formas são GitOps; a diferença é quantas pessoas precisam concordar
+entre o commit e o cluster. O que não funciona é apontar para o ramo de desenvolvimento e fingir que
+existe revisão.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o cluster de teste que ninguém olha</h3>
+<p>A Ana tem duas Applications, uma para <code>padaria</code> e outra para <code>padaria-teste</code>,
+apontando para a mesma pasta do repositório com valores diferentes (o Kustomize resolve isso com
+overlays). O risco aparece quando os valores de teste ficam meses sem ser usados: no dia em que ela
+precisa testar um upgrade, o cluster de teste está três versões atrás e não prova nada. Cluster de teste
+que não é aplicado pelo mesmo repositório vira museu.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que é drift?</p>
+<label><input type="radio" name="q1"> um erro de configuração no manifesto YAML</label>
+<label><input type="radio" name="q1"> a diferença entre o que está no Git e o que existe no cluster</label>
+<label><input type="radio" name="q1"> a sincronização automática do Argo CD</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que <code>selfHeal: true</code> faz?</p>
+<label><input type="radio" name="q2"> apaga os objetos que saíram do repositório</label>
+<label><input type="radio" name="q2"> cria um namespace novo quando falta</label>
+<label><input type="radio" name="q2"> reverte alterações feitas à mão no cluster, voltando ao que o Git
+diz</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que <code>prune</code> é perigoso?</p>
+<label><input type="radio" name="q3"> porque apaga o que a aplicação gerencia e não está mais no Git —
+inclusive quando o manifesto renderiza vazio por engano</label>
+<label><input type="radio" name="q3"> porque reinicia todos os pods a cada sincronização</label>
+<label><input type="radio" name="q3"> porque impede o uso de <code>kubectl</code> no cluster</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a Application da confeitaria</h2>
+<p>Escreva a <code>Application</code> do site da confeitaria, apontando para o repositório
+<code>https://git.loja.test/padaria/confeitaria.git</code>, ramo <code>main</code>, pasta
+<code>deploy/confeitaria</code>, no namespace <code>confeitaria</code>, com sincronização automática e
+<code>selfHeal</code> ligado. Depois responda: qual campo diz <em>em que pasta</em> do repositório estão os
+manifestos?</p>
+<div class="ex-code">source:<input aria-label="resposta 1" data-answer="path" placeholder="...">: deploy/confeitaria</div>
+<p class="ex-dica">Dica: <code>source</code> aponta para o repositório (<code>repoURL</code>), o ramo
+(<code>targetRevision</code>) e a pasta (<code>path</code>). <code>destination</code> diz onde aplicar.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>GitOps é a disciplina de tratar o repositório como fonte da verdade do cluster: o que está lá é o que
+deve existir, e um controlador — o Argo CD, o Flux — compara os dois lados sem parar e corrige a
+diferença. O objeto que amarra tudo é a <code>Application</code>: repositório, ramo, pasta, destino e
+política de sincronização.</p>
+
+<p>O problema que ele resolve tem nome: drift. Um <code>kubectl set image</code> de madrugada, um
+<code>scale</code> esquecido, um objeto criado por outra ferramenta — tudo isso afasta o cluster do Git.
+Sincronizar fecha a diferença; <code>selfHeal</code> impede que ela volte; <code>prune</code> apaga o que
+sobrou, e é onde mora o perigo, porque um manifesto que renderiza vazio pode levar embora o que não
+devia.</p>
+
+<p>O que muda de verdade é a ordem das coisas: commit, revisão, sincronização — e o terminal deixa de ser
+o caminho da pressa. O cluster fica descartável, o repositório vira o bem precioso, e a pergunta “quem
+mudou isso?” passa a ter uma resposta. O segredo continua fora do Git, e a aula de segredos externos
+mostra como.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Git é a fonte da verdade; o cluster é consequência.</li>
+  <li><code>OutOfSync</code> não é erro: é diferença. Olhe o diff antes de sincronizar.</li>
+  <li><code>selfHeal</code> desfaz o seu <code>kubectl</code>; se precisar de hotfix, commite.</li>
+  <li><code>prune</code> apaga — e um manifesto vazio com prune ligado apaga tudo.</li>
+  <li>Segredo não vai para o Git; o histórico não esquece.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

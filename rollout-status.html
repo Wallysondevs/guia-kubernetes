@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rollout status | Guia Kubernetes</title>
+<meta name="description" content="O kubectl rollout status a fundo: o que a linha de sucesso esconde, as mensagens de espera, o timeout, o código de saída e como saber se o deploy realmente terminou.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">rollout status</span></h1>
+<p class="intro">A Ana publicou a versão nova do site às onze da noite, viu <code>image updated</code> na tela
+e foi dormir. Às seis da manhã o telefone tocou: metade dos pods estava de pé, metade não. Faltava um comando
+— o que <em>espera</em> o deploy terminar e conta se ele terminou. Nesta aula ela aprende o
+<code>kubectl rollout status</code> de verdade: a linha de sucesso, as mensagens de espera, o
+<code>--timeout</code>, o código de saída que faz o pipeline parar e, principalmente, o que essa mensagem
+tranquila <strong>não</strong> garante.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que o comando responde — e o que ele não responde.</li>
+  <li>A forma certa do alvo: <code>deployment/cardapio</code>.</li>
+  <li>As mensagens de progresso, linha por linha.</li>
+  <li><code>--timeout</code>, <code>-w</code> e o código de saída no pipeline.</li>
+  <li>Onde olhar quando ele nunca chega ao fim.</li>
+  <li>Por que “successfully rolled out” não significa “a versão está boa”.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o deploy que “deu certo”</h2>
+
+<p>O comando que a Ana rodou foi <code>kubectl set image deployment/cardapio web=cardapio:2.0</code>. A
+resposta foi curta e tranquilizadora: <code>deployment.apps/cardapio image updated</code>. Ela leu aquilo
+como “publicado”, fechou o notebook e dormiu.</p>
+
+<p>Só que aquela linha diz uma coisa muito menor do que parece. Ela diz: <em>o controlador aceitou a mudança
+e começou o trabalho</em>. Nada sobre pods novos terem subido, nada sobre estarem prontos, nada sobre o site
+estar atendendo. Entre o “image updated” e o “site funcionando com a versão nova” existe um processo inteiro
+— e é esse processo que o <code>rollout status</code> acompanha.</p>
+
+<p>É a diferença entre entregar a encomenda na portaria e ver o cliente assinar. Se ninguém assina, o pacote
+pode estar perdido no caminho — e é justamente aí que o deploy travado mora. Quem só olha o “image updated”
+descobre o problema pelo telefone, às seis da manhã. Quem roda o <code>rollout status</code> descobre em
+dois minutos, no terminal, com o café ainda quente.</p>
+
+<h2>2. O que o comando responde</h2>
+
+<p>O <code>rollout status</code> é um comando que <em>espera</em>. Ele pergunta ao cluster, de segundo em
+segundo, se o Deployment chegou ao estado desejado, e só termina quando a resposta é sim — ou quando desiste.
+Enquanto espera, ele imprime o progresso. É o único comando do dia a dia que tem essa paciência embutida: o
+<code>get</code> tira uma foto e vai embora; o <code>status</code> fica sentado no sofá até o bolo assar.</p>
+
+<p>Isso muda o que você faz com ele. No terminal, serve para acompanhar uma publicação e saber na hora se
+algo saiu errado. No pipeline, serve como porteiro: se o comando não termina bem, o pipeline falha e a versão
+não segue para o próximo estágio. Sem ele, o pipeline considera sucesso o instante em que o manifesto foi
+aceito — que é o instante em que <em>menos</em> se sabe sobre o resultado.</p>
+
+<dl class="anatomy">
+<dt>rollout</dt>
+<dd>O processo de trocar a versão de um Deployment: pods novos sobem, pods velhos saem.</dd>
+<dt>status</dt>
+<dd>O subcomando que espera o rollout terminar e informa o resultado.</dd>
+<dt>revisão</dt>
+<dd>Cada mudança no template do Deployment gera uma revisão numerada (1, 2, 3…).</dd>
+<dt>readyReplicas</dt>
+<dd>Quantas réplicas estão prontas segundo o Deployment. É o número que o status observa.</dd>
+<dt>condição</dt>
+<dd>Um par tipo/status que o controlador publica no objeto: <code>Available</code>,
+<code>Progressing</code>, <code>ReplicaFailure</code>.</dd>
+<dt>timeout</dt>
+<dd>Quanto tempo o kubectl espera antes de desistir. Não cancela o deploy: só para de olhar.</dd>
+</dl>
+
+<h2>3. A forma do comando</h2>
+
+<p>O alvo vai no formato <code>tipo/nome</code>, igual ao <code>scale</code> da aula de kubectl. Sem o tipo, o
+kubectl não sabe o que procurar e a mensagem de erro sai feia — com o nome vazio entre aspas. A caixa abaixo
+começa exatamente nesse tropeço: o comando rodando antes do Deployment existir.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:deployment.apps/cardapio created;;texto:successfully rolled out;;texto:2/2">
+  <p class="try-task">A primeira linha responde NotFound porque o Deployment ainda não existe. Crie o
+  Deployment com duas réplicas, rode o <code>rollout status</code> e confira com <code>get deployments</code>.</p>
+<pre class="yaml">kubectl rollout status deployment/cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl rollout status deployment/cardapio
+Error from server (NotFound): deployments.apps "cardapio" not found
+</pre>
+<pre class="solucao">kubectl create deployment cardapio --image=cardapio:1.0 --replicas=2
+kubectl rollout status deployment/cardapio
+kubectl get deployments</pre>
+</div>
+
+<p>A primeira resposta, <code>Error from server (NotFound): deployments.apps "cardapio" not found</code>, é o
+cluster dizendo que não existe Deployment com esse nome. Repare no plural <code>deployments.apps</code>: é o
+nome do recurso com o grupo da API, do jeito que o servidor chama. Nada de grave — só falta criar.</p>
+
+<p>Depois de criar, o <code>rollout status</code> responde <code>deployment "cardapio" successfully rolled
+out</code>. Note que essa linha não tem nada a ver com a anterior: aqui o sujeito é o Deployment entre aspas,
+não o recurso. É o formato que você vai reconhecer em log de pipeline e em tutorial pela internet.</p>
+
+<p>Três flags completam o comando. <code>-n</code> escolhe o namespace, como em todo comando do kubectl.
+<code>--timeout</code> define quanto tempo esperar: o padrão é <code>0s</code>, que significa “sem limite” — o
+comando fica ali para sempre se o deploy não terminar. E <code>-w</code> liga o modo watch explícito; na
+prática o <code>status</code> já observa sozinho, então quem usa <code>-w</code> está sendo redundante mas
+inofensivo.</p>
+
+<h2>4. As duas respostas possíveis</h2>
+
+<p>Na vida real o comando tem duas saídas. Uma é a linha de sucesso. A outra é uma sequência de linhas de
+espera, que mudam conforme o rollout avança. A transcrição abaixo é de um cluster de verdade, publicando a
+versão 2.0 de um site com duas réplicas:</p>
+
+<pre class="term">ana@notebook:~$ kubectl rollout status deployment/cardapio
+Waiting for deployment "cardapio" rollout to finish: 0 of 2 updated replicas are available...
+Waiting for deployment "cardapio" rollout to finish: 1 out of 2 new replicas have been updated...
+Waiting for deployment "cardapio" rollout to finish: 1 old replicas are pending termination...
+deployment "cardapio" successfully rolled out</pre>
+
+<p>Leia as três linhas de espera como um filme. A primeira diz que nenhuma réplica nova está disponível
+ainda: o controlador acabou de criar o ReplicaSet novo e os pods estão nascendo. A segunda muda de assunto —
+uma das duas réplicas novas já foi atualizada, e a contagem de pods velhos ainda existe. A terceira diz que há
+um pod antigo esperando para ser encerrado, o que é o comportamento correto de uma troca gradual: primeiro o
+novo fica pronto, depois o velho sai.</p>
+
+<p>Cada linha é uma foto de um instante diferente, e é por isso que quem olha o terminal vê o texto “parado”
+por alguns segundos. O comando não está travado: está esperando o cluster, que é lento de propósito. Trocar
+uma versão com calma é a diferença entre um deploy e uma queda.</p>
+
+<p>A última linha é a única que importa para o pipeline. Quando ela aparece, todos os pods novos estão prontos
+e a contagem bate com o desejado. A partir daí, o comando termina com código de saída <code>0</code> — e é
+esse número, não o texto, que o script de publicação lê.</p>
+
+<h2>5. O que ele observa: o status do Deployment</h2>
+
+<p>Para esperar direito, é preciso saber o que está sendo esperado. O <code>rollout status</code> olha os
+campos de <code>status</code> que o controlador preenche no Deployment. São quatro números e uma condição, e
+eles aparecem em qualquer <code>get deployment -o yaml</code> que você pedir.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>O que conta</th><th>Onde você vê na tabela</th></tr>
+</thead>
+<tbody>
+<tr><td><code>status.replicas</code></td><td>todos os pods do Deployment, velhos e novos</td><td>soma
+escondida por trás do <code>READY</code></td></tr>
+<tr><td><code>status.readyReplicas</code></td><td>pods prontos para receber tráfego</td><td>o primeiro número
+do <code>READY</code></td></tr>
+<tr><td><code>status.updatedReplicas</code></td><td>pods que já rodam o template novo</td><td><code>UP-TO-DATE</code></td></tr>
+<tr><td><code>status.availableReplicas</code></td><td>pods prontos há pelo menos <code>minReadySeconds</code></td><td><code>AVAILABLE</code></td></tr>
+<tr><td><code>status.conditions</code></td><td>o veredito: <code>Available</code> e <code>Progressing</code></td><td>não aparece na tabela: só no
+<code>describe</code> e no YAML</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O comando considera o rollout terminado quando <code>updatedReplicas</code> e
+<code>readyReplicas</code> batem com <code>spec.replicas</code> e os pods antigos já saíram. Se você publica
+três réplicas e só duas ficam prontas, não importa quanto tempo passe: o <code>status</code> continua
+esperando. É um critério simples e rigoroso — e é o que faz dele um bom porteiro.</p>
+
+<p>As condições contam a mesma história em forma de veredito. <code>Available True</code> com o motivo
+<code>MinimumReplicasAvailable</code> significa “tem réplica suficiente no ar”. <code>Progressing True</code>
+significa “estou trabalhando nisso”. Quando o prazo estoura, <code>Progressing</code> vira
+<code>False</code> com o motivo <code>ProgressDeadlineExceeded</code> — e é aí que o comando desiste com uma
+mensagem diferente.</p>
+
+<h2>6. Acompanhar uma troca de imagem</h2>
+
+<p>O caso mais comum é trocar a imagem e acompanhar. A caixa usa o cenário da padaria, que já tem o Deployment
+<code>cardapio</code> com duas réplicas rodando <code>cardapio:1.0</code>. A missão é publicar a
+<code>2.0</code> e provar que a troca terminou — com o <code>status</code> e com o histórico.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:image updated;;texto:successfully rolled out;;texto:REVISION">
+  <p class="try-task">Acrescente as três linhas que faltam: trocar a imagem do container <code>web</code> para
+  <code>cardapio:2.0</code>, esperar com <code>rollout status</code> e listar o histórico de revisões.</p>
+<pre class="yaml">kubectl rollout status deployment/cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl rollout status deployment/cardapio
+deployment "cardapio" successfully rolled out
+</pre>
+<pre class="solucao">kubectl set image deployment/cardapio web=cardapio:2.0
+kubectl rollout status deployment/cardapio
+kubectl rollout history deployment/cardapio</pre>
+</div>
+
+<p>A ordem das respostas conta a história toda: <code>image updated</code> é o aceite, <code>successfully
+rolled out</code> é o fim do trabalho e o histórico mostra que agora existem duas revisões. Cada
+<code>set image</code> cria uma revisão nova; é essa memória que permite voltar depois (o assunto do
+rollback).</p>
+
+<p>Repare que o <code>status</code> rodou sozinho, sem ninguém precisar conferir no olho. Esse é o ponto: ele
+é um comando para <em>esperar</em>, não para <em>olhar</em>. Quem quer olhar usa <code>get</code>; quem quer
+saber se terminou usa <code>status</code>.</p>
+
+<h3>Reiniciar também é rollout</h3>
+
+<p>Existe uma mudança que não altera imagem, não altera réplica e mesmo assim mexe em todos os pods: o
+<code>rollout restart</code>. Ele é o jeito de dizer “recrie esses pods do zero, com o mesmo template”. É o
+comando que se usa quando a configuração mudou em outro objeto (um ConfigMap, um Secret) e o programa só lê a
+configuração no start.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:restarted;;texto:successfully rolled out;;texto:Running">
+  <p class="try-task">A primeira linha esqueceu o tipo do objeto e o cluster responde com o nome vazio entre
+  aspas. Corrija para <code>deployment/cardapio</code>, espere o fim e liste os pods.</p>
+<pre class="yaml">kubectl rollout restart cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl rollout restart cardapio
+Error from server (NotFound): deployments.apps "" not found
+</pre>
+<pre class="solucao">kubectl rollout restart deployment/cardapio
+kubectl rollout status deployment/cardapio
+kubectl get pods</pre>
+</div>
+
+<p>O erro <code>deployments.apps "" not found</code> é o sintoma de alvo sem tipo: o kubectl olha para a
+string, não encontra a barra e conclui que o nome é vazio. Feio, mas didático — a partir de hoje, sempre
+<code>tipo/nome</code>.</p>
+
+<p>Depois do conserto, <code>deployment.apps/cardapio restarted</code> e o <code>status</code> volta a
+esperar. Note que os pods listados no fim têm nomes diferentes dos de antes: o restart não “reinicia” o mesmo
+pod, ele cria outro — pod é descartável, e o nome novo é a prova. Quem guarda o nome antigo para investigar
+depois vai procurar um objeto que não existe mais.</p>
+
+<h2>7. Quando ele não chega ao fim</h2>
+
+<p>Existem quatro famílias de motivo para um rollout não terminar, e cada uma deixa uma pista diferente.
+Saber qual pista procurar economiza a madrugada.</p>
+
+<p>A primeira é <strong>falta de lugar</strong>: o pod novo pede mais memória ou CPU do que o cluster tem
+livre e fica em <code>Pending</code>. O <code>status</code> espera eternamente, porque nunca haverá réplica
+pronta. A segunda é <strong>imagem</strong>: nome errado, tag que não existe, registro privado sem credencial
+— o pod fica em <code>ImagePullBackOff</code> e o status não avança. A terceira é <strong>prontidão</strong>:
+o container sobe, mas a readinessProbe nunca passa, então <code>READY</code> fica em <code>0/1</code> e o
+Deployment nunca conta aquela réplica como pronta. A quarta é <strong>prazo</strong>: o rollout demora mais do
+que <code>progressDeadlineSeconds</code> permite (o padrão é 600 segundos) e o controlador desiste.</p>
+
+<pre class="term">ana@notebook:~$ kubectl rollout status deployment/cardapio --timeout=90s
+Waiting for deployment "cardapio" rollout to finish: 1 of 2 updated replicas are available...
+error: timed out waiting for the condition
+
+ana@notebook:~$ kubectl describe deployment cardapio
+Conditions:
+  Type           Status  Reason
+  Available      True    MinimumReplicasAvailable
+  Progressing    False   ProgressDeadlineExceeded
+OldReplicaSets:  cardapio-5cbfb4c44d (1/1 replicas created)
+NewReplicaSet:   cardapio-74824llwrp (1/1 replicas created)
+Events:
+  Type     Reason             Age   From                   Message
+  Normal   ScalingReplicaSet  2m    deployment-controller  Scaled up replica set cardapio-74824llwrp to 1
+  Warning  ProgressDeadlineExceeded  30s  deployment-controller  ReplicaSet "cardapio-74824llwrp" has timed out progressing.</pre>
+
+<p>Duas coisas para ler com atenção. <code>error: timed out waiting for the condition</code> é o kubectl
+desistindo de esperar — não é o cluster cancelando o deploy. O Deployment continua lá, tentando, com pods
+velhos no ar atendendo: o serviço não caiu, só não terminou de subir. Já
+<code>ProgressDeadlineExceeded</code> é o controlador dizendo, com todas as letras, que aquele rollout passou
+do prazo e ele parou de tentar.</p>
+
+<p>A diferença entre os dois é a mesma entre o cliente impaciente na porta e o cozinheiro desistindo da receita.
+O <code>--timeout</code> do kubectl é impaciência do cliente; <code>progressDeadlineSeconds</code> é decisão da
+cozinha. Você pode aumentar um sem tocar no outro — e é bom saber qual dos dois está falando quando o terminal
+devolve erro.</p>
+
+<p>O comando certo depois do erro é sempre o mesmo: <code>kubectl describe deployment</code> para as condições
+e o ReplicaSet novo, <code>kubectl get pods</code> para achar o pod que não sobe,
+<code>kubectl describe pod</code> para os eventos daquele pod. A resposta está quase sempre na última seção do
+describe: <code>FailedScheduling</code> (falta lugar), <code>ErrImagePull</code> (imagem),
+<code>Unhealthy</code> (probe).</p>
+
+<p>Cada comando responde uma pergunta diferente, e misturar as perguntas é o que faz a investigação girar em
+falso. A tabela abaixo é o mapa que vale colar no monitor:</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Comando</th><th>Responde</th><th>Use quando</th></tr>
+</thead>
+<tbody>
+<tr><td><code>rollout status</code></td><td>terminou ou ainda está esperando</td><td>acompanhar a publicação, ou no
+fim do pipeline</td></tr>
+<tr><td><code>get deployments</code></td><td><code>READY</code>, <code>UP-TO-DATE</code>,
+<code>AVAILABLE</code></td><td>uma olhada rápida, sem esperar</td></tr>
+<tr><td><code>describe deployment</code></td><td>condições, ReplicaSet novo e antigo, eventos</td><td>entender
+<em>por que</em> não termina</td></tr>
+<tr><td><code>get pods</code></td><td>quais pods existem e em que fase estão</td><td>achar o pod suspeito</td></tr>
+<tr><td><code>describe pod</code></td><td>eventos daquele pod: agendamento, imagem, probe</td><td>achar o motivo
+do pod</td></tr>
+<tr><td><code>rollout history</code></td><td>as revisões já publicadas</td><td>saber o que está no ar e o que dá
+para voltar</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma regra de bolso que vale mais que a tabela: o <code>status</code> diz <em>se</em>; o
+<code>describe</code> diz <em>por quê</em>. Quem começa pelo segundo perde minutos lendo eventos de coisas que
+estão bem. Quem só usa o primeiro fica sabendo que algo está errado e nunca descobre o que é.</p>
+
+<h2>8. O que o comando não garante</h2>
+
+<p>Aqui está a parte que a Ana teria evitado o telefonema se soubesse. <code>successfully rolled out</code>
+significa uma coisa só: o número de réplicas prontas chegou ao desejado segundo o Kubernetes. Não significa
+que a versão nova é boa, que o site responde, que o banco aceita a consulta nova ou que o preço está certo.</p>
+
+<p>Um rollout pode terminar com sucesso e o site estar quebrado de três jeitos clássicos. O primeiro: a
+readinessProbe mente — responde 200 em qualquer caminho, inclusive no <code>/saude</code> que o programa ainda
+não implementou direito. O pod é marcado pronto, o tráfego entra, e o erro aparece para o cliente. O segundo: a
+probe está apontando para a porta errada e o pod nunca fica pronto — aí o rollout não termina, o que é melhor,
+mas o sintoma engana. O terceiro: o Service não seleciona esses pods (etiqueta errada), então o deploy
+termina e nenhum usuário chega na versão nova.</p>
+
+<p>Por isso o <code>rollout status</code> é o <em>começo</em> da verificação, não o fim. Depois dele vêm as
+provas de verdade: uma requisição no endpoint de saúde, os logs procurando erro no start, uma compra de teste.
+Nenhuma dessas coisas o kubectl faz por você.</p>
+
+<p>Sobre o painel deste guia, uma nota honesta: ele responde na hora. Não existe relógio, então
+<code>--timeout</code> é aceito e ignorado, e as linhas de progresso não aparecem uma a uma. Quando o
+Deployment está pronto, o painel devolve a linha de sucesso; quando não está, devolve a mensagem de espera com
+a contagem — a mesma do kubectl real. E como ele não roda container, os estados de imagem quebrada
+(<code>ImagePullBackOff</code>) e os logs da aplicação vêm sempre de transcrição, identificados como tal.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o deploy que esperou a madrugada</h3>
+<p>O pipeline da Ana rodava <code>kubectl apply</code>, imprimia “publicado” e seguia para o teste de fumaça.
+Numa terça-feira, a versão nova pedia 2 GB de memória e nenhum pod agendou: o pipeline disse “publicado”, o
+teste passou (porque testava a versão velha, ainda no ar) e o problema só apareceu no dia seguinte. A correção
+foi de duas linhas: <code>rollout status</code> com <code>--timeout=300s</code> logo depois do apply, e o
+pipeline parando de mentir.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o status que “travou” o terminal</h3>
+<p>Ela rodou <code>rollout status</code> sem timeout, foi almoçar e voltou com o terminal parado no mesmo
+lugar. Não era bug: o comando estava esperando um pod que nunca ficaria pronto, porque a readinessProbe batia
+em <code>/health</code> e o programa respondia em <code>/saude</code>. O comando fez o trabalho dele — avisou
+que o deploy não terminou e não deixou ela acreditar no contrário. O conserto foi no caminho da probe.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o sucesso que escondia o Service vazio</h3>
+<p>Publicação limpa, <code>successfully rolled out</code>, três pods prontos. E o site fora do ar. O Service
+selecionava <code>app: vitrine</code> e os pods novos tinham <code>app: cardapio</code>. Nenhum comando do
+rollout olharia isso, porque o Deployment está perfeito — o problema está um objeto acima. A lição: depois do
+sucesso, confira o caminho do usuário, não só o caminho do pod.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que <code>successfully rolled out</code> garante?</p>
+<label><input type="radio" name="r1"> que a versão nova funciona e o site responde</label>
+<label><input type="radio" name="r1"> que o número de réplicas prontas chegou ao desejado</label>
+<label><input type="radio" name="r1"> que o deploy foi cancelado com sucesso</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que <code>error: timed out waiting for the condition</code>
+significa?</p>
+<label><input type="radio" name="r2"> o cluster cancelou o rollout e voltou a versão antiga</label>
+<label><input type="radio" name="r2"> o Deployment foi apagado</label>
+<label><input type="radio" name="r2"> o kubectl parou de esperar; o rollout continua no cluster</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Qual é a forma correta do alvo?</p>
+<label><input type="radio" name="r3"> <code>kubectl rollout status deployment/cardapio</code></label>
+<label><input type="radio" name="r3"> <code>kubectl rollout status cardapio</code></label>
+<label><input type="radio" name="r3"> <code>kubectl status rollout cardapio</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a bandeira do tempo</h2>
+<p>Você quer que o comando desista depois de cinco minutos, para o pipeline não ficar pendurado. Complete a
+bandeira que define esse limite:</p>
+<div class="ex-code">kubectl rollout status deployment/cardapio <input aria-label="resposta 1" data-answer="--timeout=5m" placeholder="..."></div>
+<p class="ex-dica">Dica: é a mesma bandeira de espera usada em outros comandos do kubectl, com valor e unidade
+(<code>5m</code>, <code>90s</code>).</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>O <code>rollout status</code> é o comando que espera. Ele recebe o alvo na forma
+<code>deployment/nome</code>, observa <code>readyReplicas</code> e <code>updatedReplicas</code> até baterem com
+o desejado e responde com <code>successfully rolled out</code> — ou com uma linha de espera, se ainda não
+terminou. No pipeline, é ele que transforma “manifesto aceito” em “publicação concluída”, porque o código de
+saída conta a verdade.</p>
+
+<p>Quando não termina, o motivo está em quatro lugares conhecidos: falta de lugar (pod <code>Pending</code>),
+imagem (pull falhando), prontidão (probe que não passa) e prazo (<code>ProgressDeadlineExceeded</code>). O
+caminho de investigação é sempre o mesmo: <code>describe deployment</code>, <code>get pods</code>,
+<code>describe pod</code>.</p>
+
+<p>E a lição maior fica para o fim: sucesso no rollout é sucesso de <em>contagem de réplicas</em>, não de
+qualidade. Quem quer garantir o site precisa de probes honestas, Service com seletor certo e um teste de
+verdade depois do deploy. Na próxima aula a Ana aprende a montar essa engrenagem completa — o deploy que não
+derruba ninguém — juntando <code>maxSurge</code>, <code>maxUnavailable</code> e a readinessProbe como
+porteiro.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl rollout status deployment/nome</code> espera; <code>get</code> só fotografa.</li>
+  <li>Alvo sempre com tipo: <code>deployment/cardapio</code>.</li>
+  <li><code>--timeout=0s</code> é o padrão (sem limite); com valor, o kubectl desiste e sai com erro.</li>
+  <li>Desistir de esperar não cancela o deploy.</li>
+  <li>Travou? <code>describe deployment</code>, <code>get pods</code>, <code>describe pod</code>.</li>
+  <li>Sucesso não é qualidade: probe honesta e teste de verdade continuam sendo seus.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

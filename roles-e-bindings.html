@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roles e bindings | Guia Kubernetes</title>
+<meta name="description" content="Role e RoleBinding do zero: escrever as regras, ligar pessoas e grupos, testar com kubectl auth can-i e entender a recusa que o API server devolve.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Roles e <span class="hl">bindings</span></h1>
+<p class="intro">Na aula anterior a Ana entendeu o modelo: quem, o quê, onde. Agora ela vai escrever os dois
+objetos com as próprias mãos, num namespace novo, na ordem certa — primeiro o namespace, depois o role,
+depois o binding — e testar cada passo com o comando que existe para isso: <code>kubectl auth can-i</code>.
+No caminho ela vê a recusa de verdade, aprende a diferença entre dar acesso a uma pessoa e dar acesso a um
+grupo, e descobre por que o <code>roleRef</code> de um binding não se conserta com um <code>edit</code>.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Escrever um <code>Role</code> com mais de uma regra, acertando <code>apiGroups</code> e
+  <code>resources</code>.</li>
+  <li>Ler as regras de um role criado (<code>describe</code> e <code>-o yaml</code>).</li>
+  <li>Ligar o role a uma pessoa, a um grupo e a uma conta de serviço.</li>
+  <li>Testar com <code>kubectl auth can-i</code>, inclusive “no lugar de” outra identidade.</li>
+  <li>Reconhecer a recusa do API server e saber onde procurar o que faltou.</li>
+  <li>Tirar um acesso sem apagar o role e sem deixar ponta solta.</li>
+</ul>
+</div>
+
+<h2>1. A cena: um acesso de leitura, do zero</h2>
+
+<p>A Bia entrou para cuidar dos relatórios. O que ela precisa é modesto: ver os pods do namespace
+<code>padaria</code> e os logs deles quando um pedido não fecha. Nada de criar, nada de apagar — e, por
+enquanto, nada de ver os Secrets, que guardam a senha do banco. A Ana decidiu montar esse acesso do zero, em
+vez de reaproveitar um role pronto, para entender cada linha.</p>
+
+<p>A ordem importa e é sempre a mesma. Primeiro o namespace precisa existir, porque Role e RoleBinding moram
+dentro dele. Depois vem o <code>Role</code>, que é a lista do que pode ser feito. Depois o
+<code>RoleBinding</code>, que é quem recebe a lista. Só então existe o que testar. Aplicar na ordem errada dá
+aquele erro que já apareceu em outras aulas: <code>namespaces "padaria" not found</code>.</p>
+
+<p>E há um detalhe de expectativa: criar o role não muda nada para ninguém. Criar o binding muda — mas só
+para os subjects listados nele. É por isso que o teste vem imediatamente depois, com
+<code>kubectl auth can-i</code>, antes de a Bia reclamar que “não funciona”.</p>
+
+<h2>2. O Role, campo a campo</h2>
+
+<p>Um Role tem <code>metadata</code> (nome e namespace) e <code>rules</code> — uma lista. Cada item da lista
+é uma permissão independente, e todas se somam: nada de “a segunda regra anula a primeira”. Dentro de cada
+regra há três campos que sempre aparecem juntos: <code>apiGroups</code>, <code>resources</code> e
+<code>verbs</code>.</p>
+
+<dl class="anatomy">
+<dt>rules</dt>
+<dd>A lista de permissões do role. Cada item permite um conjunto de verbos em um conjunto de recursos.</dd>
+<dt>apiGroups</dt>
+<dd>O grupo de API do recurso: <code>""</code> para pods e services, <code>apps</code> para deployments,
+<code>batch</code> para jobs.</dd>
+<dt>resources</dt>
+<dd>O tipo no plural e minúsculo: <code>pods</code>, <code>deployments</code>, <code>secrets</code>. Aceita
+subrecurso com barra, como <code>pods/log</code>.</dd>
+<dt>verbs</dt>
+<dd>As ações permitidas: <code>get</code>, <code>list</code>, <code>watch</code>, <code>create</code>,
+<code>update</code>, <code>patch</code>, <code>delete</code>.</dd>
+<dt>roleRef</dt>
+<dd>No binding, o ponteiro para o role. É imutável: para trocar, apague o binding e crie outro.</dd>
+</dl>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>O que vai ali</th><th>Erro comum</th></tr>
+</thead>
+<tbody>
+<tr><td><code>apiGroups</code></td><td><code>""</code>, <code>apps</code>, <code>batch</code></td><td>escrever
+<code>v1</code> (é versão, não grupo)</td></tr>
+<tr><td><code>resources</code></td><td><code>pods</code>, <code>deployments</code></td><td>usar singular
+(<code>pod</code>) ou maiúscula</td></tr>
+<tr><td><code>verbs</code></td><td><code>get</code>, <code>list</code>, <code>delete</code></td><td>achar que
+<code>get</code> cobre <code>list</code></td></tr>
+<tr><td><code>resourceNames</code></td><td>nomes específicos, ex.: <code>cardapio</code></td><td>usar com
+<code>list</code>, que nunca casa com nome</td></tr>
+<tr><td><code>metadata.namespace</code></td><td>o namespace onde a regra vale</td><td>omitir e cair no
+<code>default</code> sem perceber</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O campo <code>resourceNames</code> merece um parágrafo, porque é o jeito mais direto de dar acesso a um
+objeto só — e o mais mal-entendido. Ele vale para <code>get</code>, <code>update</code>, <code>patch</code> e
+<code>delete</code>, mas não para <code>list</code>: uma listagem não tem nome único, então a regra com
+<code>resourceNames</code> simplesmente não casa. Quem precisa listar e só pode ler um objeto está pedindo
+uma coisa que o RBAC não sabe expressar.</p>
+
+<h2>3. Escrevendo o primeiro role</h2>
+
+<p>O role da Bia tem duas regras, porque ela precisa de dois recursos. A primeira cobre pods: ler e listar. A
+segunda cobre logs, que no RBAC é um subrecurso — <code>pods/log</code> — e por isso precisa de regra
+própria. É uma pegadinha clássica: dar <code>pods</code> não dá <code>kubectl logs</code>.</p>
+
+<div class="tryk8s" data-goal="objeto:Role/leitor-relatorios;;campo:Role/leitor-relatorios|rules.0.verbs.0=get;;campo:Role/leitor-relatorios|rules.1.apiGroups.0=apps" data-get="role leitor-relatorios">
+  <p class="try-task">A segunda regra deveria valer para <code>deployments</code>, que é do grupo
+  <code>apps</code>, mas está com o grupo vazio. Corrija o <code>apiGroups</code> da segunda regra e rode.</p>
+<pre class="yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leitor-relatorios
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["deployments"]
+    verbs: ["get", "list"]</pre>
+<pre class="out">
+role.rbac.authorization.k8s.io/leitor-relatorios created
+
+NAME                AGE
+leitor-relatorios   6m
+</pre>
+<pre class="solucao">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leitor-relatorios
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]</pre>
+</div>
+
+<p>Com o grupo vazio, o cluster aceita o role sem reclamar — e a regra não serve para nada, porque não existe
+<code>deployments</code> no grupo <code>v1</code>. Esse é o pior tipo de erro em RBAC: o silencioso. O
+manifesto aplica, o objeto aparece na lista, e o acesso continua negado. A pergunta “existe mesmo esse recurso
+nesse grupo?” se responde com <code>kubectl api-resources</code>, que mostra a coluna <code>APIVERSION</code>
+com <code>apps/v1</code> para deployments.</p>
+
+<h2>4. Lendo as regras de um role criado</h2>
+
+<p>O <code>kubectl get roles</code> mostra só nome e idade. Para ver o conteúdo há dois caminhos. O primeiro é
+o <code>describe</code>, que no cluster de verdade imprime um bloco chamado <code>PolicyRule</code> — uma
+tabela de recursos, nomes e verbos. Esta é uma transcrição de um cluster real:</p>
+
+<pre class="term">ana@notebook:~$ kubectl describe role leitor-relatorios -n padaria
+Name:         leitor-relatorios
+Labels:       &lt;none&gt;
+Annotations:  &lt;none&gt;
+PolicyRule:
+  Resources         Non-Resource URLs  Resource Names  Verbs
+  ---------         -----------------  --------------  -----
+  pods              []                 []              [get list]
+  deployments.apps  []                 []              [get list]</pre>
+
+<p>Repare na segunda linha: <code>deployments.apps</code> — o recurso com o grupo colado por um ponto. É assim
+que o cluster mostra “deployments do grupo apps”, e é uma boa forma de conferir se o <code>apiGroups</code>
+ficou certo. O segundo caminho é o <code>-o yaml</code>, que devolve o objeto cru. No painel, use esse: o
+<code>describe</code> de Role ali é mais pobrezinho que o do cluster real e mostra só o cabeçalho.</p>
+
+<p>Vale combinar os dois com um hábito: depois de aplicar qualquer mudança de permissão, rode
+<code>kubectl get role NOME -o yaml</code> e leia <code>rules</code> com os olhos, não com a memória. Nove
+entre dez “o acesso não pega” se explicam ali: grupo errado, recurso no singular, verbo faltando.</p>
+
+<h2>5. O binding: pessoa, grupo ou conta de serviço</h2>
+
+<p>O <code>RoleBinding</code> tem duas listas e um ponteiro: <code>subjects</code> (quem), <code>roleRef</code>
+(o quê) e o namespace onde as duas coisas se encontram. O <code>subjects</code> aceita três tipos de
+identidade, e escolher o tipo certo é metade do trabalho.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th><code>kind</code></th><th>Representa</th><th>Precisa de <code>namespace</code>?</th></tr>
+</thead>
+<tbody>
+<tr><td><code>User</code></td><td>uma pessoa, com o nome que o autenticador devolveu</td><td>não</td></tr>
+<tr><td><code>Group</code></td><td>um conjunto de pessoas, também vindo do autenticador</td><td>não</td></tr>
+<tr><td><code>ServiceAccount</code></td><td>a identidade de um pod</td><td>sim: o namespace da conta</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A diferença entre <code>User</code> e <code>ServiceAccount</code> não é burocrática. O Kubernetes
+<strong>não guarda</strong> usuários: não existe objeto “User” para criar, listar ou apagar. O nome do
+usuário vem do certificado, do provedor de identidade ou do token usado — e o RBAC só compara textos. Já a
+ServiceAccount é um objeto de verdade, que você cria, apaga e vê na lista. Na próxima aula ela é o assunto
+principal; aqui basta saber que ela é a identidade do pod, não da pessoa.</p>
+
+<div class="tryk8s" data-goal="objeto:RoleBinding/equipe-relatorios;;campo:RoleBinding/equipe-relatorios|subjects.0.kind=Group;;campo:RoleBinding/equipe-relatorios|roleRef.name=leitor-relatorios" data-get="rolebindings">
+  <p class="try-task">Este binding foi escrito para uma pessoa chamada <code>relatorios</code>, mas
+  <code>relatorios</code> é um grupo de gente. Troque o <code>kind</code> do subject para
+  <code>Group</code> e rode.</p>
+<pre class="yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: equipe-relatorios
+subjects:
+  - kind: User
+    name: relatorios
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor-relatorios</pre>
+<pre class="out">
+rolebinding.rbac.authorization.k8s.io/equipe-relatorios created
+
+NAME                AGE
+equipe-relatorios   3m
+</pre>
+<pre class="solucao">apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: equipe-relatorios
+subjects:
+  - kind: Group
+    name: relatorios
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor-relatorios</pre>
+</div>
+
+<p>As duas versões são aceitas pelo cluster, e é justamente por isso que o erro é caro: um binding para
+<code>User relatorios</code> fica bonito na lista e não casa com ninguém, porque não existe usuário com esse
+nome — existe um <em>grupo</em> com esse nome. Bindings de grupo são a forma recomendada de dar acesso a
+times: quando alguém entra ou sai, muda a composição do grupo no provedor de identidade, e nenhum manifesto
+de Kubernetes precisa ser tocado.</p>
+
+<p>Sobre o <code>roleRef</code>: ele é imutável. Se você aplicar um binding com o role errado e depois
+corrigir o arquivo, o <code>apply</code> responde com um erro do tipo
+<code>cannot change roleRef</code>. Não é teimosia do servidor — é para que a mudança de permissão apareça como
+um objeto novo (com data e autor), e não como um campo trocado em silêncio. O caminho é
+<code>kubectl delete rolebinding</code> e aplicar de novo.</p>
+
+<h2>6. Testando com auth can-i</h2>
+
+<p>Antes de avisar a Bia, a Ana testa. O comando <code>kubectl auth can-i</code> pergunta ao servidor
+exatamente o que o nome diz, e aceita <code>--as=</code> para perguntar no lugar de outra identidade (e
+<code>--as-group=</code> para incluir um grupo). As três respostas abaixo são de um cluster real, com o
+binding de grupo aplicado no namespace <code>padaria</code>:</p>
+
+<pre class="term">ana@notebook:~$ kubectl auth can-i list pods -n padaria --as=bia --as-group=relatorios
+yes
+ana@notebook:~$ kubectl auth can-i get pods/log -n padaria --as=bia --as-group=relatorios
+yes
+ana@notebook:~$ kubectl auth can-i delete pods -n padaria --as=bia --as-group=relatorios
+no</pre>
+
+<p>Leia na ordem: listar sim, ver log sim, apagar não. O subrecurso aparece com barra
+(<code>pods/log</code>), do mesmo jeito que no manifesto. E note o que acontece quando o grupo é omitido: a
+pergunta passa a ser sobre a pessoa sozinha, que não tem binding nenhum — e a resposta vira <code>no</code>.
+Grupos não vêm no corpo da pessoa; vêm do autenticador, na hora do login.</p>
+
+<p>Quando a resposta é <code>no</code> e alguém insiste mesmo assim, o servidor devolve a recusa completa:</p>
+
+<pre class="term">ana@notebook:~$ kubectl --as=bia --as-group=relatorios delete pod cardapio -n padaria
+Error from server (Forbidden): pods "cardapio" is forbidden: User "bia" cannot delete resource "pods" in API group "" in the namespace "padaria"</pre>
+
+<p>A frase diz que o problema é o verbo <code>delete</code> em <code>pods</code>, no namespace
+<code>padaria</code>, para o usuário <code>bia</code>. Não diz quais verbos ela <em>tem</em> — o servidor não
+entrega o mapa da mina. Quem tem o mapa é você, olhando os bindings do namespace. Uma dica prática: comece a
+investigação pelo binding, não pelo role. Se o subject não casar, o conteúdo do role é irrelevante.</p>
+
+<p>Existe um jeito de pedir o mapa para si mesmo: <code>kubectl auth can-i --list</code>. Sem
+<code>--as=</code>, ele devolve a tabela de tudo o que <em>você</em> pode fazer, agrupado por verbo e recurso,
+com uma coluna final dizendo de qual regra veio a permissão. É a primeira coisa a rodar quando alguém diz “eu
+deveria conseguir”. Com <code>--as=</code> o comando só responde sim ou não: pedir a lista no lugar de outra
+pessoa seria entregar o mapa para quem talvez não devesse vê-lo. O painel desta aula não implementa
+<code>--list</code>, e como <code>can-i</code> ali consulta só os bindings que já existem no cluster de exemplo,
+ele responde <code>no</code> para qualquer <code>--as=</code> enquanto não houver um binding aplicado — então o
+que você vê desta seção é transcrição de cluster real.</p>
+
+<p>Outro hábito que economiza tempo: teste os três verbos separadamente antes de anunciar o acesso. Um
+<code>can-i</code> de <code>list</code> respondendo <code>yes</code> não garante que <code>logs</code>
+funciona, nem que <code>describe</code> traz o que a pessoa precisa. Três perguntas certas valem mais que uma
+tentativa frustrada na frente do colega.</p>
+
+<h2>7. Tudo junto, num namespace novo</h2>
+
+<p>Hora de juntar as peças na ordem certa. A caixa abaixo tem três documentos: o namespace <code>padaria</code>,
+o role e o binding, cada um declarando o namespace em <code>metadata.namespace</code>. O painel aplica na
+sequência do arquivo, e o <code>get</code> final mostra o binding já no lugar certo.</p>
+
+<div class="tryk8s" data-goal="texto:namespace/padaria created;;texto:equipe-relatorios" data-get="rolebindings -n padaria">
+  <p class="try-task">Falta o namespace: sem ele, o role e o binding são recusados com
+  <code>namespaces "padaria" not found</code>. Acrescente o documento do Namespace no começo e rode.</p>
+<pre class="yaml">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leitor-relatorios
+  namespace: padaria
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: equipe-relatorios
+  namespace: padaria
+subjects:
+  - kind: Group
+    name: relatorios
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor-relatorios</pre>
+<pre class="out">
+Error from server (NotFound): error when creating "STDIN": namespaces "padaria" not found
+Error from server (NotFound): error when creating "STDIN": namespaces "padaria" not found
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Namespace
+metadata:
+  name: padaria
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: leitor-relatorios
+  namespace: padaria
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: equipe-relatorios
+  namespace: padaria
+subjects:
+  - kind: Group
+    name: relatorios
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leitor-relatorios</pre>
+</div>
+
+<p>A resposta traz as três linhas de criação e, no fim, a tabela do <code>get rolebindings -n padaria</code>
+com <code>equipe-relatorios</code>. Repare que o <code>get</code> final precisou de <code>-n</code>: sem ele,
+o kubectl olharia o <code>default</code> e diria <code>No resources found</code> — o mesmo binding existindo,
+invisível. Esse é o “sumiço” mais comum de RBAC, e não tem nada a ver com permissão.</p>
+
+<p>Se as três linhas de criação não aparecerem e sim um erro com <code>STDIN</code> no meio, o documento do
+Namespace ficou de fora. O servidor recusa o role inteiro, não só o binding: namespace inexistente é erro de
+criação, não aviso.</p>
+
+<h2>8. Tirar acesso, revisar e não deixar ponta solta</h2>
+
+<p>Revogar é mais fácil que conceder. O acesso acaba quando o binding some: apagar o
+<code>RoleBinding</code> corta o efeito na hora, e o <code>Role</code> pode ficar guardado para o próximo
+uso. Apagar o role <em>antes</em> do binding deixa o binding apontando para o vazio — inofensivo, mas sujeira
+que confunde a próxima auditoria. A ordem limpa é binding primeiro, role depois.</p>
+
+<p>Para revisar quem tem o quê, o caminho é listar bindings e ler os subjects, não listar roles. Um role pode
+ser usado por dez bindings, e portanto por dez grupos diferentes. Em cluster de verdade existem comandos que
+resumem isso (<code>kubectl auth whoami</code> para a sua própria identidade, plugins de auditoria para o
+resto), mas o dado bruto está sempre em <code>kubectl get rolebindings -o yaml</code>. No painel isso
+funciona e mostra <code>subjects</code> e <code>roleRef</code> de cada um.</p>
+
+<p>Três hábitos evitam a maior parte dos problemas. O primeiro: um role por <em>função</em>, com nome que
+diga para que serve (<code>leitor-relatorios</code>, não <code>role-da-bia</code>) — porque ele vai ser usado
+por mais gente que a Bia. O segundo: conceda a grupos, quase nunca a pessoas. O terceiro: não dê
+<code>get</code> em <code>secrets</code> para quem só precisa ver se o pod está no ar; segredo lido é segredo
+que vazou, e esse vazamento não tem log de leitura por padrão.</p>
+
+<p>Para o teste rápido, existe o caminho imperativo: <code>kubectl create role</code> e
+<code>kubectl create rolebinding</code> montam os objetos em uma linha, sem arquivo. É ótimo para um teste de
+cinco minutos e péssimo para o que precisa ser reproduzido depois, porque o comando fica no histórico do
+terminal e não no repositório. A transcrição abaixo é de um cluster real, com as duas formas lado a lado:</p>
+
+<pre class="term">ana@notebook:~$ kubectl create role leitor-pods --verb=get,list --resource=pods -n padaria
+role.rbac.authorization.k8s.io/leitor-pods created
+ana@notebook:~$ kubectl create rolebinding bia-leitor --role=leitor-pods --user=bia -n padaria
+rolebinding.rbac.authorization.k8s.io/bia-leitor created
+ana@notebook:~$ kubectl auth can-i list pods -n padaria --as=bia
+yes</pre>
+
+<p>Funciona, e é assim que se destrava um colega às pressas. O problema aparece duas semanas depois: ninguém
+sabe quem criou, ninguém acha o arquivo, e o acesso fica. O painel desta aula não implementa esses dois
+subcomandos — ele responde <code>unknown command</code> — então, ali, o caminho é sempre o manifesto. Na
+dúvida entre rápido e reproduzível, escolha reproduzível; RBAC é justamente o tipo de coisa que precisa ser
+lida de novo seis meses depois.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o log que não abria</h3>
+<p>A Bia tinha <code>get</code> e <code>list</code> em <code>pods</code> e via a lista perfeitamente. Mas
+<code>kubectl logs</code> respondia <code>Forbidden</code>. O motivo: logs são o subrecurso
+<code>pods/log</code>, com regra própria. O conserto foi uma linha em <code>resources</code>, não um novo
+binding — o subject já estava certo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o binding que ninguém sabia que existia</h3>
+<p>Um acesso “temporário” de <code>edit</code> foi criado num sábado para um teste e nunca removido. Meses
+depois, a auditoria achou o binding pelo <code>-o yaml</code>: o subject era um grupo que ainda existia. A
+lição não é sobre RBAC, é sobre higiene: binding com nome de data (<code>temp-2026-11</code>) e uma revisão
+mensal resolvem.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o role certo, no namespace errado</h3>
+<p>O time aplicou o Role e o RoleBinding no <code>default</code>, mas o site roda em <code>padaria</code>.
+Tudo criado, tudo bonito, e a resposta continuava <code>no</code>. Role e binding valem no namespace onde
+estão — e o namespace de um objeto sem <code>metadata.namespace</code> é o do contexto corrente, que quase
+sempre é o <code>default</code>.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. Um role com <code>resources: ["pods"]</code> e
+<code>verbs: ["get"]</code> permite <code>kubectl get pods</code> (a lista)?</p>
+<label><input type="radio" name="q1"> sim, porque listar é só um jeito de ler</label>
+<label><input type="radio" name="q1"> sim, desde que o namespace seja o mesmo</label>
+<label><input type="radio" name="q1"> não: listar é o verbo <code>list</code></label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">2. O que acontece ao aplicar um binding cujo
+<code>roleRef.name</code> não existe?</p>
+<label><input type="radio" name="q2"> o binding é criado normalmente e não dá acesso a ninguém</label>
+<label><input type="radio" name="q2"> o servidor recusa com <code>NotFound</code></label>
+<label><input type="radio" name="q2"> o role é criado automaticamente, vazio</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">3. Para dar acesso a um time inteiro, o subject mais
+adequado é…</p>
+<label><input type="radio" name="q3"> um <code>User</code> por pessoa, repetido em cada binding</label>
+<label><input type="radio" name="q3"> um <code>Group</code>, que vem do autenticador</label>
+<label><input type="radio" name="q3"> um <code>ServiceAccount</code> compartilhado pelo time</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a regra do log</h2>
+
+<p>Complete o item de <code>resources</code> que permite <code>kubectl logs</code> num pod, sabendo que logs
+são um subrecurso:</p>
+
+<div class="ex-code">resources: ["pods", "pods/<input aria-label="resposta 1" data-answer="log" placeholder="...">"]</div>
+
+<p class="ex-dica">Dica: é o mesmo nome que aparece depois da barra em <code>kubectl auth can-i get
+pods/log</code>. Sem essa entrada, <code>kubectl logs</code> responde <code>Forbidden</code> mesmo com
+permissão de leitura nos pods.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Role é a lista do que pode ser feito num namespace: <code>apiGroups</code> certos,
+<code>resources</code> no plural e <code>verbs</code> explícitos. RoleBinding é quem recebe: um ou mais
+subjects, do tipo <code>User</code>, <code>Group</code> ou <code>ServiceAccount</code>, apontando para o role
+por um <code>roleRef</code> que não muda depois de criado. Sem binding, role nenhum dá acesso.</p>
+
+<p>A ordem de criação é namespace, role, binding. O teste é <code>kubectl auth can-i</code>, com
+<code>--as=</code> e <code>--as-group=</code> quando você quer perguntar no lugar de outra pessoa. A recusa
+vem como <code>Forbidden</code> e nomeia verbo, recurso e namespace. Errar o grupo do recurso ou o
+<code>kind</code> do subject produz o pior resultado possível: tudo criado, ninguém com acesso.</p>
+
+<p>E o hábito que vale mais que a sintaxe: revisar bindings, não roles. É no binding que está quem recebeu, e
+é lá que o acesso se revoga — apagando o binding, com o role intacto para o próximo uso. Na próxima aula a
+Ana conhece a identidade que não é de gente: a ServiceAccount do pod.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>Role</code> + <code>RoleBinding</code> valem no namespace onde estão; omitir
+  <code>metadata.namespace</code> manda tudo para o <code>default</code>.</li>
+  <li><code>get</code> lê um objeto, <code>list</code> lista todos; <code>pods/log</code> é regra
+  separada.</li>
+  <li><code>Group</code> é o subject certo para times; <code>ServiceAccount</code> precisa de
+  <code>namespace</code> no subject.</li>
+  <li><code>roleRef</code> é imutável: trocar exige apagar e recriar o binding.</li>
+  <li><code>kubectl auth can-i</code> é o teste; binding para role inexistente é aceito e não dá
+  acesso.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

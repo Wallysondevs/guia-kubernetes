@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Values | Guia Kubernetes</title>
+<meta name="description" content="Values no Helm: valores por ambiente com -f, a precedência entre defaults, arquivos e --set, e por que sobrescrever tudo na linha de comando vira dívida técnica.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Values</span></h1>
+<p class="intro">O site da Ana subiu em produção com uma linha de comando de quatrocentos caracteres: doze
+<code>--set</code>, um <code>-f</code> e um <code>--namespace</code>. Funcionou. Três semanas depois, ao
+refazer o deploy num cluster novo, ninguém conseguiu repetir a linha — ela estava no histórico do terminal de
+alguém que saiu de férias. O <strong>values</strong> é a parte do Helm que resolve isso: os valores de cada
+ambiente em arquivo, versionados junto com o chart, e a linha de comando voltando a ter vinte caracteres.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>Como os values chegam ao template, em cascata.</li>
+  <li>A precedência: defaults do chart, arquivos <code>-f</code> e <code>--set</code>.</li>
+  <li>Como organizar um arquivo de valores por ambiente.</li>
+  <li>O que os values viram no cluster: réplicas, imagem e configuração.</li>
+  <li>As formas de passar valor e em que cada uma é melhor.</li>
+  <li>Por que o <code>--set</code> para tudo vira dívida técnica — e o que fazer no lugar.</li>
+</ul>
+</div>
+
+<h2>1. A cena: a linha de comando que ninguém sabe refazer</h2>
+
+<p>O comando original era mais ou menos assim: <code>helm install cardapio ./cardapio --set
+replicaCount=4 --set image.tag=2.0 --set resources.limits.memory=512Mi --set
+service.targetPort=8080 --set ingress.host=cardapio.loja.test ...</code> e continuava por mais sete flags.
+Cada uma foi acrescentada num dia diferente, resolvendo um problema real.</p>
+
+<p>O problema aparece quando alguém precisa repetir aquilo: um ambiente novo, um cluster de recuperação, uma
+revisão de auditoria. O comando não está em lugar nenhum além do histórico de um terminal, e quem o digitou
+não lembra por que <code>memory</code> é 512Mi (e não 256Mi) nem se aquele <code>targetPort</code> ainda é
+necessário.</p>
+
+<p>A solução do Helm é simples e é a mesma do resto do guia: o que é configuração sai da linha de comando e
+vai para um arquivo versionado. O comando volta a ser <code>helm upgrade cardapio ./cardapio -f
+values-producao.yaml</code>, e a diferença entre os ambientes fica visível num diff.</p>
+
+<h2>2. Como os values chegam ao template</h2>
+
+<p>Dentro do template, tudo o que o chart recebe aparece em <code>.Values</code>. O que chega ali é o
+resultado de uma cascata, e entender a ordem é o que evita a frase “mas eu passei o valor e ele não pegou”.</p>
+
+<dl class="anatomy">
+<dt>values.yaml</dt>
+<dd>O arquivo de padrões dentro do chart. É o primeiro da cascata e o que serve de documentação.</dd>
+<dt>-f / --values</dt>
+<dd>Um arquivo extra de valores. Pode ser repetido; o último da linha vence quando os dois definem a mesma
+chave.</dd>
+<dt>--set</dt>
+<dd>Um valor solto na linha de comando, em notação de pontos: <code>image.tag=2.0</code>. Tem a maior
+precedência.</dd>
+<dt>--set-string</dt>
+<dd>Igual ao <code>--set</code>, mas força o valor a ser texto. Serve para tags como <code>1.0</code>.</dd>
+<dt>precedência</dt>
+<dd>A ordem em que as fontes se sobrepõem: padrões, depois arquivos, depois linha de comando.</dd>
+<dt>revisão</dt>
+<dd>Cada <code>upgrade</code> guarda os values usados, e eles podem ser lidos depois com
+<code>helm get values</code>.</dd>
+</dl>
+
+<p>Uma consequência que vale destacar: a cascata é <em>por chave</em>, não por bloco. Se o
+<code>values.yaml</code> do chart define <code>resources.limits.memory: 256Mi</code> e o seu arquivo de
+produção define <code>resources.limits.memory: 512Mi</code>, o resto do bloco
+<code>resources</code> continua vindo do padrão. Você não precisa repetir o que não muda — e é por isso que
+um arquivo de ambiente costuma ser curto.</p>
+
+<h2>3. O values.yaml do chart</h2>
+
+<p>O arquivo de padrões é a interface do chart com quem instala. Um bom <code>values.yaml</code> tem os
+valores que fazem sentido em qualquer ambiente e um comentário em cada bloco explicando o que ele
+controla.</p>
+
+<pre class="file" data-file="cardapio/values.yaml">replicaCount: 1
+image:
+  repository: cardapio
+  tag: "1.0"
+  pullPolicy: IfNotPresent
+service:
+  port: 80
+  targetPort: 8080
+ambiente: teste
+config:
+  porta: "8080"
+  log: "info"</pre>
+
+<p>Note a escolha de <code>ambiente: teste</code> como padrão. Poderia ser <code>producao</code>, mas o
+padrão seguro é o ambiente menos perigoso: quem instala em produção precisa dizer isso explicitamente, e
+quem esquece não derruba nada importante. O mesmo raciocínio vale para <code>replicaCount: 1</code> e para
+tags conservadoras.</p>
+
+<p>Note também as aspas em <code>tag: "1.0"</code> e <code>porta: "8080"</code>. Sem elas, o YAML lê
+<code>1.0</code> como número e <code>8080</code> como inteiro. Em campos que o Kubernetes espera como texto
+— como o conteúdo de um ConfigMap — isso gera erro de tipo na hora de aplicar. A regra prática: número que
+não vai ser usado em conta vai entre aspas.</p>
+
+<h2>4. Um arquivo por ambiente</h2>
+
+<p>Com o padrão no chart, cada ambiente ganha o seu arquivo, com só o que muda. O de produção da padaria
+tem quatro linhas de conteúdo:</p>
+
+<pre class="file" data-file="values-producao.yaml">replicaCount: 3
+image:
+  tag: "2.0"
+ambiente: producao
+config:
+  log: "warn"</pre>
+
+<p>Quatro linhas contra as doze <code>--set</code> do começo da aula, e agora elas estão num arquivo que
+aparece no diff, que tem autor e que pode ser revisado. O de teste pode ser ainda menor — às vezes vazio,
+porque os padrões já são de teste.</p>
+
+<p>Onde guardar esses arquivos é decisão de time. Duas opções comuns: dentro do chart, numa pasta
+<code>values/</code> (útil quando o chart é do próprio time), ou num repositório separado, ao lado dos
+manifestos de cada ambiente (útil quando o chart é de terceiro e você só guarda as sobrescritas). A regra é
+uma só: os arquivos entram no controle de versão junto com o que os usa.</p>
+
+<p>Uma armadilha de organização: não crie <code>values-producao.yaml</code> com o arquivo inteiro copiado. A
+cópia inteira funciona hoje e cria um problema amanhã — quando o chart ganhar uma chave nova com padrão
+seguro, o arquivo copiado não terá essa chave e a instalação ficará com comportamento diferente do resto.
+Sobrescreva só o que muda.</p>
+
+<h2>5. A precedência, na prática</h2>
+
+<p>Quando duas fontes definem a mesma chave, uma vence. A ordem é fixa e vale a pena decorar, porque é ela
+que explica a maioria dos “não pegou”.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Ordem</th><th>Fonte</th><th>Vence quando</th></tr>
+</thead>
+<tbody>
+<tr><td>1º (mais fraco)</td><td><code>values.yaml</code> do chart</td><td>nada mais define a chave</td></tr>
+<tr><td>2º</td><td><code>-f arquivo1.yaml -f arquivo2.yaml</code></td><td>o último arquivo que define a chave ganha</td></tr>
+<tr><td>3º (mais forte)</td><td><code>--set</code> e <code>--set-string</code></td><td>sempre, para a chave que ele define</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Dois detalhes que só aparecem na prática. O primeiro: a ordem dos <code>-f</code> importa, e é comum ver
+um arquivo comum seguido do arquivo do ambiente — <code>-f values.yaml -f values-producao.yaml</code> — para
+que o segundo refine o primeiro. O segundo: <code>--set</code> ganha de todos, inclusive do
+<code>-f</code> que veio depois dele na linha. Não é ordem de leitura; é força.</p>
+
+<p>Existe um jeito de conferir tudo isso sem instalar: <code>helm template</code> renderiza com os values da
+linha de comando e mostra o manifesto final. Se o valor não apareceu onde você esperava, o problema está na
+cascata ou no nome da chave — e não no cluster.</p>
+
+<h2>6. O que os values viram: réplicas</h2>
+
+<p>O caso mais simples é o número de réplicas, porque ele vai direto do values para o campo do Deployment. O
+manifesto abaixo é o que o chart renderiza quando <code>replicaCount</code> vale 3. Ele está com uma réplica:
+ajuste e rode.</p>
+
+<div class="tryk8s" data-goal="pronto:Deployment/cardapio=3;;campo:Deployment/cardapio|spec.replicas=3">
+  <p class="try-task">O values de produção diz <code>replicaCount: 3</code>. Ponha três réplicas no
+  Deployment e confira na tabela.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   1/1     1            1           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Depois de aplicar, o painel mostra três pods e o Deployment com <code>3/3</code> prontos. É a mudança mais
+comum de um <code>upgrade</code> e a mais barata: o controlador cria as réplicas que faltam sem recriar as
+existentes.</p>
+
+<p>O detalhe que pega iniciante: <code>--set replicaCount=3</code> na linha de comando também funciona, e é
+para lá que a maioria corre. Só que esse três não fica registrado em lugar nenhum revisável — fica no
+histórico da release, que é uma tabela difícil de comparar. O arquivo de valores é lido, revisado e
+discutido; o <code>--set</code> é esquecido.</p>
+
+<h2>7. O que os values viram: imagem e tag</h2>
+
+<p>A segunda mudança clássica é a imagem. Aqui o Helm não faz nada especial: ele só troca o texto que o
+template renderiza. O efeito no cluster é o de sempre — imagem nova significa ReplicaSet novo e rollout.
+Vale dizer que o Helm <em>não</em> faz rollout progressivo próprio: quem faz é o Deployment, com as regras que
+já vimos.</p>
+
+<div class="tryk8s" data-goal="pronto:Deployment/cardapio=2;;campo:Deployment/cardapio|spec.template.spec.containers.0.image=cardapio:2.0">
+  <p class="try-task">O values de produção usa a tag <code>2.0</code>. Troque a imagem para
+  <code>cardapio:2.0</code> e mantenha duas réplicas.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:2.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Essa é a mudança que mais aparece em produção e a que mais precisa de disciplina: a tag precisa ser única
+por build (nada de <code>latest</code>), e o values precisa dizer exatamente qual tag está no ar. Com
+<code>latest</code>, dois ambientes podem estar rodando imagens diferentes com o mesmo values — e o
+diagnóstico vira especulação.</p>
+
+<p>Um cuidado com <code>--set image.tag=2.0</code>: o Helm interpreta <code>2.0</code> como número e tenta
+converter. Em muitos casos ele avisa e usa <code>2</code>, e o resultado é a imagem
+<code>cardapio:2</code>. Para tags assim, use <code>--set-string image.tag=2.0</code> ou, melhor ainda, o
+arquivo de valores, onde as aspas resolvem o problema na origem.</p>
+
+<h2>8. O que os values viram: configuração</h2>
+
+<p>A terceira mudança típica é a configuração do programa: uma porta, um nível de log, um endereço. Nos
+charts bem feitos, isso vira um ConfigMap — e aí o values precisa de um cuidado extra, porque o conteúdo de
+ConfigMap é sempre texto.</p>
+
+<div class="tryk8s" data-goal="objeto:ConfigMap/cardapio-config;;campo:ConfigMap/cardapio-config|data.PORTA=8080;;campo:ConfigMap/cardapio-config|data.AMBIENTE=producao">
+  <p class="try-task">O values de produção define as chaves <code>PORTA</code> (8080) e <code>AMBIENTE</code>
+  (<code>producao</code>). Renomeie as chaves no ConfigMap — o programa lê exatamente esses dois nomes.</p>
+<pre class="yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+  labels:
+    app: cardapio
+data:
+  port: "8080"
+  env: "producao"</pre>
+<pre class="out">
+configmap/cardapio-config created
+
+NAME              DATA   AGE
+cardapio-config   2      2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardapio-config
+  labels:
+    app: cardapio
+data:
+  PORTA: "8080"
+  AMBIENTE: "producao"</pre>
+</div>
+
+<p>Repare que os valores continuam entre aspas. Num ConfigMap, o valor precisa ser texto; se o template
+renderizar <code>PORTA: 8080</code> sem aspas, o cluster recusa com uma mensagem do tipo
+<code>cannot unmarshal number into Go struct field ConfigMap.data of type string</code>. É o erro que mais
+aparece em chart novo, e a causa quase sempre é o <code>values.yaml</code> sem aspas.</p>
+
+<p>Quando a configuração cresce, o padrão do Helm é o oposto do que se vê por aí: em vez de uma chave por
+valor, um bloco inteiro de texto. O template usa <code>{{ toYaml .Values.config | nindent 2 }}</code> e o
+values guarda o bloco como uma árvore. Assim, acrescentar uma linha de configuração não exige mexer no
+template.</p>
+
+<h2>9. A dívida do --set</h2>
+
+<p>Agora a parte que dá título à aula. O <code>--set</code> não é proibido: para um teste rápido, para
+sobrescrever uma chave só num experimento, ele é a ferramenta certa. O problema é quando ele vira o jeito
+padrão de operar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Forma</th><th>Serve bem para</th><th>Cuidado</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-f arquivo.yaml</code></td><td>o que é do ambiente: réplicas, imagem, configuração</td><td>é o que se revisa e se versiona</td></tr>
+<tr><td><code>--set chave=valor</code></td><td>teste rápido, uma chave só</td><td>não fica no repositório; some com o terminal</td></tr>
+<tr><td><code>--set-string</code></td><td>tag numérica como <code>1.0</code>, conteúdo de ConfigMap</td><td>força texto e evita o número</td></tr>
+<tr><td><code>--set-file</code></td><td>conteúdo de arquivo (ex.: um script, um certificado)</td><td>o conteúdo inteiro vai parar no Secret da release</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Listas são o caso em que o <code>--set</code> mais sofre. Para definir dois hosts de Ingress, a sintaxe
+é <code>--set ingress.hosts[0]=cardapio.loja.test --set ingress.hosts[1]=pedidos.loja.test</code> — e basta
+uma vírgula ou um colchete fora do lugar para o Helm interpretar outra coisa. Em arquivo, a mesma informação é
+uma lista YAML comum, com um item por linha, do jeito que você já escreve manifesto.</p>
+
+<p>Outro limite: o <code>--set</code> sobrescreve, mas não remove. Se o padrão do chart traz
+<code>ingress.enabled: true</code> e você quer desligar, <code>--set ingress.enabled=false</code> funciona;
+agora, para apagar uma chave que veio de um <code>-f</code>, é <code>--set chave=null</code>, o que ninguém
+lembra na hora. Arquivo resolvido com um diff de duas linhas é mais claro do que qualquer malabarismo na
+linha de comando.</p>
+
+<p>Três motivos concretos para preferir arquivo. O primeiro é a repetibilidade: o arquivo está no
+repositório, então qualquer pessoa refaz o deploy com o mesmo comando. O segundo é a legibilidade: vinte
+<code>--set</code> numa linha não são lidos por ninguém, e um diff de arquivo mostra exatamente o que mudou
+entre dois deploys.</p>
+
+<p>O terceiro é o mais sério e quase ninguém pensa nele: os values passados por <code>--set</code> ficam
+gravados no Secret de histórico da release, em texto legível. Se alguém passar uma senha por ali, ela vira
+permanente e visível para quem lê Secrets no namespace. Senha vai em Secret criado à parte; o chart só
+referencia o nome.</p>
+
+<p>Para saber o que foi passado numa release, existe <code>helm get values</code>, que mostra exatamente o
+que veio da linha de comando e dos arquivos (transcrição):</p>
+
+<pre class="term">$ helm get values cardapio -n padaria-prod
+USER-SUPPLIED VALUES:
+ambiente: producao
+config:
+  log: warn
+image:
+  tag: 2.0
+replicaCount: 3</pre>
+
+<p>É esse bloco que você compara com o do ambiente de teste para saber o que difere. E é esse bloco que
+deveria vir de um arquivo — porque ali ele está revisado, e no Secret ele é só consequência.</p>
+
+<p>Um erro clássico de quem muda values é trocar algo que o Kubernetes não permite alterar depois. Mudar o
+<code>selectors</code> de um Deployment existente, por exemplo, é recusado pelo cluster, e a mensagem sai
+pelo Helm (transcrição):</p>
+
+<pre class="term">$ helm upgrade cardapio ./cardapio -f values-producao.yaml
+Error: UPGRADE FAILED: cannot patch "cardapio" with kind Deployment:
+Deployment.apps "cardapio" is invalid: spec.selector: Invalid value:
+v1.LabelSelector{MatchLabels:map[string]string{"app":"cardapio-novo"}}:
+field is immutable</pre>
+
+<p>Nesse caso não é o values que está errado — é o tipo de mudança. Campo imutável exige apagar e recriar o
+objeto (o que, em produção, é um deploy com downtime planejado, não um ajuste de values).</p>
+
+<h2>10. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o --set esquecido no deploy seguinte</h3>
+<p>Um <code>--set resources.limits.memory=512Mi</code> foi passado uma vez, num dia de pico. Meses depois, um
+<code>upgrade</code> com o arquivo de valores (que não tinha esse campo) devolveu o limite para o padrão do
+chart, e o pod passou a ser morto por memória. O valor estava no histórico da release, mas ninguém olhou.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: dois ambientes, um arquivo copiado</h3>
+<p>O <code>values-homologacao.yaml</code> foi criado copiando o de produção inteiro. Quando produção ganhou
+uma chave nova, homologação ficou com o comportamento antigo e o bug só apareceu lá. A correção foi reduzir
+cada arquivo ao que realmente difere — quatro ou cinco linhas — e deixar o resto no padrão do chart.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: a senha no Secret da release</h3>
+<p>Alguém passou <code>--set postgresql.password=...</code> num chart de banco. A release subiu, e a senha
+ficou gravada no Secret de histórico, legível por qualquer pessoa com permissão de leitura no namespace. A
+auditoria encontrou três meses depois. O conserto foi criar o Secret à parte e apontar o chart para ele.</p>
+</div>
+
+<h2>11. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="3"><p class="mc-q">1. Qual fonte de valores tem a maior precedência?</p>
+<label><input type="radio" name="q1"> o <code>values.yaml</code> dentro do chart</label>
+<label><input type="radio" name="q1"> o primeiro arquivo passado com <code>-f</code></label>
+<label><input type="radio" name="q1"> o <code>--set</code>, sempre</label>
+</div>
+
+<div class="mc" data-answer="2"><p class="mc-q">2. Por que usar <code>--set-string image.tag=1.0</code>?</p>
+<label><input type="radio" name="q2"> porque o <code>--set</code> não aceita números</label>
+<label><input type="radio" name="q2"> porque sem forçar texto o <code>1.0</code> vira o número 1 e a tag
+sai errada</label>
+<label><input type="radio" name="q2"> porque assim o valor não fica no histórico da release</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Onde os valores passados por <code>--set</code> ficam
+gravados?</p>
+<label><input type="radio" name="q3"> no Secret de histórico da release, no namespace</label>
+<label><input type="radio" name="q3"> apenas na memória do processo do Helm, durante o comando</label>
+<label><input type="radio" name="q3"> no <code>values.yaml</code> do chart, que é atualizado</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o arquivo de produção</h2>
+<p>Complete o comando para instalar o chart usando o arquivo de valores de produção, e o trecho do arquivo
+que define três réplicas.</p>
+<div class="ex-code">helm upgrade cardapio ./cardapio <input aria-label="resposta 1" data-answer="-f" placeholder="..."> values-producao.yaml
+
+# values-producao.yaml
+<input aria-label="resposta 2" data-answer="replicaCount" placeholder="...">: 3</div>
+<p class="ex-dica">Dica: a flag que carrega arquivo de valores tem forma curta e longa; a chave do arquivo é
+a mesma que o template lê em <code>.Values</code>. Um <code>--set</code> depois dela ganharia desse
+valor.</p>
+</div>
+
+<h2>12. Resumo</h2>
+
+<p>Values é a configuração do chart: o <code>values.yaml</code> traz os padrões, cada ambiente tem o seu
+arquivo com o que muda, e a linha de comando serve para ajustes pontuais. A cascata é
+<code>values.yaml</code> → arquivos <code>-f</code> (o último vence) → <code>--set</code>, e a sobreposição é
+por chave, não por bloco inteiro.</p>
+
+<p>O que o values faz no cluster é sempre a mesma história: vira texto no template renderizado. Réplicas
+mudam sem recriar pods; imagem nova provoca rollout; configuração precisa de aspas, porque ConfigMap é texto.
+Campo imutável, como o <code>selector</code>, não se resolve com values.</p>
+
+<p>E a dívida: <code>--set</code> para tudo é um comando que ninguém reconstrói, um diff que ninguém lê e um
+valor que fica gravado no Secret da release. Use arquivo para o que é do ambiente, <code>--set</code> só
+para o experimento do minuto. Na <a href="kustomize.html">aula de Kustomize</a>, a alternativa sem template para quem só quer sobrepor YAML: o
+Kustomize.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Precedência: padrões do chart → <code>-f</code> (último vence) → <code>--set</code>.</li>
+  <li>Sobrescreva só o que muda; arquivo de ambiente copiado inteiro vira armadilha.</li>
+  <li><code>--set-string</code> para tags numéricas e para conteúdo de ConfigMap.</li>
+  <li>Texto que vai para ConfigMap precisa estar entre aspas no values.</li>
+  <li><code>--set</code> fica gravado no Secret da release: nada de senha por ali.</li>
+  <li><code>helm get values</code> mostra o que foi sobrescrito; compare ambientes com ele.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

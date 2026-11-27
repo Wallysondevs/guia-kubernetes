@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operators e CRDs | Guia Kubernetes</title>
+<meta name="description" content="Operators e CRDs: como o Kubernetes ganha tipos novos, o que é o loop de reconciliação, como ler um recurso customizado com kubectl explain e quando vale instalar um operador.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Operators e <span class="hl">CRDs</span></h1>
+<p class="intro">A Ana quer um banco de dados dentro do cluster que faça backup sozinho, troque de versão sem
+perder dado e saiba promover a réplica quando a principal cair. Um Deployment não sabe nada disso: ele só
+mantém pods de pé. Quem sabe é um <em>operador</em> — um programa que mora no cluster e cuida de um tipo de
+recurso que o Kubernetes não tinha antes. Nesta aula a Ana entende as duas peças que andam juntas: a
+<strong>CRD</strong>, que ensina a API a aceitar um tipo novo, e o <strong>operador</strong>, que é o loop que
+faz esse tipo acontecer de verdade.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é uma CRD e por que ela muda o que o <code>kubectl</code> conhece.</li>
+  <li>O que é um operador, na prática: um pod com permissão que compara desejo e realidade.</li>
+  <li>Como descobrir os campos de um recurso com <code>kubectl explain</code>.</li>
+  <li>O que o operador cria por você e o que continua sendo responsabilidade sua.</li>
+  <li>Por que instalar a CRD sem o operador é ter o cardápio sem o cozinheiro.</li>
+  <li>Quando um operador vale a complexidade — e quando um StatefulSet já resolve.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o banco que precisa se cuidar sozinho</h2>
+
+<p>O banco de preços da padaria roda hoje numa máquina alugada, com um script de backup que a Ana roda
+quando lembra. Ela quer trazê-lo para o cluster. O caminho óbvio é um StatefulSet com um volume por réplica:
+o Kubernetes mantém os pods de pé e o disco montado. Só que StatefulSet não sabe promover réplica, não sabe
+fazer backup consistente, não sabe trocar de versão esperando a réplica nova ficar saudável.</p>
+
+<p>É aí que aparece a palavra que todo mundo repete sem explicar: <em>operator</em>. Um operador é um programa
+que roda como pod, olha para um tipo de objeto do cluster e age para que a realidade combine com o que está
+escrito ali. Se o objeto diz “três réplicas, versão 16, backup diário”, o operador cria o StatefulSet, os
+Services, o volume, o cronograma de backup — e continua vigiando.</p>
+
+<p>Para que esse objeto exista, o cluster precisa aprender um tipo novo. Pod, Deployment e Service são tipos
+embutidos na API. Um tipo inventado — <code>Cardapio</code>, <code>BancoPadaria</code>, <code>Cluster</code> —
+precisa ser <em>registrado</em>. Quem registra é a CRD, e é por ela que começamos.</p>
+
+<h2>2. A CRD: ensinando um tipo novo à API</h2>
+
+<p>O Kubernetes é uma API HTTP com recursos. Cada recurso tem um grupo, uma versão e um nome: pod é
+<code>v1</code>, Deployment é <code>apps/v1</code>, Ingress é <code>networking.k8s.io/v1</code>. Uma
+<strong>CustomResourceDefinition</strong> é um objeto que diz ao servidor: “existe um tipo chamado
+<code>Cardapio</code>, no grupo <code>padaria.test</code>, versão <code>v1</code>, com escopo de namespace”.
+A partir do instante em que ela é aceita, o <code>kubectl</code> passa a tratar esse tipo como qualquer
+outro: <code>get</code>, <code>apply</code>, <code>describe</code>, <code>delete</code>.</p>
+
+<p>Instalar uma CRD é uma mudança de plataforma, não de aplicação. Ela não cria nada sozinha: só abre o
+balcão para um tipo novo. Um objeto daquele tipo — a <em>custom resource</em>, ou CR — é o pedido que você
+escreve: <code>kind: Cardapio</code>, com os campos que a CRD declarou. Sem operador, esse objeto fica
+guardado no etcd como texto: existe, aparece no <code>get</code>, e nada acontece no mundo real.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th>Recurso embutido</th><th>Recurso de CRD</th></tr>
+</thead>
+<tbody>
+<tr><td>Quem define</td><td>o projeto do Kubernetes</td><td>quem instalou a CRD</td></tr>
+<tr><td>Exemplo</td><td><code>Deployment</code> em <code>apps/v1</code></td><td><code>Cardapio</code> em
+<code>padaria.test/v1</code></td></tr>
+<tr><td>Quem faz acontecer</td><td>controladores do próprio cluster</td><td>o operador que você
+instalou</td></tr>
+<tr><td>Quem valida os campos</td><td>o servidor, com o schema embutido</td><td>o schema que veio na
+CRD</td></tr>
+<tr><td>Atualiza junto com o cluster?</td><td>sim</td><td>não: a CRD e o operador têm ciclo
+próprio</td></tr>
+<tr><td>Se o operador cair</td><td>não se aplica</td><td>os objetos ficam congelados, sem
+reconciliação</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A última linha é a que mais surpreende. Uma CRD instalada sem operador não quebra nada — ela só fica
+inerte. O sintoma é sutil: o <code>apply</code> responde <code>created</code>, o <code>get</code> mostra o
+objeto, e nenhum pod nasce. Quem vem de Deployment espera que “criar” signifique “acontecer”, e aqui não
+significa.</p>
+
+<dl class="anatomy">
+<dt>CRD</dt>
+<dd>A definição que registra um tipo novo na API: grupo, versão, nome, escopo e o schema dos campos.</dd>
+<dt>custom resource (CR)</dt>
+<dd>Um objeto daquele tipo. É o pedido: “quero um cardápio com 12 pratos e backup diário”.</dd>
+<dt>operador</dt>
+<dd>Programa que roda no cluster, vigia um tipo e age para que o mundo real combine com o pedido.</dd>
+<dt>controlador</dt>
+<dd>O laço de código que observa, compara e age. Um operador costuma ter vários controladores.</dd>
+<dt>loop de reconciliação</dt>
+<dd>O ciclo “veja o estado atual, compare com o desejado, corrija a diferença”. Roda para
+sempre.</dd>
+<dt>finalizer</dt>
+<dd>Marca que impede o objeto de sumir antes de o operador limpar o que criou (backup, disco,
+DNS).</dd>
+<dt>ownerReference</dt>
+<dd>Campo que diz quem é o dono de um objeto. É o que faz o Kubernetes apagar os filhos junto com o
+pai.</dd>
+<dt>ServiceAccount</dt>
+<dd>A identidade com que o pod do operador fala com a API. Sem permissão, o operador não vê
+nada.</dd>
+</dl>
+
+<p>Repare na dupla CRD + operador: a CRD é o <em>contrato</em>, o operador é o <em>trabalhador</em>. Um
+projeto de operador publica os dois juntos, quase sempre com um Helm chart ou um único YAML com vários
+documentos separados por <code>---</code>.</p>
+
+<h2>3. O operador por dentro: observar, comparar, agir</h2>
+
+<p>O operador é um programa comum, escrito em Go na maioria dos casos, empacotado em imagem e rodado como
+Deployment de uma réplica. O que ele tem de especial é o laço. Ele abre uma conexão com o servidor da API e
+pede para ser avisado quando um objeto do seu tipo mudar. A cada aviso — e também a cada poucos minutos, por
+segurança — ele faz três perguntas.</p>
+
+<p>A primeira: <em>o que o objeto pede?</em> É o <code>spec</code> da custom resource. A segunda: <em>o que
+existe hoje?</em> Ele lista os StatefulSets, Services, Secrets e volumes que carregam a etiqueta de dono
+daquele objeto. A terceira: <em>qual é a diferença?</em> Se falta uma réplica, ele cria; se sobra, apaga; se a
+versão está diferente, ele faz o upgrade na ordem certa, esperando cada passo ficar saudável.</p>
+
+<p>Por rodar dentro do cluster, o operador precisa de permissão para ler e escrever nos tipos que manipula.
+Isso é RBAC: uma identidade (ServiceAccount), um conjunto de regras (Role ou ClusterRole) e uma ligação entre
+os dois (RoleBinding). O assunto tem aula própria mais adiante; aqui basta saber que <strong>um operador é um
+pod com poderes de administrador sobre uma parte do cluster</strong>, e que isso é tanto a graça quanto o
+risco.</p>
+
+<p>Dois detalhes de operação que ninguém conta. O primeiro é que o operador também quebra: se o pod dele cai e
+não volta, a reconciliação para. Nada do que já existe desaparece — os pods do banco continuam rodando —, mas
+mudanças param de ser aplicadas. O segundo é que a versão do operador importa: atualizar o operador sem ler as
+notas de versão pode migrar dados de um jeito irreversível.</p>
+
+<h2>4. A caixa: descobrir o que o cluster conhece</h2>
+
+<p>O comando que responde “este cluster conhece quais tipos?” é <code>kubectl api-resources</code>. Ele lista
+cada recurso com nome plural, apelidos, grupo/versão, se é de namespace e qual é o <code>kind</code>. Depois
+de instalar uma CRD, o tipo novo aparece nessa lista — é assim que você confirma que a instalação
+pegou.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:horizontalpodautoscalers;;texto:namespaces">
+  <p class="try-task">O comando está no singular e o kubectl não o reconhece. Corrija para
+  <code>kubectl api-resources</code> e rode: a sessão tem de mostrar a tabela de recursos.</p>
+<pre class="yaml">kubectl api-resource</pre>
+<pre class="out">
+ana@notebook:~$ kubectl api-resource
+error: unknown command "api-resource" for "kubectl"
+</pre>
+<pre class="solucao">kubectl api-resources</pre>
+</div>
+
+<p>Antes da correção a resposta é <code>error: unknown command "api-resource" for "kubectl"</code> — o
+kubectl não tenta adivinhar o comando que você quis digitar. Depois, a tabela mostra os tipos embutidos:
+<code>pods</code>, <code>deployments</code>, <code>services</code>, <code>horizontalpodautoscalers</code>,
+<code>namespaces</code> e o resto.</p>
+
+<p>Vale guardar duas colunas dessa tabela. <code>APIVERSION</code> é o que vai no topo do manifesto — é ela
+que você erra quando copia um exemplo antigo. E <code>NAMESPACED</code> diz se o objeto vive dentro de um
+namespace ou é global, como <code>namespaces</code> e <code>nodes</code>. Errar isso gera aquele
+<code>NotFound</code> que parece mentira, porque você acabou de criar o objeto.</p>
+
+<p>Sobre o painel desta aula, uma nota honesta: o cluster simulado conhece apenas os tipos embutidos. As CRDs
+aparecem nas transcrições, com o formato real, mas não podem ser instaladas aqui. É de propósito — instalar
+uma CRD no editor não provaria nada, porque quem faz o tipo acontecer é o operador, e o painel não roda
+containers.</p>
+
+<h2>5. A caixa: perguntar quais campos existem</h2>
+
+<p>Ninguém decora o schema de um recurso. O comando para perguntar é <code>kubectl explain</code>: você passa
+o caminho do campo e ele devolve descrição, tipo e subcampos. Funciona igual para recurso embutido e para
+recurso de CRD — desde que a CRD esteja instalada, porque a documentação vem do schema dela.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:RollingUpdate;;texto:FIELD:">
+  <p class="try-task">O <code>explain</code> exige o nome completo do recurso: <code>deploy</code> não serve.
+  Troque por <code>deployment.spec.strategy</code> e rode.</p>
+<pre class="yaml">kubectl explain deploy.spec.strategy</pre>
+<pre class="out">
+ana@notebook:~$ kubectl explain deploy.spec.strategy
+error: field "deploy.spec.strategy" does not exist
+</pre>
+<pre class="solucao">kubectl explain deployment.spec.strategy</pre>
+</div>
+
+<p>Com o apelido, a resposta é <code>error: field "deploy.spec.strategy" does not exist</code>. Com o nome
+completo, aparece o bloco <code>FIELD: strategy &lt;DeploymentStrategy&gt;</code>, a descrição e os subcampos
+<code>type</code> e <code>rollingUpdate</code> — inclusive o valor <code>RollingUpdate</code>, que é o padrão.
+É a documentação da versão que está rodando no seu cluster, não a da internet.</p>
+
+<p>Aprender esse comando muda o dia a dia por um motivo simples: ele responde “esse campo existe mesmo?” antes
+de você perder meia hora num manifesto que o servidor aceita e ignora. Foi assim que descobrimos, numa aula
+anterior, que <code>livenessProb</code> sem o “e” final não é erro: é campo desconhecido, descartado em
+silêncio.</p>
+
+<h2>6. A caixa: o operador desligado</h2>
+
+<p>O operador é um pod. Se ele não está rodando, o laço não gira. Esta caixa mostra o operador do cardápio com
+<code>replicas: 0</code> — alguém desligou “para economizar” durante a Black Friday e esqueceu de voltar. Os
+objetos do banco continuam lá, mas nenhuma mudança nova é aplicada.</p>
+
+<div class="tryk8s" data-get="deployments" data-goal="pronto:Deployment/cardapio-operator=1">
+  <p class="try-task">O operador tem de ficar com uma réplica pronta. Corrija o <code>replicas</code> para
+  <code>1</code> e rode.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-operator
+  labels:
+    managed-by: cardapio-operator
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: cardapio-operator
+  template:
+    metadata:
+      labels:
+        app: cardapio-operator
+    spec:
+      serviceAccountName: cardapio-operator
+      containers:
+        - name: manager
+          image: cardapio-operator:0.4
+          args:
+            - --watch-namespace=default</pre>
+<pre class="out">
+deployment.apps/cardapio-operator created
+
+NAME                READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio-operator   0/0     0            0           9m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-operator
+  labels:
+    managed-by: cardapio-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio-operator
+  template:
+    metadata:
+      labels:
+        app: cardapio-operator
+    spec:
+      serviceAccountName: cardapio-operator
+      containers:
+        - name: manager
+          image: cardapio-operator:0.4
+          args:
+            - --watch-namespace=default</pre>
+</div>
+
+<p>Com zero réplicas, o painel mostra o Deployment sem nenhum pod pronto e a tabela com
+<code>READY 0/1</code>. Com uma, o pod sobe e o laço começa a girar. Em cluster de verdade, o efeito é o que
+interessa: os objetos que o operador criou <em>continuam existindo</em> e funcionando, mas o operador não
+percebe mudanças — uma alteração no <code>spec</code> da custom resource fica sem efeito, um pod do banco que
+morre pode não ser reposto na ordem certa.</p>
+
+<p>Essa diferença é a chave para entender operadores: eles não são o banco, são o <em>gerente</em> do banco.
+Tirar o gerente não fecha a loja; só deixa a loja sem ninguém para repor estoque, ajustar preço e chamar o
+conserto.</p>
+
+<h2>7. O que o operador cria por você</h2>
+
+<p>Quando o operador do banco recebe um pedido de três réplicas, ele escreve no cluster um conjunto de
+objetos. Um StatefulSet com três pods e três volumes; um Service sem IP fixo para os pods se acharem pelo
+nome; um Secret com a senha do usuário de aplicação; talvez um CronJob de backup. Cada objeto criado leva uma
+etiqueta dizendo de quem é filho, e o Kubernetes usa isso para apagar tudo junto se a custom resource for
+removida.</p>
+
+<p>Esta é uma transcrição de cluster real, de um cluster com uma CRD de banco instalada e um objeto criado
+havia três minutos. Repare no bloco <code>Status</code>: é o operador que o preenche, não o servidor da
+API.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get bancos
+NAME       ENGINE    VERSION   READY   AGE
+precos     postgres  16        3/3     3m
+
+ana@notebook:~$ kubectl describe banco precos
+Name:         precos
+Namespace:    default
+API Version:  padaria.test/v1
+Kind:         Banco
+Spec:
+  Engine:     postgres
+  Replicas:   3
+  Version:    16
+  Backup:
+    Schedule:  0 3 * * *
+    Retention: 7d
+Status:
+  Phase:      Ready
+  Ready:      3
+  Endpoint:   precos-0.precossvc.default.svc.cluster.local:5432
+  Conditions:
+    Type                Status  Reason
+    Consistent          True    AllReplicasReady
+    BackupScheduled     True    CronJobCreated
+Events:
+  Type    Reason        Age   From              Message
+  ----    ------        ----  ----              -------
+  Normal  StatefulSetSet 3m   banco-controller  created StatefulSet precos
+  Normal  ServiceCreated 3m   banco-controller  created Service precossvc
+  Normal  SecretCreated  3m   banco-controller  created Secret precos-app</pre>
+
+<p>Três coisas nesse texto explicam o padrão. O <code>Status</code> é escrito pelo operador, com campos que
+ele inventou — <code>Phase</code>, <code>Ready</code>, <code>Endpoint</code>. Os <code>Events</code> têm como
+origem o <code>banco-controller</code>, e não o <code>default-scheduler</code>: é o operador contando o que
+fez. E o <code>Endpoint</code> mostra que o operador não só criou objetos como também sabe o nome DNS que o
+cliente deve usar.</p>
+
+<p>Do lado de quem usa, a vantagem é enorme: um <code>apply</code> de quinze linhas substitui um StatefulSet,
+dois Services, um Secret, três volumes e um CronJob. Do lado de quem opera, o custo também é real: agora você
+depende de um programa de terceiros, com versão própria, bugs próprios e permissões amplas.</p>
+
+<h2>8. Depois de instalar: como conferir</h2>
+
+<p>Instalar um operador tem uma ordem e uma conferência. A ordem é: CRD, depois RBAC, depois o Deployment do
+operador, depois a custom resource. Inverter — criar o objeto antes da CRD — resulta no erro que você já viu
+nesta trilha: <code>no matches for kind ...</code>. E a conferência é sempre a mesma tríade.</p>
+
+<pre class="term">ana@notebook:~$ kubectl get crd
+NAME                     CREATED AT
+bancos.padaria.test      2026-11-20T18:12:33Z
+
+ana@notebook:~$ kubectl api-resources --api-group=padaria.test
+NAME      SHORTNAMES   APIVERSION         NAMESPACED   KIND
+bancos                 padaria.test/v1    true         Banco
+
+ana@notebook:~$ kubectl explain banco.spec.backup
+GROUP:      padaria.test
+KIND:       Banco
+VERSION:    v1
+
+FIELD: backup &lt;BackupSpec&gt;
+
+DESCRIPTION:
+     Backup schedule and retention for the database cluster.
+
+FIELDS:
+   schedule   &lt;string&gt;
+     Cron expression in UTC.
+
+   retention  &lt;string&gt;
+     How long to keep each backup, for example 7d.</pre>
+
+<p>A tríade confirma três coisas diferentes. <code>get crd</code> diz que o tipo está registrado. O
+<code>api-resources</code> filtrado pelo grupo mostra o nome plural, o apelido e o escopo — é o que você usa
+no <code>kubectl get</code>. E o <code>explain</code> prova que o schema veio junto: os campos
+<code>schedule</code> e <code>retention</code> existem, com descrição escrita por quem fez o operador.</p>
+
+<p>Se o <code>explain</code> disser <code>field does not exist</code> para um campo que a documentação do
+projeto menciona, quase sempre é versão: a CRD instalada é mais antiga que o operador, ou o contrário. Vale
+comparar a versão do chart com a do <code>spec.versions</code> da CRD antes de culpar o manifesto.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Tarefa</th><th>Com operador</th><th>Sem operador</th></tr>
+</thead>
+<tbody>
+<tr><td>criar pods, Services e volumes</td><td>automático, a partir da custom resource</td><td>você
+escreve cada manifesto</td></tr>
+<tr><td>promover réplica, refazer nó</td><td>o laço detecta e age</td><td>procedimento manual, com
+runbook</td></tr>
+<tr><td>backup agendado</td><td>o operador cria o CronJob</td><td>seu CronJob e seu script</td></tr>
+<tr><td>testar a restauração</td><td>continua seu</td><td>continua seu</td></tr>
+<tr><td>capacidade e custo</td><td>continua seu</td><td>continua seu</td></tr>
+<tr><td>atualizar versão do banco</td><td>o operador executa, você decide a janela</td><td>você executa e
+decide</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>E o que continua sendo sua responsabilidade mesmo com operador? Capacidade — o operador cria pods, não
+compra nó, e um banco de três réplicas que não cabe no cluster vira <code>Pending</code> igual a qualquer
+outro. Backup <em>testado</em> — o operador agenda, mas restaurar é seu. Credenciais e rotação de senha.
+Monitoramento e alerta. E a decisão de atualizar: operador antigo com CRD nova costuma ser a receita de
+incidente silencioso.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: a CRD instalada sem o operador</h3>
+<p>O time aplicou o YAML da CRD e criou um <code>Cardapio</code> “para testar”. O <code>get</code> mostrou o
+objeto, e nada aconteceu — nenhum pod, nenhum Service. Faltava o Deployment do operador, que estava no mesmo
+arquivo, três documentos abaixo. A lição: instalar CRD sem operador é abrir a porta sem ter a
+cozinha.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o operador com permissão de menos</h3>
+<p>Depois de um upgrade do chart, o operador passou a logar <code>forbidden: cannot list resource
+"bancos"</code> a cada poucos segundos. A CRD e o Deployment estavam certos; o ClusterRole tinha ficado para
+trás e não incluía o novo recurso. O sintoma no <code>get</code> era um objeto eternamente em
+<code>Reconciling</code>.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o operador que valia menos que um StatefulSet</h3>
+<p>A Ana quase instalou um operador de cache para economizar trabalho. Comparando, o “operador” só criava um
+StatefulSet de uma réplica e um Service: nada que ela não escrevesse em vinte linhas. Ela ficou com o
+StatefulSet e economizou um programa de terceiros para atualizar. Operador é para lógica que você não quer
+escrever — não para empacotar YAML.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que uma CRD faz?</p>
+<label><input type="radio" name="q1"> cria os pods do operador automaticamente</label>
+<label><input type="radio" name="q1"> registra um tipo novo na API, com grupo, versão e schema</label>
+<label><input type="radio" name="q1"> faz backup dos volumes do cluster</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Qual é o trabalho do operador?</p>
+<label><input type="radio" name="q2"> validar o YAML antes de chegar ao servidor</label>
+<label><input type="radio" name="q2"> armazenar os objetos no etcd</label>
+<label><input type="radio" name="q2"> comparar o estado desejado com o atual e corrigir a
+diferença</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. O <code>kubectl explain banco.spec.backup</code> deu
+<code>field does not exist</code>. Qual é a explicação mais provável?</p>
+<label><input type="radio" name="q3"> a CRD instalada é mais antiga que a documentação do
+operador</label>
+<label><input type="radio" name="q3"> o cluster não tem o operador rodando</label>
+<label><input type="radio" name="q3"> falta permissão de leitura para o seu usuário</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o comando que lista os tipos</h2>
+<p>Você instalou uma CRD e quer confirmar que o cluster passou a conhecer o tipo novo. Complete o comando que
+lista todos os recursos da API.</p>
+<div class="ex-code">kubectl <input aria-label="resposta 1" data-answer="api-resources" placeholder="..."> | grep padaria</div>
+<p class="ex-dica">Dica: é o plural de “api resource”, tudo em minúsculas e com hífen.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>CRD é contrato, operador é trabalhador. A CRD ensina a API a aceitar um tipo novo, com grupo, versão e
+schema; a partir dali o <code>kubectl</code> trata o recurso como qualquer outro. O operador é um pod com
+permissão que gira um laço: observa o objeto, compara com o que existe e corrige a diferença — criando
+StatefulSets, Services, Secrets e CronJobs por você.</p>
+
+<p>A dupla tem ordem de instalação e conferência própria: CRD, RBAC, operador, custom resource; depois
+<code>get crd</code>, <code>api-resources</code> e <code>explain</code>. E tem um preço: mais um programa para
+atualizar, com permissões amplas e ciclo de vida separado do cluster.</p>
+
+<p>Na próxima aula a Ana volta ao agendador, agora com as ferramentas que só fazem sentido em cluster grande:
+afinidade entre pods, espalhamento por topologia e o <code>Pending</code> que nenhum evento explica de
+primeira.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>CRD registra o tipo; a custom resource é o pedido; o operador faz acontecer.</li>
+  <li>Sem operador, a CR existe e nada acontece.</li>
+  <li><code>kubectl api-resources</code> mostra o que o cluster conhece; <code>explain</code> mostra os
+  campos.</li>
+  <li>Operador é um pod: caiu, o laço para; os objetos existentes continuam.</li>
+  <li>O <code>status</code> de uma CR costuma ser escrito pelo operador, não pelo servidor.</li>
+  <li>Nem todo problema precisa de operador: StatefulSet + Service resolve muita coisa.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

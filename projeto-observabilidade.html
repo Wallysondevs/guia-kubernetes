@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Observabilidade | Guia Kubernetes</title>
+<meta name="description" content="Projeto de observabilidade da padaria: probes no Deployment, metrics-server no kube-system, leitura de eventos e um painel mental de saúde para saber se a loja está de pé.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Observabilidade</span></h1>
+<p class="intro">A Ana já sabe criar um Deployment, expor um Service e ler um erro. O que ela não tem é
+resposta para a pergunta das três da manhã: “a loja está de pé?”. Neste projeto ela monta a sala de controle
+da padaria em três passos — as verificações de saúde no manifesto, o medidor de consumo no
+<code>kube-system</code> e a rotina de eventos que o cluster já entrega de graça — e sai com um painel mental
+de quatro perguntas que funciona sem abrir o kubectl.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>As três verificações de saúde e o que cada falha provoca no cluster.</li>
+  <li>Como instalar o <code>metrics-server</code> e por que ele mora no <code>kube-system</code>.</li>
+  <li>Ler eventos: a lista que conta o que o cluster tentou fazer.</li>
+  <li>As quatro perguntas do painel mental e o comando que responde cada uma.</li>
+  <li>Os cinco erros clássicos de quem começa a medir saúde.</li>
+  <li>O que o painel deste guia faz de verdade e o que ele só representa.</li>
+</ul>
+</div>
+
+<h2>1. O que você vai construir</h2>
+
+<p>No fim deste projeto a padaria tem três peças novas e uma rotina. A primeira peça é um Deployment cujo
+container se declara <em>pronto</em> para receber pedidos e <em>vivo</em> para continuar rodando — são as
+probes. A segunda é o <code>metrics-server</code>, o componente que transforma consumo de CPU e memória em
+números que o kubectl consegue mostrar. A terceira não é uma peça que se instala: são os eventos, que o
+cluster grava sozinho e que quase ninguém lê.</p>
+
+<p>A rotina é o que chamei de painel mental: quatro perguntas, cada uma com um comando e uma resposta
+esperada. “Está de pé?” é o <code>kubectl get deployment</code>. “Está pronto para receber?” é o
+<code>kubectl get endpoints</code>. “O que aconteceu?” é o <code>kubectl get events</code>. “Quanto está
+consumindo?” é o <code>kubectl top</code>. Quem responde essas quatro em trinta segundos não precisa acordar
+o time inteiro às três da manhã.</p>
+
+<dl class="anatomy">
+<dt>readinessProbe</dt>
+<dd>A pergunta “pode mandar tráfego?”. Enquanto ela falha, o pod continua rodando mas sai dos endpoints do
+Service. Não reinicia nada.</dd>
+<dt>livenessProbe</dt>
+<dd>A pergunta “você está vivo?”. Se ela falha várias vezes seguidas, o kubelet mata o container e o
+cluster cria outro no lugar.</dd>
+<dt>startupProbe</dt>
+<dd>A pergunta “já terminou de acordar?”. Ela segura as outras duas até passar e serve para programa que
+demora a subir.</dd>
+<dt>periodSeconds</dt>
+<dd>De quanto em quanto tempo a verificação roda. Junto com <code>failureThreshold</code>, define quantos
+segundos de falha o cluster tolera antes de agir.</dd>
+<dt>metrics-server</dt>
+<dd>Um programa que lê os números de cada kubelet e publica na API como <code>metrics.k8s.io</code>. É ele
+que alimenta o <code>kubectl top</code>.</dd>
+</dl>
+
+<p>Repare no que a lista <em>não</em> promete: nada disso avisa ninguém. O cluster não manda mensagem, não
+liga para o celular e não abre ticket. O que ele faz é <em>deixar o estado visível</em>. Quem transforma
+estado em aviso é uma camada de cima — Prometheus com Alertmanager, por exemplo, nas aulas seguintes. Este
+projeto é a base sem a qual o alerta não tem o que alertar.</p>
+
+<h2>2. O cenário da padaria</h2>
+
+<p>Numa sexta-feira o site começou a devolver erro em um pedido a cada três. O time olhou o
+<code>kubectl get pods</code> e viu o que todo mundo vê nessa hora: <code>Running</code>, <code>1/1</code>,
+zero reinícios. Conclusão apressada: “o cluster está bem, o problema é no código”. Duas horas depois,
+alguém rodou <code>kubectl get endpoints</code> e descobriu que só um dos dois pods estava no Service. O
+outro estava de pé, recebendo nada — e o que estava recebendo tudo era o que tinha a conexão com o banco meio
+morta.</p>
+
+<p>O erro não foi técnico, foi de vocabulário. <code>Running</code> quer dizer que o container existe e não
+morreu. Não quer dizer que o programa responde, que ele está pronto, que ele está recebendo tráfego nem que
+ele tem memória sobrando. Cada uma dessas perguntas tem um sinal diferente no cluster, e o trabalho de
+observabilidade começa em saber qual sinal responde qual pergunta.</p>
+
+<p>O segundo problema apareceu no sábado: consumo. O nó começou a despejar pods e ninguém sabia qual deles
+estava comendo a memória. Sem métricas, o time apagava pods no escuro. O <code>metrics-server</code> resolve
+essa parte — não previne o problema, mas faz a pergunta “quem está consumindo?” ter resposta em um comando.</p>
+
+<h2>3. Antes de começar</h2>
+
+<p>Você precisa de três coisas: um cluster respondendo (o do curso serve), o Deployment do cardápio já criado
+e o kubectl configurado. Nada de instalar Prometheus ou Grafana ainda: este projeto é o alicerce, e ele
+inteiro cabe em dois manifestos e três comandos.</p>
+
+<p>Vale conhecer os sinais que o cluster já entrega sem instalar nada. O <code>status</code> do pod diz a fase
+(<code>Pending</code>, <code>Running</code>, <code>Succeeded</code>, <code>Failed</code>). As
+<em>conditions</em> dizem em que etapa ele está: <code>PodScheduled</code>, <code>Initialized</code>,
+<code>Ready</code>, <code>ContainersReady</code>. Os <em>endpoints</em> dizem quem está recebendo tráfego
+naquele instante. E os <em>events</em> dizem o que o cluster tentou fazer — inclusive as tentativas que
+falharam. Métrica de consumo é o único sinal que precisa de instalação.</p>
+
+<p>Uma última preparação conceitual: probes não são monitoramento e monitoramento não é alerta. Probe é uma
+decisão local do kubelet (“mando tráfego ou não?”, “mato esse container ou não?”). Monitoramento é a série
+histórica de números. Alerta é a regra que transforma número em mensagem. Confundir os três é o motivo de
+existirem clusters com quarenta alertas e nenhum diagnóstico.</p>
+
+<h2>4. Passo 1 — as três perguntas de saúde</h2>
+
+<p>O manifesto abaixo é o coração do projeto. Ele cria o Deployment do cardápio com duas réplicas e um
+container que declara duas verificações: uma de prontidão, em <code>/saude</code> na porta 8080, e uma de
+vida, também em <code>/saude</code>. A caixa começa com o Deployment sem nenhuma das duas: o pod sobe e é
+considerado saudável por omissão, mesmo que o programa não responda a nada.</p>
+
+<div class="tryk8s" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.readinessProbe.httpGet.path=/saude;;campo:Deployment/cardapio|spec.template.spec.containers.0.livenessProbe.httpGet.port=8080;;pronto:Deployment/cardapio=2">
+  <p class="try-task">Acrescente ao container as duas verificações: <code>readinessProbe</code> e
+  <code>livenessProbe</code>, ambas com <code>httpGet</code> em <code>/saude</code> na porta
+  <code>8080</code>, com <code>periodSeconds: 10</code>. Rode e veja as duas réplicas prontas.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /saude
+              port: 8080
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /saude
+              port: 8080
+            periodSeconds: 10</pre>
+</div>
+
+<p>Leia o manifesto de dentro para fora. <code>httpGet</code> diz que a verificação é uma chamada HTTP, com
+<code>path</code> e <code>port</code> — se o programa responde 200, a verificação passou; se responde 500 ou
+não responde, falhou. O <code>periodSeconds: 10</code> diz que ela roda a cada dez segundos. O padrão de
+<code>failureThreshold</code> é 3, então três falhas seguidas — trinta segundos — fazem o cluster agir. Na
+readiness, agir significa tirar o pod do Service; na liveness, matar o container.</p>
+
+<p>Essa diferença de consequência é o que mais confunde quem começa. Prova de prontidão é sobre
+<em>tráfego</em>: falhou, o pod fica fora dos endpoints e volta sozinho quando passar. Prova de vida é sobre
+<em>existência</em>: falhou o suficiente, o container é morto e recriado. Colocar uma verificação de vida no
+lugar da de prontidão transforma uma lentidão momentânea em reinício em cascata — e é assim que nasce um
+<code>CrashLoopBackOff</code> causado por excesso de cuidado.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Verificação</th><th>Pergunta</th><th>Se falhar</th><th>Use quando</th></tr>
+</thead>
+<tbody>
+<tr><td><code>readinessProbe</code></td><td>posso mandar pedido para este pod?</td><td>sai dos endpoints do Service; não reinicia</td><td>o programa tem dependência que pode falhar (banco, fila, cache)</td></tr>
+<tr><td><code>livenessProbe</code></td><td>o programa ainda está vivo?</td><td>o container é morto e recriado</td><td>o processo pode travar sem morrer</td></tr>
+<tr><td><code>startupProbe</code></td><td>já terminou de acordar?</td><td>segura as outras duas; se nunca passar, reinicia</td><td>programa lento para subir, como um importador de dados</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>No painel, as probes aparecem no manifesto e no <code>kubectl get deployment cardapio -o yaml</code>. O
+que ele <em>não</em> faz é executar a verificação: não há kubelet nem container de verdade, então o pod
+aparece pronto pelo agendamento, não por ter respondido 200 em <code>/saude</code>. Num cluster real, é entre
+o <code>Running</code> e o <code>READY 1/1</code> que a probe trabalha — e a diferença entre os dois é
+exatamente o que o painel não simula.</p>
+
+<h2>5. Passo 2 — o medidor: metrics-server</h2>
+
+<p>O kubectl não sabe quanto um pod consome: essa informação mora no kubelet, em cada nó, e não passa pela
+API principal. Quem faz a ponte é o <code>metrics-server</code>, um programa que roda dentro do próprio
+cluster, lê os kubelets de tempos em tempos e publica o resultado como uma API nova,
+<code>metrics.k8s.io</code>. Quando o <code>kubectl top</code> pergunta, é essa API que responde.</p>
+
+<p>Por isso ele mora no <code>kube-system</code>: é infraestrutura do cluster, não carga de trabalho da
+padaria. E por isso ele precisa de permissão para falar com os nós — um ServiceAccount e um ClusterRole que
+o manifesto completo do projeto oficial traz. Abaixo está a peça central, o Deployment; a caixa começa com
+ele sem namespace, e é aí que a maioria dos tutoriais falha.</p>
+
+<div class="tryk8s" data-get="deployment metrics-server -n kube-system -o yaml" data-goal="texto:namespace: kube-system;;texto:--kubelet-insecure-tls">
+  <p class="try-task">Coloque o Deployment no namespace certo (<code>namespace: kube-system</code>) e
+  confira o argumento <code>--kubelet-insecure-tls</code>, que é o que faz o medidor funcionar em cluster de
+  laboratório com certificado autoassinado.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: metrics-server
+  template:
+    metadata:
+      labels:
+        k8s-app: metrics-server
+    spec:
+      containers:
+        - name: metrics-server
+          image: registry.k8s.io/metrics-server/metrics-server:v0.7.2
+          args:
+            - --kubelet-insecure-tls</pre>
+<pre class="out">
+deployment.apps/metrics-server created
+
+Error from server (NotFound): deployments "metrics-server" not found
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-server
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: metrics-server
+  template:
+    metadata:
+      labels:
+        k8s-app: metrics-server
+    spec:
+      containers:
+        - name: metrics-server
+          image: registry.k8s.io/metrics-server/metrics-server:v0.7.2
+          args:
+            - --kubelet-insecure-tls</pre>
+</div>
+
+<p>O argumento <code>--kubelet-insecure-tls</code> merece uma explicação honesta: ele manda o medidor
+aceitar o certificado que o kubelet apresenta sem validar a autoridade que assinou. Em cluster de nuvem, com
+certificado de verdade, ele não é necessário — e em cluster de estudo, com <code>kind</code>, ele é o que
+separa “funciona” de “<code>unable to authenticate</code>”. Use em laboratório, tire em produção.</p>
+
+<p>Com o Deployment pronto, o <code>kubectl top</code> passa a responder. A transcrição abaixo é de um
+cluster local com o medidor instalado:</p>
+
+<pre class="term">ana@notebook:~$ kubectl top pods -n padaria
+NAME                        CPU(cores)   MEMORY(bytes)
+cardapio-5cbfb4c44d-4jjxx   12m          38Mi
+cardapio-5cbfb4c44d-nxfdg   9m           41Mi
+
+ana@notebook:~$ kubectl top nodes
+NAME                 CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+guia-control-plane   312m         7%     1180Mi          31%
+guia-worker          198m         4%     902Mi           24%</pre>
+
+<p>Duas leituras rápidas. <code>12m</code> é doze milicores, ou 1,2% de um núcleo — <code>m</code> é
+“mili”, não “mega”. E <code>38Mi</code> é memória em mebibytes. Se o número de memória de um pod cresce sem
+parar a cada leitura, você está vendo um vazamento antes de o nó reclamar; é exatamente esse o valor de ter o
+medidor instalado.</p>
+
+<p>No painel deste guia, <code>kubectl top</code> responde <code>error: Metrics API not available</code>
+mesmo com o Deployment aplicado — porque a camada de agregação de API não é simulada. Não é bug nem
+configuração sua: é o limite do simulador, e a frase é a mesma que um cluster de verdade devolve antes de o
+metrics-server ficar pronto. Ali, a instalação completa é o manifesto oficial, que inclui ServiceAccount,
+ClusterRole, RoleBinding, Service e APIService.</p>
+
+<dl class="anatomy">
+<dt>APIService</dt>
+<dd>O objeto que registra a API <code>metrics.k8s.io</code> no cluster. Sem ele, o <code>top</code> não
+encontra o medidor.</dd>
+<dt>Service metrics-server</dt>
+<dd>O endereço interno, na porta 443, por onde o agrupador de API fala com o pod do medidor.</dd>
+<dt>--kubelet-insecure-tls</dt>
+<dd>Argumento que dispensa validar o certificado do kubelet. Atalho de laboratório.</dd>
+<dt>kubelet</dt>
+<dd>O agente de cada nó. É ele que sabe o consumo real de cada container e entrega o número ao medidor.</dd>
+</dl>
+
+<h2>6. Passo 3 — o alarme que já existe: eventos</h2>
+
+<p>Eventos são a parte mais subestimada do cluster. Cada controlador escreve ali o que tentou fazer e por que
+desistiu, e o kubectl guarda isso por cerca de uma hora. É a lista que responde “o que aconteceu?” sem você
+ter configurado nada. A caixa usa um cluster com um pod que não cabe em nó nenhum: leia os eventos antes de
+qualquer outra coisa.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="pod-pendente" data-goal="texto:FailedScheduling;;texto:Insufficient cpu">
+  <p class="try-task">O pod <code>forno</code> está preso em <code>Pending</code>. Peça a lista de eventos e
+  descreva o pod para encontrar o motivo — o painel tem de mostrar <code>FailedScheduling</code> e
+  <code>Insufficient cpu</code>.</p>
+<pre class="yaml">kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get pods
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">kubectl get events
+kubectl describe pod forno</pre>
+</div>
+
+<p>A tabela de eventos tem cinco colunas: quando foi visto pela última vez, o tipo
+(<code>Normal</code> ou <code>Warning</code>), o motivo, o objeto e a mensagem. Comece pelos
+<code>Warning</code>: são eles que contam o que deu errado. No caso do <code>forno</code>, a mensagem diz que
+os três nós foram avaliados, nenhum tinha CPU sobrando e o cluster não achou nada que pudesse ser despejado
+para abrir espaço.</p>
+
+<p>A mesma frase aparece dentro do <code>describe pod</code>, na seção <code>Events</code>, junto com as
+condições do pod. O <code>describe</code> junta num lugar só o que o <code>get</code> separa em tabelas — e é
+por isso que ele é o comando de investigação, e não o de rotina. Quando o assunto é probe, o evento é ainda
+mais direto. A transcrição abaixo é de um cluster real, com a verificação de prontidão batendo numa porta
+onde ninguém escuta:</p>
+
+<pre class="term">  Warning  Unhealthy  2m (x6 over 5m)  kubelet
+  Readiness probe failed: Get "http://10.244.1.5:8080/saude": dial tcp 10.244.1.5:8080: connect: connection refused</pre>
+
+<p>Leia a frase por partes: o motivo é <code>Unhealthy</code>, quem reportou foi o <code>kubelet</code> do nó,
+a verificação que falhou foi a de prontidão, e a URL mostra o caminho exato que ele tentou. “Connection
+refused” é porta fechada — não é lentidão, não é timeout, é um programa que não está escutando ali. Se fosse
+timeout, a mensagem seria outra, e o conserto também.</p>
+
+<h2>7. Conferindo com o painel</h2>
+
+<p>Agora a rotina que fecha o projeto. Quatro perguntas, quatro comandos, um minuto de trabalho. A tabela
+abaixo é o que vale colar no mural do time — e é o mesmo roteiro que você vai repetir em qualquer incidente
+daqui para frente.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Pergunta</th><th>Comando</th><th>Resposta saudável</th><th>Sinal de problema</th></tr>
+</thead>
+<tbody>
+<tr><td>está de pé?</td><td><code>kubectl get deployment cardapio</code></td><td><code>READY</code> igual a <code>AVAILABLE</code></td><td><code>AVAILABLE</code> abaixo do desejado</td></tr>
+<tr><td>está pronto para receber?</td><td><code>kubectl get endpoints cardapio</code></td><td>IPs com porta, um por pod</td><td><code>&lt;none&gt;</code> ou menos IPs que pods</td></tr>
+<tr><td>o que aconteceu?</td><td><code>kubectl get events</code></td><td>só <code>Normal</code> nas últimas linhas</td><td>repetição de <code>Warning</code> com o mesmo motivo</td></tr>
+<tr><td>quanto consome?</td><td><code>kubectl top pods</code></td><td>CPU e memória estáveis</td><td>memória crescendo a cada leitura</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Repare que três das quatro respostas vêm de graça, e a quarta é a única que exige instalação. Isso explica
+por que observabilidade em Kubernetes começa com disciplina de leitura, não com ferramenta: quem não lê os
+três sinais gratuitos vai instalar um painel bonito para olhar o mesmo problema com mais cores.</p>
+
+<p>Para o detalhe, o caminho é o objeto inteiro: <code>kubectl get deployment cardapio -o yaml</code> mostra
+o <code>spec</code> com as probes e o <code>status</code> com as réplicas prontas; <code>kubectl describe
+pod</code> mostra as condições e os eventos daquele pod. E vale conhecer o hábito de comparar: dois pods do
+mesmo Deployment devem ter o mesmo <code>READY</code>, o mesmo número de reinícios e tempos de vida parecidos.
+Quando um deles destoa, você achou o problema antes do cliente.</p>
+
+<h2>8. Quando não funciona</h2>
+
+<p>Cinco tropeços concentram quase todo o sofrimento de quem monta essa base. O primeiro é a probe apontando
+para a porta errada: o container escuta em 8080 e a verificação bate em 80. O segundo é o caminho errado —
+<code>/healthz</code> no manifesto, <code>/saude</code> no código. O terceiro é o
+<code>initialDelaySeconds</code> curto demais em programa lento: a liveness mata o container antes de ele
+terminar de subir, e o cluster entra em reinício perpétuo.</p>
+
+<p>O quarto é o <code>metrics-server</code> no namespace errado. Fora do <code>kube-system</code> ele até
+sobe, mas não recebe a permissão de falar com os nós e o <code>top</code> continua vazio. O quinto é de
+interpretação: o evento some depois de cerca de uma hora. Quem investiga no dia seguinte encontra a lista
+vazia e conclui que “não havia evento nenhum”. A transcrição abaixo mostra o recado que aparece quando o
+medidor não está no ar — o mesmo que o painel deste guia devolve:</p>
+
+<pre class="term">ana@notebook:~$ kubectl top pods
+error: Metrics API not available</pre>
+
+<p>Traduzindo os cinco: porta, caminho, tempo, namespace e memória curta. Nenhum deles aparece como erro
+vermelho no cluster; todos aparecem como comportamento estranho. É por isso que a rotina da seção anterior
+importa: ela transforma “estranho” em “qual dos quatro sinais está diferente”.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sintoma</th><th>Primeiro comando</th><th>O que você procura</th></tr>
+</thead>
+<tbody>
+<tr><td>pod não sobe</td><td><code>kubectl describe pod</code></td><td><code>FailedScheduling</code> nos eventos: falta de recurso, etiqueta ou nó</td></tr>
+<tr><td>sobe e reinicia</td><td><code>kubectl get pods</code> e <code>describe</code></td><td><code>RESTARTS</code> subindo e <code>Last State: Terminated</code></td></tr>
+<tr><td>sobe, mas o site dá erro</td><td><code>kubectl get endpoints</code></td><td>IPs faltando: a readiness não está passando</td></tr>
+<tr><td>consumo esquisito</td><td><code>kubectl top pods</code></td><td>memória crescendo a cada leitura, CPU colada no limite</td></tr>
+<tr><td>“não aconteceu nada”</td><td><code>kubectl get events</code></td><td>lista vazia pode ser evento expirado: refaça o passo</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="cenario">
+<h3>Cenário 1: o pod saudável que não recebia pedido</h3>
+<p>Dois pods em <code>Running</code>, um deles fora dos endpoints porque a readiness falhava ao consultar o
+banco. Nada reiniciava, nada alarmava, e metade dos pedidos ia para o pod bom. O conserto foi aumentar o
+<code>timeoutSeconds</code> da verificação: o banco respondia, só demorava mais do que o padrão de um
+segundo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a liveness que reiniciava no pico</h3>
+<p>A verificação de vida consultava o mesmo endpoint que fazia consulta pesada ao banco. No horário de pico,
+ela passava de um segundo e o container era morto — em loop, derrubando o pod que estava justamente
+atendendo. A lição: prova de vida deve ser barata, local e sem dependência externa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o alerta que veio da reclamação</h3>
+<p>Sem métricas, o time só soube do vazamento de memória quando o nó começou a despejar pods e o site caiu.
+Depois do <code>metrics-server</code>, a leitura semanal de <code>kubectl top pods</code> mostrou o número
+subindo 2 Mi por hora. O alerta passou a ser uma regra simples sobre esse crescimento.</p>
+</div>
+
+<h2>9. O que ficou de aprendizado</h2>
+
+<p>Você construiu a base da observabilidade em três gestos: declarar saúde no manifesto, instalar o medidor e
+ler o que o cluster já conta. O que ficou não é um painel — é um vocabulário. <code>Running</code> é
+existência, <code>READY</code> é prontidão, endpoints são tráfego, eventos são história e métricas são
+tendência. Quem sabe qual palavra responde qual pergunta não se perde no incidente.</p>
+
+<p>Para continuar sozinho, três caminhos. O primeiro é automatizar a rotina: um script que roda os quatro
+comandos e salva a saída com data no nome do arquivo. O segundo é subir um Prometheus e apontar o
+<code>kubectl top</code> para séries históricas — as aulas de monitoramento mostram como. O terceiro é
+escrever as regras de alerta em cima dos mesmos sinais: <code>AVAILABLE</code> abaixo do desejado por cinco
+minutos, endpoints vazios por dois minutos, memória crescendo por uma hora.</p>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que acontece quando a
+<code>readinessProbe</code> falha?</p>
+<label><input type="radio" name="q1"> o container é morto e recriado pelo kubelet</label>
+<label><input type="radio" name="q1"> o pod sai dos endpoints do Service e continua rodando</label>
+<label><input type="radio" name="q1"> o Deployment é apagado</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Onde o <code>metrics-server</code> deve rodar?</p>
+<label><input type="radio" name="q2"> no mesmo namespace da aplicação</label>
+<label><input type="radio" name="q2"> no namespace <code>default</code>, junto com o Service</label>
+<label><input type="radio" name="q2"> no <code>kube-system</code>, como componente do cluster</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. <code>kubectl get pods</code> mostra <code>Running</code>
+e <code>1/1</code>, mas o site devolve erro. Qual é o próximo comando?</p>
+<label><input type="radio" name="q3"> <code>kubectl get endpoints</code>, para ver quem está recebendo
+tráfego</label>
+<label><input type="radio" name="q3"> <code>kubectl delete pod</code>, para recriar o pod</label>
+<label><input type="radio" name="q3"> <code>kubectl scale</code>, para subir mais réplicas</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a verificação de prontidão do cardápio</h2>
+<p>O site da padaria só deve receber pedidos quando a rota <code>/saude</code> da porta 8080 responder. Qual é
+o campo do container que declara essa condição — aquele que tira o pod dos endpoints quando falha, sem
+reiniciar nada?</p>
+<div class="ex-code">spec.template.spec.containers[0].<input aria-label="resposta 1" data-answer="readinessProbe" placeholder="...">:
+  httpGet:
+    path: /saude
+    port: 8080</div>
+<p class="ex-dica">Dica: são duas verificações parecidas. A que reinicia o container é a
+<code>livenessProbe</code>; a que só decide se o pod entra no Service é a outra. O hub do painel pode
+acompanhar as duas em <code>kubectl get deployment cardapio -o yaml</code>.</p>
+</div>
+
+<h2>10. Resumo</h2>
+
+<p>Saúde em Kubernetes tem três perguntas e três consequências: prontidão decide tráfego, vida decide
+reinício, início segura as duas até o programa acordar. Elas vão no manifesto, dentro do container, com
+<code>httpGet</code> apontando para um caminho que o próprio programa serve — e o pior erro é colocar
+dependência externa na prova de vida.</p>
+
+<p>Consumo vem do <code>metrics-server</code>, que mora no <code>kube-system</code>, fala com os kubelets e
+publica a API <code>metrics.k8s.io</code>. Com ele, <code>kubectl top pods</code> e <code>kubectl top
+nodes</code> respondem; sem ele, a resposta é <code>Metrics API not available</code>. No painel deste guia a
+camada de agregação não é simulada, então o <code>top</code> sempre devolve essa frase — e a saída real está
+na transcrição.</p>
+
+<p>E o que o cluster entrega de graça: <code>status</code>, <code>conditions</code>, endpoints e eventos. Os
+eventos duram cerca de uma hora e contam a história do que foi tentado. A rotina de quatro comandos —
+<code>get deployment</code>, <code>get endpoints</code>, <code>get events</code>, <code>top pods</code> — é o
+painel mental que responde “a loja está de pé?” antes de qualquer ferramenta sofisticada entrar em cena.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+<li><code>readinessProbe</code> tira do Service; <code>livenessProbe</code> reinicia; <code>startupProbe</code>
+segura as duas.</li>
+<li><code>periodSeconds</code> × <code>failureThreshold</code> = tempo de tolerância antes de agir.</li>
+<li><code>metrics-server</code> vai no <code>kube-system</code> e publica <code>metrics.k8s.io</code>.</li>
+<li><code>kubectl top</code> sem medidor responde <code>error: Metrics API not available</code>.</li>
+<li>Eventos são a história do cluster e duram cerca de uma hora: leia antes que sumam.</li>
+<li><code>Running</code> não é saudável; <code>READY</code> é pronto; endpoints é quem recebe tráfego.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recursos da API | Guia Kubernetes</title>
+<meta name="description" content="Consulta dos recursos da API Kubernetes: os grupos (core, apps, batch, networking, rbac, autoscaling), o que é namespaced, e como descobrir tudo com api-resources e explain.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Recursos da <span class="hl">API</span></h1>
+<p class="intro">A Ana já reparou que o <code>apiVersion</code> do Pod é <code>v1</code> e o do Deployment
+é <code>apps/v1</code>, mas nunca entendeu por quê. A resposta é simples: o Kubernetes não é uma API só,
+são vários grupos de recursos publicados no mesmo endereço. Esta página é o mapa desses grupos — o que é
+<code>apps</code>, o que é <code>batch</code>, o que é <code>networking.k8s.io</code> —, com o jeito de
+descobrir tudo isso no seu próprio cluster em vez de decorar.</p>
+
+<div class="note">
+<strong>Como usar esta página</strong>
+<ul>
+  <li>A tabela 1 é por grupo; a tabela 2 é por tipo. Use a que estiver mais perto da sua dúvida.</li>
+  <li>A seção 6 é a que resolve na prática: dois comandos que respondem “qual é a versão?” e “qual é o
+  campo?”.</li>
+  <li>O que é “namespaced” muda o comando que você digita — a seção 5 explica com exemplos.</li>
+</ul>
+</div>
+
+<h2>1. Para que serve esta página (e o que ela não cobre)</h2>
+
+<p>Esta é a folha de consulta da <em>superfície</em> da API: os grupos, as versões, os escopos e os
+apelidos. Ela responde a três perguntas que aparecem em quase todo manifesto que não sobe: qual é o
+<code>apiVersion</code> deste tipo, este tipo vive em namespace ou no cluster inteiro, e como eu descubro
+isso no meu próprio cluster quando esqueço.</p>
+
+<p>Ela não ensina o que cada campo de cada recurso faz — para isso existem as páginas
+<a href="ref-pods.html">Pods</a>, <a href="ref-deployments.html">Deployments</a> e
+<a href="ref-servicos.html">Services e Ingress</a>. Também não é uma lista completa: o Kubernetes tem mais
+de cinquenta tipos, e o seu cluster provavelmente tem outros que alguém instalou. Por isso o fim desta
+página insiste em dois comandos: <code>kubectl api-resources</code> e <code>kubectl explain</code>.</p>
+
+<p>Por que a API é dividida assim? Porque cada grupo evolui no seu ritmo. O núcleo
+(<code>v1</code>) está congelado há anos: mudar o formato de um Pod quebraria todos os manifestos do mundo.
+Já os grupos com domínio no nome podem nascer, amadurecer e ganhar versões novas sem tocar no núcleo — o
+<code>apps/v1</code> substituiu <code>extensions/v1beta1</code>, e o <code>autoscaling/v2</code> convive com o
+<code>v1</code> até hoje. Essa separação é o que permite ao Kubernetes mudar sem parar o mundo.</p>
+
+<p>Uma ideia que ajuda a entender o resto: pensa no Kubernetes como uma biblioteca com várias prateleiras.
+Cada prateleira é um <strong>grupo</strong> (<code>apps</code>, <code>batch</code>,
+<code>networking.k8s.io</code>), cada grupo tem uma ou mais <strong>versões</strong> (<code>v1</code>,
+<code>v2</code>) e cada versão publica <strong>tipos</strong> (<code>Deployment</code>,
+<code>Job</code>, <code>Ingress</code>). O endereço completo de um tipo é a combinação
+grupo/versão/tipo — e é isso que o <code>apiVersion</code> mais o <code>kind</code> escrevem no
+manifesto.</p>
+
+<h2>2. O essencial em 10 linhas</h2>
+
+<ul>
+  <li>O núcleo da API usa <code>apiVersion: v1</code> e não tem grupo no nome.</li>
+  <li>Todo o resto tem grupo: <code>apps/v1</code>, <code>batch/v1</code>,
+  <code>networking.k8s.io/v1</code>.</li>
+  <li><code>apiVersion</code> aceita <code>v1</code> ou <code>grupo/versão</code>; nunca
+  <code>grupo</code> sozinho.</li>
+  <li><code>kind</code> é o tipo, com maiúscula; o plural em minúsculas é o que você digita no
+  <code>get</code>.</li>
+  <li>Quase tudo vive num namespace; alguns tipos vivem no cluster inteiro.</li>
+  <li>Namespaced: Pod, Deployment, Service, ConfigMap, Secret, Job, PVC, Ingress, HPA.</li>
+  <li>Cluster: Namespace, Node, PersistentVolume, StorageClass, ClusterRole, CRD.</li>
+  <li><code>kubectl api-resources</code> lista nome, apelido, versão e escopo de tudo.</li>
+  <li><code>kubectl explain TIPO</code> mostra a versão e os campos daquele tipo.</li>
+  <li>Recurso customizado (CRD) também aparece nos dois comandos — a API é extensível.</li>
+</ul>
+
+<p>Sobre a palavra <em>beta</em>: uma versão <code>v1beta1</code> é uma promessa mais fraca. Ela funciona,
+é usada em produção por muita gente, mas pode mudar de forma ou ser removida numa versão futura do
+Kubernetes — e quando é removida, os manifestos que a usavam param de aplicar com <code>no matches for
+kind</code>. Uma versão <code>v1</code> não muda assim. Se você está começando um projeto hoje, prefira
+sempre a versão estável que o <code>api-resources</code> mostra.</p>
+
+<p>Duas consequências práticas dessas dez linhas. A primeira: quando o manifesto é recusado com
+<code>no matches for kind</code>, o problema está na combinação grupo/versão/tipo — e o
+<code>api-resources</code> dá a resposta em uma tela. A segunda: quando você cria um objeto
+<em>cluster-scoped</em>, o <code>-n</code> não faz diferença nenhuma; quando cria um namespaced sem
+<code>-n</code>, ele vai para <code>default</code>.</p>
+
+<p>Uma distinção de vocabulário que o guia usa o tempo todo: <strong>recurso</strong> é o tipo publicado pela
+API (<code>deployments</code>), <strong>objeto</strong> é uma instância daquele tipo (<code>o Deployment
+cardapio</code>). O <code>api-resources</code> lista recursos; o <code>get</code> lista objetos. Quando
+alguém diz “o recurso não existe”, quase sempre quer dizer que o tipo não está registrado no cluster — e
+não que o objeto sumiu.</p>
+
+<p>E uma armadilha de leitura: o <code>kind</code> do manifesto é singular e maiúsculo
+(<code>Deployment</code>), mas o comando aceita singular, plural e apelido (<code>deployment</code>,
+<code>deployments</code>, <code>deploy</code>). São três grafias para a mesma coisa, e nenhuma delas
+funciona no lugar da outra: no <code>kind</code>, só a primeira.</p>
+
+<h2>3. Anatomia de um nome de API</h2>
+
+<dl class="anatomy">
+<dt>grupo</dt>
+<dd>A prateleira: <code>apps</code>, <code>batch</code>, <code>networking.k8s.io</code>,
+<code>rbac.authorization.k8s.io</code>. O núcleo não tem grupo e é chamado de <em>core</em>.</dd>
+<dt>versão</dt>
+<dd>A edição daquela prateleira: <code>v1</code>, <code>v2</code>, <code>v1beta1</code>. Versões
+<code>beta</code> podem mudar ou desaparecer; <code>v1</code> é estável.</dd>
+<dt>apiVersion</dt>
+<dd>O que você escreve no manifesto: <code>v1</code> para o núcleo e <code>grupo/versão</code> para o
+resto. É a junção dos dois campos acima.</dd>
+<dt>kind</dt>
+<dd>O tipo, em CamelCase: <code>Deployment</code>, <code>ConfigMap</code>, <code>Job</code>. É o que
+decide qual <code>spec</code> é válido.</dd>
+<dt>plural e apelido</dt>
+<dd>Como o <code>kubectl</code> chama o tipo no comando: <code>deployments</code> e <code>deploy</code>,
+<code>services</code> e <code>svc</code>. É o que o <code>api-resources</code> mostra nas duas primeiras
+colunas.</dd>
+<dt>escopo</dt>
+<dd><em>Namespaced</em> (vive dentro de um namespace) ou <em>cluster-scoped</em> (existe no cluster
+inteiro). Muda o <code>-n</code> e muda quem pode criar.</dd>
+</dl>
+
+<p>Juntando as peças: <code>apiVersion: apps/v1</code> + <code>kind: Deployment</code> quer dizer
+“prateleira <code>apps</code>, versão <code>v1</code>, tipo <code>Deployment</code>”. No endereço HTTP da
+API isso vira <code>/apis/apps/v1/deployments</code>; no núcleo, sem grupo, vira
+<code>/api/v1/pods</code> — a diferença do <code>/apis</code> com “s” é um detalhe do desenho da API, que
+você vê quando usa <code>kubectl get --raw</code>.</p>
+
+<h2>4. Os grupos do dia a dia</h2>
+
+<p>Você não precisa decorar todos, mas precisa reconhecer os seis que aparecem em qualquer projeto. A
+tabela está por grupo; a coluna “tipos” traz os que você já viu ou vai ver neste guia.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Grupo</th><th><code>apiVersion</code></th><th>Tipos principais</th><th>Assunto</th></tr>
+</thead>
+<tbody>
+<tr><td>core</td><td><code>v1</code></td><td>Pod, Service, ConfigMap, Secret, Namespace, Node, PVC,
+PV</td><td>o dia a dia do cluster</td></tr>
+<tr><td><code>apps</code></td><td><code>apps/v1</code></td><td>Deployment, ReplicaSet, StatefulSet,
+DaemonSet</td><td>cargas de trabalho com controlador</td></tr>
+<tr><td><code>batch</code></td><td><code>batch/v1</code></td><td>Job, CronJob</td><td>trabalho que
+termina</td></tr>
+<tr><td><code>networking.k8s.io</code></td><td><code>networking.k8s.io/v1</code></td><td>Ingress,
+NetworkPolicy, IngressClass</td><td>entrada e isolamento de rede</td></tr>
+<tr><td><code>rbac.authorization.k8s.io</code></td><td><code>rbac.authorization.k8s.io/v1</code></td><td>Role,
+RoleBinding, ClusterRole, ClusterRoleBinding</td><td>quem pode o quê</td></tr>
+<tr><td><code>autoscaling</code></td><td><code>autoscaling/v2</code></td><td>HorizontalPodAutoscaler</td><td>escala
+automática</td></tr>
+<tr><td><code>storage.k8s.io</code></td><td><code>storage.k8s.io/v1</code></td><td>StorageClass,
+CSIDriver</td><td>como o disco é provisionado</td></tr>
+<tr><td><code>apiextensions.k8s.io</code></td><td><code>apiextensions.k8s.io/v1</code></td><td>CustomResourceDefinition</td><td>criar
+tipos novos</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Agora na direção contrária: você tem o tipo na cabeça e quer saber o plural, o apelido e o escopo. Esta
+é a tabela que responde ao comando que você vai digitar.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th><code>kind</code></th><th>Plural</th><th>Apelido</th><th>Escopo</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Pod</code></td><td><code>pods</code></td><td><code>po</code></td><td>namespaced</td></tr>
+<tr><td><code>Deployment</code></td><td><code>deployments</code></td><td><code>deploy</code></td><td>namespaced</td></tr>
+<tr><td><code>Service</code></td><td><code>services</code></td><td><code>svc</code></td><td>namespaced</td></tr>
+<tr><td><code>ConfigMap</code></td><td><code>configmaps</code></td><td><code>cm</code></td><td>namespaced</td></tr>
+<tr><td><code>Job</code></td><td><code>jobs</code></td><td>—</td><td>namespaced</td></tr>
+<tr><td><code>Ingress</code></td><td><code>ingresses</code></td><td><code>ing</code></td><td>namespaced</td></tr>
+<tr><td><code>Namespace</code></td><td><code>namespaces</code></td><td><code>ns</code></td><td>cluster</td></tr>
+<tr><td><code>Node</code></td><td><code>nodes</code></td><td><code>no</code></td><td>cluster</td></tr>
+<tr><td><code>PersistentVolume</code></td><td><code>persistentvolumes</code></td><td><code>pv</code></td><td>cluster</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma curiosidade que explica os nomes: só os grupos do núcleo e os primeiros grupos ganharam nome curto
+(<code>apps</code>, <code>batch</code>). Os grupos criados depois usaram o domínio do projeto
+(<code>networking.k8s.io</code>, <code>rbac.authorization.k8s.io</code>) para não colidir com nada. É por
+isso que a coluna <code>APIVERSION</code> tem linhas de dois formatos, e é por isso que
+<code>apiVersion: networking/v1</code> não existe: o nome do grupo é o domínio inteiro, não a primeira
+palavra.</p>
+
+<p>Repare que nem todo tipo tem apelido. <code>jobs</code> não tem, e isso não é esquecimento: apelido é
+uma conveniência, e só existe quando alguém pediu. Se você digitar <code>kubectl get job</code>, o
+<code>kubectl</code> aceita o singular; se digitar <code>kubectl get j</code>, ele responde que não conhece
+o tipo — o que ensina a diferença entre “nome do recurso” e “apelido do recurso”.</p>
+
+<h2>5. Namespaced e cluster-scoped</h2>
+
+<p>Essa distinção parece burocracia e é o motivo de metade dos comandos que “não acham nada”. Um objeto
+<em>namespaced</em> existe dentro de um namespace, como um caderno dentro de uma gaveta: o mesmo nome pode
+existir em duas gavetas, e o <code>-n</code> escolhe a gaveta. Um objeto <em>cluster-scoped</em> existe no
+cluster inteiro, como a porta da frente: só existe uma, e o <code>-n</code> não muda nada.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Recurso</th><th>Escopo</th><th>Por quê</th></tr>
+</thead>
+<tbody>
+<tr><td>Pod, Deployment, Service, ConfigMap, Secret</td><td>namespaced</td><td>é a carga da padaria, e cada
+time tem a sua</td></tr>
+<tr><td>Job, CronJob, PVC, Ingress, HPA</td><td>namespaced</td><td>pertencem a uma aplicação, num
+ambiente</td></tr>
+<tr><td>Role, RoleBinding</td><td>namespaced</td><td>permissão válida dentro de um
+namespace</td></tr>
+<tr><td>Namespace</td><td>cluster</td><td>é a própria gaveta; não cabe dentro de outra</td></tr>
+<tr><td>Node</td><td>cluster</td><td>a máquina não pertence a um time</td></tr>
+<tr><td>PersistentVolume, StorageClass</td><td>cluster</td><td>o disco é do cluster; o PVC é que é do
+namespace</td></tr>
+<tr><td>ClusterRole, ClusterRoleBinding</td><td>cluster</td><td>permissão válida em todos os
+namespaces</td></tr>
+<tr><td>CustomResourceDefinition</td><td>cluster</td><td>o tipo novo vale para o cluster
+inteiro</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma pista para não decorar: se o tipo representa “o que roda” ou “o que configura uma aplicação”, ele
+é namespaced; se representa “o que sustenta o cluster” ou “o que vale para todos”, é cluster-scoped. A
+regra tem exceção (o PersistentVolume é o caso clássico), mas acerta na maioria das dúvidas.</p>
+
+<p>Na prática, o escopo decide três coisas. Primeiro, o comando: <code>kubectl get pods -n padaria</code>
+faz sentido; <code>kubectl get nodes -n padaria</code> aceita a flag e a ignora. Segundo, o nome: você pode
+ter um Service <code>cardapio</code> em <code>default</code> e outro em <code>padaria</code>, mas não pode
+ter dois Nodes com o mesmo nome. Terceiro, a permissão: um Role só vale dentro do namespace onde foi
+criado; para valer em todos, é ClusterRole.</p>
+
+<p>Um exemplo do dia a dia fecha a ideia. A Ana tem o namespace <code>default</code> (onde ela testa) e o
+<code>padaria</code> (onde o site roda). O Service <code>cardapio</code> existe nos dois, com o mesmo nome e
+configurações diferentes: um aponta para a versão de teste, o outro para a de produção. Já o Node
+<code>guia-worker</code> existe uma vez só — não faz sentido ter “o mesmo nó” em dois namespaces, porque o
+nó é a máquina, e a máquina é do cluster.</p>
+
+<p>Há um caso que confunde de propósito: o PersistentVolume é cluster-scoped e o
+PersistentVolumeClaim é namespaced. O PV é o disco em si (do cluster); o PVC é o pedido de um time por um
+disco (do namespace). Quando um PVC encontra um PV, os dois se ligam por um vínculo que atravessa o
+escopo — e é por isso que apagar o namespace não apaga o PV automaticamente em todas as
+configurações.</p>
+
+<h2>6. Como descobrir: <code>api-resources</code> e <code>explain</code></h2>
+
+<p>Estes dois comandos substituem qualquer tabela deste guia, porque respondem com o que o <em>seu</em>
+cluster tem — inclusive os tipos que alguém instalou depois. O primeiro lista; o segundo detalha.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Comando</th><th>Responde</th><th>Exemplo de resposta</th><th>No painel</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kubectl api-resources</code></td><td>nome, apelido, versão e escopo de todos os
+tipos</td><td><code>deployments  deploy  apps/v1  true  Deployment</code></td><td>funciona</td></tr>
+<tr><td><code>kubectl api-resources --namespaced=false</code></td><td>só os tipos de escopo de
+cluster</td><td><code>nodes  no  v1  false  Node</code></td><td>não: mostra a lista
+inteira</td></tr>
+<tr><td><code>kubectl explain deployment</code></td><td>a versão e os campos do tipo</td><td><code>VERSION:
+apps/v1</code></td><td>funciona</td></tr>
+<tr><td><code>kubectl explain deployment.spec.strategy</code></td><td>um campo e os subcampos
+dele</td><td><code>FIELD: strategy &lt;DeploymentStrategy&gt;</code></td><td>funciona</td></tr>
+<tr><td><code>kubectl api-versions</code></td><td>só as versões publicadas</td><td><code>apps/v1</code>,
+<code>batch/v1</code></td><td>não: transcrição</td></tr>
+<tr><td><code>kubectl get --raw /apis</code></td><td>a resposta crua da API</td><td>JSON com os
+grupos</td><td>não: transcrição</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A transcrição abaixo é de um cluster de verdade, com a saída alinhada como o <code>kubectl</code>
+imprime. Repare na coluna <code>NAMESPACED</code>: <code>true</code> quer dizer que o tipo vive dentro de
+namespace, <code>false</code> que é do cluster.</p>
+
+<pre class="term">$ kubectl api-resources
+NAME                       SHORTNAMES   APIVERSION                     NAMESPACED   KIND
+pods                       po           v1                             true         Pod
+deployments                deploy       apps/v1                        true         Deployment
+replicasets                rs           apps/v1                        true         ReplicaSet
+daemonsets                 ds           apps/v1                        true         DaemonSet
+jobs                                    batch/v1                       true         Job
+cronjobs                   cj           batch/v1                       true         CronJob
+services                   svc          v1                             true         Service
+ingresses                  ing          networking.k8s.io/v1           true         Ingress
+persistentvolumes          pv           v1                             false        PersistentVolume</pre>
+
+<p>O <code>explain</code> é o outro lado: em vez de listar, ele abre um tipo e mostra os campos. É a
+resposta para “isto é lista ou mapa?” e para “qual é o nome exato do campo?”. A transcrição abaixo também
+é de um cluster de verdade — no painel, ele responde para <code>pod</code>, <code>deployment</code> e
+<code>deployment.spec.strategy</code>.</p>
+
+<pre class="term">$ kubectl explain ingress.spec
+KIND:       Ingress
+VERSION:    networking.k8s.io/v1
+
+FIELD: spec &lt;IngressSpec&gt;
+
+DESCRIPTION:
+     IngressSpec describes the Ingress the user wishes to exist.
+
+FIELDS:
+   defaultBackend       &lt;IngressBackend&gt;
+   ingressClassName     &lt;string&gt;
+   rules                &lt;[]IngressRule&gt;
+     A list of host rules used to configure the Ingress.
+
+$ kubectl api-versions | head -n 5
+admissionregistration.k8s.io/v1
+apps/v1
+autoscaling/v1
+autoscaling/v2
+batch/v1</pre>
+
+<p>Vale aprender a ler as colunas do <code>api-resources</code> em ordem, porque cada uma responde uma
+pergunta. <code>NAME</code> é o plural que você digita no comando; <code>SHORTNAMES</code> traz os apelidos
+separados por vírgula (vazio quando não há); <code>APIVERSION</code> é o valor que vai no manifesto;
+<code>NAMESPACED</code> é <code>true</code> ou <code>false</code>; e <code>KIND</code> é o tipo com
+maiúscula, exatamente como você escreve no <code>kind</code>.</p>
+
+<p>Uma última utilidade do <code>explain</code>: ele aceita o caminho inteiro com índices de lista, como
+<code>deployment.spec.template.spec.containers</code>, e costuma funcionar mesmo quando o campo é novo e não
+está em tutorial nenhum. É a documentação que viaja com o cluster.</p>
+
+<p>Duas leituras rápidas dessas saídas. No <code>api-resources</code>, a coluna <code>APIVERSION</code> é
+exatamente o que vai no manifesto — copie daí e não erre. No <code>explain</code>, o campo aparece com o
+tipo entre sinais de menor e maior: <code>&lt;string&gt;</code> é texto, <code>&lt;[]IngressRule&gt;</code>
+é lista de objetos (o <code>[]</code> é o sinal da lista), e <code>&lt;int32&gt;</code> é número
+inteiro.</p>
+
+<h2>7. Duas coisas para praticar agora</h2>
+
+<p>A primeira caixa é a sessão de descoberta: listar os recursos e abrir um tipo. A segunda é o conserto
+mais comum de <code>apiVersion</code> quando o assunto é rede — o Ingress copiado de um tutorial antigo,
+com uma versão que o cluster não publica mais.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:apps/v1;;texto:NAMESPACED">
+  <p class="try-task">Rode a sessão de descoberta: liste os recursos da API e abra o tipo
+  <code>Deployment</code>. O painel tem de mostrar a versão <code>apps/v1</code> e a coluna
+  <code>NAMESPACED</code>.</p>
+<pre class="yaml">kubectl version
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl version
+Client Version: v1.37.3
+Kustomize Version: v5.8.1
+
+ana@notebook:~$ kubectl get pods
+No resources found in default namespace.
+</pre>
+<pre class="solucao">kubectl api-resources
+kubectl explain deployment</pre>
+</div>
+
+<div class="tryk8s" data-goal="objeto:Ingress/cardapio;;texto:ingress.networking.k8s.io/cardapio created;;campo:Ingress/cardapio|spec.rules.0.http.paths.0.pathType=Prefix" data-get="ingress">
+  <p class="try-task">O Ingress do cardápio foi copiado com <code>networking.k8s.io/v1beta1</code>, uma
+  versão que o cluster não publica. Rode, leia o erro e troque pela versão da tabela 1.</p>
+<pre class="yaml">apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+<pre class="out">
+error: resource mapping not found for name: "cardapio" namespace: "" from "STDIN": no matches for kind "Ingress" in version "networking.k8s.io/v1beta1"
+ensure CRDs are installed first
+</pre>
+<pre class="solucao">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cardapio
+spec:
+  rules:
+    - host: loja.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cardapio
+                port:
+                  number: 80</pre>
+</div>
+
+<p>No painel, a segunda caixa mostra a tabela do <code>get ingress</code> depois do conserto: nome,
+classe, host, endereço, portas e idade. A coluna <code>CLASS</code> vem <code>&lt;none&gt;</code> porque o
+manifesto não declara <code>ingressClassName</code>, e a coluna <code>HOSTS</code> traz
+<code>loja.test</code>, o host que você escreveu na regra. Num cluster de verdade, sem um controller de
+Ingress instalado, a coluna <code>ADDRESS</code> ficaria vazia — o endereço é do controller, não do
+objeto.</p>
+
+<p>Sobre o painel: <code>api-resources</code> funciona inteiro e é a melhor forma de conferir as tabelas
+desta página. O <code>explain</code> responde para <code>pod</code>, <code>deployment</code> e
+<code>deployment.spec.strategy</code>; nos outros campos, ele devolve o aviso de que o campo não existe no
+motor — é quando a transcrição acima vira a sua referência. Nada disso muda a lição: quem manda é o
+cluster, e os dois comandos são a consulta oficial.</p>
+
+<p>Duas coisas para observar. No erro da segunda caixa aparece a frase <code>ensure CRDs are installed
+first</code>: ela é a dica padrão do <code>kubectl</code> quando não acha o tipo, e no nosso caso não há
+CRD nenhuma faltando — só a versão trocada. E, mesmo com o Ingress criado, não há tráfego de verdade no
+painel: a rede é modelo (quem descreve o roteamento é o manifesto, não o tráfego). O mesmo vale para o
+<code>ADDRESS</code> que aparece na tabela: é o endereço de documentação <code>192.0.2.10</code>.</p>
+
+<h2>8. Para ir além</h2>
+
+<ul>
+  <li><a href="ref-manifestos.html">Manifestos</a> — o esqueleto e o mapa de <code>apiVersion</code> por
+  tipo.</li>
+  <li><a href="pod-manifesto.html">O manifesto do Pod</a> — o primeiro contato com
+  <code>apiVersion</code> e <code>kind</code>.</li>
+  <li><a href="yaml-anatomia.html">A anatomia do YAML</a> — formato, listas e indentação.</li>
+  <li><a href="apply-e-dry-run.html">apply e dry-run</a> — o ensaio antes de enviar ao servidor.</li>
+  <li><a href="namespaces.html">Namespaces</a> — o escopo namespaced na prática.</li>
+  <li><a href="ref-kubectl.html">kubectl</a> — os verbos e as flags que mostram tudo isso.</li>
+  <li><a href="sidecar.html">Sidecar e multi-container</a> — quando o mesmo pod precisa de mais de um
+  tipo de processo.</li>
+  <li><a href="storageclass.html">StorageClass</a> — o tipo cluster-scoped que decide como o disco
+  nasce.</li>
+</ul>
+
+<h2>Resumo</h2>
+
+<p>A API do Kubernetes é organizada em grupos: o núcleo (<code>v1</code>, sem grupo no nome) e os grupos com
+domínio (<code>apps/v1</code>, <code>batch/v1</code>, <code>networking.k8s.io/v1</code>,
+<code>rbac.authorization.k8s.io/v1</code>, <code>autoscaling/v2</code>,
+<code>storage.k8s.io/v1</code>). O <code>apiVersion</code> do manifesto é a junção grupo + versão, e o
+<code>kind</code> é o tipo publicado ali.</p>
+
+<p>Quase tudo vive dentro de um namespace (Pod, Deployment, Service, ConfigMap, Secret, Job, PVC, Ingress,
+HPA); alguns tipos vivem no cluster inteiro (Namespace, Node, PV, StorageClass, ClusterRole, CRD). O escopo
+muda o efeito do <code>-n</code>, a unicidade do nome e o alcance da permissão. Para descobrir tudo isso no
+seu próprio cluster: <code>kubectl api-resources</code> lista nome, apelido, versão e escopo, e
+<code>kubectl explain TIPO</code> abre os campos do tipo — os dois respondem offline e valem mais do que
+qualquer tabela fixa.</p>
+
+<div class="pager"></div>
+
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

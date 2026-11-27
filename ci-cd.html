@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI/CD | Guia Kubernetes</title>
+<meta name="description" content="O caminho do commit ao cluster: build, imagem com tag imutável, manifesto atualizado e onde o kubectl entra (ou não entra) no pipeline — com as caixas rodando de verdade.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">CI/CD</span></h1>
+<p class="intro">A Ana mudou uma linha do cardápio às nove da manhã e, às nove e nove, o site novo estava no
+ar — sem ela abrir um terminal. No meio do caminho, uma máquina baixou o código, rodou os testes, construiu
+uma imagem, empurrou para o registro e avisou o cluster. Nesta aula você acompanha esse caminho estação por
+estação, entende por que <code>latest</code> é uma armadilha, vê onde o <code>kubectl</code> deve (e não
+deve) aparecer e descobre o que um Job de migração tem a ver com tudo isso.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é CI e o que é CD, sem sopa de letrinhas.</li>
+  <li>As cinco estações do caminho: commit, build, teste, imagem e deploy.</li>
+  <li>Por que tag imutável importa e por que <code>latest</code> engana o rollout.</li>
+  <li>Como o pipeline publica a imagem e como o cluster baixa dela (pull secret).</li>
+  <li>Onde o <code>kubectl</code> entra — e por que muitos times o tiram do pipeline.</li>
+  <li>Como rodar uma migração antes do deploy, com Job e <code>backoffLimit</code>.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o commit que virou site no ar</h2>
+
+<p>Antes, cada deploy da padaria era um ritual. A Ana abria o terminal, rodava
+<code>docker build</code>, esperava, fazia <code>docker push</code>, editava o YAML na mão, aplicava,
+lembrava de conferir os pods, e torcia. Levava quarenta minutos e, metade das vezes, ela descobria no
+meio que tinha esquecido de mudar a tag da imagem no manifesto.</p>
+
+<p>Agora o ritual virou um <em>pipeline</em>: uma receita que roda sozinha sempre que alguém faz commit.
+A receita tem estações, e cada estação só começa se a anterior deu certo. Se o teste falha, nada é
+construído. Se o build falha, nada é publicado. Se a publicação falha, o cluster nem fica sabendo. É
+essa ordem — e essa teimosia — que transforma “deploy” em algo que não depende de memória humana.</p>
+
+<p>As siglas: <strong>CI</strong>, integração contínua, é a parte que pega o código e prova que ele
+funciona (build + testes + imagem). <strong>CD</strong> é a parte que leva o resultado até o cluster —
+entrega contínua, quando o último passo espera um clique, ou implantação contínua, quando vai direto. O
+que separa as duas é só quanta gente precisa concordar no fim.</p>
+
+<h2>2. O caminho em cinco estações</h2>
+
+<p>Pense numa linha de produção de pão: a massa entra crua numa ponta e sai embalada na outra, e cada
+estação faz uma coisa só. Se a massa não cresceu, ninguém embala — a esteira para. O pipeline é isso, com
+uma vantagem: cada estação deixa um registro do que fez, e a caixa que sai no fim tem um número que diz
+exatamente de qual fornada ela veio.</p>
+
+<p>Na prática, as cinco estações são estas. <strong>Commit</strong>: alguém faz push num ramo e o
+servidor de CI acorda. <strong>Build</strong>: baixa o código, instala dependências e compila (ou, em
+linguagem interpretada, só valida que empacota). <strong>Teste</strong>: roda os testes automatizados.
+<strong>Imagem</strong>: constrói a imagem do container e a publica num registro, com uma tag que
+identifica aquela fornada. <strong>Deploy</strong>: atualiza o manifesto no repositório de configuração
+(ou aplica direto) e o cluster passa a rodar a imagem nova.</p>
+
+<dl class="anatomy">
+<dt>pipeline</dt>
+<dd>A receita executada pelo servidor de CI: uma sequência de passos, em ordem, que para no primeiro
+erro.</dd>
+<dt>build</dt>
+<dd>Transformar código-fonte no que vai rodar. No caso do Kubernetes, o resultado final é uma
+imagem.</dd>
+<dt>imagem</dt>
+<dd>O pacote com o programa e suas dependências. Tem nome e <em>tag</em>:
+<code>registry.loja.test/padaria/cardapio:2.4.0</code>.</dd>
+<dt>registro</dt>
+<dd>O armário de imagens (Docker Hub, GHCR, Harbor...). O cluster baixa daqui, não do seu
+computador.</dd>
+<dt>tag imutável</dt>
+<dd>Uma tag que aponta para uma imagem só, para sempre — normalmente o número da versão ou o hash do
+commit.</dd>
+<dt>artefato</dt>
+<dd>O que uma estação produz e a seguinte consome: o binário, o relatório de testes, a imagem.</dd>
+</dl>
+
+<p>Repare que o Kubernetes entra só no fim. Ele não constrói, não testa e não publica: ele baixa uma
+imagem que já existe e a mantém rodando. Todo o trabalho de CI acontece fora do cluster — e é bom que
+seja assim, porque um build dentro do cluster de produção disputa CPU com o site da padaria.</p>
+
+<h2>3. Tag imutável: por que <code>latest</code> sabota o rollout</h2>
+
+<p>A tag é o sobrenome da imagem. <code>cardapio:2.4.0</code> é uma fornada específica;
+<code>cardapio:latest</code> é “a fornada mais recente”, o que parece prático e é uma armadilha. O
+problema: quando você publica uma imagem nova com a mesma tag, o manifesto continua igual. O
+<code>kubectl apply</code> responde <code>unchanged</code>, o Deployment não vê mudança nenhuma, nenhum
+pod é recriado, e o cluster continua rodando a imagem antiga que já estava no nó.</p>
+
+<p>Pior: dois nós podem ter imagens diferentes com a mesma tag. Um baixou ontem, outro baixou hoje. Você
+tem duas versões do site rodando ao mesmo tempo, com o mesmo nome, e o balanceamento manda metade dos
+clientes para cada uma. Quando o bug aparece, ninguém consegue reproduzir.</p>
+
+<p>A saída é usar tag que nunca se repete: número de versão (<code>2.4.0</code>), data e hora
+(<code>2026-11-27-1</code>) ou, melhor ainda, o hash do commit (<code>a3f91c2</code>). Com tag imutável,
+mudar a versão muda o manifesto, o Deployment percebe, o rollout acontece — e o
+<code>kubectl rollout undo</code> volta para uma imagem que existe de verdade, com o mesmo conteúdo de
+antes. Se você quiser ser rigoroso ao extremo, pode fixar o <em>digest</em>
+(<code>cardapio@sha256:...</code>), que é o hash do conteúdo da imagem: aí nem a tag pode mentir.</p>
+
+<p>Um detalhe prático que economiza muita dor: o <code>imagePullPolicy</code>. Com tag fixa, o padrão
+<code>IfNotPresent</code> aproveita a imagem que já está no nó. Com <code>latest</code>, o Kubernetes
+assume <code>Always</code> e baixa de novo a cada start — o que só disfarça o problema, porque o
+manifesto continua sem mudar e o rollout continua não acontecendo.</p>
+
+<h2>4. Do build ao registro: credenciais e o pull secret</h2>
+
+<p>Publicar imagem exige login no registro. O pipeline recebe uma credencial (um token, guardado no
+cofre do servidor de CI, nunca no repositório) e faz <code>docker push</code> — ou usa uma ferramenta que
+constrói sem <em>daemon</em>, como o Kaniko, que roda dentro de um container e é a escolha comum quando o
+CI também roda em Kubernetes.</p>
+
+<p>Baixar imagem privada também exige credencial, mas do outro lado: quem baixa é o kubelet, no nó, e ele
+não conhece o cofre do CI. A ponte é um Secret do tipo <code>kubernetes.io/dockerconfigjson</code>,
+referenciado no pod por <code>imagePullSecrets</code>. Sem ele, o pod fica em
+<code>ImagePullBackOff</code> com a mensagem <code>unauthorized</code> — o erro clássico de quem publicou
+a imagem no registro privado e esqueceu de avisar o cluster.</p>
+
+<p>Duas boas práticas que evitam confusão. A primeira: um Secret por registro, com nome claro
+(<code>registry</code>), criado no namespace do time e não no <code>default</code>. A segunda: quando
+possível, amarrar o Secret à ServiceAccount do pod (<code>imagePullSecrets</code> na própria conta), para
+que cada Deployment não precise repetir a referência. As duas funcionam; a segunda é menos repetitiva e
+por isso menos esquecida.</p>
+
+<h2>5. A caixa: o manifesto que o pipeline aplica</h2>
+
+<p>A caixa abaixo é o manifesto que o último passo do pipeline entrega ao cluster. Ele tem dois problemas
+de júnior: a imagem é <code>cardapio:latest</code>, tirada de um registro sem credencial, e o pod não
+sabe como baixar de um registro privado. Corrija os dois e rode.</p>
+
+<div class="tryk8s" data-get="deployments" data-goal="campo:Deployment/cardapio|spec.template.spec.containers.0.image=registry.loja.test/padaria/cardapio:2.4.0;;campo:Deployment/cardapio|spec.template.spec.imagePullSecrets.0.name=registry;;pronto:Deployment/cardapio=2">
+  <p class="try-task">Troque a imagem por <code>registry.loja.test/padaria/cardapio:2.4.0</code> e faça o
+  pod usar o Secret <code>registry</code> como <code>imagePullSecrets</code>. O painel tem de mostrar o
+  Deployment com <code>2/2</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: registry
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: e30=
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      containers:
+        - name: web
+          image: cardapio:latest
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+secret/registry created
+deployment.apps/cardapio created
+
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Secret
+metadata:
+  name: registry
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: e30=
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio
+  template:
+    metadata:
+      labels:
+        app: cardapio
+    spec:
+      imagePullSecrets:
+        - name: registry
+      containers:
+        - name: web
+          image: registry.loja.test/padaria/cardapio:2.4.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>As duas linhas de resposta são <code>secret/registry created</code> e
+<code>deployment.apps/cardapio created</code>, e a tabela mostra <code>2/2</code>. Note que o painel não
+tenta baixar a imagem: ele agenda o pod e o considera pronto. Quem baixaria de verdade é o kubelet, no nó
+— e é por isso que <code>ImagePullBackOff</code> só aparece nas aulas como transcrição, nunca como
+resultado de uma caixa.</p>
+
+<p>O <code>e30=</code> no Secret é o conteúdo <code>{}</code> codificado em base64: um arquivo de
+credencial vazio, só para o exemplo ficar válido. Num cluster de verdade, esse campo é o
+<code>.dockerconfigjson</code> gerado por <code>kubectl create secret docker-registry</code>, com
+usuário, senha e servidor. Nunca escreva a credencial no YAML que vai para o Git — o assunto está na aula
+de segredos externos.</p>
+
+<h2>6. Onde entra o <code>kubectl</code> (e onde não entra)</h2>
+
+<p>Existem dois desenhos de pipeline, e a diferença é quem tem a credencial do cluster. No primeiro, o
+servidor de CI guarda um <em>kubeconfig</em> com permissão de escrita e roda <code>kubectl apply</code> no
+fim. No segundo, o CI só publica a imagem e atualiza o manifesto; quem aplica é um controlador dentro do
+cluster (o Argo CD da aula passada), que lê o repositório.</p>
+
+<p>O primeiro é mais fácil de montar e mais perigoso de manter: a credencial do cluster vive num servidor
+que qualquer pessoa com acesso ao CI pode usar, e o histórico do que foi aplicado fica espalhado em logs
+de build. O segundo tira a credencial do CI e deixa um único ponto de aplicação. Em troca, exige o
+controlador, o repositório de configuração e mais um conceito para o time aprender.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Item</th><th>Pipeline com <code>kubectl</code></th><th>Pipeline que só publica</th></tr>
+</thead>
+<tbody>
+<tr><td>quem aplica</td><td>o servidor de CI, no fim do job</td><td>o controlador no cluster (Argo CD,
+Flux)</td></tr>
+<tr><td>credencial do cluster</td><td>no CI, com escrita</td><td>só no cluster</td></tr>
+<tr><td>histórico do que mudou</td><td>nos logs de build</td><td>no Git</td></tr>
+<tr><td>rollback</td><td>rodar o pipeline de novo com a versão antiga</td><td><code>git revert</code></td></tr>
+<tr><td>quando faz sentido</td><td>time pequeno, cluster único, começando agora</td><td>vários ambientes,
+auditoria, times maiores</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Um meio-termo comum e honesto: o CI aplica em desenvolvimento e só publica a imagem para produção,
+onde o Argo CD sincroniza. O importante é saber qual dos dois mundos você está vivendo — pipeline que
+aplica é GitOps pela metade, e a metade que falta é justamente a que impede o drift da aula anterior.</p>
+
+<h2>7. A caixa: o passo de deploy, com as respostas certas</h2>
+
+<p>Quando o pipeline aplica, ele faz três coisas e confere uma. A caixa abaixo é o fim de um job de deploy
+num cluster que já tem o site rodando (o cenário da padaria). Complete a sequência: apontar a imagem nova,
+esperar o rollout terminar e ler o histórico.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:image updated;;texto:successfully rolled out;;texto:REVISION">
+  <p class="try-task">Troque a imagem do container <code>web</code> para <code>cardapio:2.4.0</code>,
+  espere o rollout e mostre o histórico. O painel tem de trazer <em>image updated</em>,
+  <em>successfully rolled out</em> e a tabela <code>REVISION</code>.</p>
+<pre class="yaml">kubectl set image deployment/cardapio web=cardapio:latest
+kubectl rollout status deployment/cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl set image deployment/cardapio web=cardapio:latest
+deployment.apps/cardapio image updated
+
+ana@notebook:~$ kubectl rollout status deployment/cardapio
+deployment "cardapio" successfully rolled out
+</pre>
+<pre class="solucao">kubectl set image deployment/cardapio web=cardapio:2.4.0
+kubectl rollout status deployment/cardapio
+kubectl rollout history deployment/cardapio</pre>
+</div>
+
+<p>A resposta tem três blocos: <code>deployment.apps/cardapio image updated</code>, a linha
+<code>deployment "cardapio" successfully rolled out</code> e a tabela do histórico. O
+<code>rollout status</code> é o passo que falta em quase todo pipeline caseiro: sem ele, o job termina
+“verde” no instante em que aplicou, mesmo que os pods novos nunca fiquem prontos. Com ele, o job falha
+junto com o deploy — que é o que você quer, para receber o aviso na hora.</p>
+
+<p>O histórico, num cluster de verdade, mostra a causa de cada revisão. Nosso painel é econômico e
+registra o comando:</p>
+
+<pre class="term">REVISION   CHANGE-CAUSE
+1          &lt;none&gt;
+2          set image</pre>
+
+<p>O <code>&lt;none&gt;</code> é a revisão de criação, feita sem anotação de causa. Para o histórico ficar
+legível, o pipeline anota o Deployment com <code>kubernetes.io/change-cause</code> antes de aplicar —
+algo como “build 481: cardapio 2.4.0”. Num cluster real, essa anotação aparece na coluna
+<code>CHANGE-CAUSE</code>; o painel deste guia mostra o comando, não a anotação, e é bom saber a
+diferença.</p>
+
+<h2>8. Antes do deploy: o Job que prepara o terreno</h2>
+
+<p>Algumas mudanças precisam acontecer <em>antes</em> de a versão nova subir: migrar a tabela do banco,
+gerar um arquivo de configuração, rodar um script de dados. Isso não é Deployment (não fica rodando para
+sempre) nem pod solto (ninguém recria se falhar): é <strong>Job</strong>, que roda até terminar e tem
+contagem de tentativas.</p>
+
+<p>O campo que importa aqui é o <code>backoffLimit</code>: quantas vezes o Job tenta de novo depois de
+falhar. O padrão é 6, o que para uma migração é perigoso — seis tentativas de alterar o banco podem
+significar seis vezes o mesmo erro pela metade. Numa migração, use <code>0</code> e deixe o pipeline
+decidir: falhou, para tudo e avisa.</p>
+
+<div class="tryk8s" data-get="jobs -o yaml" data-goal="campo:Job/migra-cardapio|spec.backoffLimit=0;;campo:Job/migra-cardapio|spec.template.spec.containers.0.args.1=--destination=registry.loja.test/padaria/cardapio:2.4.0;;conta:jobs=1">
+  <p class="try-task">Ajuste o Job: nenhuma nova tentativa (<code>backoffLimit: 0</code>) e a imagem de
+  destino na versão <code>2.4.0</code>. Rode e veja o Job terminar.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migra-cardapio
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migra
+          image: kaniko:v1.23.2
+          args:
+            - --context=git://git.loja.test/padaria/site.git
+            - --destination=registry.loja.test/padaria/cardapio:2.3.0</pre>
+<pre class="out">
+job.batch/migra-cardapio created
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migra-cardapio
+  namespace: default
+spec:
+  backoffLimit: 6
+  completions: 1
+  parallelism: 1
+  template:
+    metadata: {}
+    spec:
+      containers:
+        - args:
+            - "--context=git://git.loja.test/padaria/site.git"
+            - "--destination=registry.loja.test/padaria/cardapio:2.3.0"
+          image: kaniko:v1.23.2
+          imagePullPolicy: IfNotPresent
+          name: migra
+          resources:
+            limits: {}
+            requests: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+status:
+  active: 0
+  conditions:
+    - status: "True"
+      type: Complete
+  succeeded: 1
+</pre>
+<pre class="solucao">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migra-cardapio
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migra
+          image: kaniko:v1.23.2
+          args:
+            - --context=git://git.loja.test/padaria/site.git
+            - --destination=registry.loja.test/padaria/cardapio:2.4.0</pre>
+</div>
+
+<p>O painel responde <code>job.batch/migra-cardapio created</code> e, no <code>-o yaml</code>, o Job já
+aparece com <code>status.conditions</code> do tipo <code>Complete</code> e <code>succeeded: 1</code>. No
+cluster de verdade, o Job cria um pod, o pod roda até o fim e o Job marca a conclusão; é esse estado que o
+pipeline espera antes de seguir para o Deployment.</p>
+
+<pre class="term">spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata: {}
+    spec:
+      containers:
+        - args:
+            - "--context=git://git.loja.test/padaria/site.git"
+            - "--destination=registry.loja.test/padaria/cardapio:2.4.0"
+          image: kaniko:v1.23.2
+          imagePullPolicy: IfNotPresent
+          name: migra
+      restartPolicy: Never
+status:
+  active: 0
+  conditions:
+    - status: "True"
+      type: Complete
+  succeeded: 1</pre>
+
+<p>Quando a migração e a imagem precisam estar juntas, o padrão é outro: um <code>initContainer</code>
+dentro do próprio pod, que roda antes do container principal e trava o start até terminar. A diferença é
+de escopo — o Job é único para o deploy inteiro; o initContainer repete em cada pod novo. A aula de
+init containers entra nesse detalhe.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Estação</th><th>O que costuma falhar</th><th>Onde olhar primeiro</th></tr>
+</thead>
+<tbody>
+<tr><td>build</td><td>dependência que não instala, versão errada de runtime</td><td>log do job de CI</td></tr>
+<tr><td>teste</td><td>teste instável, ambiente sem serviço de apoio</td><td>relatório do próprio teste</td></tr>
+<tr><td>imagem</td><td>tag repetida, falta de login no registro</td><td>erro do <code>push</code>; confira a
+tag</td></tr>
+<tr><td>deploy</td><td>manifesto com tag antiga, RBAC sem permissão</td><td>saída do
+<code>rollout status</code></td></tr>
+<tr><td>pós-deploy</td><td>pod não fica pronto, imagem privada sem pull secret</td><td><code>get pods</code>
+e <code>describe pod</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o deploy “verde” que não mudou nada</h3>
+<p>O pipeline terminou com sucesso e o site continuou velho. A causa mais comum é a tag repetida:
+<code>latest</code> publicada de novo, manifesto igual, <code>apply</code> respondendo
+<code>unchanged</code>. A segunda causa é o pipeline aplicar num contexto (namespace ou cluster) diferente
+do que você está olhando. Antes de investigar o cluster, confira a imagem que está rodando:
+<code>kubectl get deployment cardapio -o yaml</code> mostra a tag que o cluster realmente usa.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: a imagem existe, o pod não baixa</h3>
+<p><code>ImagePullBackOff</code> com <code>unauthorized</code> quase sempre é pull secret faltando,
+ausente no namespace certo ou com credencial vencida. Vale lembrar que o pod usa o Secret do
+<em>namespace dele</em>, não do namespace onde o Secret foi criado por engano. E se a imagem acabou de ser
+publicada, espere alguns segundos: registro tem cache.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o pipeline que virou gargalo</h3>
+<p>Com o time crescendo, cada push dispara build de tudo, e a fila do CI passa de vinte minutos. O
+remédio é o mesmo do Kubernetes: separar o que é independente. Build com cache de camadas, testes em
+paralelo, e deploy só do que mudou. Pipeline que demora mais que o intervalo entre commits deixa de ser
+contínuo — e vira um segundo problema.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Por que <code>latest</code> atrapalha o deploy?</p>
+<label><input type="radio" name="q1"> porque o Kubernetes proíbe essa tag em produção</label>
+<label><input type="radio" name="q1"> porque o manifesto não muda quando a imagem muda, então o rollout
+não acontece</label>
+<label><input type="radio" name="q1"> porque ela ocupa mais espaço no registro</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. Para que serve <code>imagePullSecrets</code>?</p>
+<label><input type="radio" name="q2"> para o pipeline publicar a imagem no registro</label>
+<label><input type="radio" name="q2"> para o pod reiniciar quando a imagem muda</label>
+<label><input type="radio" name="q2"> para o kubelet autenticar no registro privado e conseguir baixar a
+imagem</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Por que um Job de migração costuma usar
+<code>backoffLimit: 0</code>?</p>
+<label><input type="radio" name="q3"> porque repetir uma migração que falhou pode piorar o estado do
+banco</label>
+<label><input type="radio" name="q3"> porque o Job só roda uma vez por dia</label>
+<label><input type="radio" name="q3"> porque sem isso o Job não cria pod</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: a tag do build 481</h2>
+<p>O build número 481 gerou a imagem <code>registry.loja.test/padaria/cardapio:2.4.0</code>. Escreva o
+trecho do Deployment que usa essa imagem e o Secret <code>registry</code> para baixá-la. Depois responda:
+qual campo do <code>spec</code> do pod recebe a referência ao Secret?</p>
+<div class="ex-code">spec:<input aria-label="resposta 1" data-answer="imagePullSecrets" placeholder="...">:<br>&nbsp;&nbsp;- name: registry</div>
+<p class="ex-dica">Dica: <code>imagePullSecrets</code> fica no <code>spec</code> do <em>pod</em> (dentro de
+<code>template.spec</code>), não no <code>spec</code> do Deployment.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>CI/CD é o caminho automático entre o commit e o cluster: build, teste, imagem publicada, manifesto
+atualizado e deploy. Cada estação só começa se a anterior passou, e cada uma deixa um artefato com
+número — a imagem com tag imutável é o mais importante deles, porque é o que o cluster baixa.</p>
+
+<p><code>latest</code> é a armadilha da aula: com tag que se repete, o manifesto não muda, o rollout não
+acontece e dois nós podem rodar versões diferentes. Use versão, data ou hash do commit. E lembre que
+imagem privada exige <code>imagePullSecrets</code> — o kubelet não conhece o cofre do CI.</p>
+
+<p>O <code>kubectl</code> pode estar no fim do pipeline ou fora dele, com um controlador aplicando (o
+GitOps da aula anterior). Em qualquer desenho, o passo que não pode faltar é o
+<code>rollout status</code>: sem ele, o pipeline diz “sucesso” antes de o site estar no ar. E quando a
+mudança exige preparar o banco, o Job com <code>backoffLimit: 0</code> roda uma vez, para tudo se falhar e
+deixa o deploy seguir só depois.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Tag imutável ou digest: é o que faz o rollout acontecer de verdade.</li>
+  <li>Pipeline verde não é site no ar — <code>kubectl rollout status</code> é o juiz.</li>
+  <li>Imagem privada + <code>imagePullSecrets</code> = pod que sobe.</li>
+  <li>Migração é Job, com <code>backoffLimit: 0</code>.</li>
+  <li>Se o CI tem a credencial do cluster, ele é o dono do deploy — saiba disso.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

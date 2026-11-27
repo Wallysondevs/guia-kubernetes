@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backup | Guia Kubernetes</title>
+<meta name="description" content="Backup de cluster: as três camadas, o que o Git já cobre, snapshots de volume, o Velero na prática e o teste de restauração que quase ninguém faz.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1><span class="hl">Backup</span></h1>
+<p class="intro">Um colega da Ana digitou <code>kubectl delete namespace padaria</code> para limpar um teste e
+acertou o namespace de produção. Levou quatro segundos. O site, os ConfigMaps, os Secrets e o volume com as
+fotos dos produtos sumiram junto — porque, no Kubernetes, apagar um namespace apaga tudo o que mora dentro
+dele. Nesta aula a Ana descobre o que é (e o que não é) backup de cluster, por que o repositório Git cobre
+só uma parte, como o Velero entra na história e por que um backup que nunca foi restaurado é apenas uma
+esperança bem armazenada.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>As três camadas de backup: estado do cluster, objetos e dados.</li>
+  <li>O que o Git já resolve e o que ele nunca vai resolver.</li>
+  <li>Como o Velero funciona: os objetos <code>Backup</code>, <code>Schedule</code> e
+  <code>Restore</code>.</li>
+  <li>Snapshot de volume (CSI) versus backup de arquivos (Kopia/Restic).</li>
+  <li>Como fazer um teste de restauração de verdade, sem tocar em produção.</li>
+  <li>Frequência, retenção e o que fica de fora de qualquer backup de cluster.</li>
+</ul>
+</div>
+
+<h2>1. A cena: quatro segundos e um namespace a menos</h2>
+
+<p>O comando era para o namespace <code>teste</code>. O dedo escorregou e o <code>Tab</code> completou
+<code>padaria</code>. O kubectl perguntou “tem certeza?” e alguém respondeu que sim. Quatro segundos depois,
+o cluster estava sem o site: Deployment, Service, ConfigMap, Secret e o volume com as fotos do cardápio
+foram embora na mesma operação, porque o namespace é o pacote e o pacote inteiro foi descartado.</p>
+
+<p>A primeira pergunta da Ana foi “o Git tem tudo, né?”. Tinha o Deployment, o Service e o ConfigMap. Não
+tinha o Secret (que é gerado por outra ferramenta), não tinha o conteúdo do volume e não tinha o histórico
+de revisões. Reaplicar o repositório traria o site de volta, vazio — como uma loja com as prateleiras
+montadas e nenhum produto.</p>
+
+<p>Backup de cluster é a resposta para essa pergunta, mas ele não é uma coisa só. É um conjunto de cópias
+com propósitos diferentes, e quem trata os três como um só descobre na hora do aperto que metade faltava.
+Vamos separar as camadas.</p>
+
+<h2>2. As três camadas de backup</h2>
+
+<p>Pense numa padaria. Existe o <strong>prédio</strong> (a estrutura, que pode ser reconstruída a partir de
+uma planta), existe o <strong>mobiliário e a configuração</strong> (onde fica cada balcão, qual a receita de
+cada pão) e existem os <strong>produtos</strong> (a farinha no estoque, os pães prontos). Perder o prédio é
+diferente de perder a receita, que é diferente de perder o estoque. Cada um tem a sua cópia e o seu tempo de
+recuperação.</p>
+
+<p>No Kubernetes, o prédio é o <strong>estado do cluster</strong>: tudo o que o API server guarda, que vive
+no <code>etcd</code>. A cópia dessa camada é o snapshot do <code>etcd</code>, e ela é
+<em>tudo ou nada</em> — restaura o cluster inteiro como estava naquele instante, incluindo o que você não
+queria. É a camada do “perdi o plano de controle”.</p>
+
+<p>A configuração é o conjunto de <strong>objetos</strong>: Deployments, Services, ConfigMaps, Secrets,
+PVCs, Roles. A cópia natural dessa camada é o próprio YAML — no Git, quando é declarativo; exportado do
+cluster, quando não é. É a camada do “alguém apagou o namespace”. E os produtos são os <strong>dados</strong>:
+o conteúdo dos volumes persistentes e o banco de dados. Nenhum YAML traz isso de volta; só uma cópia do
+conteúdo, feita por snapshot de volume ou por <em>dump</em> da aplicação.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Camada</th><th>O que cobre</th><th>Como se copia</th><th>O que não cobre</th></tr>
+</thead>
+<tbody>
+<tr><td>estado do cluster</td><td>tudo o que está no <code>etcd</code></td><td>snapshot do
+<code>etcd</code></td><td>dados em volumes externos; nada é seletivo</td></tr>
+<tr><td>objetos</td><td>manifestos e configuração</td><td>Git (GitOps) ou Velero</td><td>conteúdo de
+volume, dados de banco</td></tr>
+<tr><td>dados</td><td>volumes e bancos</td><td>snapshot CSI, Kopia/Restic, <em>dump</em> do
+banco</td><td>a configuração de quem usa o dado</td></tr>
+</tbody>
+</table>
+</div>
+
+<dl class="anatomy">
+<dt>snapshot do etcd</dt>
+<dd>Cópia binária do banco do cluster. Restaura o cluster inteiro; não permite escolher um
+namespace.</dd>
+<dt>Velero</dt>
+<dd>Ferramenta que copia objetos do cluster (e, opcionalmente, volumes) para um armazenamento externo, e
+sabe restaurá-los seletivamente.</dd>
+<dt>snapshot de volume</dt>
+<dd>Cópia do disco de um PersistentVolume, normalmente feita pela camada de armazenamento (CSI).</dd>
+<dt>RPO</dt>
+<dd>Quanto de dado você aceita perder. Backup de hora em hora tem RPO de até uma hora.</dd>
+<dt>RTO</dt>
+<dd>Quanto tempo você aceita ficar fora. É medido no ensaio de restauração, não no papel.</dd>
+<dt>restore drill</dt>
+<dd>O ensaio de restaurar de verdade, num ambiente separado, e conferir se o serviço volta a
+funcionar.</dd>
+</dl>
+
+<p>Repare que as três camadas têm donos diferentes na maioria das empresas: o time de plataforma cuida do
+<code>etcd</code>, o time de aplicação cuida do Git e do banco, e o time de armazenamento cuida dos
+snapshots. O desastre acontece justamente na fronteira — quando cada um acha que o outro tinha a
+cópia.</p>
+
+<h2>3. O Git é meio backup (e é bom saber qual metade)</h2>
+
+<p>Com GitOps, a camada de objetos está resolvida para tudo o que é declarativo: se o namespace sumir,
+você recria o namespace, aponta a <code>Application</code> e o Argo CD reaplica o que está no repositório.
+Em minutos o site está de pé de novo. Isso é backup? É — de configuração. E é um backup melhor que o
+tradicional, porque é versionado e revisado.</p>
+
+<p>Só que o Git tem três buracos conhecidos. O primeiro são os <strong>objetos que nascem no cluster</strong>
+e não no repositório: o Secret criado por um operador, o PVC que o StatefulSet gerou, o token que alguém
+criou com <code>kubectl create secret</code>. O segundo são os <strong>dados</strong>: o Git guarda o
+caminho do volume, não o conteúdo dele. O terceiro é o <strong>histórico de execução</strong>: réplicas
+escaladas no meio de um pico, revisões de rollout, eventos — nada disso está no repositório.</p>
+
+<p>Por isso a pergunta certa não é “tenho backup?”, e sim “para cada camada, qual é a minha cópia e quando
+foi a última vez que eu a usei?”. Se a resposta da camada de objetos é “o Git”, ótimo. Se é “o Git” para os
+dados também, há um buraco — e é o buraco que dói mais, porque dado perdido não se recria com
+<code>apply</code>.</p>
+
+<p>Vale um exercício de humildade: apague um namespace de teste e tente reconstruí-lo só com o repositório,
+cronometrando. Você vai descobrir em quinze minutos o que o plano de recuperação levaria um ano para
+revelar — inclusive os objetos que faltam no Git e ninguém percebeu.</p>
+
+<h2>4. O Velero: o que ele faz</h2>
+
+<p>O Velero é a ferramenta mais usada para backup de objetos no Kubernetes, e a ideia é simples: ele é um
+controlador que mora no cluster, com uma CLI do lado de fora, e que copia objetos para um armazenamento
+externo. Não copia para dentro do cluster, e isso é essencial: backup guardado no mesmo lugar que o
+original não é backup.</p>
+
+<p>Ele funciona com três objetos principais. <code>Backup</code> é uma execução: o que copiar, com quais
+filtros, e onde guardar. <code>Schedule</code> é a repetição: o mesmo backup, num horário, com prazo de
+validade. <code>Restore</code> é a volta: o que restaurar, para quais namespaces, com quais ajustes.
+Existem ainda <code>BackupStorageLocation</code> (onde os arquivos ficam) e
+<code>VolumeSnapshotLocation</code> (onde os snapshots de volume ficam).</p>
+
+<pre class="file" data-file="velero-schedule.yaml">apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: padaria-diario
+  namespace: velero
+spec:
+  schedule: "0 3 * * *"
+  template:
+    includedNamespaces:
+      - padaria
+    includedResources:
+      - deployments
+      - services
+      - configmaps
+      - secrets
+      - persistentvolumeclaims
+    storageLocation: padaria-backup
+    volumeSnapshotLocations:
+      - padaria-snapshots
+    ttl: 720h
+  useOwnerReferencesInBackup: false</pre>
+
+<p>O campo <code>ttl: 720h</code> é a retenção: trinta dias, e o Velero apaga o backup sozinho depois
+disso. <code>includedNamespaces</code> limita o escopo — um backup de tudo, incluindo
+<code>kube-system</code>, é grande, lento e quase nunca restaurável de forma limpa. E o horário segue a
+mesma sintaxe de <em>cron</em> do CronJob do Kubernetes: cinco campos, minuto, hora, dia do mês, mês e dia
+da semana.</p>
+
+<p>Por trás, o Velero precisa de um <strong>provedor de armazenamento</strong>: um plugin que fala com o
+seu armazenamento de objetos (S3, MinIO, Azure Blob, GCS, o que você tiver). Sem esse plugin configurado, o
+backup fica em <code>PartiallyFailed</code> ou nem começa — e é a causa mais comum de “o Velero está
+instalado mas nunca funcionou”.</p>
+
+<h2>5. Snapshots de volume: dois jeitos de copiar dado</h2>
+
+<p>Objeto é fácil: é YAML. Dado é difícil, porque o volume pode estar em uso enquanto é copiado. Existem
+duas abordagens, e elas não são equivalentes.</p>
+
+<p>A primeira é o <strong>snapshot de volume</strong>, feito pela camada de armazenamento via CSI. É
+rápido e consistente: o provedor tira uma foto do disco naquele instante, sem passar pelo sistema de
+arquivos. Em compensação, só existe se o seu storage suportar, e o snapshot costuma ficar preso ao provedor
+— restaurar em outro cluster com outro storage pode não funcionar.</p>
+
+<p>A segunda é o <strong>backup de arquivos</strong>: um agente no nó (o node-agent do Velero, com Kopia ou
+Restic) lê os arquivos do volume e os envia para o armazenamento de objetos. É mais lento, mas independente
+do provedor e funciona em qualquer lugar, inclusive em cluster local. O preço é CPU e tempo de cópia — um
+volume de cem gigabytes não é copiado em segundos.</p>
+
+<p>Nas duas abordagens existe o mesmo problema de consistência: copiar um banco de dados em uso, arquivo
+por arquivo, pode produzir uma cópia que “abre” mas está corrompida. É por isso que banco de dados quase
+sempre tem o seu próprio mecanismo — <em>dump</em> lógico, backup contínuo, replica. O backup do Kubernetes
+não substitui o backup do banco, e o contrário também não vale.</p>
+
+<h2>6. A caixa: exportar o manifesto antes de mexer</h2>
+
+<p>Antes de falar de ferramenta, o gesto mais barato de todos: exportar o que existe antes de mexer. Um
+YAML salvo no seu computador já resolve o “apaguei sem querer” mais comum. A caixa abaixo começa com o
+comando que mostra a tabela; troque pelo comando que devolve o objeto inteiro em YAML.</p>
+
+<div class="tryk8s" data-modo="terminal" data-cenario="padaria" data-goal="texto:kind: Deployment;;texto:image: cardapio:1.0;;texto:replicas: 2">
+  <p class="try-task">Use <code>-o yaml</code> para exportar o Deployment <code>cardapio</code> inteiro e
+  depois liste os pods. O painel tem de mostrar o <code>kind: Deployment</code>, a imagem e as réplicas
+  dentro do YAML.</p>
+<pre class="yaml">kubectl get deployment cardapio
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl get deployment cardapio
+NAME       READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio   2/2     2            2           2m
+
+ana@notebook:~$ kubectl get pods
+NAME                        READY   STATUS    RESTARTS   AGE
+cardapio-wj4jsx2tcw-q65ng   1/1     Running   0          1m
+cardapio-wj4jsx2tcw-t4jwn   1/1     Running   0          10m
+</pre>
+<pre class="solucao">kubectl get deployment cardapio -o yaml
+kubectl get pods</pre>
+</div>
+
+<p>O painel mostra o objeto completo, com <code>kind: Deployment</code>, <code>replicas: 2</code>,
+<code>image: cardapio:1.0</code> e o <code>status</code> no fim. Salve isso num arquivo
+(<code>kubectl get deployment cardapio -o yaml &gt; cardapio.yaml</code>) e você tem uma cópia datada do
+objeto. Repita para cada tipo que importa — Deployment, Service, ConfigMap, Secret, PVC — e pronto: a
+camada de objetos está coberta para aquele namespace.</p>
+
+<p>Um aviso importante sobre o que sai nesse YAML. O <code>status</code> vem junto, e reaplicar um objeto
+com status é pelo menos estranho; o ideal é limpar essa parte. O Service traz o <code>clusterIP</code>
+fixo, que não serve em outro cluster. Veja o Service do cardápio exportado pelo painel:</p>
+
+<pre class="term">apiVersion: v1
+kind: Service
+metadata:
+  name: cardapio
+  namespace: default
+spec:
+  clusterIP: 10.96.147.79
+  clusterIPs:
+    - 10.96.147.79
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+    - port: 80
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    app: cardapio
+  sessionAffinity: None
+  type: ClusterIP</pre>
+
+<p>Se você aplicar esse arquivo em outro cluster, o <code>clusterIP</code> pode conflitar com um IP já
+usado e a criação falha. É por isso que ferramentas de backup de verdade limpam campos gerenciados pelo
+cluster na hora de restaurar. À mão, a receita é remover <code>clusterIP</code>,
+<code>clusterIPs</code>, <code>ipFamilies</code>, <code>ipFamilyPolicy</code> e todo o
+<code>status</code>.</p>
+
+<h2>7. O teste de restauração que ninguém faz</h2>
+
+<p>Todo mundo tem backup. Quase ninguém tem restauração. A diferença aparece no dia do incidente, quando se
+descobre que o backup estava sendo feito num bucket que foi apagado junto, ou que o arquivo tem um formato
+que a versão nova não lê, ou que o tempo de volta é de seis horas e não de trinta minutos.</p>
+
+<p>O ensaio é sempre o mesmo: restaurar em um lugar separado, conferir que o serviço funciona e medir o
+tempo. Nunca restaurar em cima do que está no ar para “testar” — o teste perfeito para derrubar produção é
+restaurar no namespace de produção. A caixa abaixo simula o ensaio no painel: o Deployment original se
+chama <code>cardapio</code>; o restaurado tem de se chamar <code>cardapio-restaurado</code>, com as duas
+réplicas e a imagem do backup.</p>
+
+<div class="tryk8s" data-get="deployments" data-goal="campo:Deployment/cardapio-restaurado|spec.replicas=2;;campo:Deployment/cardapio-restaurado|spec.template.spec.containers.0.image=cardapio:1.0;;pronto:Deployment/cardapio-restaurado=2">
+  <p class="try-task">Ajuste o manifesto restaurado: duas réplicas e a imagem <code>cardapio:1.0</code>,
+  como no backup. O painel tem de mostrar o Deployment restaurado com <code>2/2</code>.</p>
+<pre class="yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-restaurado
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cardapio-restaurado
+  template:
+    metadata:
+      labels:
+        app: cardapio-restaurado
+    spec:
+      containers:
+        - name: web
+          image: cardapio:latest
+          ports:
+            - containerPort: 8080</pre>
+<pre class="out">
+deployment.apps/cardapio-restaurado created
+
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+cardapio-restaurado   1/1     1            1           28s
+</pre>
+<pre class="solucao">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cardapio-restaurado
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cardapio-restaurado
+  template:
+    metadata:
+      labels:
+        app: cardapio-restaurado
+    spec:
+      containers:
+        - name: web
+          image: cardapio:1.0
+          ports:
+            - containerPort: 8080</pre>
+</div>
+
+<p>Restaurar com outro nome é o truque que torna o ensaio seguro: nada do que está no ar é tocado, e você
+pode comparar os dois lado a lado. No Velero, o equivalente é restaurar em outro namespace, com
+<code>--namespace-mappings padaria:padaria-teste</code>, e só depois de conferir apontar o tráfego para
+lá.</p>
+
+<p>E tem o caso chato: restaurar em um cluster onde o objeto ainda existe. O Velero marca o restore como
+<code>PartiallyFailed</code> e lista os conflitos; o kubectl, no comando equivalente, responde assim:</p>
+
+<pre class="term">Error from server (AlreadyExists): deployments.apps "cardapio" already exists</pre>
+
+<p>Traduzindo: o objeto já está lá, e criar de novo não é possível. As saídas são três — restaurar em outro
+namespace (o ensaio), apagar o objeto antes de restaurar (janela de manutenção) ou pedir ao Velero para
+sobrescrever (<code>existingResourcePolicy: update</code>). As três têm consequência; escolher no meio do
+incidente é pior do que escolher no ensaio.</p>
+
+<h2>8. Frequência, retenção e onde guardar</h2>
+
+<p>Backup tem duas perguntas de negócio e uma de engenharia. Quanto dado você aceita perder (RPO)? Quanto
+tempo você aceita ficar fora (RTO)? E onde a cópia fica guardada? As duas primeiras definem a frequência; a
+terceira define se o backup sobrevive ao desastre.</p>
+
+<p>Se perder uma hora de pedidos é aceitável, um backup por hora resolve — mas o dado do banco talvez
+precise de replicação contínua, porque uma hora de pedidos é dinheiro. Se o RTO é de trinta minutos, o
+ensaio tem de mostrar trinta minutos, não seis horas: restaurar um volume de duzentos gigabytes pelo
+node-agent não é rápido.</p>
+
+<p>A regra do armazenamento é curta e absoluta: <strong>fora do cluster e fora da conta</strong>. Backup no
+mesmo provedor, na mesma conta e na mesma região é o primeiro item que some num incidente de conta
+comprometida. Guardar com versionamento e trava de objeto (immutable bucket) protege contra o pior cenário:
+alguém com credencial válida apagando os backups.</p>
+
+<p>A caixa abaixo é um CronJob — o mesmo relógio que um <code>Schedule</code> do Velero usa. Ele está
+suspenso e rodando de cinco em cinco minutos; ajuste para a rotina da padaria, todo dia às três da manhã,
+ativo.</p>
+
+<div class="tryk8s" data-get="cronjobs -o yaml" data-goal="campo:CronJob/backup-cardapio|spec.schedule=0 3 * * *;;campo:CronJob/backup-cardapio|spec.suspend=false;;conta:cronjobs=1">
+  <p class="try-task">Mude o horário para <code>0 3 * * *</code> (todo dia às 3h) e tire o
+  <code>suspend: true</code> — ou troque por <code>false</code>. O painel tem de mostrar o CronJob com o
+  horário novo.</p>
+<pre class="yaml">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-cardapio
+spec:
+  schedule: "*/5 * * * *"
+  suspend: true
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: velero/velero:v1.16.1</pre>
+<pre class="out">
+cronjob.batch/backup-cardapio created
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-cardapio
+  namespace: default
+spec:
+  concurrencyPolicy: Allow
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 6
+      template:
+        spec:
+          containers:
+            - image: velero/velero:v1.16.1
+              imagePullPolicy: IfNotPresent
+              name: backup
+              resources:
+                limits: {}
+                requests: {}
+              terminationMessagePath: /dev/termination-log
+              terminationMessagePolicy: File
+          dnsPolicy: ClusterFirst
+          restartPolicy: OnFailure
+          schedulerName: default-scheduler
+          securityContext: {}
+          terminationGracePeriodSeconds: 30
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 3
+  suspend: true
+</pre>
+<pre class="solucao">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-cardapio
+spec:
+  schedule: "0 3 * * *"
+  suspend: false
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: velero/velero:v1.16.1</pre>
+</div>
+
+<p>O painel mostra o CronJob com <code>schedule: 0 3 * * *</code> e <code>suspend: false</code>, mais os
+padrões que o API server preenche (<code>successfulJobsHistoryLimit: 3</code>,
+<code>failedJobsHistoryLimit: 1</code>). Aviso honesto: o painel <em>não</em> dispara CronJob — ele mostra o
+objeto, não a execução. A rotina de backup de verdade é observada pela ferramenta: no Velero, o
+<code>Schedule</code> cria <code>Backup</code>s, e cada um tem status próprio.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o backup que estava dentro do cluster</h3>
+<p>A equipe instalou o Velero e apontou o armazenamento para um PVC do mesmo cluster. Funcionou por seis
+meses, com relatórios verdes. No dia em que o cluster foi recriado, o PVC foi junto — e os backups também.
+Backup precisa sobreviver ao que ele protege: armazenamento de objetos externo, outra conta, outra
+credencial.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: o restore que faltou um pedaço</h3>
+<p>O restore do namespace terminou com sucesso, mas o site subiu sem as fotos dos produtos: o PVC voltou
+vazio, porque o backup tinha sido feito sem snapshot de volume (ou com o <code>volumeSnapshotLocations</code>
+apontando para um storage que não existia mais). Objeto e dado são camadas diferentes — conferir as duas no
+ensaio é o que revela esse tipo de buraco antes do incidente.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o ensaio que durou seis horas</h3>
+<p>O backup estava perfeito; a restauração, não. O banco tinha 400 GB e o restore pelo node-agent levou seis
+horas — muito acima do RTO combinado. A descoberta só apareceu no ensaio, o que é ótimo: o time trocou a
+estratégia para snapshot de volume mais replica de leitura, e o RTO caiu para quarenta minutos. Ensaio não é
+burocracia; é onde o plano é corrigido.</p>
+</div>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>O que fica de fora</th><th>Por quê</th><th>Como cobrir</th></tr>
+</thead>
+<tbody>
+<tr><td>imagens de container</td><td>moram no registro, não no cluster</td><td>retenção no registro; nunca
+dependa de <code>latest</code></td></tr>
+<tr><td>banco de dados externo</td><td>não é objeto nem volume do Kubernetes</td><td>backup do próprio
+banco</td></tr>
+<tr><td>dados dentro do volume</td><td>o YAML só descreve o PVC</td><td>snapshot CSI ou node-agent</td></tr>
+<tr><td>objetos cluster-scoped</td><td>não pertencem a namespace</td><td>incluir no escopo do Velero, com
+cuidado</td></tr>
+<tr><td>segredos de provedor externo</td><td>vivem no cofre de fora</td><td>recriar e reconectar; manter a
+referência documentada</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. Qual camada o snapshot do <code>etcd</code>
+cobre?</p>
+<label><input type="radio" name="q1"> só os dados dos volumes persistentes</label>
+<label><input type="radio" name="q1"> o estado inteiro do cluster, de forma tudo-ou-nada</label>
+<label><input type="radio" name="q1"> apenas os Deployments e Services de um namespace</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o Velero <em>não</em> faz sozinho?</p>
+<label><input type="radio" name="q2"> copiar objetos para um armazenamento externo</label>
+<label><input type="radio" name="q2"> agendar backups com <code>Schedule</code></label>
+<label><input type="radio" name="q2"> substituir o backup do banco de dados da aplicação</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Para que serve o ensaio de restauração?</p>
+<label><input type="radio" name="q3"> provar que o backup volta e medir o tempo real de recuperação</label>
+<label><input type="radio" name="q3"> liberar espaço no armazenamento de objetos</label>
+<label><input type="radio" name="q3"> atualizar a versão do cluster durante a janela</label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o backup da vitrine</h2>
+<p>Você vai criar um <code>Schedule</code> do Velero para o namespace <code>padaria</code>, todo dia às 3h,
+com retenção de 30 dias, guardando em <code>padaria-backup</code>. Depois responda: qual campo do
+<code>spec</code> guarda o horário?</p>
+<div class="ex-code">spec:<input aria-label="resposta 1" data-answer="schedule" placeholder="...">: "0 3 * * *"</div>
+<p class="ex-dica">Dica: <code>schedule</code> usa a mesma sintaxe de cron do CronJob: minuto, hora, dia do
+mês, mês e dia da semana.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Backup de cluster tem três camadas e elas não se substituem: o estado do cluster (snapshot do
+<code>etcd</code>, tudo-ou-nada), os objetos (Git quando declarativo, Velero quando precisa ser seletivo) e
+os dados (snapshot de volume, node-agent ou backup do próprio banco). O Git cobre bem a segunda camada e
+nunca cobre a terceira.</p>
+
+<p>O Velero organiza a cópia de objetos em <code>Backup</code>, <code>Schedule</code> e
+<code>Restore</code>, guardando fora do cluster num armazenamento de objetos configurado por plugin. Para
+dados, escolhe-se entre snapshot CSI (rápido, preso ao provedor) e backup de arquivos (portátil, lento). Em
+qualquer caso, o que decide o desenho são o RPO e o RTO combinados — e o RTO só se conhece ensaiando.</p>
+
+<p>O ensaio de restauração é a parte que separa plano de esperança: restaurar em outro namespace, conferir
+objetos e dados, medir o tempo, corrigir o plano. E lembrar do que fica de fora: imagem, banco externo,
+dados dentro do volume, segredo de cofre externo. Cada um desses tem um dono — e o backup só funciona quando
+o dono sabe que é dele.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>Backup é por camada: <code>etcd</code>, objetos, dados.</li>
+  <li>Git é backup de configuração, não de dado.</li>
+  <li>Velero: <code>Schedule</code> agenda, <code>Backup</code> executa, <code>Restore</code> volta.</li>
+  <li>Ensaie a restauração em outro namespace e cronometre.</li>
+  <li>Guarde fora do cluster, fora da conta, com trava contra exclusão.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

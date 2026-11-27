@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Probes e recursos | Guia Kubernetes</title>
+<meta name="description" content="Referência de probes e recursos: liveness, readiness e startup com os seus campos, requests e limits, as três classes de QoS e o OOMKilled explicado.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Probes e <span class="hl">recursos</span></h1>
+<p class="intro">Duas perguntas tiram a Ana do sono: “o meu site está no ar?” e “ele cabe no nó?”. A primeira se
+responde com sondas — as três verificações que o kubelet faz no container. A segunda, com
+<code>requests</code> e <code>limits</code>, os números que o agendador usa para escolher o nó e que o kernel
+usa para matar o processo. Esta página é a consulta dos dois assuntos: os campos, os padrões, as três classes
+de QoS e o dia em que o container morre com <code>OOMKilled</code>.</p>
+
+<h2>1. Para que serve esta página (e o que ela não cobre)</h2>
+
+<p>Sonda (<em>probe</em>) é uma verificação periódica: o kubelet pergunta ao container “você está vivo?”,
+“você está pronto para receber pedido?” ou “você já terminou de iniciar?”. Dependendo da resposta, ele reinicia
+o container, tira o pod do balanceamento ou simplesmente espera mais um pouco.</p>
+
+<p>Recursos são dois números por container: o que ele <strong>pede</strong> (<code>requests</code>, usado para
+escolher o nó) e o teto que ele <strong>pode usar</strong> (<code>limits</code>, usado para limitar CPU e matar
+excesso de memória). Os dois assuntos moram no mesmo lugar do manifesto — dentro do container — e por isso
+vivem na mesma página.</p>
+
+<p>Esta página é consulta: campo, padrão, efeito e a tabela de confusões. Ela não conta a história de cada
+sonda, não ensina a diagnosticar um pod que reinicia em laço e não entra em métricas de HPA. Cada um desses
+tem a sua aula, ligada no fim.</p>
+
+<p>As duas coisas custam dinheiro quando erram. Sonda de menos significa site no ar que não responde — o pod
+está <code>Running</code>, o balanceador manda pedido, e o cliente vê erro. Sonda de mais, ou tempo curto
+demais, significa reinício em container saudável: o programa demora 4 segundos para responder no pico, o
+<code>timeoutSeconds</code> é 1, e o kubelet mata o que estava bom. Recurso de menos significa nó abarrotado;
+recurso de mais significa nó vazio e conta alta. Não existe configuração “certa” universal: existe a que
+corresponde ao que o seu programa faz.</p>
+
+<p>Um aviso honesto antes de tudo: o painel deste guia guarda as sondas e os números no manifesto e mostra o
+que o <code>describe</code> mostraria, mas <strong>não executa container</strong>. Quem decide “pronto” no
+painel é o agendamento, não a sonda. Os casos de falha de sonda e de <code>OOMKilled</code> aparecem aqui como
+transcrição de cluster real, identificada como tal.</p>
+
+<h2>2. O essencial em 10 linhas</h2>
+
+<ol>
+  <li><strong>liveness</strong>: falhou, o container é reiniciado. É para processo travado, não para lentidão.</li>
+  <li><strong>readiness</strong>: falhou, o pod sai dos <code>Endpoints</code> e para de receber tráfego. Não
+  reinicia nada.</li>
+  <li><strong>startup</strong>: roda antes das outras duas e existe para programas que demoram a subir.</li>
+  <li>Toda sonda é <code>httpGet</code>, <code>tcpSocket</code>, <code>exec</code> ou <code>grpc</code> —
+  escolha uma.</li>
+  <li>Padrões: <code>periodSeconds: 10</code>, <code>timeoutSeconds: 1</code>,
+  <code>failureThreshold: 3</code>, <code>successThreshold: 1</code}>.</li>
+  <li><code>requests</code> é reserva: o agendador soma as reservas e escolhe o nó que ainda cabe.</li>
+  <li><code>limits</code> é teto: CPU acima do teto é freada; memória acima do teto mata o processo.</li>
+  <li><code>limits</code> sem <code>requests</code> faz o cluster copiar o limite para a reserva.</li>
+  <li>QoS vem dos números: <strong>Guaranteed</strong> (reserva igual ao teto em tudo), <strong>Burstable</strong>
+  (algum número declarado), <strong>BestEffort</strong> (nenhum).</li>
+  <li><code>OOMKilled</code> com código 137 é falta de memória: o limite era menor do que o programa
+  precisava.</li>
+</ol>
+
+<p>A lista já responde a maioria das dúvidas de plantão. O detalhe que ela não cabe é o efeito de cada falha,
+e é o que as duas primeiras tabelas mostram.</p>
+
+<h2>3. Anatomia: a sonda e os números do container</h2>
+
+<p>Sonda é um bloco dentro do container, com nome próprio (<code>livenessProbe</code>,
+<code>readinessProbe</code>, <code>startupProbe</code>) e os mesmos campos de tempo nos três. Recursos são
+outro bloco, <code>resources</code>, com <code>requests</code> e <code>limits</code>. A anatomia abaixo é a dos
+campos que decidem o comportamento.</p>
+
+<dl class="anatomy">
+<dt><code>httpGet</code></dt>
+<dd>a sonda faz um pedido HTTP para <code>path</code> na <code>port</code> do container. Sucesso é código de
+resposta entre 200 e 399. Aceita <code>scheme</code> (HTTP ou HTTPS) e <code>httpHeaders</code>.</dd>
+<dt><code>initialDelaySeconds</code></dt>
+<dd>quanto tempo o kubelet espera antes da primeira verificação. Padrão 0. Com startup probe, costuma ficar em
+zero e a espera vai para a sonda de startup.</dd>
+<dt><code>periodSeconds</code></dt>
+<dd>de quanto em quanto tempo a verificação acontece. Padrão 10 segundos; é o campo que mais gente
+ajusta.</dd>
+<dt><code>timeoutSeconds</code></dt>
+<dd>quanto tempo a resposta pode demorar antes de contar como falha. Padrão 1 segundo — apertado para
+aplicação que faz consulta pesada.</dd>
+<dt><code>failureThreshold</code> / <code>successThreshold</code></dt>
+<dd>quantas falhas seguidas para agir (padrão 3) e quantos sucessos seguidos para voltar a considerar saudável
+(padrão 1).</dd>
+<dt><code>resources.requests</code> / <code>resources.limits</code></dt>
+<dd>os números de CPU e memória. <code>requests</code> é o que o agendador reserva; <code>limits</code> é o
+teto que o kernel aplica. Aceitam <code>cpu</code> e <code>memory</code> separadamente.</dd>
+</dl>
+
+<p>Dois detalhes de escrita que causam erro de validação: os valores de <code>cpu</code> e <code>memory</code>
+são strings — <code>"250m"</code>, <code>"128Mi"</code> —, e os campos de tempo são números inteiros, sem
+unidade. <code>periodSeconds: "10s"</code> é inválido; <code>periodSeconds: 10</code> é o certo.</p>
+
+<p>As unidades de CPU são milesimais: <code>1000m</code> é um núcleo inteiro, <code>250m</code> é um quarto de
+núcleo. As de memória são binárias: <code>Mi</code> é mebibyte (1024 × 1024 bytes), <code>M</code> é megabyte
+decimal. Para limite, a diferença de 5% raramente importa; para bater com o que o programa aloca, importa.</p>
+
+<h2>4. As três sondas e os campos</h2>
+
+<p>A primeira tabela é a diferença entre as três — e é a diferença que muda o que acontece com o pod. A
+segunda é o campo a campo, com o padrão de cada um.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Sonda</th><th>Pergunta</th><th>Se falhar</th><th>Use para</th></tr>
+</thead>
+<tbody>
+<tr><td><code>livenessProbe</code></td><td>o processo ainda responde?</td><td>o container é reiniciado
+(<code>RESTARTS</code> sobe)</td><td>processo que trava e não morre sozinho</td></tr>
+<tr><td><code>readinessProbe</code></td><td>pode receber pedido agora?</td><td>o pod sai dos
+<code>Endpoints</code>; o container continua rodando</td><td>programa que precisa aquecer, conectar ao banco ou
+recarregar dado</td></tr>
+<tr><td><code>startupProbe</code></td><td>já terminou de iniciar?</td><td>o container é reiniciado, e as outras
+duas sondas nem rodam até ela passar</td><td>inicialização longa, que faria a liveness matar o pod antes da
+hora</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Campo</th><th>Unidade</th><th>Padrão</th><th>O que muda na prática</th></tr>
+</thead>
+<tbody>
+<tr><td><code>initialDelaySeconds</code></td><td>segundos</td><td>0</td><td>espera antes da primeira
+verificação; some quando existe startup probe</td></tr>
+<tr><td><code>periodSeconds</code></td><td>segundos</td><td>10</td><td>frequência; valor baixo gera carga e
+falso positivo</td></tr>
+<tr><td><code>timeoutSeconds</code></td><td>segundos</td><td>1</td><td>tempo máximo de resposta; aperta em
+rede lenta</td></tr>
+<tr><td><code>failureThreshold</code></td><td>tentativas</td><td>3</td><td>quantas falhas seguidas até agir: com
+<code>periodSeconds: 10</code>, são 30 segundos</td></tr>
+<tr><td><code>successThreshold</code></td><td>tentativas</td><td>1</td><td>quantos sucessos para voltar; só a
+readiness aceita valor maior que 1</td></tr>
+<tr><td><code>resources.requests</code></td><td><code>m</code> / <code>Mi</code></td><td>nenhum</td><td>reserva
+usada pelo agendador; sem ela, o pod é tratado como mínimo</td></tr>
+<tr><td><code>resources.limits</code></td><td><code>m</code> / <code>Mi</code></td><td>nenhum</td><td>teto
+aplicado pelo kernel; sem ele, o container pode consumir o nó inteiro</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Como escolher os números na prática: meça antes de declarar. Suba o pod sem sonda, observe quanto tempo ele
+leva para responder à primeira requisição e quanto de memória ele usa em repouso e no pico. O
+<code>requests</code> fica perto do repouso, o <code>limits</code> fica acima do pico, a janela da startup
+probe cobre o tempo de subida com folga de duas ou três vezes, e o <code>timeoutSeconds</code> cobre a resposta
+mais lenta que você aceita. Sem medição, qualquer número é chute — e chute em produção vira reinício.</p>
+
+<p>Repare na linha do <code>successThreshold</code>: o Kubernetes recusa valor maior que 1 em liveness e
+startup, porque “estar vivo” não é algo que melhora aos poucos. Em readiness, valor 2 ou 3 faz sentido quando o
+programa oscila ao acordar — ele só volta ao balanceamento depois de duas ou três respostas boas seguidas.</p>
+
+<p>Uma nota sobre o tipo <code>exec</code>: ele roda um comando dentro do container e considera sucesso o
+código de saída zero. É a opção para quem não tem endpoint HTTP, mas cada verificação cria um processo —
+com <code>periodSeconds: 1</code> isso vira dezenas de processos por minuto, e o próprio container fica lento.
+Prefira <code>httpGet</code> ou <code>tcpSocket</code> quando existir um servidor escutando; guarde o
+<code>exec</code> para checar arquivo ou comando interno.</p>
+
+<h2>5. Os campos que mais confundem</h2>
+
+<p>Quase todo problema de recurso começa numa destas cinco linhas. A tabela diz o que é e o que fazer; a prosa
+depois dela explica o caso do <code>OOMKilled</code>, que é o mais dramático.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Confusão</th><th>O que é</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>requests</code> × <code>limits</code></td><td>reserva para o agendador × teto aplicado pelo
+kernel</td><td>reserva perto do uso normal; teto com folga para o pico</td></tr>
+<tr><td><code>limit</code> de CPU</td><td>o container é freado (<em>throttled</em>), não morto</td><td>se a
+latência sobe no pico, o limite de CPU está baixo</td></tr>
+<tr><td><code>limit</code> de memória</td><td>o processo é morto pelo kernel com
+<code>OOMKilled</code></td><td>subir o limite ou corrigir vazamento; memória não é freada, é
+cortada</td></tr>
+<tr><td>QoS <strong>Guaranteed</strong></td><td>todos os containers com <code>requests</code> iguais aos
+<code>limits</code>, em CPU e memória</td><td>é o último a ser despejado sob pressão de memória no nó</td></tr>
+<tr><td>QoS <strong>Burstable</strong></td><td>algum número declarado, sem igualdade em tudo</td><td>o caso
+comum; o despejo escolhe pelos maiores consumidores</td></tr>
+<tr><td>QoS <strong>BestEffort</strong></td><td>nenhum <code>requests</code> nem <code>limits</code></td><td>o
+primeiro candidato a morrer; evitar em produção</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A classe QoS não é um campo: é uma conclusão que o cluster tira dos números. Guaranteed exige que
+<em>todos</em> os containers do pod tenham <code>requests</code> e <code>limits</code> iguais para CPU e
+memória. Se um único container tiver só a reserva, o pod inteiro vira Burstable — e o <code>describe</code>
+mostra isso na linha <code>QoS Class</code>.</p>
+
+<p>O caso do <code>OOMKilled</code> merece o parágrafo que a tabela não cabe. O kernel não avisa: quando a soma
+da memória do container passa do <code>limits.memory</code>, ele mata o processo maior. O Kubernetes registra
+<code>Reason: OOMKilled</code> e código de saída <strong>137</strong> (128 + sinal 9, o <code>SIGKILL</code>).
+O container reinicia, o programa volta, e se o consumo crescer de novo, morre outra vez — o famoso
+<code>CrashLoopBackOff</code> com causa de memória.</p>
+
+<p>Há ainda a conta que o agendador faz e que ninguém vê: ele soma os <code>requests</code> de todos os pods do
+nó e compara com a capacidade. Um nó de 4 núcleos com oito pods de <code>500m</code> está cheio, mesmo que
+todos estejam usando 50m. Quem olha só o consumo real acha que há espaço; quem olha a reserva vê o nó lotado e
+o próximo pod em <code>Pending</code>. É por isso que reserva exagerada é tão ruim quanto reserva nenhuma: ela
+impede o agendamento de pods que caberiam.</p>
+
+<p>Códigos de saída que valem a pena reconhecer: <code>137</code> é memória (ou <code>kill</code> externo);
+<code>143</code> é <code>SIGTERM</code>, o encerramento educado; <code>1</code> é erro do próprio programa;
+<code>127</code> é comando não encontrado. O <code>describe</code> mostra isso em <code>Last State</code>, com
+o motivo em uma palavra.</p>
+
+<h2>6. Erros e mensagens</h2>
+
+<p>Sonda errada e limite apertado produzem sintomas diferentes no mesmo lugar: o <code>describe</code>. A
+tabela reúne as mensagens que aparecem nos eventos e o que cada uma quer dizer.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Mensagem</th><th>Causa</th><th>O que fazer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Liveness probe failed: HTTP probe failed with statuscode: 500</code></td><td>o endpoint de saúde
+responde erro</td><td>conferir a rota e o que ela testa (banco, disco)</td></tr>
+<tr><td><code>Readiness probe failed: dial tcp 10.244.1.5:8081: connect: connection refused</code></td><td>a
+sonda bate numa porta que ninguém escuta</td><td>igualar a porta da sonda à do container</td></tr>
+<tr><td><code>Startup probe failed: context deadline exceeded</code></td><td>a janela
+(<code>failureThreshold × periodSeconds</code>) é curta para o tempo de inicialização</td><td>aumentar os
+dois ou trocar o caminho da sonda</td></tr>
+<tr><td><code>Last State: Terminated</code> com <code>Reason: OOMKilled</code></td><td>consumo acima de
+<code>limits.memory</code></td><td>subir o limite ou investigar vazamento</td></tr>
+<tr><td><code>must be less than or equal to cpu limit</code></td><td><code>requests</code> maior que
+<code>limits</code> no mesmo recurso</td><td>inverter os números: reserva menor ou igual ao teto</td></tr>
+<tr><td><code>FailedScheduling … Insufficient memory</code></td><td>nenhum nó tem a reserva pedida livre</td><td>reduzir
+<code>requests</code>, somar nós ou revisar o que já está agendado</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Estas duas transcrições são de um cluster real. A primeira é o evento de uma readiness batendo na porta
+errada; a segunda é o <code>describe</code> de um container que morreu por memória.</p>
+
+<pre class="term">$ kubectl describe pod cardapio
+...
+Events:
+  Type     Reason     Age                From     Message
+  ----     ------     ----               ----     -------
+  Warning  Unhealthy  8s (x6 over 80s)   kubelet  Readiness probe failed: Get "http://10.244.1.5:8081/saude": dial tcp 10.244.1.5:8081: connect: connection refused</pre>
+
+<pre class="term">$ kubectl describe pod relatorio
+...
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+      Started:      Fri, 27 Nov 2026 09:12:04 +0000
+      Finished:     Fri, 27 Nov 2026 09:14:31 +0000
+    Ready:          False
+    Restart Count:  4</pre>
+
+<p>Para ver só os eventos de sonda, o filtro por motivo ajuda: <code>kubectl get events --field-selector
+reason=Unhealthy</code> mostra as falhas de verificação sem o resto. É útil quando o pod reinicia há horas e
+o <code>describe</code> já reciclou os eventos antigos — o <code>get events</code> guarda por mais tempo e
+mostra a contagem (<code>x6 over 80s</code>), que é o que diz se a falha é pontual ou sistemática.</p>
+
+<p>Sobre medir consumo: o comando é <code>kubectl top pod</code>, e ele depende do Metrics Server instalado.
+No painel deste guia o comando responde que a Metrics API não está disponível, e isso é fiel ao que acontece
+num cluster sem o componente — a métrica não vem do kubelet, vem de um serviço à parte.</p>
+
+<p>A leitura é direta: no primeiro, o texto diz a URL exata e o motivo (<code>connection refused</code>) — a
+sonda está indo para onde não há servidor. No segundo, <code>OOMKilled</code> com <code>137</code> e quatro
+reinícios conta a história inteira: o programa precisa de mais memória do que o limite permite, e o ciclo se
+repete a cada subida.</p>
+
+<h2>7. Duas coisas para praticar agora</h2>
+
+<p>A primeira caixa declara reserva e teto. A segunda conserta a sonda que aponta para a porta errada — o erro
+mais comum de todos, e o que deixa o pod pronto no <code>get</code> mas fora do balanceamento.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/cardapio|spec.containers.0.resources.requests.cpu=250m;;campo:Pod/cardapio|spec.containers.0.resources.requests.memory=128Mi;;campo:Pod/cardapio|spec.containers.0.resources.limits.memory=256Mi;;texto:Running">
+  <p class="try-task">O pod não declara nada e por isso é <code>BestEffort</code>. Declare
+  <code>requests</code> de <code>250m</code> e <code>128Mi</code>, e <code>limits</code> de
+  <code>256Mi</code> de memória.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      resources:
+        requests:
+          cpu: 250m
+          memory: 128Mi
+        limits:
+          memory: 256Mi</pre>
+</div>
+
+<p>O painel guarda os números e mostra o pod em <code>Running</code>. Num cluster real, a classe QoS apareceria
+no <code>describe</code> como <code>Burstable</code>, porque só a memória tem teto — para chegar a
+<code>Guaranteed</code> seria preciso declarar também o limite de CPU, igual à reserva.</p>
+
+<div class="tryk8s" data-get="pods" data-goal="campo:Pod/cardapio|spec.containers.0.readinessProbe.httpGet.port=8080;;campo:Pod/cardapio|spec.containers.0.readinessProbe.httpGet.path=/saude;;texto:Running">
+  <p class="try-task">A readiness bate na porta <code>8081</code>, mas o site escuta em <code>8080</code>. Corrija
+  a porta e mantenha o caminho <code>/saude</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /saude
+          port: 8081
+        periodSeconds: 5</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+  <pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /saude
+          port: 8080
+        periodSeconds: 5</pre>
+</div>
+
+<p>Essa correção é de um caractere e evita um incidente inteiro. O sintoma num cluster real seria pod
+<code>1/1 Running</code> e nenhum tráfego chegando: a readiness falha, o pod sai dos <code>Endpoints</code>, e
+o Service fica sem backend. O <code>get endpoints</code> mostraria a lista vazia, e o evento
+<code>Unhealthy</code> diria a porta.</p>
+
+<h2>8. Para ir além</h2>
+
+<p>Cada sonda tem a sua aula, com o manifesto comentado e os tropeços; os recursos têm duas. A ordem abaixo vai
+do mais simples ao mais avançado.</p>
+
+<ul>
+  <li><a href="liveness-probe.html">Liveness probe</a> — o processo que não morre, os tempos e quando não ter
+  liveness.</li>
+  <li><a href="readiness-probe.html">Readiness probe</a> — o caminho do pod até o <code>Endpoints</code>.</li>
+  <li><a href="startup-probe.html">Startup probe</a> — a janela de inicialização e os eventos de falha.</li>
+  <li><a href="requests-limits.html">Requests e limits</a> — a conta por nó, na prática.</li>
+  <li><a href="recursos-do-pod.html">Requests e limits (manifesto)</a> — onde os campos ficam no pod.</li>
+  <li><a href="qos-classes.html">Classes de QoS</a> — as três classes e as pegadinhas.</li>
+  <li><a href="eviction-e-oom.html">Eviction e OOMKilled</a> — as duas mortes, por dentro.</li>
+  <li><a href="hpa-metricas.html">HPA e métricas</a> — quando o número de réplicas vem do uso de CPU.</li>
+</ul>
+
+<p>Para fechar o ciclo, duas leituras de diagnóstico: <a href="crashloop.html">CrashLoopBackOff</a> explica o
+laço de reinício que a sonda mal configurada provoca, e <a href="describe-diagnostico.html">Diagnóstico com
+describe</a> mostra como ler o bloco de eventos sem se perder.</p>
+
+<h2>Resumo</h2>
+
+<p>São três sondas com papéis diferentes: liveness reinicia, readiness tira do balanceamento, startup segura as
+outras duas até o programa acordar. Todas usam os mesmos campos de tempo — <code>periodSeconds</code> 10,
+<code>timeoutSeconds</code> 1, <code>failureThreshold</code> 3 —, e o tipo é <code>httpGet</code>,
+<code>tcpSocket</code>, <code>exec</code> ou <code>grpc</code>.</p>
+
+<p><code>requests</code> é reserva para o agendador; <code>limits</code> é teto do kernel. CPU acima do teto é
+freada; memória acima do teto mata com <code>OOMKilled</code> e código 137. Limite sem reserva vira reserva
+igual ao limite. A classe QoS sai dos números: Guaranteed com reserva igual ao teto em tudo, Burstable com
+algum número, BestEffort sem nenhum.</p>
+
+<p>No painel do guia, sonda e recurso aparecem no manifesto e no <code>describe</code>, mas quem decide
+“pronto” é o agendamento — o motor não executa container. Falha de sonda e <code>OOMKilled</code> são
+transcrições de cluster real: use-as para reconhecer o sintoma, e o seu cluster para reproduzir.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li>liveness reinicia; readiness tira do Service; startup adia as outras duas.</li>
+  <li>Padrões: 10 s de período, 1 s de timeout, 3 falhas para agir.</li>
+  <li><code>requests</code> reserva, <code>limits</code> limita; memória acima do limite é
+  <code>OOMKilled</code> (137).</li>
+  <li>QoS: Guaranteed, Burstable, BestEffort — e o primeiro a morrer é o BestEffort.</li>
+  <li>Sonda na porta errada deixa o pod <code>Running</code> sem tráfego.</li>
+  <li>O painel guarda os campos; comportamento de sonda é transcrição.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
