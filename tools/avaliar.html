@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><title>avaliador</title></head>
+<body>
+<script src="../assets/js-yaml.js"></script>
+<script src="../assets/k8ssim.js"></script>
+<script>
+  window.__avaliadorPronto = !!(window.K8s && window.K8sCluster && window.K8sKubectl && window.K8sSim);
+  if (!window.__avaliadorPronto) console.error("motor não carregou");
+</script>
+</body>
+</html>

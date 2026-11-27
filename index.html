@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guia Kubernetes — do primeiro pod ao cluster no ar | Guia Kubernetes</title>
+<meta name="description" content="Guia Kubernetes do zero, em português: pod, Deployment, Service, Ingress, RBAC e produção. As caixas aplicam o seu manifesto e mostram o que o kubectl responderia.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>Guia <span class="hl">Kubernetes</span></h1>
+
+<p class="intro">A Ana tem a padaria, o site do cardápio e agora um problema novo: o site não pode cair.
+Antes, ela abria um terminal e deixava o programa rodando; se a máquina reiniciasse, o site saía do ar até
+alguém perceber. Este guia ensina Kubernetes do começo — o que é um cluster, o que é um pod, como se
+escreve um manifesto, como o site fica no ar sozinho, como escalar, como descobrir o que quebrou — até o
+dia em que ela descreve o que quer e o cluster mantém de pé. Escrito em português, <strong>para quem
+nunca programou</strong>.</p>
+
+<div class="note">
+<strong>Como este guia funciona</strong>
+<ul>
+  <li><strong>144 aulas</strong>, uma ideia por aula, na ordem em que se aprende de verdade.</li>
+  <li>Toda caixa \"Experimente\" <strong>aplica o seu manifesto num cluster</strong> e mostra a resposta
+  como o <code>kubectl</code> mostraria: a linha do <code>apply</code>, a tabela do <code>get</code>, o
+  erro do API server, o evento do agendador.</li>
+  <li>As mensagens de erro do motor foram conferidas com um <strong>cluster de verdade</strong>
+  (kube-apiserver, scheduler e controller-manager reais) — uma a uma, em <code>tools/conferir.js</code>.</li>
+  <li>Não precisa instalar nada para começar: o painel já traz o leitor de YAML e o cluster simulado.</li>
+</ul>
+</div>
+
+<h2>1. Para quem é</h2>
+
+<p>Para quem nunca escreveu uma linha de código e ouviu falar que “hoje tudo roda em Kubernetes”. O guia
+não supõe que você saiba Linux, Docker ou YAML: cada peça aparece quando é necessária, explicada na hora.
+Se você já usa Docker no dia a dia, o começo vai parecer devagar — é de propósito, porque a Ana ainda
+confunde “container” com “imagem”.</p>
+
+<p>Se você já mexeu com Kubernetes antes, comece pela <em>Referência</em>: são doze páginas de consulta,
+com tabelas de <code>kubectl</code>, campos de manifesto, mensagens de erro e glossário, cada uma com o
+que fazer.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<tr><th>Nível</th><th>O que você aprende</th><th>Aulas</th></tr>
+<tr><td>1 · Fundamentos</td><td>cluster, pod, kubectl, manifesto YAML, configuração e os primeiros erros</td><td>44</td></tr>
+<tr><td>2 · Workloads e Serviços</td><td>Deployment e rollout, Service e Ingress, probes, volumes, StatefulSet, Jobs e HPA</td><td>48</td></tr>
+<tr><td>3 · Produção</td><td>RBAC, observabilidade, Helm, GitOps, operação e o que sustenta um cluster</td><td>30</td></tr>
+<tr><td>Projetos</td><td>dez aplicações inteiras, do banco com estado ao cluster local completo</td><td>10</td></tr>
+<tr><td>Referência</td><td>kubectl, manifestos, recursos, erros e glossário</td><td>12</td></tr>
+</table>
+</div>
+
+<h2>2. O primeiro pod, agora</h2>
+
+<p>Este é o mesmo manifesto que a oitava aula aplica. Leia, clique em Rodar e veja o que o cluster
+responde. O painel não é uma imagem: é o resultado de aplicar esse YAML — validação, agendamento e a
+tabela do <code>get</code>.</p>
+
+<div class="tryk8s" data-goal="campo:Pod/cardapio|spec.containers.0.image=cardapio:1.0;;texto:Running">
+<p class="try-task"><strong>Missão:</strong> o manifesto abaixo cria um pod com a imagem errada. Troque
+a imagem para <code>cardapio:1.0</code> (a do site da padaria) e rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: nginx:1.29
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+</div>
+
+<p>O painel mostra duas coisas: a linha do <code>apply</code> e a tabela do <code>get pods</code>. Se o
+manifesto tivesse um erro — nome com maiúscula, campo obrigatório faltando, seletor que não casa — o
+painel mostraria a mesma frase que o API server do Kubernetes devolve. É assim que o guia confere tudo:
+pelo resultado, não pela aparência do código.</p>
+
+<h2>3. O que você vai construir</h2>
+
+<p>No fim do Nível 1, a Ana tem o site da padaria rodando dentro do cluster: um pod, depois um
+ConfigMap com o cardápio, um Secret com a senha do banco, e a rotina de olhar o <code>get</code>, o
+<code>describe</code> e os <code>logs</code> quando algo sai errado. No Nível 2, o site vira aplicação de
+verdade: Deployment com réplicas e rollout sem queda, Service para os outros pods acharem o site,
+Ingress para o mundo chegar nele, probes para o cluster saber quem está pronto, volume para o banco
+guardar dados e HPA para crescer quando a fila aumenta.</p>
+
+<p>No Nível 3, o assunto deixa de ser “fazer funcionar” e vira “fazer durar”: RBAC para cada pessoa ver
+só o que deve, métricas e logs para enxergar o cluster, Helm e Kustomize para não repetir YAML, GitOps
+para o cluster seguir o repositório, backup, upgrade e o que fazer quando o incidente é às três da
+manhã.</p>
+
+<h2>4. Como estudar</h2>
+
+<p>Uma aula por vez, na ordem, com o terminal e o painel abertos. Ler sobre pod não ensina pod: editar o
+manifesto, rodar e ver a resposta mudar, sim. Depois de cada aula, refaça o exercício no seu próprio
+arquivo e aplique no cluster local (<code>kind</code>) — o guia ensina a montar um no Nível 1, aula 6.
+Quando o painel e o seu cluster discordarem, confie no seu cluster e leia o evento com
+<code>kubectl describe</code>.</p>
+
+<div class="tip">
+<strong>A resposta está nos eventos</strong>
+<p>Quem está começando tenta adivinhar por que o pod não sobe. O caminho certo é o contrário: rodar
+<code>kubectl describe pod nome</code> e ler os <em>events</em> do fim. Nove entre dez vezes o cluster já
+escreveu o motivo — falta de CPU, imagem que não existe, etiqueta que não casa.</p>
+</div>
+
+<h2>5. O que este guia não é</h2>
+
+<p>Não é a documentação oficial: para a lista completa de campos existe a referência do Kubernetes, e as
+páginas de consulta apontam o caminho. Não é um curso de Docker: o que aparece de imagem e container é
+explicado na hora. E não é um curso de nuvem: quando o assunto é provedor, o guia mostra o conceito e diz
+o que muda em cada um, sem vender nenhum.</p>
+
+<h2>6. Resumo</h2>
+
+<p>Kubernetes é um cluster que mantém de pé o que você descreve: você escreve o manifesto, ele agenda,
+liga, vigia e recoloca no ar. Este guia começa no pod — a menor peça — e vai até o cluster de produção,
+com 144 aulas, caixas que respondem como o kubectl e a honestidade de dizer quando um estado é
+transcrição de um cluster real e não cálculo do painel.</p>
+
+<p>Se você só puder ler uma página antes de começar, leia <a href="primeiro-pod.html">O Primeiro Pod</a>:
+ela mostra o ciclo inteiro — comando, manifesto, tabela, describe, erro — e é o padrão que todas as
+outras seguem. Depois siga a ordem do menu: cada aula supõe a anterior e nada além dela.</p>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

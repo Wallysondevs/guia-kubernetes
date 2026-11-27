@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>O Primeiro Pod | Guia Kubernetes</title>
+<meta name="description" content="O primeiro pod na prática: kubectl run, o manifesto YAML, kubectl get e describe, e o que fazer quando o pod não sobe — com o cluster respondendo de verdade na caixa.">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="assets/style.css">
+<script>(function(){try{var t=localStorage.getItem("tema");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
+</head>
+<body>
+<div class="layout">
+<nav class="sidebar" id="sidebar" aria-label="Tópicos"></nav>
+<main class="main">
+<div class="content">
+<div class="pager"></div>
+
+<h1>O Primeiro <span class="hl">Pod</span></h1>
+<p class="intro">A Ana já sabe que o Kubernetes existe, já instalou o kubectl e já viu o cluster responder
+“olá”. Agora ela quer ver <em>a coisa</em>: um pedaço de software rodando dentro do cluster. É o pod — a
+menor unidade que o Kubernetes liga e mantém de pé. Nesta aula a Ana cria o primeiro pod de duas
+maneiras (um comando e um arquivo YAML), aprende a ler a resposta do kubectl e vê, com os próprios
+olhos, o que acontece quando o nome está errado, quando a imagem não existe e quando o pod não cabe em
+lugar nenhum.</p>
+
+<div class="note">
+<strong>Você vai aprender</strong>
+<ul>
+  <li>O que é um pod, na prática, e por que ele é a unidade do cluster.</li>
+  <li>Criar um pod com <code>kubectl run</code> e com um manifesto YAML.</li>
+  <li>Ler a tabela do <code>kubectl get pods</code>: <code>READY</code>, <code>STATUS</code>,
+  <code>RESTARTS</code> e <code>AGE</code>.</li>
+  <li>Usar <code>kubectl describe</code> para ver nó, IP, imagem e eventos.</li>
+  <li>Reconhecer os três primeiros erros de todo mundo: nome inválido, imagem que não existe e pod que
+  não agenda.</li>
+  <li>Entender o que a caixa faz: aplica o seu manifesto num cluster simulado que responde como o
+  kubectl de verdade.</li>
+</ul>
+</div>
+
+<h2>1. A cena: o site rodando na mão</h2>
+
+<p>O site da padaria da Ana é um programa pequeno: um servidor que responde na porta 8080 com o
+cardápio, os preços e o horário. Até ontem ele rodava “na mão” — a Ana abria o terminal, digitava
+<code>node servidor.js</code> e deixava a janela aberta. Se o computador reiniciasse, o site saía do ar e
+ela precisava lembrar de abrir de novo. Se ela fechasse o terminal sem querer, idem. E se o programa
+travasse às três da manhã, ninguém ficava sabendo até o primeiro cliente reclamar.</p>
+
+<p>O Kubernetes resolve esse tipo de problema com uma ideia simples: em vez de você mandar comandos para
+ligar o programa, você <strong>descreve o que quer</strong> e entrega a descrição para o cluster. “Quero
+uma cópia desse programa rodando, com essa imagem, nessa porta.” O cluster então liga, monitora e
+recoloca no ar sozinho quando algo cai. A unidade que ele liga tem nome: <strong>pod</strong>.</p>
+
+<p>Pod é uma palavra esquisita para quem vem de fora — parece coisa de ficção científica. Pense num
+pod como uma <em>caixinha de entrega</em> com um ou mais programas dentro, rodando juntos no mesmo
+endereço de rede. O cluster não liga “um container”; ele liga um pod. O container é o que está dentro;
+o pod é o pacote que o cluster agenda, move e reinicia.</p>
+
+<h2>2. O que é um pod, na prática</h2>
+
+<p>Todo pod tem três partes, e você vai ver essas três palavras em todo manifesto deste guia. O
+<strong>metadata</strong> é a identidade: nome, namespace e etiquetas. O <strong>spec</strong> é o que
+você quer que exista: os containers, as imagens, as portas, os limites. E o <strong>status</strong> é o
+que o cluster conta de volta: em que nó o pod caiu, qual IP ele ganhou, se está pronto. Você escreve
+metadata e spec; o status é resposta.</p>
+
+<dl class="anatomy">
+<dt>pod</dt>
+<dd>A menor unidade que o Kubernetes agenda: um ou mais containers que compartilham rede e ciclo de
+vida. Tem nome, namespace e um IP próprio.</dd>
+<dt>container</dt>
+<dd>O programa empacotado com as suas dependências (a imagem <code>cardapio:1.0</code>, por exemplo).
+Um pod pode ter vários containers.</dd>
+<dt>node</dt>
+<dd>A máquina (física ou virtual) que roda pods. O cluster escolhe em qual nó cada pod cabe.</dd>
+<dt>namespace</dt>
+<dd>Uma divisão lógica dentro do cluster. Sem escolher, tudo vai para o namespace
+<code>default</code>.</dd>
+<dt>manifesto</dt>
+<dd>O arquivo YAML que descreve o que você quer. <code>kubectl apply -f arquivo.yaml</code> entrega
+esse arquivo ao cluster.</dd>
+</dl>
+
+<p>Uma coisa importante, que confunde no começo: você quase nunca cria pods soltos em produção. O
+normal é descrever um <em>Deployment</em>, que cria e cuida dos pods por você (o assunto do Nível 2).
+Mas o pod é a peça embaixo de tudo, e é por ele que se aprende: quando você entende um pod, entende o
+que qualquer Deployment está produzindo.</p>
+
+<h2>3. O primeiro pod, em um comando</h2>
+
+<p>A forma mais rápida de criar um pod é o <code>kubectl run</code>. Ele recebe um nome, uma imagem e
+pouco mais. É o comando que a Ana usa para testar se o cluster está de pé, antes de escrever qualquer
+arquivo. A caixa abaixo é um terminal: cada linha é um comando, e o painel mostra o que o kubectl
+responderia.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="conta:pods=1;;campo:Pod/cardapio|spec.containers.0.image=cardapio:1.0;;texto:Running">
+  <p class="try-task">Troque a imagem do pod para <code>cardapio:1.0</code> (a imagem do site da
+  padaria) e rode. O painel tem de mostrar o pod <code>cardapio</code> em <code>Running</code>.</p>
+<pre class="yaml">kubectl run cardapio --image=nginx:1.29
+kubectl get pods</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=nginx:1.29
+pod/cardapio created
+
+ana@notebook:~$ kubectl get pods
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl get pods</pre>
+</div>
+
+<p>Duas linhas, duas respostas. A primeira é <code>pod/cardapio created</code> — o cluster aceitou o
+pedido e criou o objeto. A segunda é a tabela do <code>get pods</code>, e ela é o retrato do cluster
+naquele instante. Repare que o <code>READY</code> já está em <code>1/1</code> e o <code>STATUS</code> em
+<code>Running</code>: entre o “created” e a tabela, o cluster agendou o pod num nó, baixou a imagem e
+subiu o container. Isso costuma levar de segundos a um minuto na vida real.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th></th><th><code>kubectl run</code></th><th>manifesto + <code>apply</code></th></tr>
+</thead>
+<tbody>
+<tr><td>serve para</td><td>teste rápido, um comando só</td><td>o que você guarda e versiona</td></tr>
+<tr><td>guarda a receita?</td><td>não: o comando fica no histórico do terminal</td><td>sim: o arquivo fica no repositório</td></tr>
+<tr><td>mudar depois</td><td><code>kubectl edit</code> ou apagar e recriar</td><td>editar o YAML e aplicar de novo</td></tr>
+<tr><td>quando usar</td><td>conferir se o cluster responde, testar uma imagem</td><td>todo o resto</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>O nome do pod é o que você pediu. Isso é diferente do que acontece com um Deployment, que inventa
+nomes compridos (<code>cardapio-6d8f89b786-88dn9</code>) porque ele cria e recria pods o tempo todo. Pod
+solto tem nome fixo porque ninguém vai recriá-lo por você: se ele morrer, morreu.</p>
+
+<h2>4. O mesmo pod, agora em YAML</h2>
+
+<p>O <code>kubectl run</code> é ótimo para um teste rápido, mas não serve para guardar a receita. O jeito
+de verdade é escrever o manifesto — um arquivo de texto que descreve o pod inteiro — e entregá-lo com
+<code>kubectl apply -f</code>. A caixa abaixo tem o manifesto completo de um pod. Rode e veja o que o
+cluster responde.</p>
+
+<div class="tryk8s" data-goal="objeto:Pod/cardapio;;campo:Pod/cardapio|metadata.labels.tier=web;;texto:Running">
+  <p class="try-task">Mude a imagem para <code>cardapio:1.0</code> e acrescente a etiqueta
+  <code>tier: web</code> embaixo de <code>labels</code>. Depois rode.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+spec:
+  containers:
+    - name: web
+      image: nginx:1.29
+      ports:
+        - containerPort: 8080</pre>
+<pre class="out">
+pod/cardapio created
+
+NAME       READY   STATUS    RESTARTS   AGE
+cardapio   1/1     Running   0          2m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+  labels:
+    app: cardapio
+    tier: web
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0
+      ports:
+        - containerPort: 8080</pre>
+</div>
+
+<p>O painel mostra duas coisas: a linha do <code>apply</code> (<code>pod/cardapio created</code>) e a
+tabela do <code>get pods</code> com o pod já em <code>Running</code>. As quatro primeiras linhas do
+manifesto são a identidade — <code>apiVersion</code>, <code>kind</code>, <code>metadata.name</code> e as
+etiquetas. O resto é o <code>spec</code>, e dentro dele o <code>spec.containers</code>, que é uma
+<em>lista</em> (por isso o hífen antes de <code>name: web</code>). Cada item da lista é um container com
+nome, imagem e portas.</p>
+
+<p>Repare no <code>apiVersion: v1</code>. Cada tipo de recurso pertence a um grupo da API, e o grupo faz
+parte do endereço. Pod é <code>v1</code> (o grupo antigo, sem nome). Deployment é
+<code>apps/v1</code>. Job é <code>batch/v1</code>. Se você trocar o <code>apiVersion</code> de um
+Deployment para <code>v1</code>, o kubectl nem tenta validar: ele responde que não conhece aquele tipo
+naquela versão. É um dos erros mais comuns de copiar e colar manifesto pela internet.</p>
+
+<h2>5. Lendo a tabela do get pods</h2>
+
+<p>A tabela parece simples, mas cada coluna conta uma história diferente. <strong>NAME</strong> é o nome
+do pod. <strong>READY</strong> diz quantos containers estão prontos sobre o total —
+<code>1/1</code> é “um de um”, <code>0/1</code> é “o container existe mas não está pronto”.
+<strong>STATUS</strong> é a fase: <code>Pending</code> (aceito, ainda não rodando), <code>Running</code>,
+<code>Succeeded</code> (terminou bem), <code>Failed</code> ou <code>Unknown</code>.
+<strong>RESTARTS</strong> conta quantas vezes o container já reiniciou, e <strong>AGE</strong> é o tempo
+desde a criação.</p>
+
+<div class="table-wrap">
+<table class="ref">
+<thead>
+<tr><th>Coluna</th><th>O que significa</th><th>Quando assusta</th></tr>
+</thead>
+<tbody>
+<tr><td><code>READY</code></td><td>containers prontos / total</td><td><code>0/1</code> com
+<code>Running</code>: o container subiu mas não passa na verificação de prontidão</td></tr>
+<tr><td><code>STATUS</code></td><td>fase do pod</td><td><code>Pending</code> por muito tempo:
+ninguém agendou o pod</td></tr>
+<tr><td><code>RESTARTS</code></td><td>quantas vezes o container reiniciou</td><td>número subindo de
+5 em 5 minutos: o programa está morrendo e o cluster tentando de novo</td></tr>
+<tr><td><code>AGE</code></td><td>tempo de vida</td><td>pod com <code>AGE</code> de 3 segundos toda vez
+que você olha: algo está recriando o pod</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Uma segunda leitura, com <code>-o wide</code>, mostra IP e nó. Vale comparar com o que a Ana vê no
+terminal dela, num cluster de verdade (a transcrição é de um cluster local de três nós):</p>
+
+<pre class="term">$ kubectl get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE    IP         NODE          NOMINATED NODE   READINESS GATES
+cardapio-5cbfb4c44d-4jjxx   1/1     Running   0          3m2s   10.244.1.5   guia-worker   &lt;none&gt;           &lt;none&gt;
+cardapio-5cbfb4c44d-nxfdg   1/1     Running   0          3m2s   10.244.2.4   guia-worker2  &lt;none&gt;           &lt;none&gt;</pre>
+
+<p>O IP do pod é interno ao cluster: ninguém na internet chega nele. Quem quiser acessar o site de fora
+precisa de um Service (Nível 2) — o pod sozinho é uma caixa fechada. E o <code>NODE</code> mostra onde
+ele caiu: dois pods do mesmo Deployment em nós diferentes é o normal, e é o que dá sobrevivência quando
+um nó cai.</p>
+
+<h2>6. O describe: o resto da história</h2>
+
+<p>A tabela do <code>get</code> é o resumo. Quando algo não fecha, o comando é
+<code>kubectl describe</code>: ele abre o objeto inteiro, com identidade, containers, volumes,
+condições e — a parte que mais resolve problema — os <strong>eventos</strong>. A caixa abaixo cria o pod
+e descreve.</p>
+
+<div class="tryk8s" data-modo="terminal" data-goal="texto:Status:;;texto:cardapio:1.0;;texto:Containers:">
+  <p class="try-task">Complete a imagem (<code>cardapio:1.0</code>) e rode os dois comandos: criar o pod
+  e descrevê-lo.</p>
+<pre class="yaml">kubectl run cardapio --image=cardapio
+kubectl describe pod cardapio</pre>
+<pre class="out">
+ana@notebook:~$ kubectl run cardapio --image=cardapio
+pod/cardapio created
+
+ana@notebook:~$ kubectl describe pod cardapio
+Name:            cardapio
+Namespace:       default
+Priority:        0
+Service Account: default
+Node:            guia-control-plane/192.0.2.28
+Start Time:      Fri, 27 Nov 2026 15:50:25 +0000
+Labels:          run=cardapio
+Annotations:     &lt;none&gt;
+Status:          Running
+IP:              10.244.3.71
+IPs:             IP:  10.244.3.71
+Controlled By:   &lt;none&gt;
+
+Containers:
+  cardapio:
+    Image:          cardapio
+    Port:           80/TCP
+    State:          Running
+      Started:      Fri, 27 Nov 2026 15:50:25 +0000
+    Ready:          True
+    Restart Count:  0
+    Environment:    &lt;none&gt;
+    Mounts:         &lt;none&gt;
+Conditions:
+  Type              Status
+  PodScheduled      True
+  Initialized       True
+  Ready             True
+  ContainersReady   True
+Volumes:
+  kube-api-access-t6csd:
+    Type:      Projected (a volume that contains injected data from multiple sources)
+QoS Class:                   BestEffort
+Node-Selectors:              &lt;none&gt;
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason    Age   From                Message
+  Normal   Created   20s   default-scheduler   created by ana
+</pre>
+<pre class="solucao">kubectl run cardapio --image=cardapio:1.0
+kubectl describe pod cardapio</pre>
+</div>
+
+<p>A saída começa com o cabeçalho <code>Name</code>, <code>Namespace</code>, <code>Priority</code>,
+<code>Service Account</code>, <code>Node</code>, <code>Start Time</code>, <code>Labels</code>,
+<code>Status</code> e <code>IP</code>. Depois vem <code>Containers</code>, com a imagem, a porta, o
+estado (<code>Running</code>, <code>Waiting</code>, <code>Terminated</code>) e o número de reinícios. No
+fim, <code>Conditions</code>, <code>Volumes</code>, <code>QoS Class</code> e <code>Events</code>.</p>
+
+<p>Sempre que um pod estiver esquisito, leia os <em>events</em> primeiro. Eles dizem o que o cluster
+tentou fazer e por que desistiu. Este é um evento real de um pod que não coube em nó nenhum, copiado de
+um cluster de prova:</p>
+
+<pre class="term">Events:
+  Type     Reason            Age   From               Message
+  ----     ------            ----  ----               -------
+  Warning  FailedScheduling  11s   default-scheduler  0/3 nodes are available: 3 Insufficient cpu.
+  preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.</pre>
+
+<p>Traduzindo: três nós foram avaliados, nenhum tinha CPU sobrando para o pedido do pod, e o cluster não
+achou nada que pudesse ser despejado para abrir espaço. A frase é feia, mas é específica — e é ela que
+diz se o problema é CPU, memória, etiqueta de nó ou alguma restrição que você mesmo colocou. Sem o
+<code>describe</code>, você ficaria olhando um <code>Pending</code> sem saber por quê.</p>
+
+<h2>7. Quando dá errado: os três primeiros tropeços</h2>
+
+<p>Nenhum desses erros é raro; todos acontecem na primeira semana. O primeiro é o nome. O Kubernetes
+exige nomes em minúsculas, com letras, números e hífen, começando e terminando por letra ou número.
+<code>Cardapio</code> com C maiúsculo não é “um nome feio”: é inválido, e o cluster recusa o objeto
+inteiro. A caixa abaixo tem esse erro de propósito — rode e leia a resposta.</p>
+
+<div class="tryk8s" data-goal="objeto:Pod/cardapio;;texto:Running">
+  <p class="try-task">Rode do jeito que está e leia o erro. Depois troque o nome para
+  <code>cardapio</code>, rode de novo e veja o pod nascer.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: Cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+<pre class="out">
+The Pod "Cardapio" is invalid: metadata.name: Invalid value: "Cardapio": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: cardapio
+spec:
+  containers:
+    - name: web
+      image: cardapio:1.0</pre>
+</div>
+
+<p>A mensagem é longa porque o Kubernetes repete a regra inteira: “a lowercase RFC 1123 subdomain must
+consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric
+character”. Guarde só o começo: <em>nome em minúsculas, hífen no meio, começa e termina com letra ou
+número</em>. O resto é a regex que o cluster usa, e ela é a mesma para pods, services, configmaps e
+quase tudo.</p>
+
+<p>O segundo tropeço é a imagem. Se você digitar <code>cardapio:1.0</code> quando a imagem se chama
+<code>cardapio:1.0.0</code>, o pod é criado (o objeto existe) mas o container não sobe: o cluster tenta
+baixar a imagem, falha, e o status fica <code>ErrImagePull</code> e depois
+<code>ImagePullBackOff</code> — “vou tentar de novo, com espera crescente”. O <code>describe</code>
+mostra o motivo exato, e é sempre uma destas três coisas: o nome está errado, a imagem é privada e falta
+credencial, ou o registro está fora do ar.</p>
+
+<p>O terceiro é o pod que não agenda. Acontece quando o pod pede mais recurso do que qualquer nó tem, ou
+quando você prende o pod a uma etiqueta de nó que não existe, ou quando o nó tem uma restrição (taint)
+que o pod não aceita. O sintoma é sempre o mesmo: <code>STATUS</code> em <code>Pending</code>,
+<code>READY</code> em <code>0/1</code>, e um evento <code>FailedScheduling</code> explicando o motivo. A
+caixa abaixo reproduz o caso do recurso grande demais — repare que o pod existe, mas nunca sai do
+lugar.</p>
+
+<div class="tryk8s" data-goal="texto:Running;;campo:Pod/forno|spec.containers.0.resources.requests.cpu=500m">
+  <p class="try-task">Rode. Depois reduza o pedido de CPU para <code>500m</code> e rode de novo: o pod
+  passa a <code>Running</code>.</p>
+<pre class="yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: "64"</pre>
+<pre class="out">
+pod/forno created
+
+NAME    READY   STATUS    RESTARTS   AGE
+forno   0/1     Pending   0          5m
+</pre>
+<pre class="solucao">apiVersion: v1
+kind: Pod
+metadata:
+  name: forno
+spec:
+  containers:
+    - name: forno
+      image: cardapio:1.0
+      resources:
+        requests:
+          cpu: "500m"</pre>
+</div>
+
+<p>O painel mostra <code>Pending</code> e o cluster explica o motivo no evento. <code>64</code> em CPU
+quer dizer 64 núcleos — muito mais do que qualquer nó de teste tem. <code>500m</code> é meio núcleo
+(m = milésimo). Esse é o tipo de número que parece detalhe e decide se o pod sobe.</p>
+
+<h2>8. O que a caixa faz (e o que ela não faz)</h2>
+
+<p>Vale ser honesto sobre o painel, porque o resto do guia depende dele. O manifesto que você escreve é
+lido pelo mesmo interpretador de YAML do ecossistema Node, validado com as <em>mensagens do API server
+de verdade</em> (as frases foram conferidas contra um cluster real, uma a uma) e aplicado num cluster
+simulado: nós com capacidade, agendador, controladores que criam e vigiam pods, serviços que descobrem
+endpoints. A resposta que aparece é a que o kubectl daria naquele cluster — mesmo formato de tabela,
+mesmo texto de erro, mesmos campos no <code>-o yaml</code>.</p>
+
+<p>O que não existe ali é o kubelet, o pedaço que roda o container de fato. Por isso o painel não simula
+“imagem não encontrada” nem “programa que morre no boot”: esses estados aparecem nas aulas como
+transcrições de um cluster real, e o texto diz quando é transcrição. A regra é simples: o que é cálculo
+(validar, agendar, criar pods, casar etiquetas, calcular endpoints) o motor faz; o que depende de rodar
+o container vem de fora, identificado.</p>
+
+<h2>9. Cenários do dia a dia</h2>
+
+<div class="cenario">
+<h3>Cenário 1: o pod nasce, morre e nasce de novo com outro nome</h3>
+<p>A Ana criou um pod solto, e alguém apagou o container por dentro (um processo que saiu). O
+<code>restartPolicy</code> padrão é <code>Always</code>, então o kubelet reinicia o container
+<em>dentro do mesmo pod</em> — o nome não muda, o <code>RESTARTS</code> sobe. Já se ela apagar o pod
+inteiro, ninguém recria: pod solto não tem dono. Quem recria é o Deployment, e por isso o nome dele é
+comprido e o do pod solto é curto.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 2: dois containers no mesmo pod</h3>
+<p>O time dela pôs um segundo container no pod para exportar métricas. Os dois compartilham o mesmo IP,
+e conversam por <code>localhost</code>. Isso funciona e é comum (o padrão “sidecar”), mas tem
+consequência: se um dos containers falhar, o pod inteiro é considerado não pronto, e o Service para de
+mandar tráfego para ele. Container no mesmo pod é casamento, não coleguismo.</p>
+</div>
+
+<div class="cenario">
+<h3>Cenário 3: o pod que reinicia sozinho toda hora</h3>
+<p>O <code>RESTARTS</code> subindo e o <code>STATUS</code> em <code>CrashLoopBackOff</code> querem dizer
+que o programa está morrendo no boot e o cluster tentando de novo com espera crescente. O caminho é
+<code>kubectl logs</code> (mensagem do programa) e depois <code>kubectl describe</code> (o evento com o
+código de saída). Nove entre dez vezes é configuração faltando — uma variável de ambiente, um arquivo
+que não foi montado, uma porta ocupada.</p>
+</div>
+
+<h2>10. Fixando o que ficou</h2>
+
+<div class="mc" data-answer="2"><p class="mc-q">1. O que é um pod?</p>
+<label><input type="radio" name="q1"> um arquivo YAML guardado no cluster</label>
+<label><input type="radio" name="q1"> a menor unidade que o cluster agenda: um ou mais containers com
+rede e ciclo de vida próprios</label>
+<label><input type="radio" name="q1"> o programa que roda dentro do container</label>
+</div>
+
+<div class="mc" data-answer="3"><p class="mc-q">2. O que o <code>0/1</code> na coluna READY quer
+dizer?</p>
+<label><input type="radio" name="q2"> zero containers criados de um pedido</label>
+<label><input type="radio" name="q2"> o pod reiniciou uma vez</label>
+<label><input type="radio" name="q2"> o container existe, mas não está pronto para receber
+tráfego</label>
+</div>
+
+<div class="mc" data-answer="1"><p class="mc-q">3. Onde está a explicação de um pod em
+<code>Pending</code>?</p>
+<label><input type="radio" name="q3"> nos eventos do <code>kubectl describe pod</code></label>
+<label><input type="radio" name="q3"> no <code>kubectl get pods</code>, na coluna AGE</label>
+<label><input type="radio" name="q3"> no arquivo YAML, no campo <code>status</code></label>
+</div>
+
+<div class="exercise">
+<h2>Exercício: o pod do cardápio com etiqueta</h2>
+<p>Escreva o manifesto de um pod chamado <code>cardapio</code>, com a etiqueta <code>app: cardapio</code>
+e <code>tier: web</code>, um container <code>web</code> com a imagem <code>cardapio:1.0</code> na porta
+8080. Depois responda: qual é o campo do manifesto que guarda o nome do pod?</p>
+<div class="ex-code">metadata.<input aria-label="resposta 1" data-answer="name" placeholder="...">: cardapio</div>
+<p class="ex-dica">Dica: <code>metadata</code> guarda identidade (nome, namespace, labels); <code>spec</code>
+guarda o que você quer que exista.</p>
+</div>
+
+<h2>11. Resumo</h2>
+
+<p>Pod é a unidade do cluster: um ou mais containers que compartilham rede e ciclo de vida. Você cria
+com <code>kubectl run</code> (rápido, descartável) ou com um manifesto YAML entregue por
+<code>kubectl apply -f</code> (o jeito que se guarda). O manifesto tem <code>apiVersion</code>,
+<code>kind</code>, <code>metadata</code> e <code>spec</code>; o <code>status</code> é a resposta do
+cluster.</p>
+
+<p>A tabela do <code>get pods</code> é o resumo — <code>READY</code>, <code>STATUS</code>,
+<code>RESTARTS</code> e <code>AGE</code> — e o <code>describe</code> é o raio-x, com os eventos no fim.
+Pod em <code>Pending</code> é falta de lugar; <code>0/1</code> em <code>Running</code> é falta de
+prontidão; <code>RESTARTS</code> subindo é programa morrendo. Nome inválido o cluster recusa na hora,
+com a regra inteira na mensagem.</p>
+
+<p>Duas coisas para levar: pod solto não é recriado por ninguém, e é por isso que o dia a dia usa
+Deployment; e o pod, sozinho, não é alcançável de fora — quem faz essa ponte é o Service. Na próxima
+aula a Ana aprende a olhar o cluster inteiro com <code>kubectl get</code> em todos os recursos, e a
+partir daí entra no YAML com calma.</p>
+
+<div class="note">
+<strong>Para lembrar</strong>
+<ul>
+  <li><code>kubectl run nome --image=imagem</code> cria um pod; <code>kubectl apply -f</code> aplica um
+  manifesto.</li>
+  <li>Nome em minúsculas, com hífen no meio: <code>cardapio</code> sim, <code>Cardapio</code> não.</li>
+  <li><code>Pending</code> = não achou lugar; <code>Running</code> com <code>0/1</code> = não está
+  pronto; <code>RESTARTS</code> subindo = o programa está morrendo.</li>
+  <li><code>kubectl describe pod nome</code> e leia os <em>events</em> antes de mexer em qualquer
+  coisa.</li>
+</ul>
+</div>
+
+<div class="pager"></div>
+</div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
